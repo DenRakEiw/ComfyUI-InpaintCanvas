@@ -2,22 +2,21 @@
 
 Two nodes:
 
-* ``InpaintCanvas`` - a layered canvas that lives inside the node. The user
-  loads an image, paints a selection, and the node emits the selected region
-  (plus context padding, optionally upscaled) as IMAGE/MASK for a normal
-  inpainting chain. The decoded result can be wired straight back into the
-  node's ``result`` input. That link would be a cycle for ComfyUI, so the
-  frontend strips it from the prompt and passes the source as ``result_source``
-  instead. On execution the canvas node then expands an ephemeral
-  ``InpaintCanvasStitch`` node that pulls the result in, downscales it to the
-  original region, feathers the edges and hands the patch back to the
-  frontend, which adds it as a new layer.
+* ``InpaintCanvas`` - a layered canvas edited in a full-window editor opened
+  from the node. The user loads an image, paints a selection, and the node
+  emits the selected region (plus context padding, optionally upscaled) as
+  IMAGE/MASK for a normal inpainting chain. The decoded result can be wired
+  straight back into the node's ``result`` input. That link would be a cycle
+  for ComfyUI, so the frontend strips it from the prompt and passes the source
+  as ``result_source`` instead. On execution the canvas node then expands an
+  ephemeral ``InpaintCanvasStitch`` node that pulls the result in, downscales
+  it to the original region, feathers the edges and hands the patch back to
+  the frontend, which adds it as a new layer.
 
 * ``InpaintCanvasStitch`` - the stitch step as a standalone node, usable
   explicitly as well.
 """
 
-import hashlib
 import json
 import os
 import time
@@ -48,16 +47,16 @@ def _dir_for_type(kind):
 def _ref_path(ref):
     """Resolve a {filename, subfolder, type} reference to an absolute path."""
     if not ref or not ref.get("filename"):
-        raise ValueError("InpaintCanvas: no image reference given")
+        raise ValueError("Inpaint Canvas: no image reference given")
     base = _dir_for_type(ref.get("type", "input"))
     sub = os.path.normpath(ref.get("subfolder", "") or "")
     if sub == ".":
         sub = ""
     path = os.path.abspath(os.path.join(base, sub, ref["filename"]))
     if os.path.commonpath((os.path.abspath(base), path)) != os.path.abspath(base):
-        raise ValueError("InpaintCanvas: reference outside of the ComfyUI directories")
+        raise ValueError("Inpaint Canvas: reference outside of the ComfyUI directories")
     if not os.path.isfile(path):
-        raise FileNotFoundError(f"InpaintCanvas: file not found: {path}")
+        raise FileNotFoundError(f"Inpaint Canvas: file not found: {path}")
     return path
 
 
@@ -88,11 +87,12 @@ def _blur_mask(mask, radius):
     return torch.from_numpy(np.asarray(img).astype(np.float32) / 255.0)
 
 
-def _resize_image(image, width, height):
-    """Lanczos resize of a [B, H, W, C] tensor."""
+def _resize_image(image, width, height, crop="disabled"):
+    """Lanczos resize of a [B, H, W, C] tensor. ``crop="center"`` keeps the aspect
+    ratio by center-cropping instead of distorting."""
     if image.shape[2] == width and image.shape[1] == height:
         return image
-    out = comfy.utils.common_upscale(image.movedim(-1, 1), width, height, "lanczos", "disabled")
+    out = comfy.utils.common_upscale(image.movedim(-1, 1), width, height, "lanczos", crop)
     return out.movedim(1, -1).clamp(0, 1)
 
 
@@ -128,6 +128,28 @@ def _selection_bbox(mask, padding):
     return x0, y0, x1, y1
 
 
+def _fit_span_to_multiple(a0, a1, limit, m):
+    """Grow [a0, a1) symmetrically so its length is a multiple of ``m``, staying
+    inside [0, limit). If the image is too small for the next multiple, use the
+    largest multiple that fits."""
+    size = a1 - a0
+    target = -(-size // m) * m
+    if target > limit:
+        target = (limit // m) * m
+        if target <= 0:
+            return a0, a1
+    extra = target - size
+    a0 -= extra // 2
+    a1 = a0 + target
+    if a0 < 0:
+        a1 -= a0
+        a0 = 0
+    if a1 > limit:
+        a0 -= a1 - limit
+        a1 = limit
+    return max(0, a0), a1
+
+
 # ---------------------------------------------------------------------------
 # nodes
 # ---------------------------------------------------------------------------
@@ -146,6 +168,8 @@ class InpaintCanvas:
                                         "tooltip": "Longest side of the emitted crop. 0 keeps the native size."}),
                 "feather": ("INT", {"default": 16, "min": 0, "max": 512, "step": 1,
                                     "tooltip": "Blur radius applied to the selection edge when the result is stitched back."}),
+                "multiple_of": ("INT", {"default": 64, "min": 1, "max": 256, "step": 1,
+                                        "tooltip": "crop_image width and height are made a multiple of this (Flux wants 64)."}),
             },
             "optional": {
                 "result": ("IMAGE", {"lazy": True,
@@ -157,14 +181,16 @@ class InpaintCanvas:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "MASK", "STRING")
-    RETURN_NAMES = ("crop_image", "crop_mask", "image", "mask", "stitch_info")
+    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "MASK", "STRING", "INT", "INT")
+    RETURN_NAMES = ("crop_image", "crop_mask", "image", "mask", "stitch_info", "crop_width", "crop_height")
     OUTPUT_TOOLTIPS = (
         "Selected region plus padding, scaled to target_size. Inpaint this.",
         "Selection mask matching crop_image.",
         "The flattened canvas at full size.",
         "Selection mask at full size.",
         "Stitch parameters for a standalone Inpaint Canvas Stitch node.",
+        "Width of crop_image. Wire it into generators that need an explicit size.",
+        "Height of crop_image.",
     )
     FUNCTION = "run"
     CATEGORY = "image/inpaint"
@@ -174,17 +200,13 @@ class InpaintCanvas:
                    "into this node. Each result lands on the canvas as a new layer.")
 
     @classmethod
-    def IS_CHANGED(cls, padding=64, target_size=1024, feather=16, prompt=None, unique_id=None, **kwargs):
-        state, result_source = _state_from_prompt(prompt, unique_id)
-        if result_source:
-            # A result is wired back in, so every queue should produce a fresh stitch.
-            return float("nan")
-        digest = hashlib.sha256()
-        digest.update(json.dumps(state, sort_keys=True).encode("utf-8"))
-        digest.update(f"{padding}|{target_size}|{feather}".encode("utf-8"))
-        return digest.hexdigest()
+    def IS_CHANGED(cls, **kwargs):
+        # Always re-run. The stitch of a wired-back result only happens while this
+        # node executes, and this node cannot know whether the upstream inpaint
+        # chain (seed, prompt, ...) changed. Running it is cheap.
+        return float("nan")
 
-    def run(self, padding=64, target_size=1024, feather=16, prompt=None, unique_id=None, **kwargs):
+    def run(self, padding=64, target_size=1024, feather=16, multiple_of=64, prompt=None, unique_id=None, **kwargs):
         state, result_source = _state_from_prompt(prompt, unique_id)
         base_ref = state.get("base")
         if not base_ref:
@@ -194,15 +216,20 @@ class InpaintCanvas:
         height, width = image.shape[1], image.shape[2]
         mask = _load_mask(state.get("mask"), height, width)
 
+        m = max(1, int(multiple_of))
         x0, y0, x1, y1 = _selection_bbox(mask, padding)
+        if target_size <= 0:
+            # Native size: grow the region itself so the emitted crop is a clean multiple.
+            x0, x1 = _fit_span_to_multiple(x0, x1, width, m)
+            y0, y1 = _fit_span_to_multiple(y0, y1, height, m)
         crop = image[:, y0:y1, x0:x1]
         crop_mask = mask[y0:y1, x0:x1]
 
         if target_size > 0:
             cw, ch = x1 - x0, y1 - y0
             scale = target_size / max(cw, ch)
-            nw = max(8, int(round(cw * scale / 8)) * 8)
-            nh = max(8, int(round(ch * scale / 8)) * 8)
+            nw = max(m, int(round(cw * scale / m)) * m)
+            nh = max(m, int(round(ch * scale / m)) * m)
             crop = _resize_image(crop, nw, nh)
             crop_mask = _resize_mask(crop_mask, nw, nh)
 
@@ -216,7 +243,8 @@ class InpaintCanvas:
             "height": height,
         })
 
-        outputs = (crop, crop_mask[None], image, mask[None], stitch_info)
+        outputs = (crop, crop_mask[None], image, mask[None], stitch_info,
+                   int(crop.shape[2]), int(crop.shape[1]))
 
         if result_source:
             src_id, _, src_slot = result_source.partition(":")
@@ -257,9 +285,13 @@ class InpaintCanvasStitch:
         x, y, w, h = [int(v) for v in info["bbox"]]
         feather = int(info.get("feather", 0))
 
-        patch = _resize_image(result[0:1].cpu().float(), w, h)[0]
+        # First image of the batch, RGB only (API nodes may return RGBA).
+        src = result[0:1, :, :, :3].cpu().float()
+        # Keep the aspect ratio: if the generator returned a different shape,
+        # center-crop instead of distorting the content.
+        patch = _resize_image(src, w, h, crop="center")[0]
+
         blend = _blur_mask(mask, feather)[y:y + h, x:x + w]
-        # Never let the blur leak outside the crop region: keep it zero at the crop border.
         blend3 = blend[..., None]
 
         out = base.clone()

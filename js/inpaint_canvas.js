@@ -1,12 +1,14 @@
-// Inpaint Canvas - layered canvas editor living inside a ComfyUI node.
+// Inpaint Canvas - layered canvas editor for ComfyUI.
 //
-// Responsibilities of this file:
-//   * build the in-node editor (layers, selection tools, pan/zoom)
-//   * persist the canvas state in the workflow (widget value)
-//   * on queue: flatten the visible layers + selection mask, upload both,
-//     and put a small JSON into the prompt as `canvas_state`
-//   * strip the `result` back-link from the prompt (it would be a cycle)
-//     and pass its source as `result_source`
+// The node itself only shows a thumbnail and a button. The editor opens as a
+// full-window overlay so it never fights litegraph for pointer or wheel
+// events. Responsibilities of this file:
+//   * the editor (layers, selection tools, pan/zoom, undo)
+//   * persisting the canvas state in the workflow (widget value)
+//   * on queue: flatten visible layers + selection mask, upload both, and put a
+//     small JSON into the prompt as `canvas_state`
+//   * strip the `result` back-link from the prompt (it would be a cycle) and
+//     pass its source as `result_source`
 //   * receive stitched results from the backend and add them as layers
 
 import { app } from "../../scripts/app.js";
@@ -77,11 +79,41 @@ function el(tag, cls, text) {
     return e;
 }
 
-function button(label, title, onClick) {
-    const b = el("button", "ipc-btn", label);
+// ---------------------------------------------------------------------------
+// icons (24x24, stroke based)
+// ---------------------------------------------------------------------------
+
+const ICONS = {
+    brush: '<path d="M14 4l6 6-9 9H5v-6z"/><path d="M12 6l6 6"/><path d="M5 19c-1 0-2-1-2-2"/>',
+    rect: '<rect x="4" y="5" width="16" height="14" rx="1" stroke-dasharray="3 2"/>',
+    lasso: '<path d="M12 4c4.4 0 8 2.2 8 5s-3.6 5-8 5-8-2.2-8-5 3.6-5 8-5z"/><path d="M6 12.5c-1 2 0 3.5 2 3.5s3 1.5 2 4"/>',
+    erase: '<path d="M4 15l8-8 6 6-5 5H8z"/><path d="M13 21h7"/>',
+    hand: '<path d="M8 12V6a1.5 1.5 0 013 0v5"/><path d="M11 11V4.5a1.5 1.5 0 013 0V11"/><path d="M14 11V6a1.5 1.5 0 013 0v7"/><path d="M8 12v0a1.5 1.5 0 00-3 1l2 5a4 4 0 004 3h3a4 4 0 004-4v-4"/>',
+    undo: '<path d="M9 14L4 9l5-5"/><path d="M4 9h10a6 6 0 010 12h-3"/>',
+    redo: '<path d="M15 14l5-5-5-5"/><path d="M20 9H10a6 6 0 000 12h3"/>',
+    clear: '<circle cx="12" cy="12" r="8"/><path d="M6.5 6.5l11 11"/>',
+    invert: '<circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 010 16z" fill="currentColor" stroke="none"/>',
+    fit: '<path d="M4 9V4h5"/><path d="M20 9V4h-5"/><path d="M4 15v5h5"/><path d="M20 15v5h-5"/>',
+    flatten: '<path d="M12 4l8 4-8 4-8-4z"/><path d="M4 12l8 4 8-4"/><path d="M4 16l8 4 8-4"/>',
+    load: '<path d="M4 17v3h16v-3"/><path d="M12 4v11"/><path d="M7 9l5-5 5 5"/>',
+    play: '<path d="M7 4l12 8-12 8z" fill="currentColor" stroke="none"/>',
+    close: '<path d="M6 6l12 12"/><path d="M18 6L6 18"/>',
+    eye: '<path d="M2 12s4-6 10-6 10 6 10 6-4 6-10 6S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+    eyeOff: '<path d="M4 4l16 16"/><path d="M10 6.3A10 10 0 0112 6c6 0 10 6 10 6a17 17 0 01-3.2 3.4"/><path d="M6.6 8.6C4 10.4 2 12 2 12s4 6 10 6a10 10 0 003-.5"/>',
+    trash: '<path d="M4 7h16"/><path d="M9 7V4h6v3"/><path d="M6 7l1 13h10l1-13"/>',
+    edit: '<path d="M4 20h4l10-10-4-4L4 16z"/><path d="M12 8l4 4"/>',
+};
+
+function icon(name, size = 18) {
+    return `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name]}</svg>`;
+}
+
+function iconButton(name, title, onClick, label) {
+    const b = el("button", "ipc-ib");
     b.type = "button";
-    b.title = title || label;
-    b.addEventListener("click", (e) => { e.stopPropagation(); onClick(e); });
+    b.title = title;
+    b.innerHTML = icon(name) + (label ? `<span>${label}</span>` : "");
+    b.addEventListener("click", (e) => { e.stopPropagation(); e.preventDefault(); onClick(e); });
     return b;
 }
 
@@ -90,17 +122,36 @@ function button(label, title, onClick) {
 // ---------------------------------------------------------------------------
 
 const STYLE = `
-.ipc-root { display:flex; flex-direction:column; width:100%; height:100%; min-height:200px; box-sizing:border-box;
-  background:#1e1e1e; color:#ddd; font: 12px/1.3 system-ui, sans-serif; border-radius:6px; overflow:hidden; outline:none; }
-.ipc-root:focus { box-shadow: inset 0 0 0 1px #4a90d9; }
-.ipc-bar { display:flex; flex-wrap:wrap; gap:4px; align-items:center; padding:4px 6px; background:#2a2a2a; border-bottom:1px solid #111; }
-.ipc-bar .ipc-sep { width:1px; height:18px; background:#444; margin:0 3px; }
-.ipc-btn { background:#3a3a3a; color:#ddd; border:1px solid #555; border-radius:4px; padding:2px 8px; cursor:pointer; font:inherit; }
-.ipc-btn:hover { background:#4a4a4a; }
-.ipc-btn.ipc-active { background:#2f5f9f; border-color:#4a90d9; color:#fff; }
-.ipc-bar label { display:flex; align-items:center; gap:4px; color:#aaa; }
-.ipc-bar input[type=range] { width:80px; }
+.ipc-node { display:flex; flex-direction:column; gap:6px; width:100%; height:100%; box-sizing:border-box; padding:4px;
+  color:#ccc; font:12px/1.3 system-ui, sans-serif; }
+.ipc-node .ipc-thumb { flex:1; min-height:80px; width:100%; border-radius:6px; background:#1a1a1a; cursor:pointer;
+  display:flex; align-items:center; justify-content:center; overflow:hidden; position:relative; }
+.ipc-node .ipc-thumb canvas { max-width:100%; max-height:100%; display:block; }
+.ipc-node .ipc-thumb .ipc-hint { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+  text-align:center; color:#777; padding:12px; pointer-events:none; white-space:pre-line; }
+.ipc-node .ipc-open { display:flex; align-items:center; justify-content:center; gap:8px; padding:7px 10px; border-radius:6px;
+  background:#2f5f9f; color:#fff; border:1px solid #4a90d9; cursor:pointer; font:inherit; font-weight:600; }
+.ipc-node .ipc-open:hover { background:#3a70b8; }
+.ipc-node .ipc-status { color:#888; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
+.ipc-modal { position:fixed; inset:0; z-index:10000; display:flex; flex-direction:column; background:#181818; color:#ddd;
+  font:13px/1.3 system-ui, sans-serif; outline:none; }
+.ipc-top { display:flex; align-items:center; gap:10px; padding:6px 10px; background:#242424; border-bottom:1px solid #0d0d0d; }
+.ipc-top .ipc-title { font-weight:600; margin-right:6px; }
+.ipc-top .ipc-grow { flex:1; }
+.ipc-top label { display:flex; align-items:center; gap:6px; color:#aaa; }
+.ipc-top input[type=range] { width:140px; }
+.ipc-ib { display:inline-flex; align-items:center; justify-content:center; gap:6px; background:#333; color:#ddd; border:1px solid #4a4a4a;
+  border-radius:6px; padding:5px 8px; cursor:pointer; font:inherit; min-width:32px; }
+.ipc-ib:hover { background:#444; color:#fff; }
+.ipc-ib.ipc-active { background:#2f5f9f; border-color:#4a90d9; color:#fff; }
+.ipc-ib.ipc-primary { background:#2f7f4f; border-color:#3fa76a; color:#fff; padding:5px 12px; }
+.ipc-ib.ipc-primary:hover { background:#39955d; }
+.ipc-ib.ipc-danger:hover { background:#7a2f2f; }
 .ipc-body { display:flex; flex:1; min-height:0; }
+.ipc-tools { display:flex; flex-direction:column; gap:4px; padding:6px; background:#202020; border-right:1px solid #0d0d0d; }
+.ipc-tools .ipc-ib { width:38px; height:36px; padding:0; }
+.ipc-tools .ipc-sep { height:1px; background:#3a3a3a; margin:4px 2px; }
 .ipc-view { flex:1; position:relative; overflow:hidden; min-width:0; cursor:crosshair;
   background-color:#2b2b2b;
   background-image: linear-gradient(45deg,#333 25%,transparent 25%),linear-gradient(-45deg,#333 25%,transparent 25%),
@@ -108,20 +159,25 @@ const STYLE = `
   background-size:16px 16px; background-position:0 0,0 8px,8px -8px,-8px 0; }
 .ipc-view canvas { position:absolute; inset:0; width:100%; height:100%; display:block; touch-action:none; }
 .ipc-view.ipc-pan { cursor:grab; }
+.ipc-view.ipc-panning { cursor:grabbing; }
 .ipc-drop { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; text-align:center;
-  color:#888; pointer-events:none; padding:20px; }
-.ipc-layers { width:190px; display:flex; flex-direction:column; background:#252525; border-left:1px solid #111; }
-.ipc-layers h4 { margin:0; padding:5px 8px; font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:#999; background:#2a2a2a; border-bottom:1px solid #111; }
+  color:#888; pointer-events:none; padding:20px; white-space:pre-line; font-size:15px; }
+.ipc-side { width:240px; display:flex; flex-direction:column; background:#202020; border-left:1px solid #0d0d0d; }
+.ipc-side h4 { margin:0; padding:7px 10px; font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:#999; background:#262626; border-bottom:1px solid #0d0d0d; }
 .ipc-list { flex:1; overflow:auto; }
-.ipc-layer { display:flex; flex-direction:column; gap:3px; padding:5px 6px; border-bottom:1px solid #1a1a1a; }
-.ipc-layer.ipc-selected { background:#2f3a48; }
-.ipc-layer .ipc-row { display:flex; align-items:center; gap:4px; }
-.ipc-layer .ipc-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:default; }
-.ipc-layer .ipc-eye { width:22px; text-align:center; cursor:pointer; opacity:.9; }
-.ipc-layer .ipc-eye.ipc-off { opacity:.3; }
-.ipc-layer .ipc-del { cursor:pointer; color:#c66; padding:0 3px; }
+.ipc-layer { display:flex; flex-direction:column; gap:4px; padding:6px 8px; border-bottom:1px solid #161616; }
+.ipc-layer .ipc-row { display:flex; align-items:center; gap:6px; }
+.ipc-layer .ipc-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.ipc-layer .ipc-mini { display:inline-flex; align-items:center; justify-content:center; width:26px; height:24px; border-radius:4px;
+  cursor:pointer; color:#bbb; background:transparent; border:none; padding:0; }
+.ipc-layer .ipc-mini:hover { background:#3a3a3a; color:#fff; }
+.ipc-layer .ipc-mini.ipc-off { color:#555; }
+.ipc-layer .ipc-mini.ipc-del:hover { color:#f66; }
 .ipc-layer input[type=range] { width:100%; margin:0; }
-.ipc-status { padding:3px 8px; background:#2a2a2a; border-top:1px solid #111; color:#999; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.ipc-info { padding:8px 10px; color:#aaa; border-top:1px solid #0d0d0d; display:grid; grid-template-columns:auto 1fr; gap:3px 10px; }
+.ipc-info b { color:#ddd; font-weight:500; }
+.ipc-bottom { padding:5px 10px; background:#242424; border-top:1px solid #0d0d0d; color:#999; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.ipc-kbd { color:#777; margin-left:auto; }
 `;
 
 function injectStyle() {
@@ -151,26 +207,98 @@ class InpaintEditor {
         this.redo = [];
         this.selectionDirty = true;
         this.selectionDataUrl = null;
+        this.cachedBounds = null;
         this.uploaded = { baseHash: null, baseRef: null, maskHash: null, maskRef: null };
         this.seenResults = new Set();
         this.layerCounter = 0;
-        this.pointer = null;         // active gesture
+        this.pointer = null;
         this.lassoPoints = null;
-        this.status = "";
+        this.hover = null;
+        this.status = "No image loaded.";
+        this.isOpen = false;
 
-        this.buildDom();
+        injectStyle();
+        this.buildNodeWidget();
+        this.buildModal();
     }
 
-    // ---- DOM -------------------------------------------------------------
+    // ---- node widget (thumbnail + button) --------------------------------
 
-    buildDom() {
-        injectStyle();
-        const root = el("div", "ipc-root");
+    buildNodeWidget() {
+        const root = el("div", "ipc-node");
+        this.nodeRoot = root;
+        const thumbWrap = el("div", "ipc-thumb");
+        this.thumb = document.createElement("canvas");
+        this.thumb.width = 4; this.thumb.height = 4;
+        thumbWrap.appendChild(this.thumb);
+        this.thumbHint = el("div", "ipc-hint", "No image yet.\nOpen the editor to load one.");
+        thumbWrap.appendChild(this.thumbHint);
+        thumbWrap.addEventListener("click", (e) => { e.stopPropagation(); this.open(); });
+        thumbWrap.addEventListener("pointerdown", (e) => e.stopPropagation());
+        root.appendChild(thumbWrap);
+
+        const openBtn = el("button", "ipc-open");
+        openBtn.type = "button";
+        openBtn.innerHTML = icon("edit") + "<span>Open editor</span>";
+        openBtn.addEventListener("pointerdown", (e) => e.stopPropagation());
+        openBtn.addEventListener("click", (e) => { e.stopPropagation(); this.open(); });
+        root.appendChild(openBtn);
+
+        this.nodeStatus = el("div", "ipc-status", this.status);
+        root.appendChild(this.nodeStatus);
+
+        // Drop / paste onto the node as a shortcut.
+        root.addEventListener("dragover", (e) => { e.preventDefault(); e.stopPropagation(); });
+        root.addEventListener("drop", (e) => {
+            e.preventDefault(); e.stopPropagation();
+            const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+            if (f && f.type.startsWith("image/")) this.loadFile(f);
+        });
+        root.addEventListener("wheel", (e) => e.stopPropagation(), { passive: true });
+
+        this.thumbObserver = new ResizeObserver(() => this.drawThumb());
+        this.thumbObserver.observe(thumbWrap);
+    }
+
+    drawThumb() {
+        const wrap = this.thumb.parentElement;
+        if (!wrap) return;
+        const rect = wrap.getBoundingClientRect();
+        if (!this.base || rect.width < 4 || rect.height < 4) {
+            this.thumb.width = 4; this.thumb.height = 4;
+            this.thumbHint.style.display = this.base ? "none" : "flex";
+            return;
+        }
+        this.thumbHint.style.display = "none";
+        const s = Math.min(rect.width / this.width, rect.height / this.height, 1) * (window.devicePixelRatio || 1);
+        const w = Math.max(1, Math.round(this.width * s));
+        const h = Math.max(1, Math.round(this.height * s));
+        if (this.thumb.width !== w || this.thumb.height !== h) {
+            this.thumb.width = w; this.thumb.height = h;
+        }
+        this.thumb.style.width = (w / (window.devicePixelRatio || 1)) + "px";
+        this.thumb.style.height = (h / (window.devicePixelRatio || 1)) + "px";
+        const ctx = this.thumb.getContext("2d");
+        ctx.setTransform(w / this.width, 0, 0, h / this.height, 0, 0);
+        ctx.clearRect(0, 0, this.width, this.height);
+        this.drawComposite(ctx);
+        if (this.selection) {
+            ctx.globalAlpha = 0.45;
+            ctx.drawImage(this.selection, 0, 0);
+            ctx.globalAlpha = 1;
+        }
+    }
+
+    // ---- modal -------------------------------------------------------------
+
+    buildModal() {
+        const root = el("div", "ipc-modal");
         root.tabIndex = 0;
         this.root = root;
 
-        // toolbar
-        const bar = el("div", "ipc-bar");
+        // top bar
+        const top = el("div", "ipc-top");
+        top.appendChild(el("span", "ipc-title", "Inpaint Canvas"));
         this.fileInput = document.createElement("input");
         this.fileInput.type = "file";
         this.fileInput.accept = "image/*";
@@ -180,111 +308,159 @@ class InpaintEditor {
             if (f) this.loadFile(f);
             this.fileInput.value = "";
         });
-        bar.appendChild(this.fileInput);
-        bar.appendChild(button("Load", "Load an image as the base layer (or paste / drop one)", () => this.fileInput.click()));
-        bar.appendChild(el("span", "ipc-sep"));
+        top.appendChild(this.fileInput);
+        top.appendChild(iconButton("load", "Load an image as the base layer (Ctrl+V or drop also works)", () => this.fileInput.click(), "Load"));
 
-        this.toolButtons = {};
-        const tools = [
-            ["brush", "Brush", "Paint selection (B)"],
-            ["rect", "Rect", "Rectangle selection (R)"],
-            ["lasso", "Lasso", "Lasso selection (L)"],
-            ["erase", "Erase", "Erase from selection (E)"],
-        ];
-        for (const [id, label, title] of tools) {
-            const b = button(label, title, () => this.setTool(id));
-            this.toolButtons[id] = b;
-            bar.appendChild(b);
-        }
-        const sizeLabel = el("label", null, "Size");
+        const sizeLabel = el("label", null, "Brush");
         this.sizeInput = document.createElement("input");
         this.sizeInput.type = "range";
-        this.sizeInput.min = 2;
-        this.sizeInput.max = 400;
-        this.sizeInput.value = this.brushSize;
-        this.sizeInput.addEventListener("input", () => { this.brushSize = +this.sizeInput.value; this.draw(); });
+        this.sizeInput.min = 2; this.sizeInput.max = 400; this.sizeInput.value = this.brushSize;
+        this.sizeInput.addEventListener("input", () => { this.brushSize = +this.sizeInput.value; this.sizeValue.textContent = this.brushSize + "px"; this.draw(); });
+        this.sizeValue = el("span", null, this.brushSize + "px");
         sizeLabel.appendChild(this.sizeInput);
-        bar.appendChild(sizeLabel);
-        bar.appendChild(el("span", "ipc-sep"));
-        bar.appendChild(button("Clear", "Clear selection", () => this.clearSelection()));
-        bar.appendChild(button("Invert", "Invert selection", () => this.invertSelection()));
-        bar.appendChild(button("Undo", "Undo selection change (Ctrl+Z)", () => this.undoSelection()));
-        bar.appendChild(el("span", "ipc-sep"));
-        bar.appendChild(button("Fit", "Fit canvas to view (F)", () => this.fitView()));
-        bar.appendChild(button("Flatten", "Merge all visible layers into the base layer", () => this.flatten()));
-        root.appendChild(bar);
+        sizeLabel.appendChild(this.sizeValue);
+        top.appendChild(sizeLabel);
+
+        top.appendChild(el("span", "ipc-grow"));
+        this.generateBtn = iconButton("play", "Queue the workflow (Ctrl+Enter). The result comes back as a new layer.", () => this.generate(), "Generate");
+        this.generateBtn.classList.add("ipc-primary");
+        top.appendChild(this.generateBtn);
+        const closeBtn = iconButton("close", "Close editor (Esc)", () => this.close());
+        closeBtn.classList.add("ipc-danger");
+        top.appendChild(closeBtn);
+        root.appendChild(top);
 
         // body
         const body = el("div", "ipc-body");
+
+        const tools = el("div", "ipc-tools");
+        this.toolButtons = {};
+        const toolDefs = [
+            ["brush", "Paint selection (B)"],
+            ["rect", "Rectangle selection (R)"],
+            ["lasso", "Lasso selection (L)"],
+            ["erase", "Erase from selection (E)"],
+            ["hand", "Pan (H, Space or middle mouse)"],
+        ];
+        for (const [id, title] of toolDefs) {
+            const b = iconButton(id, title, () => this.setTool(id));
+            this.toolButtons[id] = b;
+            tools.appendChild(b);
+        }
+        tools.appendChild(el("div", "ipc-sep"));
+        tools.appendChild(iconButton("undo", "Undo (Ctrl+Z)", () => this.undoSelection()));
+        tools.appendChild(iconButton("redo", "Redo (Ctrl+Shift+Z)", () => this.redoSelection()));
+        tools.appendChild(el("div", "ipc-sep"));
+        tools.appendChild(iconButton("clear", "Clear selection (Ctrl+D)", () => this.clearSelection()));
+        tools.appendChild(iconButton("invert", "Invert selection (Ctrl+I)", () => this.invertSelection()));
+        tools.appendChild(el("div", "ipc-sep"));
+        tools.appendChild(iconButton("fit", "Fit to view (F)", () => this.fitView()));
+        tools.appendChild(iconButton("flatten", "Flatten all visible layers into the base", () => this.flatten()));
+        body.appendChild(tools);
+
         this.viewEl = el("div", "ipc-view");
         this.canvas = document.createElement("canvas");
         this.ctx = this.canvas.getContext("2d");
         this.viewEl.appendChild(this.canvas);
-        this.dropHint = el("div", "ipc-drop", "Load, paste (Ctrl+V) or drop an image here.\nThen paint a selection and queue the prompt.");
-        this.dropHint.style.whiteSpace = "pre-line";
+        this.dropHint = el("div", "ipc-drop", "Load an image, paste it (Ctrl+V) or drop it here.\nThen paint a selection and press Generate.");
         this.viewEl.appendChild(this.dropHint);
         body.appendChild(this.viewEl);
 
-        const layersPanel = el("div", "ipc-layers");
-        layersPanel.appendChild(el("h4", null, "Layers"));
+        const side = el("div", "ipc-side");
+        side.appendChild(el("h4", null, "Layers"));
         this.layerList = el("div", "ipc-list");
-        layersPanel.appendChild(this.layerList);
-        body.appendChild(layersPanel);
+        side.appendChild(this.layerList);
+        side.appendChild(el("h4", null, "Crop"));
+        this.infoEl = el("div", "ipc-info");
+        side.appendChild(this.infoEl);
+        body.appendChild(side);
         root.appendChild(body);
 
-        this.statusEl = el("div", "ipc-status", "");
-        root.appendChild(this.statusEl);
+        const bottom = el("div", "ipc-bottom");
+        this.statusEl = el("span", null, this.status);
+        bottom.appendChild(this.statusEl);
+        const kbd = el("span", "ipc-kbd", "  Wheel: zoom  ·  Space/middle: pan  ·  [ ]: brush size  ·  Esc: close");
+        bottom.appendChild(kbd);
+        bottom.style.display = "flex";
+        root.appendChild(bottom);
 
         this.bindEvents();
         this.setTool("brush");
         this.renderLayers();
-        this.setStatus("No image loaded.");
-
+        this.renderInfo();
         this.resizeObserver = new ResizeObserver(() => this.resizeCanvas());
         this.resizeObserver.observe(this.viewEl);
+    }
+
+    open() {
+        if (this.isOpen) return;
+        this.isOpen = true;
+        document.body.appendChild(this.root);
+        // Esc must work no matter which element inside (or outside) has focus.
+        this._docKey = (e) => {
+            if (e.key === "Escape" && this.isOpen) { e.stopPropagation(); e.preventDefault(); this.close(); }
+        };
+        window.addEventListener("keydown", this._docKey, true);
+        this.root.focus({ preventScroll: true });
+        this.resizeCanvas();
+        this.fitView();
+        this.renderLayers();
+        this.renderInfo();
+    }
+
+    close() {
+        if (!this.isOpen) return;
+        this.isOpen = false;
+        this.pointer = null;
+        this.lassoPoints = null;
+        if (this._docKey) window.removeEventListener("keydown", this._docKey, true);
+        this._docKey = null;
+        this.root.remove();
+        this.drawThumb();
+        this.notifyChanged();
     }
 
     bindEvents() {
         const root = this.root;
         const stop = (e) => e.stopPropagation();
-        // Keep litegraph from reacting to interactions inside the editor.
-        for (const type of ["pointerdown", "pointerup", "pointermove", "mousedown", "mouseup", "click", "dblclick", "contextmenu"]) {
+        for (const type of ["pointerdown", "pointerup", "mousedown", "mouseup", "click", "dblclick", "contextmenu", "keyup"]) {
             root.addEventListener(type, stop);
         }
         root.addEventListener("contextmenu", (e) => e.preventDefault());
+        // Keep keyboard shortcuts alive after clicking a toolbar button.
+        root.addEventListener("click", (e) => {
+            if (e.target && e.target.closest && e.target.closest("button")) this.root.focus({ preventScroll: true });
+        });
         root.addEventListener("wheel", (e) => {
             e.preventDefault();
             e.stopPropagation();
             if (e.target === this.canvas) this.onWheel(e);
         }, { passive: false });
-
         root.addEventListener("keydown", (e) => {
-            if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) return;
+            if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) {
+                if (e.key === "Escape") this.close();
+                return;
+            }
             e.stopPropagation();
             this.onKey(e);
         });
-        root.addEventListener("keyup", stop);
         root.addEventListener("paste", (e) => {
             const items = e.clipboardData && e.clipboardData.items;
             if (!items) return;
             for (const item of items) {
                 if (item.type.startsWith("image/")) {
-                    e.preventDefault();
-                    e.stopPropagation();
+                    e.preventDefault(); e.stopPropagation();
                     this.loadFile(item.getAsFile());
                     return;
                 }
             }
         });
-
         this.viewEl.addEventListener("dragover", (e) => { e.preventDefault(); e.stopPropagation(); });
         this.viewEl.addEventListener("drop", (e) => {
-            e.preventDefault();
-            e.stopPropagation();
+            e.preventDefault(); e.stopPropagation();
             const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
             if (f && f.type.startsWith("image/")) this.loadFile(f);
         });
-
         this.canvas.addEventListener("pointerdown", (e) => this.onPointerDown(e));
         this.canvas.addEventListener("pointermove", (e) => this.onPointerMove(e));
         this.canvas.addEventListener("pointerup", (e) => this.onPointerUp(e));
@@ -294,18 +470,21 @@ class InpaintEditor {
 
     setStatus(text) {
         this.status = text;
-        this.statusEl.textContent = text;
+        if (this.statusEl) this.statusEl.textContent = text;
+        if (this.nodeStatus) this.nodeStatus.textContent = text;
     }
 
     setTool(tool) {
         this.tool = tool;
-        for (const [id, b] of Object.entries(this.toolButtons)) {
-            b.classList.toggle("ipc-active", id === tool);
-        }
+        for (const [id, b] of Object.entries(this.toolButtons)) b.classList.toggle("ipc-active", id === tool);
+        this.viewEl.classList.toggle("ipc-pan", tool === "hand");
+        this.draw();
     }
 
     onKey(e) {
         const k = e.key.toLowerCase();
+        if (e.key === "Escape") { e.preventDefault(); this.close(); return; }
+        if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); this.generate(); return; }
         if ((e.ctrlKey || e.metaKey) && k === "z") { e.preventDefault(); e.shiftKey ? this.redoSelection() : this.undoSelection(); return; }
         if ((e.ctrlKey || e.metaKey) && k === "y") { e.preventDefault(); this.redoSelection(); return; }
         if ((e.ctrlKey || e.metaKey) && k === "d") { e.preventDefault(); this.clearSelection(); return; }
@@ -316,32 +495,48 @@ class InpaintEditor {
             case "r": this.setTool("rect"); break;
             case "l": this.setTool("lasso"); break;
             case "e": this.setTool("erase"); break;
+            case "h": this.setTool("hand"); break;
             case "f": this.fitView(); break;
-            case "[": this.brushSize = Math.max(2, Math.round(this.brushSize / 1.2)); this.sizeInput.value = this.brushSize; this.draw(); break;
-            case "]": this.brushSize = Math.min(400, Math.round(this.brushSize * 1.2)); this.sizeInput.value = this.brushSize; this.draw(); break;
-            case " ": this.spaceDown = true; this.viewEl.classList.add("ipc-pan"); e.preventDefault(); break;
-        }
-        if (k === " ") {
-            const up = (ev) => { if (ev.key === " ") { this.spaceDown = false; this.viewEl.classList.remove("ipc-pan"); window.removeEventListener("keyup", up, true); } };
-            window.addEventListener("keyup", up, true);
+            case "[": this.setBrushSize(Math.round(this.brushSize / 1.2)); break;
+            case "]": this.setBrushSize(Math.round(this.brushSize * 1.2)); break;
+            case " ":
+                if (!this.spaceDown) {
+                    this.spaceDown = true;
+                    this.viewEl.classList.add("ipc-pan");
+                    const up = (ev) => {
+                        if (ev.key === " ") {
+                            this.spaceDown = false;
+                            this.viewEl.classList.toggle("ipc-pan", this.tool === "hand");
+                            window.removeEventListener("keyup", up, true);
+                        }
+                    };
+                    window.addEventListener("keyup", up, true);
+                }
+                e.preventDefault();
+                break;
         }
     }
 
-    // ---- geometry --------------------------------------------------------
+    setBrushSize(v) {
+        this.brushSize = Math.min(400, Math.max(2, v));
+        this.sizeInput.value = this.brushSize;
+        this.sizeValue.textContent = this.brushSize + "px";
+        this.draw();
+    }
+
+    // ---- geometry ----------------------------------------------------------
 
     resizeCanvas() {
+        if (!this.isOpen) return;
         const rect = this.viewEl.getBoundingClientRect();
         if (rect.width < 2 || rect.height < 2) return;
         const dpr = window.devicePixelRatio || 1;
-        // The DOM widget may be CSS-scaled by the graph zoom; measure the real box.
         const w = Math.round(rect.width * dpr);
         const h = Math.round(rect.height * dpr);
         if (this.canvas.width !== w || this.canvas.height !== h) {
-            const hadImage = this.width > 0;
-            const wasFit = this._fitted;
             this.canvas.width = w;
             this.canvas.height = h;
-            if (hadImage && wasFit) this.fitView(); else this.draw();
+            if (this.width && this._fitted !== false) this.fitView(); else this.draw();
         }
     }
 
@@ -359,11 +554,9 @@ class InpaintEditor {
     }
 
     fitView() {
-        if (!this.width) return;
-        const pad = 12;
-        const sw = (this.canvas.width - pad * 2) / this.width;
-        const sh = (this.canvas.height - pad * 2) / this.height;
-        const s = Math.max(0.01, Math.min(sw, sh));
+        if (!this.width || !this.canvas.width) return;
+        const pad = 24;
+        const s = Math.max(0.01, Math.min((this.canvas.width - pad * 2) / this.width, (this.canvas.height - pad * 2) / this.height));
         this.view.scale = s;
         this.view.x = (this.canvas.width - this.width * s) / 2;
         this.view.y = (this.canvas.height - this.height * s) / 2;
@@ -383,16 +576,17 @@ class InpaintEditor {
         this.draw();
     }
 
-    // ---- pointer gestures -----------------------------------------------
+    // ---- pointer gestures --------------------------------------------------
 
     onPointerDown(e) {
         this.root.focus({ preventScroll: true });
         if (!this.width) return;
-        const pan = e.button === 1 || this.spaceDown || e.button === 2;
+        const pan = e.button === 1 || e.button === 2 || this.spaceDown || this.tool === "hand";
         try { this.canvas.setPointerCapture(e.pointerId); } catch (_) { /* ignore */ }
         const [cx, cy] = this.toCanvasPx(e);
         if (pan) {
             this.pointer = { kind: "pan", startX: cx, startY: cy, vx: this.view.x, vy: this.view.y };
+            this.viewEl.classList.add("ipc-panning");
             return;
         }
         if (e.button !== 0) return;
@@ -436,6 +630,7 @@ class InpaintEditor {
         const p = this.pointer;
         if (!p) return;
         this.pointer = null;
+        this.viewEl.classList.remove("ipc-panning");
         try { this.canvas.releasePointerCapture(e.pointerId); } catch (_) { /* ignore */ }
         if (p.kind === "rect") {
             const [x0, y0] = p.start;
@@ -469,7 +664,6 @@ class InpaintEditor {
         const sctx = this.selection.getContext("2d");
         sctx.globalCompositeOperation = this.tool === "erase" ? "destination-out" : "source-over";
         sctx.strokeStyle = "#ff0000";
-        sctx.fillStyle = "#ff0000";
         sctx.lineCap = "round";
         sctx.lineJoin = "round";
         sctx.lineWidth = this.brushSize;
@@ -480,7 +674,7 @@ class InpaintEditor {
         sctx.globalCompositeOperation = "source-over";
     }
 
-    // ---- selection ops ---------------------------------------------------
+    // ---- selection ops -----------------------------------------------------
 
     pushUndo() {
         if (!this.selection) return;
@@ -538,6 +732,7 @@ class InpaintEditor {
         this.selectionDirty = true;
         this.selectionDataUrl = null;
         this.uploaded.maskHash = null;
+        this.renderInfo();
         this.notifyChanged();
     }
 
@@ -546,8 +741,9 @@ class InpaintEditor {
         const d = this.selection.getContext("2d").getImageData(0, 0, this.width, this.height).data;
         let x0 = this.width, y0 = this.height, x1 = -1, y1 = -1;
         for (let y = 0; y < this.height; y++) {
+            const row = y * this.width;
             for (let x = 0; x < this.width; x++) {
-                if (d[(y * this.width + x) * 4 + 3] > 127) {
+                if (d[(row + x) * 4 + 3] > 127) {
                     if (x < x0) x0 = x;
                     if (x > x1) x1 = x;
                     if (y < y0) y0 = y;
@@ -559,7 +755,50 @@ class InpaintEditor {
         return [x0, y0, x1 + 1, y1 + 1];
     }
 
-    // ---- layers ----------------------------------------------------------
+    getBounds() {
+        if (this.selectionDirty) {
+            this.cachedBounds = this.selectionBounds();
+            this.selectionDirty = false;
+        }
+        return this.cachedBounds;
+    }
+
+    cropRect() {
+        const b = this.getBounds();
+        const padding = this.widgetValue("padding", 0);
+        if (!b) return [0, 0, this.width, this.height];
+        const x0 = Math.max(0, b[0] - padding), y0 = Math.max(0, b[1] - padding);
+        const x1 = Math.min(this.width, b[2] + padding), y1 = Math.min(this.height, b[3] + padding);
+        return [x0, y0, x1 - x0, y1 - y0];
+    }
+
+    widgetValue(name, fallback) {
+        const w = this.node.widgets && this.node.widgets.find((x) => x.name === name);
+        return w ? (+w.value || 0) : fallback;
+    }
+
+    renderInfo() {
+        if (!this.infoEl) return;
+        const rows = [];
+        if (this.base) {
+            rows.push(["Canvas", `${this.width} × ${this.height}`]);
+            const b = this.getBounds();
+            rows.push(["Selection", b ? `${b[2] - b[0]} × ${b[3] - b[1]}` : "none (whole image)"]);
+            const [, , cw, ch] = this.cropRect();
+            rows.push(["Crop", `${cw} × ${ch}`]);
+            const target = this.widgetValue("target_size", 0);
+            const m = Math.max(1, this.widgetValue("multiple_of", 64) || 64);
+            if (target > 0) {
+                const s = target / Math.max(cw, ch);
+                rows.push(["Emitted", `${Math.max(m, Math.round(cw * s / m) * m)} × ${Math.max(m, Math.round(ch * s / m) * m)}`]);
+            } else {
+                rows.push(["Emitted", `${Math.min(this.width, Math.ceil(cw / m) * m)} × ${Math.min(this.height, Math.ceil(ch / m) * m)}`]);
+            }
+        }
+        this.infoEl.innerHTML = rows.map(([k, v]) => `<span>${k}</span><b>${v}</b>`).join("");
+    }
+
+    // ---- layers ------------------------------------------------------------
 
     async setBase(ref, img, { keepLayers = true } = {}) {
         const sizeChanged = img.naturalWidth !== this.width || img.naturalHeight !== this.height;
@@ -578,19 +817,20 @@ class InpaintEditor {
         this.selectionDirty = true;
         this.selectionDataUrl = null;
         this.renderLayers();
+        this.renderInfo();
         this.fitView();
-        this.setStatus(`${this.width} x ${this.height}`);
+        this.drawThumb();
+        this.setStatus(`${this.width} × ${this.height}`);
         this.notifyChanged();
     }
 
     async loadFile(file) {
         if (!file) return;
         try {
-            this.setStatus("Uploading " + file.name + " ...");
-            const blob = file;
-            const ext = (file.name.match(/\.[a-z0-9]+$/i) || [".png"])[0];
-            const safeName = file.name.replace(/[^a-z0-9._-]/gi, "_").replace(/\.[a-z0-9]+$/i, "") + ext;
-            const ref = await uploadBlob(blob, safeName, { overwrite: false });
+            this.setStatus("Uploading " + (file.name || "image") + " ...");
+            const ext = ((file.name || "").match(/\.[a-z0-9]+$/i) || [".png"])[0];
+            const stem = (file.name || "pasted").replace(/\.[a-z0-9]+$/i, "").replace(/[^a-z0-9._-]/gi, "_") || "image";
+            const ref = await uploadBlob(file, stem + ext, { overwrite: false });
             const img = await loadImageEl(viewUrl(ref));
             await this.setBase(ref, img, { keepLayers: false });
         } catch (err) {
@@ -608,6 +848,7 @@ class InpaintEditor {
         this.uploaded.baseHash = null;
         this.renderLayers();
         this.draw();
+        this.drawThumb();
         this.notifyChanged();
     }
 
@@ -616,6 +857,7 @@ class InpaintEditor {
         this.uploaded.baseHash = null;
         this.renderLayers();
         this.draw();
+        this.drawThumb();
         this.notifyChanged();
     }
 
@@ -634,7 +876,7 @@ class InpaintEditor {
                 }
                 const n = this.layers.length + 1;
                 this.addLayer({ name: "Result " + n, ref, img, x: r.x || 0, y: r.y || 0, w: r.width || img.naturalWidth, h: r.height || img.naturalHeight });
-                this.setStatus(`Result ${n} added at ${r.x},${r.y} (${r.width} x ${r.height})`);
+                this.setStatus(`Result ${n} added (${r.width} × ${r.height} at ${r.x}, ${r.y})`);
             } catch (err) {
                 console.error(err);
                 this.setStatus(String(err.message || err));
@@ -643,29 +885,34 @@ class InpaintEditor {
     }
 
     renderLayers() {
+        if (!this.layerList) return;
         const list = this.layerList;
         list.innerHTML = "";
-        const rows = [];
-        for (let i = this.layers.length - 1; i >= 0; i--) rows.push(this.layers[i]);
-        for (const layer of rows) {
+        for (let i = this.layers.length - 1; i >= 0; i--) {
+            const layer = this.layers[i];
             const row = el("div", "ipc-layer");
             const top = el("div", "ipc-row");
-            const eye = el("span", "ipc-eye" + (layer.visible ? "" : " ipc-off"), "👁");
+            const eye = el("button", "ipc-mini" + (layer.visible ? "" : " ipc-off"));
+            eye.type = "button";
             eye.title = "Toggle visibility";
+            eye.innerHTML = icon(layer.visible ? "eye" : "eyeOff", 16);
             eye.addEventListener("click", (e) => {
                 e.stopPropagation();
                 layer.visible = !layer.visible;
                 this.uploaded.baseHash = null;
                 this.renderLayers();
                 this.draw();
+                this.drawThumb();
                 this.notifyChanged();
             });
             top.appendChild(eye);
             const name = el("span", "ipc-name", layer.name);
-            name.title = `${layer.w} x ${layer.h} at ${layer.x},${layer.y}`;
+            name.title = `${layer.w} × ${layer.h} at ${layer.x}, ${layer.y}`;
             top.appendChild(name);
-            const del = el("span", "ipc-del", "✕");
+            const del = el("button", "ipc-mini ipc-del");
+            del.type = "button";
             del.title = "Delete layer";
+            del.innerHTML = icon("trash", 16);
             del.addEventListener("click", (e) => { e.stopPropagation(); this.removeLayer(layer.id); });
             top.appendChild(del);
             row.appendChild(top);
@@ -674,25 +921,23 @@ class InpaintEditor {
             op.min = 0; op.max = 100; op.value = Math.round(layer.opacity * 100);
             op.title = "Opacity";
             op.addEventListener("input", () => { layer.opacity = op.value / 100; this.uploaded.baseHash = null; this.draw(); });
-            op.addEventListener("change", () => this.notifyChanged());
+            op.addEventListener("change", () => { this.drawThumb(); this.notifyChanged(); });
             row.appendChild(op);
             list.appendChild(row);
         }
-        if (this.base) {
-            const row = el("div", "ipc-layer");
-            const top = el("div", "ipc-row");
-            top.appendChild(el("span", "ipc-eye", "👁"));
-            const name = el("span", "ipc-name", "Base");
-            name.title = this.base.ref ? this.base.ref.filename : "";
-            top.appendChild(name);
-            row.appendChild(top);
-            list.appendChild(row);
-        } else {
-            list.appendChild(el("div", "ipc-layer", "No image"));
-        }
+        const row = el("div", "ipc-layer");
+        const top = el("div", "ipc-row");
+        const eye = el("span", "ipc-mini");
+        eye.innerHTML = icon("eye", 16);
+        top.appendChild(eye);
+        const name = el("span", "ipc-name", this.base ? "Base" : "No image");
+        name.title = this.base && this.base.ref ? this.base.ref.filename : "";
+        top.appendChild(name);
+        row.appendChild(top);
+        list.appendChild(row);
     }
 
-    // ---- compositing -----------------------------------------------------
+    // ---- compositing -------------------------------------------------------
 
     drawComposite(ctx) {
         if (!this.base) return;
@@ -729,8 +974,7 @@ class InpaintEditor {
         if (!this.base || !this.layers.length) return;
         try {
             this.setStatus("Flattening ...");
-            const flat = this.flattenToCanvas();
-            const blob = await canvasToBlob(flat);
+            const blob = await canvasToBlob(this.flattenToCanvas());
             const hash = await hashBlob(blob);
             const ref = await uploadBlob(blob, `n${this.node.id}_base_${hash}.png`);
             const img = await loadImageEl(viewUrl(ref));
@@ -740,6 +984,7 @@ class InpaintEditor {
             this.uploaded.baseRef = ref;
             this.renderLayers();
             this.draw();
+            this.drawThumb();
             this.notifyChanged();
             this.setStatus("Flattened into base layer.");
         } catch (err) {
@@ -749,6 +994,7 @@ class InpaintEditor {
     }
 
     draw() {
+        if (!this.isOpen) return;
         const ctx = this.ctx;
         const W = this.canvas.width, H = this.canvas.height;
         ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -759,30 +1005,20 @@ class InpaintEditor {
         ctx.imageSmoothingEnabled = s < 1;
         this.drawComposite(ctx);
 
-        // selection overlay
         ctx.globalAlpha = 0.4;
         ctx.drawImage(this.selection, 0, 0);
         ctx.globalAlpha = 1;
 
-        // crop preview (selection bbox + padding)
-        if (this.selectionDirty) {
-            this.cachedBounds = this.selectionBounds();
-            this.selectionDirty = false;
-        }
-        const padding = this.getPadding();
-        if (this.cachedBounds) {
-            const [x0, y0, x1, y1] = this.cachedBounds;
-            const bx0 = Math.max(0, x0 - padding), by0 = Math.max(0, y0 - padding);
-            const bx1 = Math.min(this.width, x1 + padding), by1 = Math.min(this.height, y1 + padding);
+        if (this.getBounds()) {
+            const [x, y, w, h] = this.cropRect();
             ctx.save();
             ctx.setLineDash([6 / s, 4 / s]);
             ctx.lineWidth = 1.5 / s;
             ctx.strokeStyle = "#4a90d9";
-            ctx.strokeRect(bx0, by0, bx1 - bx0, by1 - by0);
+            ctx.strokeRect(x, y, w, h);
             ctx.restore();
         }
 
-        // gesture previews
         const p = this.pointer;
         if (p && p.kind === "rect") {
             ctx.save();
@@ -802,7 +1038,7 @@ class InpaintEditor {
             ctx.stroke();
             ctx.restore();
         }
-        if (this.hover && (this.tool === "brush" || this.tool === "erase") && !(p && p.kind === "pan")) {
+        if (this.hover && (this.tool === "brush" || this.tool === "erase") && !(p && p.kind === "pan") && !this.spaceDown) {
             ctx.save();
             ctx.lineWidth = 1 / s;
             ctx.strokeStyle = this.tool === "erase" ? "#ffd166" : "#fff";
@@ -813,21 +1049,34 @@ class InpaintEditor {
         }
     }
 
-    getPadding() {
-        const w = this.node.widgets && this.node.widgets.find((x) => x.name === "padding");
-        return w ? +w.value || 0 : 0;
+    // ---- queue -------------------------------------------------------------
+
+    async generate() {
+        if (!this.base) { this.setStatus("Load an image first."); return; }
+        try {
+            this.generateBtn.disabled = true;
+            this.setStatus("Queueing ...");
+            await app.queuePrompt(0);
+        } catch (err) {
+            console.error(err);
+            this.setStatus(String(err.message || err));
+        } finally {
+            this.generateBtn.disabled = false;
+            if (this.isOpen) this.root.focus({ preventScroll: true });
+        }
     }
 
-    // ---- persistence -----------------------------------------------------
+    // ---- persistence -------------------------------------------------------
 
     notifyChanged() {
-        // Let the graph know the widget value changed (undo/redo, dirty flag).
         try { this.node.graph && this.node.graph.setDirtyCanvas && this.node.graph.setDirtyCanvas(true, true); } catch (_) { /* ignore */ }
         try { app.canvas && app.canvas.setDirty && app.canvas.setDirty(true, true); } catch (_) { /* ignore */ }
     }
 
     getValue() {
-        if (!this.base) return "{}";
+        // While a restore is still loading images, hand back the last known state
+        // so an autosave in that window does not wipe the canvas.
+        if (!this.base) return this.lastValueString || "{}";
         if (!this.selectionDataUrl && this.selection) {
             this.selectionDataUrl = this.selection.toDataURL("image/png");
         }
@@ -848,12 +1097,21 @@ class InpaintEditor {
         let state = null;
         try { state = typeof value === "string" ? JSON.parse(value || "{}") : (value || {}); } catch (_) { state = null; }
         if (!state || !state.base) return;
+        const raw = typeof value === "string" ? value : JSON.stringify(value);
+        if (raw === this.lastValueString && (this.base || this._loading)) return;
+        this.lastValueString = raw;
+        // Only the most recent setValue call may touch the editor; older loads abort.
+        const token = (this._loadToken = (this._loadToken || 0) + 1);
+        const stale = () => this._loadToken !== token;
+        this._loading = true;
         try {
             const img = await loadImageEl(viewUrl(state.base));
+            if (stale()) return;
             await this.setBase(state.base, img, { keepLayers: false });
             for (const l of state.layers || []) {
                 try {
                     const limg = await loadImageEl(viewUrl(l.ref));
+                    if (stale()) return;
                     this.layers.push({ id: l.id, name: l.name, ref: l.ref, img: limg, x: l.x, y: l.y, w: l.w, h: l.h, opacity: l.opacity ?? 1, visible: l.visible !== false });
                 } catch (err) {
                     console.warn("Inpaint Canvas: layer missing", l.ref, err);
@@ -862,14 +1120,19 @@ class InpaintEditor {
             for (const key of state.seen || []) this.seenResults.add(key);
             if (state.selection) {
                 const sel = await loadImageEl(state.selection);
+                if (stale()) return;
                 this.selection.getContext("2d").drawImage(sel, 0, 0);
                 this.selectionDirty = true;
             }
             this.renderLayers();
+            this.renderInfo();
             this.draw();
+            this.drawThumb();
         } catch (err) {
             console.error(err);
             this.setStatus("Could not restore canvas: " + (err.message || err));
+        } finally {
+            if (!stale()) this._loading = false;
         }
     }
 
@@ -877,22 +1140,20 @@ class InpaintEditor {
     async serializeForPrompt() {
         if (!this.base) return "{}";
         const id = this.node.id;
-        // flattened base
         let baseRef = this.uploaded.baseRef;
         if (!this.uploaded.baseHash || !baseRef) {
-            let blob, hash;
+            let hash;
             if (!this.layers.some((l) => l.visible) && this.base.ref) {
                 baseRef = this.base.ref;
                 hash = "orig:" + this.base.ref.filename;
             } else {
-                blob = await canvasToBlob(this.flattenToCanvas());
+                const blob = await canvasToBlob(this.flattenToCanvas());
                 hash = await hashBlob(blob);
                 baseRef = await uploadBlob(blob, `n${id}_base_${hash}.png`);
             }
             this.uploaded.baseHash = hash;
             this.uploaded.baseRef = baseRef;
         }
-        // selection mask
         let maskRef = this.uploaded.maskRef;
         if (!this.uploaded.maskHash || !maskRef) {
             const blob = await canvasToBlob(this.maskToCanvas());
@@ -901,7 +1162,8 @@ class InpaintEditor {
             this.uploaded.maskHash = hash;
             this.uploaded.maskRef = maskRef;
         }
-        this.setStatus("Queued: " + (this.cachedBounds ? "selection " + this.cachedBounds.join(",") : "no selection, full image"));
+        const [x, y, w, h] = this.cropRect();
+        this.setStatus(`Queued crop ${w} × ${h} at ${x}, ${y}. Waiting for the result ...`);
         return JSON.stringify({
             width: this.width,
             height: this.height,
@@ -909,6 +1171,12 @@ class InpaintEditor {
             mask: maskRef,
             layers: this.layers.length,
         });
+    }
+
+    destroy() {
+        this.close();
+        try { this.resizeObserver.disconnect(); } catch (_) { /* ignore */ }
+        try { this.thumbObserver.disconnect(); } catch (_) { /* ignore */ }
     }
 }
 
@@ -926,22 +1194,42 @@ app.registerExtension({
                 const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
                 const editor = new InpaintEditor(this);
                 this.inpaintEditor = editor;
-                const widget = this.addDOMWidget("canvas_state", "INPAINT_CANVAS", editor.root, {
+                const widget = this.addDOMWidget("canvas_state", "INPAINT_CANVAS", editor.nodeRoot, {
                     getValue: () => editor.getValue(),
                     setValue: (v) => { editor.setValue(v); },
-                    getMinHeight: () => 320,
-                    hideOnZoom: false,
+                    getMinHeight: () => 220,
                 });
                 widget.serializeValue = async () => editor.serializeForPrompt();
                 editor.widget = widget;
-                // Redraw the crop preview whenever padding changes.
-                const pad = this.widgets && this.widgets.find((w) => w.name === "padding");
-                if (pad) {
-                    const cb = pad.callback;
-                    pad.callback = function () { const x = cb ? cb.apply(this, arguments) : undefined; editor.draw(); return x; };
+                for (const name of ["padding", "target_size", "multiple_of"]) {
+                    const w = this.widgets && this.widgets.find((x) => x.name === name);
+                    if (!w) continue;
+                    const cb = w.callback;
+                    w.callback = function () { const x = cb ? cb.apply(this, arguments) : undefined; editor.renderInfo(); editor.draw(); return x; };
                 }
                 const [w, h] = this.size;
-                this.setSize([Math.max(w, 760), Math.max(h, 640)]);
+                this.setSize([Math.max(w, 340), Math.max(h, 460)]);
+                return r;
+            };
+
+            // Workflows saved before a widget was added carry their values shifted
+            // by one. Put the canvas JSON back where it belongs and reset any widget
+            // that received a string instead of a number.
+            const onConfigure = nodeType.prototype.onConfigure;
+            nodeType.prototype.onConfigure = function (info) {
+                const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
+                const values = (info && info.widgets_values) || [];
+                const json = values.find((v) => typeof v === "string" && v.trim().startsWith("{"));
+                if (json && this.widgets) {
+                    for (const w of this.widgets) {
+                        if (w.name === "canvas_state") {
+                            const ed = this.inpaintEditor;
+                            if (ed && ed.lastValueString !== json) w.value = json;
+                        } else if (typeof w.value === "string" && w.value.trim().startsWith("{")) {
+                            w.value = w.options && w.options.default != null ? w.options.default : (w.name === "multiple_of" ? 64 : 0);
+                        }
+                    }
+                }
                 return r;
             };
 
@@ -955,13 +1243,12 @@ app.registerExtension({
 
             const onRemoved = nodeType.prototype.onRemoved;
             nodeType.prototype.onRemoved = function () {
-                try { this.inpaintEditor?.resizeObserver?.disconnect(); } catch (_) { /* ignore */ }
+                try { this.inpaintEditor?.destroy(); } catch (_) { /* ignore */ }
                 return onRemoved?.apply(this, arguments);
             };
         }
 
         if (nodeData.name === STITCH_CLASS) {
-            // Standalone stitch node: route its result to the canvas it came from.
             const onExecuted = nodeType.prototype.onExecuted;
             nodeType.prototype.onExecuted = function (output) {
                 onExecuted?.apply(this, arguments);
@@ -994,5 +1281,12 @@ app.registerExtension({
             }
             return origQueue.call(this, number, prompt, ...rest);
         };
+
+        // Surface execution errors in the editor status line.
+        api.addEventListener("execution_error", ({ detail }) => {
+            const id = detail && (detail.node_id || "");
+            const node = app.graph.getNodeById(+String(id).split(".")[0]);
+            if (node && node.inpaintEditor) node.inpaintEditor.setStatus("Error: " + (detail.exception_message || "execution failed"));
+        });
     },
 });
