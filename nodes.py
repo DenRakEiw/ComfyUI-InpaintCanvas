@@ -181,8 +181,8 @@ class InpaintCanvas:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "MASK", "STRING", "INT", "INT", "STRING")
-    RETURN_NAMES = ("crop_image", "crop_mask", "image", "mask", "stitch_info", "crop_width", "crop_height", "prompt")
+    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "MASK", "STRING", "INT", "INT", "STRING", "IMAGE")
+    RETURN_NAMES = ("crop_image", "crop_mask", "image", "mask", "stitch_info", "crop_width", "crop_height", "prompt", "control_image")
     OUTPUT_TOOLTIPS = (
         "Selected region plus padding, scaled to target_size. Inpaint this.",
         "Selection mask matching crop_image.",
@@ -192,6 +192,7 @@ class InpaintCanvas:
         "Width of crop_image. Wire it into generators that need an explicit size.",
         "Height of crop_image.",
         "The prompt typed into the editor.",
+        "Layers marked as control (scribble, lineart, depth, pose) on black, cropped and scaled exactly like crop_image. Feed it to ControlNet.",
     )
     FUNCTION = "run"
     CATEGORY = "image/inpaint"
@@ -226,6 +227,15 @@ class InpaintCanvas:
         crop = image[:, y0:y1, x0:x1]
         crop_mask = mask[y0:y1, x0:x1]
 
+        control_ref = state.get("control")
+        if control_ref:
+            control = _load_rgb(control_ref)
+            if control.shape[1] != height or control.shape[2] != width:
+                control = _resize_image(control, width, height)
+        else:
+            control = torch.zeros_like(image)
+        control_crop = control[:, y0:y1, x0:x1]
+
         if target_size > 0:
             cw, ch = x1 - x0, y1 - y0
             scale = target_size / max(cw, ch)
@@ -233,6 +243,7 @@ class InpaintCanvas:
             nh = max(m, int(round(ch * scale / m)) * m)
             crop = _resize_image(crop, nw, nh)
             crop_mask = _resize_mask(crop_mask, nw, nh)
+            control_crop = _resize_image(control_crop, nw, nh)
 
         stitch_info = json.dumps({
             "canvas_node": str(unique_id),
@@ -245,7 +256,8 @@ class InpaintCanvas:
         })
 
         outputs = (crop, crop_mask[None], image, mask[None], stitch_info,
-                   int(crop.shape[2]), int(crop.shape[1]), str(state.get("prompt", "") or ""))
+                   int(crop.shape[2]), int(crop.shape[1]), str(state.get("prompt", "") or ""),
+                   control_crop)
 
         if result_source:
             src_id, _, src_slot = result_source.partition(":")

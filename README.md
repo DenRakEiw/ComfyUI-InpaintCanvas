@@ -19,22 +19,36 @@ Editor
 - **Select** tools on the left: brush (B), rectangle (R), lasso (L), deselect
   brush (D). The loop toggle below them closes brush strokes Photoshop-style:
   paint a closed ring and the inside is selected too.
-- **Layer** tools: paint (P) with the color from the top bar, eraser (E),
-  fill selection with color (Shift+F), transform (T) to move a layer or drag
-  its corners to scale it (Shift for free aspect), hand (H) to pan.
-  Painting on the base creates a paint layer automatically; the base itself
-  is never erased.
+- **Selection** section: grow or shrink by n pixels (exact distance
+  transform), or take the selection from the opaque area of the active layer.
+- **Layer** tools: paint (P), eraser (E), fill selection with color (Shift+F),
+  transform (T) to move a layer or drag its corners to scale it (Shift for free
+  aspect), hand (H) to pan. Painting on the base creates a paint layer
+  automatically; the base itself is never erased.
+- Brush **size**, **hardness** (soft edge) and **opacity** sit in the top bar
+  next to the color. Opacity applies per stroke, not per dab.
 - Undo / redo (Ctrl+Z / Ctrl+Shift+Z) cover selection, strokes and transforms.
   Clear (Ctrl+D), invert (Ctrl+I), fit to view (F), flatten all visible layers.
-- `[` and `]` change the brush size, the slider at the top does the same.
+- `[` and `]` change the brush size.
 - Mouse wheel zooms. Space, middle mouse, right mouse or the hand tool pans.
 - **Generate** (Ctrl+Enter) queues the workflow. The result appears in the
   layer list while the editor stays open. Esc closes it.
 - **Layers** on the right: click to make a layer active, toggle visibility,
-  opacity slider, move up / down, delete (Delete key for the active layer).
-  The plus button adds an empty paint layer (Ctrl+Shift+N).
-- **Prompt**: the text field on the right is stored with the workflow and
-  comes out of the node as the `prompt` output.
+  opacity, blend mode (multiply, screen, overlay, ...), control role, move
+  up / down, delete (Delete key for the active layer). The plus button adds an
+  empty paint layer (Ctrl+Shift+N).
+- **Control layers**: give a layer a role (scribble, lineart, depth, pose,
+  canny, other). Such layers are excluded from the image that goes to the
+  inpaint chain and instead composited on black into the `control_image`
+  output, cropped and scaled exactly like `crop_image`. Feed it to ControlNet.
+- **Canvas** section: extend the canvas on any side (outpainting). The
+  visible image is baked into the new base, edge pixels are stretched into the
+  border, and the border becomes the selection. Press Generate to fill it.
+- **Prompt**: the text field is stored with the workflow and comes out of the
+  node as the `prompt` output.
+- **History**: every result with a preview and the prompt it was made with.
+  Click a preview (or the solo button) to show only that result, discard one
+  to remove its layer, restore a discarded one later.
 
 The dashed rectangle is the crop that will be emitted: the selection's bounding
 box plus `padding`. The Crop panel shows its size and the size that actually
@@ -65,6 +79,8 @@ Outputs
   that take an explicit size (the Flux.2 API node, for example) so the result
   comes back in the same aspect ratio.
 - `prompt`: the text from the editor's prompt field.
+- `control_image`: the control layers on black, aligned with `crop_image`
+  (black if there are none).
 
 ### Inpaint Canvas Stitch (`InpaintCanvasStitch`)
 

@@ -3,10 +3,11 @@
 // The node itself only shows a thumbnail and a button. The editor opens as a
 // full-window overlay so it never fights litegraph for pointer or wheel
 // events. Responsibilities of this file:
-//   * the editor (layers, selection tools, paint tools, transform, pan/zoom, undo)
+//   * the editor (layers, selection tools, paint tools, transform, pan/zoom, undo,
+//     control layers, outpainting, result history)
 //   * persisting the canvas state in the workflow (widget value)
-//   * on queue: flatten visible layers + selection mask, upload both, and put a
-//     small JSON into the prompt as `canvas_state`
+//   * on queue: flatten visible layers + selection mask (+ control layers), upload
+//     them, and put a small JSON into the prompt as `canvas_state`
 //   * strip the `result` back-link from the prompt (it would be a cycle) and
 //     pass its source as `result_source`
 //   * receive stitched results from the backend and add them as layers
@@ -19,6 +20,8 @@ const STITCH_CLASS = "InpaintCanvasStitch";
 const SUBFOLDER = "inpaint_canvas";
 const MAX_UNDO = 30;
 const HANDLE_PX = 9;
+const BLEND_MODES = ["normal", "multiply", "screen", "overlay", "darken", "lighten", "soft-light", "hard-light", "difference"];
+const ROLES = ["none", "scribble", "lineart", "depth", "pose", "canny", "other"];
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -66,6 +69,12 @@ async function uploadBlob(blob, filename, { overwrite = true, type = "input" } =
     return { filename: data.name, subfolder: data.subfolder || SUBFOLDER, type: data.type || type };
 }
 
+async function uploadCanvas(canvas, prefix) {
+    const blob = await canvasToBlob(canvas);
+    const hash = await hashBlob(blob);
+    return { ref: await uploadBlob(blob, `${prefix}_${hash}.png`), hash };
+}
+
 function makeCanvas(w, h) {
     const c = document.createElement("canvas");
     c.width = Math.max(1, w | 0);
@@ -84,6 +93,75 @@ function el(tag, cls, text) {
     if (cls) e.className = cls;
     if (text != null) e.textContent = text;
     return e;
+}
+
+function numberInput(value, min, max, title, width = 58) {
+    const i = document.createElement("input");
+    i.type = "number";
+    i.value = value; i.min = min; i.max = max; i.title = title;
+    i.className = "ipc-num";
+    i.style.width = width + "px";
+    i.addEventListener("keydown", (e) => e.stopPropagation());
+    return i;
+}
+
+function selectInput(options, value, title) {
+    const s = document.createElement("select");
+    s.className = "ipc-sel";
+    s.title = title;
+    for (const o of options) {
+        const opt = document.createElement("option");
+        opt.value = o; opt.textContent = o;
+        s.appendChild(opt);
+    }
+    s.value = value;
+    s.addEventListener("click", (e) => e.stopPropagation());
+    s.addEventListener("keydown", (e) => e.stopPropagation());
+    return s;
+}
+
+/**
+ * Exact squared Euclidean distance transform (Felzenszwalb & Huttenlocher).
+ * `feature` is a Uint8Array with 1 where the feature is; returns Float32Array of
+ * squared distances to the nearest feature pixel.
+ */
+function distanceTransform(feature, W, H) {
+    const INF = 1e20;
+    const f = new Float32Array(Math.max(W, H));
+    const d = new Float32Array(Math.max(W, H));
+    const v = new Int32Array(Math.max(W, H));
+    const z = new Float32Array(Math.max(W, H) + 1);
+    const out = new Float32Array(W * H);
+    for (let i = 0; i < W * H; i++) out[i] = feature[i] ? 0 : INF;
+    const edt1d = (n) => {
+        let k = 0;
+        v[0] = 0; z[0] = -INF; z[1] = INF;
+        for (let q = 1; q < n; q++) {
+            let s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
+            while (s <= z[k]) {
+                k--;
+                s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
+            }
+            k++;
+            v[k] = q; z[k] = s; z[k + 1] = INF;
+        }
+        k = 0;
+        for (let q = 0; q < n; q++) {
+            while (z[k + 1] < q) k++;
+            d[q] = (q - v[k]) * (q - v[k]) + f[v[k]];
+        }
+    };
+    for (let x = 0; x < W; x++) {
+        for (let y = 0; y < H; y++) f[y] = out[y * W + x];
+        edt1d(H);
+        for (let y = 0; y < H; y++) out[y * W + x] = d[y];
+    }
+    for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) f[x] = out[y * W + x];
+        edt1d(W);
+        for (let x = 0; x < W; x++) out[y * W + x] = d[x];
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -117,6 +195,12 @@ const ICONS = {
     plus: '<path d="M12 5v14"/><path d="M5 12h14"/>',
     up: '<path d="M6 14l6-6 6 6"/>',
     down: '<path d="M6 10l6 6 6-6"/>',
+    solo: '<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3" fill="currentColor" stroke="none"/>',
+    restore: '<path d="M4 12a8 8 0 108-8"/><path d="M4 4v5h5"/>',
+    grow: '<circle cx="12" cy="12" r="4"/><circle cx="12" cy="12" r="8" stroke-dasharray="3 2"/><path d="M12 2v3"/><path d="M12 19v3"/><path d="M2 12h3"/><path d="M19 12h3"/>',
+    shrink: '<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="4" stroke-dasharray="3 2"/><path d="M12 5v3"/><path d="M12 16v3"/><path d="M5 12h3"/><path d="M16 12h3"/>',
+    fromLayer: '<path d="M12 4l8 4-8 4-8-4z"/><path d="M4 14l8 4 8-4" stroke-dasharray="3 2"/>',
+    extend: '<rect x="8" y="8" width="8" height="8"/><path d="M12 2v4"/><path d="M12 18v4"/><path d="M2 12h4"/><path d="M18 12h4"/><path d="M10 4l2-2 2 2"/><path d="M10 20l2 2 2-2"/><path d="M4 10l-2 2 2 2"/><path d="M20 10l2 2-2 2"/>',
 };
 
 function icon(name, size = 18) {
@@ -129,6 +213,15 @@ function iconButton(name, title, onClick, label) {
     b.title = title;
     b.innerHTML = icon(name) + (label ? `<span>${label}</span>` : "");
     b.addEventListener("click", (e) => { e.stopPropagation(); e.preventDefault(); onClick(e); });
+    return b;
+}
+
+function miniButton(name, title, onClick, cls = "") {
+    const b = el("button", "ipc-mini " + cls);
+    b.type = "button";
+    b.title = title;
+    b.innerHTML = icon(name, 16);
+    b.addEventListener("click", (e) => { e.stopPropagation(); onClick(); });
     return b;
 }
 
@@ -151,11 +244,12 @@ const STYLE = `
 
 .ipc-modal { position:fixed; inset:0; z-index:10000; display:flex; flex-direction:column; background:#181818; color:#ddd;
   font:13px/1.3 system-ui, sans-serif; outline:none; }
-.ipc-top { display:flex; align-items:center; gap:10px; padding:6px 10px; background:#242424; border-bottom:1px solid #0d0d0d; }
+.ipc-top { display:flex; align-items:center; gap:10px; padding:6px 10px; background:#242424; border-bottom:1px solid #0d0d0d; flex-wrap:wrap; }
 .ipc-top .ipc-title { font-weight:600; margin-right:6px; }
 .ipc-top .ipc-grow { flex:1; }
-.ipc-top label { display:flex; align-items:center; gap:6px; color:#aaa; }
-.ipc-top input[type=range] { width:140px; }
+.ipc-top label { display:flex; align-items:center; gap:6px; color:#aaa; font-size:12px; }
+.ipc-top label span { min-width:36px; text-align:right; color:#ccc; }
+.ipc-top input[type=range] { width:100px; }
 .ipc-top input[type=color] { width:34px; height:26px; padding:0; border:1px solid #4a4a4a; border-radius:5px; background:#333; cursor:pointer; }
 .ipc-ib { display:inline-flex; align-items:center; justify-content:center; gap:6px; background:#333; color:#ddd; border:1px solid #4a4a4a;
   border-radius:6px; padding:5px 8px; cursor:pointer; font:inherit; min-width:32px; }
@@ -165,6 +259,7 @@ const STYLE = `
 .ipc-ib.ipc-primary { background:#2f7f4f; border-color:#3fa76a; color:#fff; padding:5px 12px; }
 .ipc-ib.ipc-primary:hover { background:#39955d; }
 .ipc-ib.ipc-danger:hover { background:#7a2f2f; }
+.ipc-ib.ipc-small { padding:3px 7px; font-size:12px; min-width:0; }
 .ipc-body { display:flex; flex:1; min-height:0; }
 .ipc-tools { display:flex; flex-direction:column; gap:4px; padding:6px; background:#202020; border-right:1px solid #0d0d0d; overflow:auto; }
 .ipc-tools .ipc-ib { width:38px; height:36px; padding:0; }
@@ -182,20 +277,29 @@ const STYLE = `
 .ipc-view.ipc-scale { cursor:nwse-resize; }
 .ipc-drop { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; text-align:center;
   color:#888; pointer-events:none; padding:20px; white-space:pre-line; font-size:15px; }
-.ipc-side { width:260px; display:flex; flex-direction:column; background:#202020; border-left:1px solid #0d0d0d; }
-.ipc-side h4 { margin:0; padding:6px 10px; font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:#999; background:#262626; border-bottom:1px solid #0d0d0d;
-  display:flex; align-items:center; gap:6px; }
-.ipc-side h4 .ipc-grow { flex:1; }
+.ipc-side { width:290px; display:flex; flex-direction:column; background:#202020; border-left:1px solid #0d0d0d; overflow:auto; }
+.ipc-side h4, .ipc-side summary { margin:0; padding:6px 10px; font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:#999; background:#262626;
+  border-bottom:1px solid #0d0d0d; border-top:1px solid #0d0d0d; display:flex; align-items:center; gap:6px; cursor:default; list-style:none; }
+.ipc-side summary { cursor:pointer; }
+.ipc-side summary::-webkit-details-marker { display:none; }
+.ipc-side summary::before { content:"▸"; color:#666; font-size:10px; }
+.ipc-side details[open] > summary::before { content:"▾"; }
+.ipc-side h4 .ipc-grow, .ipc-side summary .ipc-grow { flex:1; }
 .ipc-side h4 .ipc-mini { width:24px; height:22px; }
-.ipc-list { flex:1; overflow:auto; min-height:120px; }
+.ipc-sec { padding:8px 10px; display:flex; flex-wrap:wrap; gap:6px; align-items:center; color:#aaa; font-size:12px; }
+.ipc-sec .ipc-row4 { display:grid; grid-template-columns:auto 1fr auto 1fr; gap:4px 6px; align-items:center; width:100%; }
+.ipc-num { background:#161616; color:#ddd; border:1px solid #3a3a3a; border-radius:4px; padding:3px 5px; font:inherit; }
+.ipc-sel { background:#161616; color:#ccc; border:1px solid #3a3a3a; border-radius:4px; padding:2px 4px; font:11px system-ui, sans-serif; max-width:110px; }
+.ipc-list { overflow:auto; min-height:90px; max-height:34vh; }
 .ipc-layer { display:flex; flex-direction:column; gap:4px; padding:6px 8px; border-bottom:1px solid #161616; cursor:pointer; }
 .ipc-layer:hover { background:#262b33; }
 .ipc-layer.ipc-selected { background:#2b3a4f; box-shadow: inset 3px 0 0 #4a90d9; }
 .ipc-layer .ipc-row { display:flex; align-items:center; gap:4px; }
 .ipc-layer .ipc-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .ipc-layer .ipc-kind { font-size:10px; color:#777; text-transform:uppercase; }
+.ipc-layer .ipc-kind.ipc-ctrl { color:#ffb347; }
 .ipc-mini { display:inline-flex; align-items:center; justify-content:center; width:26px; height:24px; border-radius:4px;
-  cursor:pointer; color:#bbb; background:transparent; border:none; padding:0; }
+  cursor:pointer; color:#bbb; background:transparent; border:none; padding:0; flex:none; }
 .ipc-mini:hover { background:#3a3a3a; color:#fff; }
 .ipc-mini.ipc-off { color:#555; }
 .ipc-mini.ipc-del:hover { color:#f66; }
@@ -203,11 +307,19 @@ const STYLE = `
 .ipc-layer .ipc-op { display:flex; align-items:center; gap:6px; color:#888; font-size:11px; }
 .ipc-layer .ipc-op input[type=range] { flex:1; margin:0; }
 .ipc-layer .ipc-op b { width:34px; text-align:right; font-weight:500; color:#bbb; }
-.ipc-prompt { padding:8px; border-bottom:1px solid #0d0d0d; }
-.ipc-prompt textarea { width:100%; box-sizing:border-box; min-height:96px; resize:vertical; background:#161616; color:#ddd; border:1px solid #3a3a3a;
+.ipc-layer .ipc-op label { display:flex; align-items:center; gap:4px; }
+.ipc-prompt { padding:8px; }
+.ipc-prompt textarea { width:100%; box-sizing:border-box; min-height:80px; resize:vertical; background:#161616; color:#ddd; border:1px solid #3a3a3a;
   border-radius:6px; padding:6px 8px; font:13px/1.35 system-ui, sans-serif; }
 .ipc-prompt textarea:focus { outline:none; border-color:#4a90d9; }
-.ipc-info { padding:8px 10px; color:#aaa; border-top:1px solid #0d0d0d; display:grid; grid-template-columns:auto 1fr; gap:3px 10px; }
+.ipc-hist { max-height:30vh; overflow:auto; }
+.ipc-hitem { display:flex; align-items:center; gap:8px; padding:5px 8px; border-bottom:1px solid #161616; }
+.ipc-hitem.ipc-gone { opacity:.55; }
+.ipc-hitem canvas { width:56px; height:56px; object-fit:contain; background:#111; border-radius:4px; flex:none; cursor:pointer; }
+.ipc-hitem .ipc-htext { flex:1; min-width:0; font-size:11px; color:#aaa; }
+.ipc-hitem .ipc-htext b { display:block; color:#ddd; font-weight:500; }
+.ipc-hitem .ipc-htext span { display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.ipc-info { padding:8px 10px; color:#aaa; display:grid; grid-template-columns:auto 1fr; gap:3px 10px; }
 .ipc-info b { color:#ddd; font-weight:500; }
 .ipc-bottom { padding:5px 10px; background:#242424; border-top:1px solid #0d0d0d; color:#999; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; display:flex; }
 .ipc-kbd { color:#777; margin-left:auto; }
@@ -231,12 +343,15 @@ class InpaintEditor {
         this.width = 0;
         this.height = 0;
         this.base = null;            // { ref, img }
-        this.layers = [];            // { id, name, kind, ref, canvas, x, y, w, h, opacity, visible, dirty }
+        this.layers = [];            // { id, name, kind, role, blend, ref, canvas, x, y, w, h, opacity, visible, dirty }
         this.activeLayerId = null;   // null = base
         this.selection = null;       // canvas WxH, red pixels where selected
+        this.history = [];           // { key, ref, x, y, w, h, prompt, layerId, thumb }
         this.view = { scale: 1, x: 0, y: 0 };
         this.tool = "select";
         this.brushSize = 40;
+        this.hardness = 1;
+        this.brushOpacity = 1;
         this.color = "#ff3b30";
         this.fillEnclosed = true;
         this.promptText = "";
@@ -245,7 +360,7 @@ class InpaintEditor {
         this.selectionDirty = true;
         this.selectionDataUrl = null;
         this.cachedBounds = null;
-        this.uploaded = { baseHash: null, baseRef: null, maskHash: null, maskRef: null };
+        this.uploaded = { baseHash: null, baseRef: null, maskHash: null, maskRef: null, controlHash: null, controlRef: null };
         this.seenResults = new Set();
         this.layerCounter = 0;
         this.paintCounter = 0;
@@ -349,15 +464,19 @@ class InpaintEditor {
         top.appendChild(this.fileInput);
         top.appendChild(iconButton("load", "Load an image as the base layer (Ctrl+V or drop also works)", () => this.fileInput.click(), "Load"));
 
-        const sizeLabel = el("label", null, "Size");
-        this.sizeInput = document.createElement("input");
-        this.sizeInput.type = "range";
-        this.sizeInput.min = 2; this.sizeInput.max = 400; this.sizeInput.value = this.brushSize;
-        this.sizeInput.addEventListener("input", () => { this.brushSize = +this.sizeInput.value; this.sizeValue.textContent = this.brushSize + "px"; this.draw(); });
-        this.sizeValue = el("span", null, this.brushSize + "px");
-        sizeLabel.appendChild(this.sizeInput);
-        sizeLabel.appendChild(this.sizeValue);
-        top.appendChild(sizeLabel);
+        const slider = (label, min, max, value, fmt, onInput) => {
+            const lab = el("label", null, label);
+            const inp = document.createElement("input");
+            inp.type = "range"; inp.min = min; inp.max = max; inp.value = value;
+            const val = el("span", null, fmt(value));
+            inp.addEventListener("input", () => { onInput(+inp.value); val.textContent = fmt(+inp.value); });
+            lab.appendChild(inp); lab.appendChild(val);
+            top.appendChild(lab);
+            return { input: inp, value: val };
+        };
+        this.sizeCtl = slider("Size", 2, 400, this.brushSize, (v) => v + "px", (v) => { this.brushSize = v; this.draw(); });
+        this.hardCtl = slider("Hardness", 0, 100, 100, (v) => v + "%", (v) => { this.hardness = v / 100; });
+        this.opacCtl = slider("Opacity", 1, 100, 100, (v) => v + "%", (v) => { this.brushOpacity = v / 100; });
 
         const colorLabel = el("label", null, "Color");
         this.colorInput = document.createElement("input");
@@ -425,37 +544,87 @@ class InpaintEditor {
         this.viewEl.appendChild(this.dropHint);
         body.appendChild(this.viewEl);
 
+        // side panel
         const side = el("div", "ipc-side");
+        const section = (title, open, build) => {
+            const d = document.createElement("details");
+            d.open = open;
+            const sum = el("summary", null, title);
+            d.appendChild(sum);
+            build(d, sum);
+            side.appendChild(d);
+            return d;
+        };
+
         const layersHead = el("h4", null, "Layers");
         layersHead.appendChild(el("span", "ipc-grow"));
-        const addPaint = el("button", "ipc-mini");
-        addPaint.type = "button";
-        addPaint.title = "Add a paint layer (Ctrl+Shift+N)";
-        addPaint.innerHTML = icon("plus", 16);
-        addPaint.addEventListener("click", (e) => { e.stopPropagation(); this.addPaintLayer(); });
-        layersHead.appendChild(addPaint);
+        layersHead.appendChild(miniButton("plus", "Add a paint layer (Ctrl+Shift+N)", () => this.addPaintLayer()));
         side.appendChild(layersHead);
         this.layerList = el("div", "ipc-list");
         side.appendChild(this.layerList);
 
-        side.appendChild(el("h4", null, "Prompt"));
-        const promptWrap = el("div", "ipc-prompt");
-        this.promptInput = document.createElement("textarea");
-        this.promptInput.placeholder = "Describe what should appear in the selection. Available as the node's prompt output.";
-        this.promptInput.spellcheck = false;
-        this.promptInput.addEventListener("input", () => { this.promptText = this.promptInput.value; });
-        this.promptInput.addEventListener("change", () => this.notifyChanged());
-        this.promptInput.addEventListener("keydown", (e) => {
-            e.stopPropagation();
-            if (e.key === "Escape") { this.promptInput.blur(); this.root.focus({ preventScroll: true }); }
-            if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); this.generate(); }
+        section("Selection", true, (d) => {
+            const sec = el("div", "ipc-sec");
+            this.growInput = numberInput(16, 1, 1024, "Pixels to grow or shrink by", 60);
+            sec.appendChild(el("span", null, "by"));
+            sec.appendChild(this.growInput);
+            sec.appendChild(el("span", null, "px"));
+            const grow = iconButton("grow", "Grow the selection by n pixels", () => this.growSelection(+this.growInput.value), "Grow");
+            grow.classList.add("ipc-small");
+            sec.appendChild(grow);
+            const shrink = iconButton("shrink", "Shrink the selection by n pixels", () => this.growSelection(-this.growInput.value), "Shrink");
+            shrink.classList.add("ipc-small");
+            sec.appendChild(shrink);
+            const from = iconButton("fromLayer", "Replace the selection with the opaque area of the active layer", () => this.selectionFromLayer(), "From layer");
+            from.classList.add("ipc-small");
+            sec.appendChild(from);
+            d.appendChild(sec);
         });
-        promptWrap.appendChild(this.promptInput);
-        side.appendChild(promptWrap);
 
-        side.appendChild(el("h4", null, "Crop"));
-        this.infoEl = el("div", "ipc-info");
-        side.appendChild(this.infoEl);
+        section("Canvas", false, (d) => {
+            const sec = el("div", "ipc-sec");
+            const grid = el("div", "ipc-row4");
+            this.extendInputs = {};
+            for (const [key, label] of [["top", "Top"], ["right", "Right"], ["bottom", "Bottom"], ["left", "Left"]]) {
+                grid.appendChild(el("span", null, label));
+                this.extendInputs[key] = numberInput(0, 0, 8192, `Pixels to add at the ${key}`, 64);
+                grid.appendChild(this.extendInputs[key]);
+            }
+            sec.appendChild(grid);
+            const ext = iconButton("extend", "Extend the canvas (outpainting). The new border becomes the selection.", () => this.extendCanvas(), "Extend canvas");
+            ext.classList.add("ipc-small");
+            sec.appendChild(ext);
+            this.canvasInfo = el("span", null, "");
+            sec.appendChild(this.canvasInfo);
+            d.appendChild(sec);
+        });
+
+        section("Prompt", true, (d) => {
+            const wrap = el("div", "ipc-prompt");
+            this.promptInput = document.createElement("textarea");
+            this.promptInput.placeholder = "Describe what should appear in the selection. Available as the node's prompt output.";
+            this.promptInput.spellcheck = false;
+            this.promptInput.addEventListener("input", () => { this.promptText = this.promptInput.value; });
+            this.promptInput.addEventListener("change", () => this.notifyChanged());
+            this.promptInput.addEventListener("keydown", (e) => {
+                e.stopPropagation();
+                if (e.key === "Escape") { this.promptInput.blur(); this.root.focus({ preventScroll: true }); }
+                if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); this.generate(); }
+            });
+            wrap.appendChild(this.promptInput);
+            d.appendChild(wrap);
+        });
+
+        section("History", true, (d) => {
+            this.historyList = el("div", "ipc-hist");
+            d.appendChild(this.historyList);
+        });
+
+        section("Crop", true, (d) => {
+            this.infoEl = el("div", "ipc-info");
+            d.appendChild(this.infoEl);
+        });
+
         body.appendChild(side);
         root.appendChild(body);
 
@@ -468,6 +637,7 @@ class InpaintEditor {
         this.bindEvents();
         this.setTool("select");
         this.renderLayers();
+        this.renderHistory();
         this.renderInfo();
         this.resizeObserver = new ResizeObserver(() => this.resizeCanvas());
         this.resizeObserver.observe(this.viewEl);
@@ -489,6 +659,7 @@ class InpaintEditor {
         this.resizeCanvas();
         this.fitView();
         this.renderLayers();
+        this.renderHistory();
         this.renderInfo();
     }
 
@@ -513,19 +684,18 @@ class InpaintEditor {
         }
         root.addEventListener("contextmenu", (e) => e.preventDefault());
         root.addEventListener("click", (e) => {
-            if (e.target && e.target.closest && e.target.closest("button")) this.root.focus({ preventScroll: true });
+            const t = e.target;
+            if (t && t.closest && t.closest("button") && !t.closest("input, select, textarea")) this.root.focus({ preventScroll: true });
         });
         root.addEventListener("wheel", (e) => {
-            if (e.target === this.promptInput || (e.target && e.target.closest && e.target.closest(".ipc-list"))) { e.stopPropagation(); return; }
+            if (e.target !== this.canvas) { e.stopPropagation(); return; }
             e.preventDefault();
             e.stopPropagation();
-            if (e.target === this.canvas) this.onWheel(e);
+            this.onWheel(e);
         }, { passive: false });
         root.addEventListener("keydown", (e) => {
-            if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) {
-                e.stopPropagation();
-                return;
-            }
+            const tag = e.target && e.target.tagName;
+            if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") { e.stopPropagation(); return; }
             e.stopPropagation();
             this.onKey(e);
         });
@@ -612,8 +782,8 @@ class InpaintEditor {
 
     setBrushSize(v) {
         this.brushSize = Math.min(400, Math.max(2, v));
-        this.sizeInput.value = this.brushSize;
-        this.sizeValue.textContent = this.brushSize + "px";
+        this.sizeCtl.input.value = this.brushSize;
+        this.sizeCtl.value.textContent = this.brushSize + "px";
         this.draw();
     }
 
@@ -675,6 +845,10 @@ class InpaintEditor {
         return this.layers.find((l) => l.id === this.activeLayerId) || null;
     }
 
+    isControl(layer) {
+        return !!(layer.role && layer.role !== "none");
+    }
+
     /** Which corner handle of the active layer is under image point (ix, iy)? */
     handleAt(ix, iy) {
         const l = this.activeLayer();
@@ -721,8 +895,9 @@ class InpaintEditor {
                 layer = this.addPaintLayer();
             }
             this.pushUndo({ kind: "layer", id: layer.id });
-            this.pointer = { kind: "layerpaint", layer, last: [ix, iy] };
-            this.layerDab(layer, ix, iy, ix, iy);
+            const stroke = makeCanvas(layer.canvas.width, layer.canvas.height);
+            this.pointer = { kind: "layerpaint", layer, stroke, erase: this.tool === "erase", last: [ix, iy] };
+            this.layerDab(this.pointer, ix, iy, ix, iy);
         } else if (this.tool === "transform") {
             const layer = this.activeLayer();
             if (!layer) { this.setStatus("Select a layer to move or scale it. The base stays put."); return; }
@@ -744,10 +919,7 @@ class InpaintEditor {
         this.hover = [ix, iy];
         const p = this.pointer;
         if (!p) {
-            if (this.tool === "transform") {
-                const h = this.handleAt(ix, iy);
-                this.viewEl.classList.toggle("ipc-scale", !!h);
-            }
+            if (this.tool === "transform") this.viewEl.classList.toggle("ipc-scale", !!this.handleAt(ix, iy));
             this.draw();
             return;
         }
@@ -760,7 +932,7 @@ class InpaintEditor {
             this.selectionDab(p.last[0], p.last[1], ix, iy);
             p.last = [ix, iy];
         } else if (p.kind === "layerpaint") {
-            this.layerDab(p.layer, p.last[0], p.last[1], ix, iy);
+            this.layerDab(p, p.last[0], p.last[1], ix, iy);
             p.last = [ix, iy];
         } else if (p.kind === "rect") {
             p.cur = [ix, iy];
@@ -778,7 +950,6 @@ class InpaintEditor {
     applyScale(p, ix, iy) {
         const o = p.orig;
         const l = p.layer;
-        // Anchor is the corner opposite to the dragged handle.
         const anchorX = p.handle.includes("w") ? o.x + o.w : o.x;
         const anchorY = p.handle.includes("n") ? o.y + o.h : o.y;
         let nw = Math.abs(ix - anchorX);
@@ -828,9 +999,11 @@ class InpaintEditor {
             if (this.tool === "select" && this.fillEnclosed) this.fillEnclosedAreas();
             this.markSelectionChanged();
         } else if (p.kind === "layerpaint") {
+            this.commitStroke(p);
             this.markLayerChanged(p.layer);
         } else if (p.kind === "move" || p.kind === "scale") {
             this.uploaded.baseHash = null;
+            this.uploaded.controlHash = null;
             this.renderLayers();
             this.drawThumb();
             this.notifyChanged();
@@ -861,7 +1034,7 @@ class InpaintEditor {
         const sctx = this.selection.getContext("2d");
         const img = sctx.getImageData(0, 0, W, H);
         const d = img.data;
-        const reach = new Uint8Array(W * H);   // 1 = unselected and connected to the border
+        const reach = new Uint8Array(W * H);
         const stack = [];
         const push = (i) => { if (!reach[i] && d[i * 4 + 3] <= 127) { reach[i] = 1; stack.push(i); } };
         for (let x = 0; x < W; x++) { push(x); push((H - 1) * W + x); }
@@ -884,21 +1057,85 @@ class InpaintEditor {
         if (filled) sctx.putImageData(img, 0, 0);
     }
 
-    /** Paint or erase on a layer; image coords are mapped into the layer's own pixels. */
-    layerDab(layer, x0, y0, x1, y1) {
-        const c = layer.canvas;
+    /**
+     * Draw one brush segment into the stroke buffer of a layer-paint gesture.
+     * Hard brushes use a round line, soft brushes stamp radial-gradient dabs.
+     * Image coords are mapped into the layer's own pixels.
+     */
+    layerDab(p, x0, y0, x1, y1) {
+        const layer = p.layer;
+        const c = p.stroke;
         const sx = c.width / layer.w, sy = c.height / layer.h;
         const ctx = c.getContext("2d");
-        ctx.globalCompositeOperation = this.tool === "erase" ? "destination-out" : "source-over";
-        ctx.strokeStyle = this.color;
-        ctx.lineCap = "round";
-        ctx.lineJoin = "round";
-        ctx.lineWidth = this.brushSize * (sx + sy) / 2;
-        ctx.beginPath();
-        ctx.moveTo((x0 - layer.x) * sx, (y0 - layer.y) * sy);
-        ctx.lineTo((x1 - layer.x) * sx + 0.01, (y1 - layer.y) * sy + 0.01);
-        ctx.stroke();
+        const lx0 = (x0 - layer.x) * sx, ly0 = (y0 - layer.y) * sy;
+        const lx1 = (x1 - layer.x) * sx, ly1 = (y1 - layer.y) * sy;
+        const radius = this.brushSize * (sx + sy) / 4;
+        const color = p.erase ? "#000000" : this.color;
         ctx.globalCompositeOperation = "source-over";
+        if (this.hardness >= 0.98) {
+            ctx.strokeStyle = color;
+            ctx.lineCap = "round";
+            ctx.lineJoin = "round";
+            ctx.lineWidth = radius * 2;
+            ctx.beginPath();
+            ctx.moveTo(lx0, ly0);
+            ctx.lineTo(lx1 + 0.01, ly1 + 0.01);
+            ctx.stroke();
+            return;
+        }
+        if (!p.gradient || p.gradientRadius !== radius) {
+            const g = ctx.createRadialGradient(0, 0, 0, 0, 0, radius);
+            const rgb = color.length === 7 ? `${parseInt(color.slice(1, 3), 16)},${parseInt(color.slice(3, 5), 16)},${parseInt(color.slice(5, 7), 16)}` : "0,0,0";
+            g.addColorStop(0, `rgba(${rgb},1)`);
+            g.addColorStop(Math.max(0, Math.min(0.97, this.hardness)), `rgba(${rgb},1)`);
+            g.addColorStop(1, `rgba(${rgb},0)`);
+            p.gradient = g;
+            p.gradientRadius = radius;
+        }
+        const dist = Math.hypot(lx1 - lx0, ly1 - ly0);
+        const spacing = Math.max(1, radius * 0.18);
+        const steps = Math.max(1, Math.ceil(dist / spacing));
+        ctx.fillStyle = p.gradient;
+        for (let i = 0; i <= steps; i++) {
+            const t = steps === 0 ? 0 : i / steps;
+            const x = lx0 + (lx1 - lx0) * t, y = ly0 + (ly1 - ly0) * t;
+            ctx.save();
+            ctx.translate(x, y);
+            ctx.beginPath();
+            ctx.arc(0, 0, radius, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+        }
+    }
+
+    /** Apply the stroke buffer to the layer with the brush opacity. */
+    commitStroke(p) {
+        const ctx = p.layer.canvas.getContext("2d");
+        ctx.save();
+        ctx.globalAlpha = this.brushOpacity;
+        ctx.globalCompositeOperation = p.erase ? "destination-out" : "source-over";
+        ctx.drawImage(p.stroke, 0, 0);
+        ctx.restore();
+    }
+
+    /** Layer pixels with the in-progress stroke applied, for live preview. */
+    layerWithStroke(layer) {
+        const p = this.pointer;
+        if (!p || p.kind !== "layerpaint" || p.layer !== layer) return layer.canvas;
+        if (!this.strokePreview || this.strokePreview.width !== layer.canvas.width || this.strokePreview.height !== layer.canvas.height) {
+            this.strokePreview = makeCanvas(layer.canvas.width, layer.canvas.height);
+        }
+        const ctx = this.strokePreview.getContext("2d");
+        ctx.globalCompositeOperation = "source-over";
+        ctx.globalAlpha = 1;
+        ctx.clearRect(0, 0, this.strokePreview.width, this.strokePreview.height);
+        ctx.drawImage(layer.canvas, 0, 0);
+        ctx.globalAlpha = this.brushOpacity;
+        ctx.globalCompositeOperation = p.erase ? "destination-out" : "source-over";
+        ctx.drawImage(p.stroke, 0, 0);
+        ctx.globalAlpha = 1;
+        ctx.globalCompositeOperation = "source-over";
+        return this.strokePreview;
     }
 
     fillSelection() {
@@ -915,11 +1152,127 @@ class InpaintEditor {
         const c = layer.canvas;
         const ctx = c.getContext("2d");
         ctx.save();
+        ctx.globalAlpha = this.brushOpacity;
         ctx.setTransform(c.width / layer.w, 0, 0, c.height / layer.h, 0, 0);
         ctx.drawImage(shape, -layer.x, -layer.y);
         ctx.restore();
         this.markLayerChanged(layer);
         this.draw();
+    }
+
+    // ---- selection: grow / shrink / from layer ------------------------------
+
+    growSelection(n) {
+        if (!this.selection || !n) return;
+        const W = this.width, H = this.height;
+        const sctx = this.selection.getContext("2d");
+        const img = sctx.getImageData(0, 0, W, H);
+        const d = img.data;
+        const grow = n > 0;
+        const r = Math.abs(n);
+        const feature = new Uint8Array(W * H);
+        for (let i = 0; i < W * H; i++) {
+            const sel = d[i * 4 + 3] > 127;
+            feature[i] = grow ? (sel ? 1 : 0) : (sel ? 0 : 1);
+        }
+        this.pushUndo({ kind: "selection" });
+        const dist = distanceTransform(feature, W, H);
+        const r2 = r * r;
+        for (let i = 0; i < W * H; i++) {
+            const inside = grow ? dist[i] <= r2 : dist[i] > r2;
+            d[i * 4] = 255; d[i * 4 + 1] = 0; d[i * 4 + 2] = 0; d[i * 4 + 3] = inside ? 255 : 0;
+        }
+        sctx.putImageData(img, 0, 0);
+        this.markSelectionChanged();
+        this.draw();
+        this.setStatus(`Selection ${grow ? "grown" : "shrunk"} by ${r}px.`);
+    }
+
+    selectionFromLayer() {
+        const layer = this.activeLayer();
+        if (!layer) { this.setStatus("Select a layer first (the base is fully opaque)."); return; }
+        this.pushUndo({ kind: "selection" });
+        const tmp = makeCanvas(this.width, this.height);
+        tmp.getContext("2d").drawImage(layer.canvas, layer.x, layer.y, layer.w, layer.h);
+        const src = tmp.getContext("2d").getImageData(0, 0, this.width, this.height).data;
+        const sctx = this.selection.getContext("2d");
+        const img = sctx.createImageData(this.width, this.height);
+        const d = img.data;
+        for (let i = 0; i < src.length; i += 4) {
+            d[i] = 255; d[i + 1] = 0; d[i + 2] = 0; d[i + 3] = src[i + 3] > 127 ? 255 : 0;
+        }
+        sctx.putImageData(img, 0, 0);
+        this.markSelectionChanged();
+        this.draw();
+        this.setStatus(`Selection taken from ${layer.name}.`);
+    }
+
+    // ---- outpainting ---------------------------------------------------------
+
+    async extendCanvas() {
+        if (!this.base) { this.setStatus("Load an image first."); return; }
+        const top = Math.max(0, +this.extendInputs.top.value || 0);
+        const right = Math.max(0, +this.extendInputs.right.value || 0);
+        const bottom = Math.max(0, +this.extendInputs.bottom.value || 0);
+        const left = Math.max(0, +this.extendInputs.left.value || 0);
+        if (!(top || right || bottom || left)) { this.setStatus("Enter how many pixels to add on each side."); return; }
+        const W = this.width, H = this.height;
+        const nw = W + left + right, nh = H + top + bottom;
+        try {
+            this.setStatus(`Extending canvas to ${nw} × ${nh} ...`);
+            // Flatten what is visible now, then stretch its edge pixels into the new border.
+            const flat = this.flattenToCanvas({ forRun: true });
+            const nb = makeCanvas(nw, nh);
+            const ctx = nb.getContext("2d");
+            ctx.imageSmoothingEnabled = true;
+            if (top) ctx.drawImage(flat, 0, 0, W, 1, left, 0, W, top);
+            if (bottom) ctx.drawImage(flat, 0, H - 1, W, 1, left, top + H, W, bottom);
+            if (left) ctx.drawImage(flat, 0, 0, 1, H, 0, top, left, H);
+            if (right) ctx.drawImage(flat, W - 1, 0, 1, H, left + W, top, right, H);
+            if (top && left) ctx.drawImage(flat, 0, 0, 1, 1, 0, 0, left, top);
+            if (top && right) ctx.drawImage(flat, W - 1, 0, 1, 1, left + W, 0, right, top);
+            if (bottom && left) ctx.drawImage(flat, 0, H - 1, 1, 1, 0, top + H, left, bottom);
+            if (bottom && right) ctx.drawImage(flat, W - 1, H - 1, 1, 1, left + W, top + H, right, bottom);
+            ctx.drawImage(flat, left, top);
+            const { ref } = await uploadCanvas(nb, `n${this.node.id}_base`);
+            const img = await loadImageEl(viewUrl(ref));
+
+            // Everything visible was baked into the new base; keep only control layers.
+            const kept = this.layers.filter((l) => this.isControl(l));
+            for (const l of kept) {
+                if (l.kind === "paint" && l.canvas.width === W && l.canvas.height === H && l.w === W && l.h === H) {
+                    const c = makeCanvas(nw, nh);
+                    c.getContext("2d").drawImage(l.canvas, left, top);
+                    l.canvas = c; l.x = 0; l.y = 0; l.w = nw; l.h = nh;
+                } else {
+                    l.x += left; l.y += top;
+                }
+                l.dirty = true;
+            }
+            this.layers = kept;
+            this.activeLayerId = null;
+            this.base = { ref, img };
+            this.width = nw; this.height = nh;
+            this.selection = makeCanvas(nw, nh);
+            const sctx = this.selection.getContext("2d");
+            sctx.fillStyle = "#ff0000";
+            sctx.fillRect(0, 0, nw, nh);
+            sctx.clearRect(left, top, W, H);
+            this.undo = []; this.redo = [];
+            this.uploaded = { baseHash: null, baseRef: null, maskHash: null, maskRef: null, controlHash: null, controlRef: null };
+            this.selectionDirty = true;
+            this.selectionDataUrl = null;
+            for (const k of Object.keys(this.extendInputs)) this.extendInputs[k].value = 0;
+            this.renderLayers();
+            this.renderInfo();
+            this.fitView();
+            this.drawThumb();
+            this.notifyChanged();
+            this.setStatus(`Canvas is ${nw} × ${nh}. The new border is selected; press Generate to outpaint it.`);
+        } catch (err) {
+            console.error(err);
+            this.setStatus(String(err.message || err));
+        }
     }
 
     // ---- undo ----------------------------------------------------------------
@@ -963,6 +1316,7 @@ class InpaintEditor {
             } else if (snap.kind === "transform") {
                 Object.assign(layer, { x: snap.x, y: snap.y, w: snap.w, h: snap.h });
                 this.uploaded.baseHash = null;
+                this.uploaded.controlHash = null;
                 this.renderLayers();
                 this.drawThumb();
                 this.notifyChanged();
@@ -1024,6 +1378,7 @@ class InpaintEditor {
     markLayerChanged(layer) {
         layer.dirty = true;
         this.uploaded.baseHash = null;
+        this.uploaded.controlHash = null;
         this.drawThumb();
         this.notifyChanged();
     }
@@ -1086,8 +1441,11 @@ class InpaintEditor {
             } else {
                 rows.push(["Emitted", `${Math.min(this.width, Math.ceil(cw / m) * m)} × ${Math.min(this.height, Math.ceil(ch / m) * m)}`]);
             }
+            const ctrl = this.layers.filter((l) => this.isControl(l) && l.visible).length;
+            rows.push(["Control", ctrl ? `${ctrl} layer${ctrl > 1 ? "s" : ""}` : "none (black)"]);
         }
         this.infoEl.innerHTML = rows.map(([k, v]) => `<span>${k}</span><b>${v}</b>`).join("");
+        if (this.canvasInfo) this.canvasInfo.textContent = this.base ? `now ${this.width} × ${this.height}` : "";
     }
 
     // ---- layers: management ------------------------------------------------
@@ -1105,6 +1463,7 @@ class InpaintEditor {
         }
         this.uploaded.baseHash = null;
         this.uploaded.baseRef = null;
+        this.uploaded.controlHash = null;
         this.dropHint.style.display = "none";
         this.selectionDirty = true;
         this.selectionDataUrl = null;
@@ -1137,9 +1496,12 @@ class InpaintEditor {
         if (layer.visible == null) layer.visible = true;
         if (layer.opacity == null) layer.opacity = 1;
         if (!layer.kind) layer.kind = "result";
+        if (!layer.blend) layer.blend = "normal";
+        if (!layer.role) layer.role = "none";
         this.layers.push(layer);
         if (activate) this.activeLayerId = layer.id;
         this.uploaded.baseHash = null;
+        this.uploaded.controlHash = null;
         this.renderLayers();
         this.draw();
         this.drawThumb();
@@ -1162,7 +1524,9 @@ class InpaintEditor {
         this.layers = this.layers.filter((l) => l.id !== id);
         if (this.activeLayerId === id) this.activeLayerId = null;
         this.uploaded.baseHash = null;
+        this.uploaded.controlHash = null;
         this.renderLayers();
+        this.renderHistory();
         this.draw();
         this.drawThumb();
         this.notifyChanged();
@@ -1175,6 +1539,7 @@ class InpaintEditor {
         const [l] = this.layers.splice(i, 1);
         this.layers.splice(j, 0, l);
         this.uploaded.baseHash = null;
+        this.uploaded.controlHash = null;
         this.renderLayers();
         this.draw();
         this.drawThumb();
@@ -1194,8 +1559,10 @@ class InpaintEditor {
                     await this.setBase(ref, img, { keepLayers: false });
                     continue;
                 }
-                const n = this.layers.filter((l) => l.kind === "result").length + 1;
-                this.addLayer({ name: "Result " + n, kind: "result", ref, canvas: imageToCanvas(img), x: r.x || 0, y: r.y || 0, w: r.width || img.naturalWidth, h: r.height || img.naturalHeight });
+                const n = this.history.length + 1;
+                const layer = this.addLayer({ name: "Result " + n, kind: "result", ref, canvas: imageToCanvas(img), x: r.x || 0, y: r.y || 0, w: r.width || img.naturalWidth, h: r.height || img.naturalHeight });
+                this.history.push({ key, name: layer.name, ref, x: layer.x, y: layer.y, w: layer.w, h: layer.h, prompt: this.promptText, layerId: layer.id, time: Date.now() });
+                this.renderHistory();
                 this.setStatus(`Result ${n} added (${r.width} × ${r.height} at ${r.x}, ${r.y})`);
             } catch (err) {
                 console.error(err);
@@ -1208,35 +1575,28 @@ class InpaintEditor {
         if (!this.layerList) return;
         const list = this.layerList;
         list.innerHTML = "";
-        const mini = (name, title, onClick, cls = "") => {
-            const b = el("button", "ipc-mini " + cls);
-            b.type = "button";
-            b.title = title;
-            b.innerHTML = icon(name, 16);
-            b.addEventListener("click", (e) => { e.stopPropagation(); onClick(); });
-            return b;
-        };
         for (let i = this.layers.length - 1; i >= 0; i--) {
             const layer = this.layers[i];
             const row = el("div", "ipc-layer" + (layer.id === this.activeLayerId ? " ipc-selected" : ""));
             row.addEventListener("click", () => { this.activeLayerId = layer.id; this.renderLayers(); this.draw(); });
             const top = el("div", "ipc-row");
-            top.appendChild(mini(layer.visible ? "eye" : "eyeOff", "Toggle visibility", () => {
+            top.appendChild(miniButton(layer.visible ? "eye" : "eyeOff", "Toggle visibility", () => {
                 layer.visible = !layer.visible;
                 this.uploaded.baseHash = null;
-                this.renderLayers(); this.draw(); this.drawThumb(); this.notifyChanged();
+                this.uploaded.controlHash = null;
+                this.renderLayers(); this.renderInfo(); this.draw(); this.drawThumb(); this.notifyChanged();
             }, layer.visible ? "" : "ipc-off"));
             const name = el("span", "ipc-name", layer.name);
             name.title = `${layer.w} × ${layer.h} at ${layer.x}, ${layer.y}`;
             top.appendChild(name);
-            top.appendChild(el("span", "ipc-kind", layer.kind));
-            const up = mini("up", "Move layer up", () => this.moveLayer(layer.id, +1));
+            top.appendChild(el("span", "ipc-kind" + (this.isControl(layer) ? " ipc-ctrl" : ""), this.isControl(layer) ? layer.role : layer.kind));
+            const up = miniButton("up", "Move layer up", () => this.moveLayer(layer.id, +1));
             up.disabled = i === this.layers.length - 1;
             top.appendChild(up);
-            const down = mini("down", "Move layer down", () => this.moveLayer(layer.id, -1));
+            const down = miniButton("down", "Move layer down", () => this.moveLayer(layer.id, -1));
             down.disabled = i === 0;
             top.appendChild(down);
-            top.appendChild(mini("trash", "Delete layer", () => this.removeLayer(layer.id), "ipc-del"));
+            top.appendChild(miniButton("trash", "Delete layer", () => this.removeLayer(layer.id), "ipc-del"));
             row.appendChild(top);
 
             const opRow = el("div", "ipc-op");
@@ -1247,11 +1607,29 @@ class InpaintEditor {
             op.title = "Layer opacity";
             const pct = el("b", null, Math.round(layer.opacity * 100) + "%");
             op.addEventListener("click", (e) => e.stopPropagation());
-            op.addEventListener("input", () => { layer.opacity = op.value / 100; pct.textContent = op.value + "%"; this.uploaded.baseHash = null; this.draw(); });
+            op.addEventListener("input", () => { layer.opacity = op.value / 100; pct.textContent = op.value + "%"; this.uploaded.baseHash = null; this.uploaded.controlHash = null; this.draw(); });
             op.addEventListener("change", () => { this.drawThumb(); this.notifyChanged(); });
             opRow.appendChild(op);
             opRow.appendChild(pct);
             row.appendChild(opRow);
+
+            const modeRow = el("div", "ipc-op");
+            const blendLab = el("label", null, "Blend");
+            const blend = selectInput(BLEND_MODES, layer.blend || "normal", "Blend mode");
+            blend.addEventListener("change", () => { layer.blend = blend.value; this.uploaded.baseHash = null; this.draw(); this.drawThumb(); this.notifyChanged(); });
+            blendLab.appendChild(blend);
+            modeRow.appendChild(blendLab);
+            const roleLab = el("label", null, "Control");
+            const role = selectInput(ROLES, layer.role || "none", "Control role: layers with a role go to the control_image output instead of the image");
+            role.addEventListener("change", () => {
+                layer.role = role.value;
+                this.uploaded.baseHash = null;
+                this.uploaded.controlHash = null;
+                this.renderLayers(); this.renderInfo(); this.draw(); this.drawThumb(); this.notifyChanged();
+            });
+            roleLab.appendChild(role);
+            modeRow.appendChild(roleLab);
+            row.appendChild(modeRow);
             list.appendChild(row);
         }
         const row = el("div", "ipc-layer" + (this.activeLayerId === null ? " ipc-selected" : ""));
@@ -1268,22 +1646,111 @@ class InpaintEditor {
         list.appendChild(row);
     }
 
-    // ---- compositing -------------------------------------------------------
+    // ---- history -------------------------------------------------------------
 
-    drawComposite(ctx) {
-        if (!this.base) return;
-        ctx.drawImage(this.base.img, 0, 0);
-        for (const layer of this.layers) {
-            if (!layer.visible || !layer.canvas) continue;
-            ctx.globalAlpha = layer.opacity;
-            ctx.drawImage(layer.canvas, layer.x, layer.y, layer.w, layer.h);
+    renderHistory() {
+        if (!this.historyList) return;
+        const list = this.historyList;
+        list.innerHTML = "";
+        if (!this.history.length) {
+            list.appendChild(el("div", "ipc-sec", "Results show up here with a preview."));
+            return;
         }
-        ctx.globalAlpha = 1;
+        for (let i = this.history.length - 1; i >= 0; i--) {
+            const h = this.history[i];
+            const layer = this.layers.find((l) => l.id === h.layerId) || null;
+            const item = el("div", "ipc-hitem" + (layer ? "" : " ipc-gone"));
+            const thumb = document.createElement("canvas");
+            thumb.width = 112; thumb.height = 112;
+            thumb.title = "Solo: show only this result";
+            this.drawHistoryThumb(thumb, h);
+            thumb.addEventListener("click", (e) => { e.stopPropagation(); this.soloResult(h); });
+            item.appendChild(thumb);
+            const text = el("div", "ipc-htext");
+            const title = el("b", null, h.name + (layer ? "" : " (discarded)"));
+            text.appendChild(title);
+            text.appendChild(el("span", null, `${h.w} × ${h.h} at ${h.x}, ${h.y}`));
+            if (h.prompt) { const p = el("span", null, h.prompt); p.title = h.prompt; text.appendChild(p); }
+            item.appendChild(text);
+            if (layer) {
+                item.appendChild(miniButton("solo", "Solo: show only this result", () => this.soloResult(h)));
+                item.appendChild(miniButton("trash", "Discard: remove the layer (the file stays, restore is possible)", () => this.removeLayer(layer.id), "ipc-del"));
+            } else {
+                item.appendChild(miniButton("restore", "Restore this result as a layer", () => this.restoreResult(h)));
+            }
+            list.appendChild(item);
+        }
     }
 
-    flattenToCanvas() {
+    drawHistoryThumb(canvas, h) {
+        const paint = (img) => {
+            const ctx = canvas.getContext("2d");
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            const s = Math.min(canvas.width / img.width, canvas.height / img.height);
+            const w = img.width * s, hh = img.height * s;
+            ctx.drawImage(img, (canvas.width - w) / 2, (canvas.height - hh) / 2, w, hh);
+        };
+        const layer = this.layers.find((l) => l.id === h.layerId);
+        if (layer && layer.canvas) { paint(layer.canvas); return; }
+        if (h.thumbImg) { paint(h.thumbImg); return; }
+        loadImageEl(viewUrl(h.ref)).then((img) => { h.thumbImg = img; paint(img); }).catch(() => { /* ignore */ });
+    }
+
+    soloResult(h) {
+        for (const l of this.layers) {
+            if (l.kind !== "result") continue;
+            l.visible = l.id === h.layerId;
+        }
+        const layer = this.layers.find((l) => l.id === h.layerId);
+        if (layer) this.activeLayerId = layer.id;
+        this.uploaded.baseHash = null;
+        this.renderLayers();
+        this.renderInfo();
+        this.draw();
+        this.drawThumb();
+        this.notifyChanged();
+        this.setStatus(layer ? `Showing only ${h.name}.` : `${h.name} is discarded; restore it first.`);
+    }
+
+    async restoreResult(h) {
+        try {
+            const img = h.thumbImg || await loadImageEl(viewUrl(h.ref));
+            const layer = this.addLayer({ name: h.name, kind: "result", ref: h.ref, canvas: imageToCanvas(img), x: h.x, y: h.y, w: h.w, h: h.h });
+            h.layerId = layer.id;
+            this.renderHistory();
+            this.setStatus(`${h.name} restored.`);
+        } catch (err) {
+            console.error(err);
+            this.setStatus(String(err.message || err));
+        }
+    }
+
+    // ---- compositing -------------------------------------------------------
+
+    drawComposite(ctx, { forRun = false, controlOnly = false } = {}) {
+        if (!this.base) return;
+        if (controlOnly) {
+            ctx.fillStyle = "#000";
+            ctx.fillRect(0, 0, this.width, this.height);
+        } else {
+            ctx.drawImage(this.base.img, 0, 0);
+        }
+        for (const layer of this.layers) {
+            if (!layer.visible || !layer.canvas) continue;
+            const ctrl = this.isControl(layer);
+            if (controlOnly && !ctrl) continue;
+            if (forRun && ctrl) continue;
+            ctx.globalAlpha = layer.opacity;
+            ctx.globalCompositeOperation = (!controlOnly && layer.blend && layer.blend !== "normal") ? layer.blend : "source-over";
+            ctx.drawImage(this.layerWithStroke(layer), layer.x, layer.y, layer.w, layer.h);
+        }
+        ctx.globalAlpha = 1;
+        ctx.globalCompositeOperation = "source-over";
+    }
+
+    flattenToCanvas(opts = {}) {
         const c = makeCanvas(this.width, this.height);
-        this.drawComposite(c.getContext("2d"));
+        this.drawComposite(c.getContext("2d"), opts);
         return c;
     }
 
@@ -1305,20 +1772,19 @@ class InpaintEditor {
         if (!this.base || !this.layers.length) return;
         try {
             this.setStatus("Flattening ...");
-            const blob = await canvasToBlob(this.flattenToCanvas());
-            const hash = await hashBlob(blob);
-            const ref = await uploadBlob(blob, `n${this.node.id}_base_${hash}.png`);
+            const { ref, hash } = await uploadCanvas(this.flattenToCanvas({ forRun: true }), `n${this.node.id}_base`);
             const img = await loadImageEl(viewUrl(ref));
-            this.layers = [];
+            this.layers = this.layers.filter((l) => this.isControl(l));
             this.activeLayerId = null;
             this.base = { ref, img };
             this.uploaded.baseHash = hash;
             this.uploaded.baseRef = ref;
             this.renderLayers();
+            this.renderHistory();
             this.draw();
             this.drawThumb();
             this.notifyChanged();
-            this.setStatus("Flattened into base layer.");
+            this.setStatus("Flattened into base layer (control layers kept).");
         } catch (err) {
             console.error(err);
             this.setStatus(String(err.message || err));
@@ -1329,9 +1795,8 @@ class InpaintEditor {
     async syncLayers() {
         for (const layer of this.layers) {
             if (!layer.dirty || !layer.canvas) continue;
-            const blob = await canvasToBlob(layer.canvas);
-            const hash = await hashBlob(blob);
-            layer.ref = await uploadBlob(blob, `n${this.node.id}_layer_${hash}.png`);
+            const { ref } = await uploadCanvas(layer.canvas, `n${this.node.id}_layer`);
+            layer.ref = ref;
             layer.dirty = false;
         }
         this.notifyChanged();
@@ -1363,7 +1828,6 @@ class InpaintEditor {
             ctx.restore();
         }
 
-        // active layer outline + handles
         const active = this.activeLayer();
         if (active && (this.tool === "transform" || this.tool === "paint" || this.tool === "erase")) {
             ctx.save();
@@ -1408,6 +1872,12 @@ class InpaintEditor {
             ctx.beginPath();
             ctx.arc(this.hover[0], this.hover[1], this.brushSize / 2, 0, Math.PI * 2);
             ctx.stroke();
+            if ((this.tool === "paint" || this.tool === "erase") && this.hardness < 0.98) {
+                ctx.setLineDash([3 / s, 3 / s]);
+                ctx.beginPath();
+                ctx.arc(this.hover[0], this.hover[1], (this.brushSize / 2) * this.hardness, 0, Math.PI * 2);
+                ctx.stroke();
+            }
             ctx.restore();
         }
     }
@@ -1419,7 +1889,15 @@ class InpaintEditor {
         try {
             this.generateBtn.disabled = true;
             this.setStatus("Queueing ...");
-            await app.queuePrompt(0);
+            try {
+                await app.queuePrompt(0);
+            } catch (first) {
+                // Some third-party extensions wrap queuePrompt and throw once on the
+                // first call after a page load. One retry gets past that.
+                console.warn("Inpaint Canvas: queuePrompt failed once, retrying", first);
+                await new Promise((r) => setTimeout(r, 300));
+                await app.queuePrompt(0);
+            }
         } catch (err) {
             console.error(err);
             this.setStatus(String(err.message || err));
@@ -1437,8 +1915,6 @@ class InpaintEditor {
     }
 
     getValue() {
-        // While a restore is still loading images, hand back the last known state
-        // so an autosave in that window does not wipe the canvas.
         if (!this.base) return this.lastValueString || "{}";
         if (!this.selectionDataUrl && this.selection) {
             this.selectionDataUrl = this.selection.toDataURL("image/png");
@@ -1449,9 +1925,10 @@ class InpaintEditor {
             base: this.base.ref,
             prompt: this.promptText,
             layers: this.layers.map((l) => ({
-                id: l.id, name: l.name, kind: l.kind, ref: l.ref, x: l.x, y: l.y, w: l.w, h: l.h,
-                opacity: l.opacity, visible: l.visible,
+                id: l.id, name: l.name, kind: l.kind, role: l.role || "none", blend: l.blend || "normal", ref: l.ref,
+                x: l.x, y: l.y, w: l.w, h: l.h, opacity: l.opacity, visible: l.visible,
             })),
+            history: this.history.slice(-100).map((h) => ({ key: h.key, name: h.name, ref: h.ref, x: h.x, y: h.y, w: h.w, h: h.h, prompt: h.prompt, layerId: h.layerId, time: h.time })),
             selection: this.selectionDataUrl,
             seen: Array.from(this.seenResults).slice(-200),
         });
@@ -1464,7 +1941,6 @@ class InpaintEditor {
         const raw = typeof value === "string" ? value : JSON.stringify(value);
         if (raw === this.lastValueString && (this.base || this._loading)) return;
         this.lastValueString = raw;
-        // Only the most recent setValue call may touch the editor; older loads abort.
         const token = (this._loadToken = (this._loadToken || 0) + 1);
         const stale = () => this._loadToken !== token;
         this._loading = true;
@@ -1480,7 +1956,8 @@ class InpaintEditor {
                     const limg = await loadImageEl(viewUrl(l.ref));
                     if (stale()) return;
                     this.layers.push({
-                        id: l.id, name: l.name, kind: l.kind || "result", ref: l.ref, canvas: imageToCanvas(limg),
+                        id: l.id, name: l.name, kind: l.kind || "result", role: l.role || "none", blend: l.blend || "normal",
+                        ref: l.ref, canvas: imageToCanvas(limg),
                         x: l.x, y: l.y, w: l.w, h: l.h, opacity: l.opacity ?? 1, visible: l.visible !== false, dirty: false,
                     });
                     if (l.kind === "paint") this.paintCounter += 1;
@@ -1488,6 +1965,7 @@ class InpaintEditor {
                     console.warn("Inpaint Canvas: layer missing", l.ref, err);
                 }
             }
+            this.history = (state.history || []).map((h) => ({ ...h }));
             for (const key of state.seen || []) this.seenResults.add(key);
             if (state.selection) {
                 const sel = await loadImageEl(state.selection);
@@ -1496,6 +1974,7 @@ class InpaintEditor {
                 this.selectionDirty = true;
             }
             this.renderLayers();
+            this.renderHistory();
             this.renderInfo();
             this.draw();
             this.drawThumb();
@@ -1507,7 +1986,7 @@ class InpaintEditor {
         }
     }
 
-    /** Called when the prompt is built: upload flattened image + mask, return the prompt JSON. */
+    /** Called when the prompt is built: upload flattened image, mask and control, return the prompt JSON. */
     async serializeForPrompt() {
         if (!this.base) return "{}";
         const id = this.node.id;
@@ -1515,24 +1994,31 @@ class InpaintEditor {
         let baseRef = this.uploaded.baseRef;
         if (!this.uploaded.baseHash || !baseRef) {
             let hash;
-            if (!this.layers.some((l) => l.visible) && this.base.ref) {
+            if (!this.layers.some((l) => l.visible && !this.isControl(l)) && this.base.ref) {
                 baseRef = this.base.ref;
                 hash = "orig:" + this.base.ref.filename;
             } else {
-                const blob = await canvasToBlob(this.flattenToCanvas());
-                hash = await hashBlob(blob);
-                baseRef = await uploadBlob(blob, `n${id}_base_${hash}.png`);
+                const up = await uploadCanvas(this.flattenToCanvas({ forRun: true }), `n${id}_base`);
+                baseRef = up.ref; hash = up.hash;
             }
             this.uploaded.baseHash = hash;
             this.uploaded.baseRef = baseRef;
         }
         let maskRef = this.uploaded.maskRef;
         if (!this.uploaded.maskHash || !maskRef) {
-            const blob = await canvasToBlob(this.maskToCanvas());
-            const hash = await hashBlob(blob);
-            maskRef = await uploadBlob(blob, `n${id}_mask_${hash}.png`);
-            this.uploaded.maskHash = hash;
+            const up = await uploadCanvas(this.maskToCanvas(), `n${id}_mask`);
+            maskRef = up.ref;
+            this.uploaded.maskHash = up.hash;
             this.uploaded.maskRef = maskRef;
+        }
+        let controlRef = null;
+        if (this.layers.some((l) => l.visible && this.isControl(l))) {
+            if (!this.uploaded.controlHash || !this.uploaded.controlRef) {
+                const up = await uploadCanvas(this.flattenToCanvas({ controlOnly: true }), `n${id}_control`);
+                this.uploaded.controlHash = up.hash;
+                this.uploaded.controlRef = up.ref;
+            }
+            controlRef = this.uploaded.controlRef;
         }
         const [x, y, w, h] = this.cropRect();
         this.setStatus(`Queued crop ${w} × ${h} at ${x}, ${y}. Waiting for the result ...`);
@@ -1541,6 +2027,7 @@ class InpaintEditor {
             height: this.height,
             base: baseRef,
             mask: maskRef,
+            control: controlRef,
             prompt: this.promptText,
             layers: this.layers.length,
         });
@@ -1581,7 +2068,7 @@ app.registerExtension({
                     w.callback = function () { const x = cb ? cb.apply(this, arguments) : undefined; editor.renderInfo(); editor.draw(); return x; };
                 }
                 const [w, h] = this.size;
-                this.setSize([Math.max(w, 340), Math.max(h, 480)]);
+                this.setSize([Math.max(w, 340), Math.max(h, 500)]);
                 return r;
             };
 
