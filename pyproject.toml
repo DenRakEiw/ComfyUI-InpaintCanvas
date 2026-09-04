@@ -1,0 +1,13 @@
+[project]
+name = "comfyui-inpaintcanvas"
+description = "Krita-style inpainting inside ComfyUI: a layered canvas node with selection tools that emits the selected region for inpainting and takes the result back as a new layer."
+version = "0.1.0"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/DenRakEiw/ComfyUI-InpaintCanvas"
+
+[tool.comfy]
+PublisherId = "denrakeiw"
+DisplayName = "ComfyUI-InpaintCanvas"
+Icon = ""
