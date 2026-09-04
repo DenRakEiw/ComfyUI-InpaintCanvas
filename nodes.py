@@ -181,8 +181,8 @@ class InpaintCanvas:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "MASK", "STRING", "INT", "INT")
-    RETURN_NAMES = ("crop_image", "crop_mask", "image", "mask", "stitch_info", "crop_width", "crop_height")
+    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "MASK", "STRING", "INT", "INT", "STRING")
+    RETURN_NAMES = ("crop_image", "crop_mask", "image", "mask", "stitch_info", "crop_width", "crop_height", "prompt")
     OUTPUT_TOOLTIPS = (
         "Selected region plus padding, scaled to target_size. Inpaint this.",
         "Selection mask matching crop_image.",
@@ -191,6 +191,7 @@ class InpaintCanvas:
         "Stitch parameters for a standalone Inpaint Canvas Stitch node.",
         "Width of crop_image. Wire it into generators that need an explicit size.",
         "Height of crop_image.",
+        "The prompt typed into the editor.",
     )
     FUNCTION = "run"
     CATEGORY = "image/inpaint"
@@ -244,7 +245,7 @@ class InpaintCanvas:
         })
 
         outputs = (crop, crop_mask[None], image, mask[None], stitch_info,
-                   int(crop.shape[2]), int(crop.shape[1]))
+                   int(crop.shape[2]), int(crop.shape[1]), str(state.get("prompt", "") or ""))
 
         if result_source:
             src_id, _, src_slot = result_source.partition(":")

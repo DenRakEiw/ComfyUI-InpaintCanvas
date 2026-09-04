@@ -16,15 +16,25 @@ full-window editor.
 Editor
 
 - **Load** an image, paste one with Ctrl+V, or drop a file onto the canvas.
-- Tools on the left: brush, rectangle, lasso, eraser, hand. Keys: B, R, L, E, H.
-  `[` and `]` change the brush size, the slider at the top does the same.
-- Undo / redo (Ctrl+Z / Ctrl+Shift+Z), clear (Ctrl+D), invert (Ctrl+I),
-  fit to view (F), flatten all visible layers into the base.
+- **Select** tools on the left: brush (B), rectangle (R), lasso (L), deselect
+  brush (D). The loop toggle below them closes brush strokes Photoshop-style:
+  paint a closed ring and the inside is selected too.
+- **Layer** tools: paint (P) with the color from the top bar, eraser (E),
+  fill selection with color (Shift+F), transform (T) to move a layer or drag
+  its corners to scale it (Shift for free aspect), hand (H) to pan.
+  Painting on the base creates a paint layer automatically; the base itself
+  is never erased.
+- Undo / redo (Ctrl+Z / Ctrl+Shift+Z) cover selection, strokes and transforms.
+  Clear (Ctrl+D), invert (Ctrl+I), fit to view (F), flatten all visible layers.
+- `[` and `]` change the brush size, the slider at the top does the same.
 - Mouse wheel zooms. Space, middle mouse, right mouse or the hand tool pans.
 - **Generate** (Ctrl+Enter) queues the workflow. The result appears in the
   layer list while the editor stays open. Esc closes it.
-- Layers on the right: toggle visibility, change opacity, delete. Turn a result
-  off or delete it to reject it, keep it to build on it.
+- **Layers** on the right: click to make a layer active, toggle visibility,
+  opacity slider, move up / down, delete (Delete key for the active layer).
+  The plus button adds an empty paint layer (Ctrl+Shift+N).
+- **Prompt**: the text field on the right is stored with the workflow and
+  comes out of the node as the `prompt` output.
 
 The dashed rectangle is the crop that will be emitted: the selection's bounding
 box plus `padding`. The Crop panel shows its size and the size that actually
@@ -54,6 +64,7 @@ Outputs
 - `crop_width` / `crop_height`: size of `crop_image`. Wire them into generators
   that take an explicit size (the Flux.2 API node, for example) so the result
   comes back in the same aspect ratio.
+- `prompt`: the text from the editor's prompt field.
 
 ### Inpaint Canvas Stitch (`InpaintCanvasStitch`)
 
@@ -92,5 +103,6 @@ The canvas node always re-executes. It cannot know whether the upstream chain
 changed, and the stitch only happens while it runs.
 
 Files: uploads go to `input/inpaint_canvas/`, stitched patches to
-`output/inpaint_canvas/`. The workflow only stores file references and the
-selection, not pixel data of the layers.
+`output/inpaint_canvas/`. Edited layers (paint strokes, erased results) are
+uploaded when the editor closes and before every run. The workflow only stores
+file references and the selection, not pixel data of the layers.
