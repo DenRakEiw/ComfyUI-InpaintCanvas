@@ -159,11 +159,18 @@ size, hardness, opacity and the paint colour.
   with the image's border colour, *crop* to cover, or *stretch*. Not for
   chains that VAE-encode `crop_image`, they would encode the references too.
 - **Filter layers** (the fx button in the Layers header): a layer without
-  pixels that filters everything below it. Types: *Grain* (film-like,
-  strongest in the midtones, with a colour share and film presets from Ektar
-  and Portra to Tri-X and Delta 3200 that set amount, grain size and colour
-  share; the colour rendering of a film stock is a LUT's job), *Sharpen*
-  (unsharp mask with radius and
+  pixels that filters everything below it. Types: *Film / Grain* (film-like
+  grain, strongest in the midtones, with a colour share, and about fifty
+  film presets in groups: colour negative from Ektar and Portra to Gold,
+  UltraMax and Superia, slide films such as Ektachrome, Kodachrome, Velvia
+  and Provia, black-and-white from Pan F to Tri-X, Delta 3200, Ortho and
+  infrared, cine stocks such as Vision3 and CineStill, and special films
+  such as LomoChrome Purple, Turquoise and Metropolis, Aerochrome, redscale,
+  cross-processing, expired film and instant film; a preset sets the grain
+  and a parametric colour character whose strength the *Look* slider
+  controls. These are approximations of how the stocks are described, not
+  measurements; a real film LUT below the grain layer stays the faithful
+  route), *Sharpen* (unsharp mask with radius and
   threshold), *Levels* (input black / white, gamma, output black / white),
   *LUT* (load any 3D `.cube`, with a strength slider; the LUT is stored with
   the workflow) and *Vignette*. Sliders preview at reduced resolution while

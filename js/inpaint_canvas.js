@@ -3703,7 +3703,14 @@ class InpaintEditor {
                 sel.className = "ipc-sel";
                 sel.style.gridColumn = "2 / -1";
                 sel.title = "Film stock: sets amount, grain size and colour share (grain character only, the colour look is a LUT's job). Values assume a picture of about 2000 px.";
-                for (const o of p.options) { const opt = document.createElement("option"); opt.value = o.id; opt.textContent = o.label; sel.appendChild(opt); }
+                let group = null;
+                for (const o of p.options) {
+                    const opt = document.createElement("option"); opt.value = o.id; opt.textContent = o.label;
+                    if (o.group) {
+                        if (!group || group.label !== o.group) { group = document.createElement("optgroup"); group.label = o.group; sel.appendChild(group); }
+                        group.appendChild(opt);
+                    } else sel.appendChild(opt);
+                }
                 sel.value = p.options.some((o) => o.id === cur) ? cur : p.options[0].id;
                 sel.addEventListener("click", stop);
                 sel.addEventListener("keydown", stop);
@@ -3712,7 +3719,10 @@ class InpaintEditor {
                     if (!preset) return;
                     this.pushUndo({ kind: "filter", id: layer.id });
                     layer.params[p.key] = preset.id;
-                    for (const [k, v] of Object.entries(preset)) if (k !== "id" && k !== "label") layer.params[k] = v;
+                    for (const [k, v] of Object.entries(preset)) if (k !== "id" && k !== "label" && k !== "group") layer.params[k] = v;
+                    if (!("look" in preset)) layer.params.look = null;
+                    // layer names are not editable, so the preset may name the layer
+                    layer.name = preset.id === "custom" ? `${FILTERS[layer.filter].label} ${this.filterCounter}` : preset.label.replace(/ \(.*\)$/, "");
                     this.markFilterChanged(layer);
                     this.renderLayers();
                 });
@@ -3745,7 +3755,7 @@ class InpaintEditor {
                 if (!layer._undoPending) layer._undoPending = this.snapshot({ kind: "filter", id: layer.id });
                 layer.params[p.key] = +range.value;
                 val.textContent = fmt(p, +range.value);
-                if (presetSel && layer.params.preset !== "custom") { layer.params.preset = "custom"; presetSel.value = "custom"; }
+                if (presetSel && !p.keepPreset && layer.params.preset !== "custom") { layer.params.preset = "custom"; presetSel.value = "custom"; }
                 this.filterPreview = layer.id;
                 this.markFilterChanged(layer);
             });

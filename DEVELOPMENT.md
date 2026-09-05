@@ -717,9 +717,16 @@ is uploaded like any layer file (`n{id}_lut_{hash}.png`, so the cleanup keeps
 it), `lutFromImage` reads it back on restore. Applying is trilinear in a
 pixel loop, `strength` mixes with the input.
 
-Grain presets (`GRAIN_PRESETS`, param type `select`): a preset copies its
-`amount`, `size`, `chroma` into the params; any slider input sets the preset
-back to `custom`. `chroma` replaced the `mono` flag the same evening (old
+Grain presets (`GRAIN_PRESETS`, param type `select`, grouped by `group`
+into optgroups): a preset copies its `amount`, `size`, `chroma` and `look`
+into the params; any grain slider sets the preset back to `custom` (the
+`Look` slider, `keepPreset`, does not). `look` = `{sat, contrast, warmth,
+tint, fade, mix (3x3 row-major channel mixer), mono (luminance weights for
+black-and-white, ortho and infrared)}` applied by `applyLook` before the
+grain, mixed by `look_strength`. The artistic stocks (LomoChrome Purple /
+Turquoise, Aerochrome, redscale) are channel mixes; Metropolis, cross-
+processing, expired and instant film are saturation / contrast / fade /
+cast combinations. `chroma` replaced the `mono` flag the same evening (old
 layers: `mono === false` -> 100, else 0); the noise is a luminance part
 shared by all channels plus a per-channel part weighted by chroma. The
 values are approximations of how the stocks are described, not measured.
