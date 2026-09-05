@@ -77,7 +77,9 @@ Editor
   node as the `prompt` output.
 - **History**: every result with a preview and the prompt it was made with.
   Click a preview (or the solo button) to show only that result, discard one
-  to remove its layer, restore a discarded one later.
+  to remove its layer, restore a discarded one later. The trash icon in the
+  section header clears the whole list (after a confirmation); layers and
+  files stay, only discarded results can then no longer be restored.
 
 The dashed rectangle is the crop that will be emitted: the selection's bounding
 box plus `padding`. The Crop panel shows its size and the size that actually

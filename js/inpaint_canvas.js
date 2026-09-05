@@ -851,7 +851,11 @@ class InpaintEditor {
             d.appendChild(wrap);
         });
 
-        section("History", true, (d) => {
+        section("History", true, (d, sum) => {
+            sum.appendChild(el("span", "ipc-grow"));
+            const clr = miniButton("trash", "Clear the history list (layers and files stay)", () => this.clearHistory(), "ipc-del");
+            clr.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); });
+            sum.appendChild(clr);
             this.historyList = el("div", "ipc-hist");
             d.appendChild(this.historyList);
         });
@@ -2470,6 +2474,18 @@ class InpaintEditor {
         this.drawThumb();
         this.notifyChanged();
         this.setStatus(layer ? `Showing only ${h.name}.` : `${h.name} is discarded; restore it first.`);
+    }
+
+    clearHistory() {
+        if (!this.history.length) { this.setStatus("The history is already empty."); return; }
+        const gone = this.history.filter((h) => !this.layers.some((l) => l.id === h.layerId)).length;
+        const msg = `Clear ${this.history.length} result${this.history.length === 1 ? "" : "s"} from the history? Layers are kept.` +
+            (gone ? ` ${gone} discarded result${gone === 1 ? "" : "s"} can no longer be restored.` : "");
+        if (!window.confirm(msg)) return;
+        this.history = [];
+        this.renderHistory();
+        this.notifyChanged();
+        this.setStatus("History cleared.");
     }
 
     async restoreResult(h) {
