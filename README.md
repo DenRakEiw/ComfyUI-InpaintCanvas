@@ -294,6 +294,21 @@ size that actually leaves the node, and four settings stored with the canvas:
   of a head; with the original next to it, it knows what is under the green.
   The Flux.2 API node flattens the batch into two input images. Not meant for
   VAE Encode chains, which would encode both.
+- **Paste** decides what of the result lands on the canvas: *selection*
+  keeps only the selected area with a soft edge along the selection, *whole
+  crop* pastes the entire returned rectangle with a soft border at its edge.
+  Edit models such as Flux.2 re-render the crop as a whole and it is
+  consistent in itself; pasting only the selection meets the original along
+  the selection border, and where that border crosses a contour the two can
+  disagree, which shows as doubled lines. *Whole crop* keeps the model's
+  result intact.
+- **Align** registers the result to the unchanged surroundings before it is
+  stitched (an affine fit on the ring around the selection, applied only when
+  it measurably improves the match). Edit models often shift or slightly
+  rescale the content; without alignment every contour the selection border
+  crosses shows up doubled. Rounding the emitted size to the multiple can
+  also change the aspect ratio by a few percent; the Crop info warns about
+  it, and the stitch stretches such a result back exactly.
 - **Color match** matches the result's colours and brightness to the ring
   around the selection when it is stitched back, so results that come back
   with a colour shift leave no visible seam.
@@ -383,6 +398,9 @@ Widgets
 
 With `target_size` set, the scaled crop is rounded to the multiple. With
 `target_size` 0 the region itself is grown symmetrically until it is a multiple.
+For API models that accept up to 2048 px, `target_size` 0 (or a value above
+the region size) keeps the native resolution, so the result comes back as
+sharp as the surroundings instead of being upscaled.
 
 Inputs (both optional, both lazy)
 

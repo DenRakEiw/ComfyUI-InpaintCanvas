@@ -782,3 +782,39 @@ stays valid. Verified: chunks parse, `Bäume` survives, levels are baked
 (mean 138 -> 85). Download = object URL + `<a download>`. Ctrl+S in the
 editor, the Save button in the top bar, name / format / Download in the
 Canvas section.
+
+## 15. Doubled contours: stretch-back, alignment, whole-crop paste (2026-09-05, late)
+
+The user's swimsuit edit (Flux.2 [pro], crop 765×1424 emitted as 576×1024)
+came back with doubled outlines along the arm and shoulder while the model's
+own output looked right. Measured on the stitched patch against the base in
+the ring outside the selection: ECC affine fit scale x 1.048, shift -18 px,
+ring mean abs difference 14.2 -> 9.6 after warping; the patch's Laplacian
+variance was 145 against 1366 for the base (rendered at 1024 px, upscaled).
+
+1. `run()` rounds both emitted sides to `multiple_of` independently, which
+   changes the aspect ratio (here 4.7 %) and *stretches* the crop; the stitch
+   then center-cropped the result instead of stretching it back. Now
+   `stitch_info.emitted` carries the emitted size and a result with that
+   aspect (within 1 %) is resized with `crop="disabled"`, the exact inverse;
+   only a result with another aspect is center-cropped. The Crop info warns
+   "aspect n % off, stretched back on stitch" above 1.5 %.
+2. Edit models drift anyway. `_align_patch(patch, region, keep)`: grayscale,
+   downscaled to 512 px, `cv2.findTransformECC` MOTION_AFFINE with the ring
+   (`1 - dilate(blend, blend + feather/2)`) as inputMask; accepted only when
+   scale is within 8 %, shear < 0.03, shift < 5 % of the region and the ring
+   difference drops by at least 3 %; then `cv2.warpAffine` (inverse map,
+   reflect border) on the RGB patch. `crop.align` (Crop section "Align",
+   default on); the report goes into `ui.inpaint_result[].align` and the
+   status line. Verified offline on the real result: ring difference 14.17
+   without, 9.95 with alignment.
+3. `crop.paste` = "selection" | "crop" (Crop section "Paste"). With "crop"
+   the composite mask is the whole bbox rectangle, eroded by `f // 2` and
+   blurred by `f / 2.5` (`f = max(8, feather, blend)`), multiplied by the
+   rectangle so the fade stays inside it: alpha 1 in the middle, 0.64 at
+   10 px, 0.2 at 2 px from the edge with feather 16. The user's request: the
+   model's output is consistent in itself, only the selection border was
+   the problem.
+
+The remaining softness is resolution: `target_size` 0 (native) or above the
+region size for API models (Flux.2 accepts up to 2048 px).

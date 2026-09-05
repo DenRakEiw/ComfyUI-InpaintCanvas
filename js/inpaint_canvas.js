@@ -351,7 +351,7 @@ const SEGMENT_BACKENDS = [
 ];
 
 const MIN_AUTO_CROP = 512;          // keep in sync with nodes.py
-const CROP_DEFAULTS = { context: "auto", feather: "auto", fill: "none", colorMatch: true, extendFill: "average color", withOriginal: false };
+const CROP_DEFAULTS = { context: "auto", feather: "auto", fill: "none", colorMatch: true, extendFill: "average color", withOriginal: false, align: true, paste: "selection" };
 const CROP_LEGACY = { context: "manual", feather: "manual", fill: "none", colorMatch: false };   // workflows saved before these existed
 // Generate settings: mode picks which result input the round trip uses ("api" =
 // result, "local" = result_local); denoise and seed are emitted as node outputs.
@@ -1317,6 +1317,8 @@ class InpaintEditor {
                     fill: this.cropFillSel.value,
                     colorMatch: this.cropColorMatch.checked,
                     withOriginal: this.cropOriginal.checked,
+                    align: this.cropAlign.checked,
+                    paste: this.cropPasteSel.value === "crop" ? "crop" : "selection",
                 };
                 this.renderInfo();
                 this.draw();
@@ -1337,14 +1339,22 @@ class InpaintEditor {
             this.cropOriginal = document.createElement("input");
             this.cropOriginal.type = "checkbox";
             this.cropOriginal.checked = false;
+            this.cropAlign = document.createElement("input");
+            this.cropAlign.type = "checkbox";
+            this.cropAlign.checked = true;
+            this.cropAlign.addEventListener("change", onChange);
+            this.cropPasteSel = selectInput(["selection", "whole crop"], "selection", "What of the result is pasted back: only the selection (soft edge along the selection), or the whole returned rectangle with a soft border at its edge. Edit models re-render the crop as a whole; whole crop keeps their result intact and avoids doubled contours at the selection border.");
+            this.cropPasteSel.addEventListener("change", onChange);
             for (const c of [this.cropContextSel, this.cropFeatherSel, this.cropFillSel]) c.addEventListener("change", onChange);
             this.cropColorMatch.addEventListener("change", onChange);
             this.cropOriginal.addEventListener("change", onChange);
             row("Context", this.cropContextSel);
             row("Feather", this.cropFeatherSel);
+            row("Paste", this.cropPasteSel, "Only the selection, or the whole returned rectangle");
             row("Fill", this.cropFillSel);
             row("Original", this.cropOriginal, "With a fill mode: crop_image becomes a batch of two, the filled crop first and the untouched crop second, so an edit model (Flux.2, Kontext) sees what is under the green area. The stitch uses the first result image. Not for VAE Encode chains.");
             row("Color match", this.cropColorMatch, "Match the result's colors and brightness to the surroundings when it is stitched back");
+            row("Align", this.cropAlign, "Register the result to the unchanged surroundings before stitching (affine fit on the ring around the selection). Fixes doubled contours when the model shifted or slightly rescaled the content. Applied only when it measurably improves the match.");
             d.appendChild(sec);
             this.infoEl = el("div", "ipc-info");
             d.appendChild(this.infoEl);
@@ -3432,6 +3442,8 @@ class InpaintEditor {
         this.cropFillSel.value = this.cropSettings.fill || "none";
         this.cropColorMatch.checked = !!this.cropSettings.colorMatch;
         if (this.cropOriginal) this.cropOriginal.checked = !!this.cropSettings.withOriginal;
+        if (this.cropAlign) this.cropAlign.checked = this.cropSettings.align !== false;
+        if (this.cropPasteSel) this.cropPasteSel.value = this.cropSettings.paste === "crop" ? "whole crop" : "selection";
         if (this.extendFillSel) this.extendFillSel.value = this.cropSettings.extendFill || "average color";
     }
 
@@ -3457,7 +3469,10 @@ class InpaintEditor {
             const pair = nBatch > 1 ? ` ×${nBatch} (batch)` : "";
             if (target > 0) {
                 const s = target / Math.max(cw, ch);
-                rows.push(["Emitted", `${Math.max(m, Math.round(cw * s / m) * m)} × ${Math.max(m, Math.round(ch * s / m) * m)}${pair}`]);
+                const ew = Math.max(m, Math.round(cw * s / m) * m), eh = Math.max(m, Math.round(ch * s / m) * m);
+                const distort = Math.abs((ew / eh) / (cw / ch) - 1) * 100;
+                const warn = distort >= 1.5 ? ` · aspect ${distort.toFixed(1)} % off, stretched back on stitch` : "";
+                rows.push(["Emitted", `${ew} × ${eh}${pair}${warn}`]);
             } else {
                 rows.push(["Emitted", `${Math.min(this.width, Math.ceil(cw / m) * m)} × ${Math.min(this.height, Math.ceil(ch / m) * m)}${pair}`]);
             }
@@ -3591,7 +3606,8 @@ class InpaintEditor {
                 this.history.push({ key, name: layer.name, ref, x: layer.x, y: layer.y, w: layer.w, h: layer.h, prompt: this.promptText, layerId: layer.id, time: Date.now(),
                     seed: this.genSettings.seed, mode: this.genSettings.mode, denoise: this.genSettings.denoise });
                 this.renderHistory();
-                this.setStatus(`Result ${n} added (${r.width} × ${r.height} at ${r.x}, ${r.y})`);
+                const al = r.align && r.align.aligned ? ` · aligned (shift ${r.align.shift[0]}, ${r.align.shift[1]} px, scale ${r.align.scale[0]}, ${r.align.scale[1]})` : "";
+                this.setStatus(`Result ${n} added (${r.width} × ${r.height} at ${r.x}, ${r.y})${al}`);
             } catch (err) {
                 console.error(err);
                 this.setStatus(String(err.message || err));

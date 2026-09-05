@@ -386,6 +386,55 @@ def _color_match(patch, reference, weight):
     return ((patch - mean_t) * scale + mean_r).clamp(0, 1)
 
 
+def _align_patch(patch, region, keep):
+    """Register the result patch to the surroundings the composite keeps.
+
+    Edit models re-render the whole crop and often shift or slightly scale the
+    content; the composite then shows doubled contours wherever the selection
+    border crosses an edge. An affine ECC fit (OpenCV) on the ring ``keep``
+    (1 where the base stays visible) finds that drift; the patch is warped back
+    when the fit is plausible (scale within 8 %, shear small, shift under 5 %
+    of the region) and actually reduces the ring difference. Returns the patch
+    (warped or untouched) and a short report dict.
+    """
+    try:
+        import cv2
+    except ImportError:
+        return patch, {"aligned": False, "reason": "no cv2"}
+    h, w = patch.shape[0], patch.shape[1]
+    keep_np = keep.cpu().float().numpy()
+    ring = (keep_np > 0.5).astype(np.float32)
+    if ring.sum() < 0.02 * h * w or ring.sum() < 2000:
+        return patch, {"aligned": False, "reason": "ring too small"}
+    g0 = cv2.cvtColor((region.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32) / 255
+    g1 = cv2.cvtColor((patch.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32) / 255
+    s = min(1.0, 512.0 / max(w, h))
+    small0 = cv2.resize(g0, None, fx=s, fy=s) if s < 1 else g0
+    small1 = cv2.resize(g1, None, fx=s, fy=s) if s < 1 else g1
+    m = (cv2.resize(ring, None, fx=s, fy=s) > 0.5).astype(np.uint8) if s < 1 else ring.astype(np.uint8)
+    M = np.eye(2, 3, dtype=np.float32)
+    try:
+        cc, M = cv2.findTransformECC(small0, small1, M, cv2.MOTION_AFFINE,
+                                     (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 200, 1e-5), m, 5)
+    except cv2.error as err:
+        return patch, {"aligned": False, "reason": f"ecc failed: {str(err)[:60]}"}
+    Mf = M.astype(np.float64).copy()
+    Mf[:, 2] /= s
+    sx, sy = float(np.hypot(Mf[0, 0], Mf[1, 0])), float(np.hypot(Mf[0, 1], Mf[1, 1]))
+    shear = abs(float(Mf[0, 0] * Mf[0, 1] + Mf[1, 0] * Mf[1, 1]))
+    tx, ty = float(Mf[0, 2]), float(Mf[1, 2])
+    if abs(sx - 1) > 0.08 or abs(sy - 1) > 0.08 or shear > 0.03 or abs(tx) > 0.05 * w or abs(ty) > 0.05 * h:
+        return patch, {"aligned": False, "reason": "fit out of range", "scale": [round(sx, 4), round(sy, 4)], "shift": [round(tx, 1), round(ty, 1)]}
+    warped_g = cv2.warpAffine(g1, Mf, (w, h), flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_REFLECT)
+    before = float((np.abs(g0 - g1) * ring).sum() / ring.sum())
+    after = float((np.abs(g0 - warped_g) * ring).sum() / ring.sum())
+    if after > before * 0.97:
+        return patch, {"aligned": False, "reason": "no gain", "before": round(before * 255, 2), "after": round(after * 255, 2)}
+    rgb = patch.clamp(0, 1).cpu().numpy().astype(np.float32)
+    warped = cv2.warpAffine(rgb, Mf, (w, h), flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_REFLECT)
+    return torch.from_numpy(np.clip(warped, 0, 1)), {"aligned": True, "scale": [round(sx, 4), round(sy, 4)], "shift": [round(tx, 1), round(ty, 1)], "before": round(before * 255, 2), "after": round(after * 255, 2)}
+
+
 def _resize_image(image, width, height, crop="disabled"):
     """Lanczos resize of a [B, H, W, C] tensor. ``crop="center"`` keeps the aspect
     ratio by center-cropping instead of distorting."""
@@ -620,6 +669,9 @@ class InpaintCanvas:
             "base": base_ref,
             "mask": state.get("mask"),
             "bbox": [x0, y0, x1 - x0, y1 - y0],
+            "emitted": [int(crop.shape[2]), int(crop.shape[1])],
+            "align": bool(crop_settings.get("align", True)),
+            "paste": "crop" if crop_settings.get("paste") == "crop" else "selection",
             "feather": int(feather_used),
             "grow": int(grow_used),
             "blend": int(blend_used),
@@ -677,11 +729,23 @@ class InpaintCanvasStitch:
 
         # First image of the batch, RGB only (API nodes may return RGBA).
         src = result[0:1, :, :, :3].cpu().float()
-        # Keep the aspect ratio: if the generator returned a different shape,
-        # center-crop instead of distorting the content.
-        patch = _resize_image(src, w, h, crop="center")[0]
+        # crop_image was stretched to the emitted size (both sides rounded to the
+        # multiple): a result with that aspect is stretched back exactly. Only a
+        # result with a different aspect (an API returning a fixed shape) is
+        # center-cropped instead of distorted.
+        emitted = info.get("emitted")
+        same_aspect = bool(emitted) and abs(src.shape[2] / src.shape[1] - emitted[0] / emitted[1]) < 0.01
+        patch = _resize_image(src, w, h, crop="disabled" if same_aspect else "center")[0]
 
-        if info.get("auto_feather"):
+        if info.get("paste") == "crop":
+            # Paste the whole returned rectangle (edit models re-render the crop as a
+            # whole and it is consistent in itself); only the rectangle's border fades
+            # into the base, over the feather width, inside the rectangle.
+            rect = torch.zeros((height, width), dtype=torch.float32)
+            rect[y:y + h, x:x + w] = 1.0
+            f = max(8, feather, int(info.get("blend", 0)))
+            full = _blur_mask(_erode_mask(rect, f // 2), f / 2.5) * rect
+        elif info.get("auto_feather"):
             # Krita-style: opaque inside the selection, soft transition outside it.
             full = _composite_mask(mask, int(info.get("grow", 0)), feather, int(info.get("blend", 0)))
         else:
@@ -691,6 +755,12 @@ class InpaintCanvasStitch:
 
         out = base.clone()
         region = out[0, y:y + h, x:x + w]
+        align_report = None
+        if info.get("align", True):
+            # ring the composite keeps, shrunk by the blend width so the transition is not fitted
+            keep = 1.0 - _dilate_mask(blend, max(4, int(info.get("blend", 0)) + int(feather * 0.5)))
+            patch, align_report = _align_patch(patch, region, keep)
+            print(f"[Inpaint Canvas] align: {align_report}")
         if info.get("color_match"):
             # Match the patch to the surroundings the composite keeps (the ring
             # between the region border and the selection).
@@ -718,6 +788,7 @@ class InpaintCanvasStitch:
                     "type": "output",
                     "x": x, "y": y, "width": w, "height": h,
                     "canvas_node": info.get("canvas_node"),
+                    "align": align_report,
                 }],
             },
             "result": (out,),
