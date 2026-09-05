@@ -726,7 +726,25 @@ black-and-white, ortho and infrared)}` applied by `applyLook` before the
 grain, mixed by `look_strength`. The artistic stocks (LomoChrome Purple /
 Turquoise, Aerochrome, redscale) are channel mixes; Metropolis, cross-
 processing, expired and instant film are saturation / contrast / fade /
-cast combinations. `chroma` replaced the `mono` flag the same evening (old
+cast combinations.
+
+Grain distribution (measured 2026-09-05 on fotokorn.de plates the user
+downloaded: Kodak Gold 200, Lomography CN 400, Rollei RPX 400, Tri-X from
+the demo PSD, 6048 px wide, greyscale overlays): high-pass noise is skewed
+and heavy-tailed (skew 0.48 / 0.62 / 0.77 / 0.94, kurtosis 3.2 / 3.7 / 4.6 /
+5.4), correlation length about 0.5 px at 6048 px (sharpened scans; real
+grain is sub-pixel at our working sizes), chroma zero (the plates are
+desaturated), and the amplitudes are normalised by the vendor, so they do not
+calibrate amounts. The synthetic noise is therefore a standardised lognormal
+(`speckle` slider -> sigma up to 0.5; sigma 0.3 gives skew ~0.95 / kurtosis
+~4.6 like the black-and-white plates, presets: classic B&W 60, T-grain 40,
+colour negative 36, cine 30, slide 24). A real plate can be loaded per
+layer (`layer.plate = {name, ref, w, h, mean, std}`, `_plateImg`,
+`plateStats`): it is tiled with a canvas pattern at `plate_scale`, centred on
+its mean and normalised by its high-pass std so `amount` keeps its meaning;
+`size`, `speckle` and `chroma` are hidden while a plate is loaded. The
+measuring script: high-pass with a 12 px gaussian, std / skew / kurtosis,
+lag autocorrelation 1..12 px. `chroma` replaced the `mono` flag the same evening (old
 layers: `mono === false` -> 100, else 0); the noise is a luminance part
 shared by all channels plus a per-channel part weighted by chroma. The
 values are approximations of how the stocks are described, not measured.

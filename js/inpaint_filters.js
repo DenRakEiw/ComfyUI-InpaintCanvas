@@ -48,56 +48,56 @@ const NEG = "Colour negative", SLIDE = "Slide", BW = "Black & white", CINE = "Ci
 export const GRAIN_PRESETS = [
     { id: "custom", label: "Custom" },
     // colour negative
-    { id: "ektar100", group: NEG, label: "Kodak Ektar 100", amount: 10, size: 1.1, chroma: 20, look: { sat: 25, contrast: 10, warmth: 6 } },
-    { id: "portra160", group: NEG, label: "Kodak Portra 160", amount: 12, size: 1.2, chroma: 25, look: { sat: -6, contrast: -4, warmth: 8, fade: 3 } },
-    { id: "portra400", group: NEG, label: "Kodak Portra 400", amount: 18, size: 1.5, chroma: 30, look: { sat: -3, contrast: -4, warmth: 9, fade: 4 } },
-    { id: "portra800", group: NEG, label: "Kodak Portra 800", amount: 28, size: 1.9, chroma: 35, look: { sat: 2, contrast: 0, warmth: 10, fade: 3 } },
-    { id: "gold200", group: NEG, label: "Kodak Gold 200", amount: 20, size: 1.5, chroma: 45, look: { sat: 15, contrast: 6, warmth: 16 } },
-    { id: "colorplus200", group: NEG, label: "Kodak ColorPlus 200", amount: 24, size: 1.6, chroma: 50, look: { sat: 10, contrast: 8, warmth: 12 } },
-    { id: "ultramax400", group: NEG, label: "Kodak UltraMax 400", amount: 26, size: 1.7, chroma: 50, look: { sat: 18, contrast: 6, warmth: 10 } },
-    { id: "fujic200", group: NEG, label: "Fujifilm 200 (C200)", amount: 22, size: 1.5, chroma: 45, look: { sat: 8, contrast: 4, warmth: -3, tint: -6 } },
-    { id: "superia400", group: NEG, label: "Fujifilm Superia 400", amount: 24, size: 1.6, chroma: 50, look: { sat: 12, contrast: 6, warmth: -5, tint: -8 } },
-    { id: "pro400h", group: NEG, label: "Fujifilm Pro 400H", amount: 18, size: 1.5, chroma: 25, look: { sat: -5, contrast: -4, warmth: -6, tint: -6, fade: 3 } },
-    { id: "lomo800", group: NEG, label: "Lomography Color 800", amount: 34, size: 2.0, chroma: 55, look: { sat: 20, contrast: 8, warmth: 10 } },
-    { id: "agfavista200", group: NEG, label: "Agfa Vista 200", amount: 22, size: 1.5, chroma: 45, look: { sat: 15, contrast: 8, warmth: 4 } },
+    { id: "ektar100", group: NEG, label: "Kodak Ektar 100", amount: 10, size: 1.1, speckle: 36, chroma: 20, look: { sat: 25, contrast: 10, warmth: 6 } },
+    { id: "portra160", group: NEG, label: "Kodak Portra 160", amount: 12, size: 1.2, speckle: 36, chroma: 25, look: { sat: -6, contrast: -4, warmth: 8, fade: 3 } },
+    { id: "portra400", group: NEG, label: "Kodak Portra 400", amount: 18, size: 1.5, speckle: 36, chroma: 30, look: { sat: -3, contrast: -4, warmth: 9, fade: 4 } },
+    { id: "portra800", group: NEG, label: "Kodak Portra 800", amount: 28, size: 1.9, speckle: 36, chroma: 35, look: { sat: 2, contrast: 0, warmth: 10, fade: 3 } },
+    { id: "gold200", group: NEG, label: "Kodak Gold 200", amount: 20, size: 1.5, speckle: 36, chroma: 45, look: { sat: 15, contrast: 6, warmth: 16 } },
+    { id: "colorplus200", group: NEG, label: "Kodak ColorPlus 200", amount: 24, size: 1.6, speckle: 36, chroma: 50, look: { sat: 10, contrast: 8, warmth: 12 } },
+    { id: "ultramax400", group: NEG, label: "Kodak UltraMax 400", amount: 26, size: 1.7, speckle: 36, chroma: 50, look: { sat: 18, contrast: 6, warmth: 10 } },
+    { id: "fujic200", group: NEG, label: "Fujifilm 200 (C200)", amount: 22, size: 1.5, speckle: 36, chroma: 45, look: { sat: 8, contrast: 4, warmth: -3, tint: -6 } },
+    { id: "superia400", group: NEG, label: "Fujifilm Superia 400", amount: 24, size: 1.6, speckle: 36, chroma: 50, look: { sat: 12, contrast: 6, warmth: -5, tint: -8 } },
+    { id: "pro400h", group: NEG, label: "Fujifilm Pro 400H", amount: 18, size: 1.5, speckle: 36, chroma: 25, look: { sat: -5, contrast: -4, warmth: -6, tint: -6, fade: 3 } },
+    { id: "lomo800", group: NEG, label: "Lomography Color 800", amount: 34, size: 2.0, speckle: 36, chroma: 55, look: { sat: 20, contrast: 8, warmth: 10 } },
+    { id: "agfavista200", group: NEG, label: "Agfa Vista 200", amount: 22, size: 1.5, speckle: 36, chroma: 45, look: { sat: 15, contrast: 8, warmth: 4 } },
     // slide
-    { id: "ektachrome100", group: SLIDE, label: "Kodak Ektachrome E100", amount: 9, size: 1.0, chroma: 12, look: { sat: 15, contrast: 12, warmth: -2 } },
-    { id: "kodachrome64", group: SLIDE, label: "Kodachrome 64", amount: 12, size: 1.1, chroma: 10, look: { sat: 10, contrast: 16, warmth: 6, mix: [1.08, -0.04, -0.04, 0, 1, 0, 0, -0.04, 1.04] } },
-    { id: "velvia50", group: SLIDE, label: "Fujifilm Velvia 50", amount: 9, size: 1.0, chroma: 15, look: { sat: 40, contrast: 18, warmth: 2 } },
-    { id: "provia100f", group: SLIDE, label: "Fujifilm Provia 100F", amount: 9, size: 1.0, chroma: 12, look: { sat: 12, contrast: 10, warmth: -3 } },
-    { id: "astia100f", group: SLIDE, label: "Fujifilm Astia 100F", amount: 10, size: 1.0, chroma: 12, look: { sat: -5, contrast: 2, warmth: 4 } },
+    { id: "ektachrome100", group: SLIDE, label: "Kodak Ektachrome E100", amount: 9, size: 1.0, speckle: 24, chroma: 12, look: { sat: 15, contrast: 12, warmth: -2 } },
+    { id: "kodachrome64", group: SLIDE, label: "Kodachrome 64", amount: 12, size: 1.1, speckle: 24, chroma: 10, look: { sat: 10, contrast: 16, warmth: 6, mix: [1.08, -0.04, -0.04, 0, 1, 0, 0, -0.04, 1.04] } },
+    { id: "velvia50", group: SLIDE, label: "Fujifilm Velvia 50", amount: 9, size: 1.0, speckle: 24, chroma: 15, look: { sat: 40, contrast: 18, warmth: 2 } },
+    { id: "provia100f", group: SLIDE, label: "Fujifilm Provia 100F", amount: 9, size: 1.0, speckle: 24, chroma: 12, look: { sat: 12, contrast: 10, warmth: -3 } },
+    { id: "astia100f", group: SLIDE, label: "Fujifilm Astia 100F", amount: 10, size: 1.0, speckle: 24, chroma: 12, look: { sat: -5, contrast: 2, warmth: 4 } },
     // black and white (mono = luminance weights r, g, b)
-    { id: "panf50", group: BW, label: "Ilford Pan F Plus 50", amount: 6, size: 0.9, chroma: 0, look: { mono: [0.3, 0.59, 0.11], contrast: 15 } },
-    { id: "tmax100", group: BW, label: "Kodak T-Max 100", amount: 10, size: 1.1, chroma: 0, look: { mono: [0.3, 0.59, 0.11], contrast: 5 } },
-    { id: "acros100", group: BW, label: "Fujifilm Acros 100 II", amount: 9, size: 1.0, chroma: 0, look: { mono: [0.3, 0.59, 0.11], contrast: 5 } },
-    { id: "fp4", group: BW, label: "Ilford FP4 Plus 125", amount: 14, size: 1.3, chroma: 0, look: { mono: [0.3, 0.59, 0.11], contrast: 8 } },
-    { id: "kentmere400", group: BW, label: "Kentmere Pan 400", amount: 30, size: 1.8, chroma: 0, look: { mono: [0.3, 0.59, 0.11], contrast: 6 } },
-    { id: "tmax400", group: BW, label: "Kodak T-Max 400", amount: 20, size: 1.5, chroma: 0, look: { mono: [0.3, 0.59, 0.11], contrast: 8 } },
-    { id: "trix400", group: BW, label: "Kodak Tri-X 400", amount: 32, size: 1.9, chroma: 0, look: { mono: [0.3, 0.59, 0.11], contrast: 15 } },
-    { id: "hp5", group: BW, label: "Ilford HP5 Plus 400", amount: 28, size: 1.8, chroma: 0, look: { mono: [0.3, 0.59, 0.11], contrast: 5 } },
-    { id: "delta400", group: BW, label: "Ilford Delta 400", amount: 20, size: 1.5, chroma: 0, look: { mono: [0.3, 0.59, 0.11], contrast: 8 } },
-    { id: "xp2", group: BW, label: "Ilford XP2 Super 400", amount: 16, size: 1.4, chroma: 0, look: { mono: [0.3, 0.59, 0.11], contrast: 0 } },
-    { id: "fomapan400", group: BW, label: "Fomapan 400", amount: 34, size: 2.0, chroma: 0, look: { mono: [0.3, 0.59, 0.11], contrast: 10 } },
-    { id: "delta3200", group: BW, label: "Ilford Delta 3200", amount: 55, size: 2.8, chroma: 0, look: { mono: [0.3, 0.59, 0.11], contrast: 12 } },
-    { id: "tmax3200", group: BW, label: "Kodak T-Max P3200", amount: 50, size: 2.6, chroma: 0, look: { mono: [0.3, 0.59, 0.11], contrast: 10 } },
-    { id: "ortho80", group: BW, label: "Ilford Ortho Plus 80 (red goes dark)", amount: 8, size: 1.0, chroma: 0, look: { mono: [0.05, 0.65, 0.30], contrast: 12 } },
-    { id: "rolleiir400", group: BW, label: "Rollei Infrared 400 (foliage bright, sky dark)", amount: 24, size: 1.6, chroma: 0, look: { mono: [0.85, 0.35, -0.2], contrast: 20 } },
+    { id: "panf50", group: BW, label: "Ilford Pan F Plus 50", amount: 6, size: 0.9, speckle: 60, chroma: 0, look: { mono: [0.3, 0.59, 0.11], contrast: 15 } },
+    { id: "tmax100", group: BW, label: "Kodak T-Max 100", amount: 10, size: 1.1, speckle: 40, chroma: 0, look: { mono: [0.3, 0.59, 0.11], contrast: 5 } },
+    { id: "acros100", group: BW, label: "Fujifilm Acros 100 II", amount: 9, size: 1.0, speckle: 40, chroma: 0, look: { mono: [0.3, 0.59, 0.11], contrast: 5 } },
+    { id: "fp4", group: BW, label: "Ilford FP4 Plus 125", amount: 14, size: 1.3, speckle: 60, chroma: 0, look: { mono: [0.3, 0.59, 0.11], contrast: 8 } },
+    { id: "kentmere400", group: BW, label: "Kentmere Pan 400", amount: 30, size: 1.8, speckle: 60, chroma: 0, look: { mono: [0.3, 0.59, 0.11], contrast: 6 } },
+    { id: "tmax400", group: BW, label: "Kodak T-Max 400", amount: 20, size: 1.5, speckle: 40, chroma: 0, look: { mono: [0.3, 0.59, 0.11], contrast: 8 } },
+    { id: "trix400", group: BW, label: "Kodak Tri-X 400", amount: 32, size: 1.9, speckle: 60, chroma: 0, look: { mono: [0.3, 0.59, 0.11], contrast: 15 } },
+    { id: "hp5", group: BW, label: "Ilford HP5 Plus 400", amount: 28, size: 1.8, speckle: 60, chroma: 0, look: { mono: [0.3, 0.59, 0.11], contrast: 5 } },
+    { id: "delta400", group: BW, label: "Ilford Delta 400", amount: 20, size: 1.5, speckle: 40, chroma: 0, look: { mono: [0.3, 0.59, 0.11], contrast: 8 } },
+    { id: "xp2", group: BW, label: "Ilford XP2 Super 400", amount: 16, size: 1.4, speckle: 40, chroma: 0, look: { mono: [0.3, 0.59, 0.11], contrast: 0 } },
+    { id: "fomapan400", group: BW, label: "Fomapan 400", amount: 34, size: 2.0, speckle: 60, chroma: 0, look: { mono: [0.3, 0.59, 0.11], contrast: 10 } },
+    { id: "delta3200", group: BW, label: "Ilford Delta 3200", amount: 55, size: 2.8, speckle: 40, chroma: 0, look: { mono: [0.3, 0.59, 0.11], contrast: 12 } },
+    { id: "tmax3200", group: BW, label: "Kodak T-Max P3200", amount: 50, size: 2.6, speckle: 40, chroma: 0, look: { mono: [0.3, 0.59, 0.11], contrast: 10 } },
+    { id: "ortho80", group: BW, label: "Ilford Ortho Plus 80 (red goes dark)", amount: 8, size: 1.0, speckle: 60, chroma: 0, look: { mono: [0.05, 0.65, 0.30], contrast: 12 } },
+    { id: "rolleiir400", group: BW, label: "Rollei Infrared 400 (foliage bright, sky dark)", amount: 24, size: 1.6, speckle: 60, chroma: 0, look: { mono: [0.85, 0.35, -0.2], contrast: 20 } },
     // cine
-    { id: "vision3_50d", group: CINE, label: "Kodak Vision3 50D", amount: 9, size: 1.0, chroma: 25, look: { sat: -4, contrast: -8, fade: 5 } },
-    { id: "vision3_250d", group: CINE, label: "Kodak Vision3 250D", amount: 14, size: 1.3, chroma: 30, look: { sat: -5, contrast: -8, fade: 5 } },
-    { id: "vision3_500t", group: CINE, label: "Kodak Vision3 500T (daylight, uncorrected)", amount: 26, size: 1.8, chroma: 40, look: { sat: -4, contrast: -8, warmth: -14, tint: 3, fade: 5 } },
-    { id: "cinestill50d", group: CINE, label: "CineStill 50D", amount: 10, size: 1.1, chroma: 25, look: { sat: 5, contrast: 4, warmth: 3 } },
-    { id: "cinestill400d", group: CINE, label: "CineStill 400D", amount: 22, size: 1.6, chroma: 35, look: { sat: 5, contrast: 2, warmth: 5 } },
-    { id: "cinestill800t", group: CINE, label: "CineStill 800T (daylight, teal cast)", amount: 34, size: 2.1, chroma: 45, look: { sat: 0, contrast: 2, warmth: -15, tint: 4 } },
+    { id: "vision3_50d", group: CINE, label: "Kodak Vision3 50D", amount: 9, size: 1.0, speckle: 30, chroma: 25, look: { sat: -4, contrast: -8, fade: 5 } },
+    { id: "vision3_250d", group: CINE, label: "Kodak Vision3 250D", amount: 14, size: 1.3, speckle: 30, chroma: 30, look: { sat: -5, contrast: -8, fade: 5 } },
+    { id: "vision3_500t", group: CINE, label: "Kodak Vision3 500T (daylight, uncorrected)", amount: 26, size: 1.8, speckle: 30, chroma: 40, look: { sat: -4, contrast: -8, warmth: -14, tint: 3, fade: 5 } },
+    { id: "cinestill50d", group: CINE, label: "CineStill 50D", amount: 10, size: 1.1, speckle: 30, chroma: 25, look: { sat: 5, contrast: 4, warmth: 3 } },
+    { id: "cinestill400d", group: CINE, label: "CineStill 400D", amount: 22, size: 1.6, speckle: 30, chroma: 35, look: { sat: 5, contrast: 2, warmth: 5 } },
+    { id: "cinestill800t", group: CINE, label: "CineStill 800T (daylight, teal cast)", amount: 34, size: 2.1, speckle: 30, chroma: 45, look: { sat: 0, contrast: 2, warmth: -15, tint: 4 } },
     // special and artistic (channel mix: rows r', g', b' from r, g, b)
-    { id: "lomopurple", group: FX, label: "LomoChrome Purple (greens to purple)", amount: 26, size: 1.7, chroma: 50, look: { sat: 15, contrast: 6, mix: [0.55, 0.45, 0, 0.1, 0.15, 0.75, 0.15, 0.85, 0] } },
-    { id: "lomoturquoise", group: FX, label: "LomoChrome Turquoise (reds to blue, blues to gold)", amount: 26, size: 1.7, chroma: 50, look: { sat: 15, contrast: 6, mix: [0.25, 0.05, 0.7, 0.05, 0.9, 0.05, 0.75, 0.2, 0.05] } },
-    { id: "lomometropolis", group: FX, label: "LomoChrome Metropolis (muted, contrasty)", amount: 30, size: 1.8, chroma: 40, look: { sat: -35, contrast: 20, warmth: -4, fade: 2 } },
-    { id: "aerochrome", group: FX, label: "Kodak Aerochrome (false-colour infrared)", amount: 14, size: 1.3, chroma: 20, look: { sat: 20, contrast: 8, mix: [0.15, 0.85, 0, 0.75, 0, 0.25, 0.35, 0, 0.65] } },
-    { id: "redscale", group: FX, label: "Redscale (shot through the base)", amount: 30, size: 1.8, chroma: 40, look: { sat: 10, contrast: 10, mix: [0.9, 0.35, 0, 0.3, 0.5, 0.05, 0.1, 0.05, 0.1] } },
-    { id: "xpro", group: FX, label: "Cross-processed slide (E-6 in C-41)", amount: 22, size: 1.5, chroma: 40, look: { sat: 30, contrast: 30, warmth: 5, tint: -10, fade: -2 } },
-    { id: "expired", group: FX, label: "Expired colour negative", amount: 34, size: 2.0, chroma: 55, look: { sat: -20, contrast: -6, warmth: 4, tint: 8, fade: 12 } },
-    { id: "instant", group: FX, label: "Instant film (SX-70 style)", amount: 8, size: 2.5, chroma: 20, look: { sat: -10, contrast: -10, warmth: 12, fade: 10 } },
+    { id: "lomopurple", group: FX, label: "LomoChrome Purple (greens to purple)", amount: 26, size: 1.7, speckle: 40, chroma: 50, look: { sat: 15, contrast: 6, mix: [0.55, 0.45, 0, 0.1, 0.15, 0.75, 0.15, 0.85, 0] } },
+    { id: "lomoturquoise", group: FX, label: "LomoChrome Turquoise (reds to blue, blues to gold)", amount: 26, size: 1.7, speckle: 40, chroma: 50, look: { sat: 15, contrast: 6, mix: [0.25, 0.05, 0.7, 0.05, 0.9, 0.05, 0.75, 0.2, 0.05] } },
+    { id: "lomometropolis", group: FX, label: "LomoChrome Metropolis (muted, contrasty)", amount: 30, size: 1.8, speckle: 40, chroma: 40, look: { sat: -35, contrast: 20, warmth: -4, fade: 2 } },
+    { id: "aerochrome", group: FX, label: "Kodak Aerochrome (false-colour infrared)", amount: 14, size: 1.3, speckle: 40, chroma: 20, look: { sat: 20, contrast: 8, mix: [0.15, 0.85, 0, 0.75, 0, 0.25, 0.35, 0, 0.65] } },
+    { id: "redscale", group: FX, label: "Redscale (shot through the base)", amount: 30, size: 1.8, speckle: 40, chroma: 40, look: { sat: 10, contrast: 10, mix: [0.9, 0.35, 0, 0.3, 0.5, 0.05, 0.1, 0.05, 0.1] } },
+    { id: "xpro", group: FX, label: "Cross-processed slide (E-6 in C-41)", amount: 22, size: 1.5, speckle: 40, chroma: 40, look: { sat: 30, contrast: 30, warmth: 5, tint: -10, fade: -2 } },
+    { id: "expired", group: FX, label: "Expired colour negative", amount: 34, size: 2.0, speckle: 40, chroma: 55, look: { sat: -20, contrast: -6, warmth: 4, tint: 8, fade: 12 } },
+    { id: "instant", group: FX, label: "Instant film (SX-70 style)", amount: 8, size: 2.5, speckle: 40, chroma: 20, look: { sat: -10, contrast: -10, warmth: 12, fade: 10 } },
 ];
 
 const LOOK_DEFAULT = { sat: 0, contrast: 0, warmth: 0, tint: 0, fade: 0 };
@@ -147,37 +147,71 @@ function applyGrain(src, p, info) {
     const nd = nctx.createImageData(nw, nh);
     const d = nd.data;
     const rand = rng(hashString(String(info.seed || "grain")));
+    // Real grain plates measure skewed and heavy-tailed (bright specks on a darker
+    // ground: skew 0.5-0.9, kurtosis 3.2-5.4 on fotokorn's scans, black-and-white
+    // stocks the most). A standardised lognormal reproduces that: sigma 0.3 gives
+    // skew ~0.95 / kurtosis ~4.6, sigma 0.12 stays close to gaussian.
+    const sigma = Math.max(0, Math.min(0.5, (p.speckle ?? 25) / 100 * 0.5));
+    const e1 = Math.exp(sigma * sigma / 2), norm = Math.sqrt((Math.exp(sigma * sigma) - 1) * Math.exp(sigma * sigma)) || 1;
+    const gauss = () => { const u = Math.max(1e-12, rand()), v = rand(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+    const sample = () => (sigma > 0.005 ? (Math.exp(sigma * gauss()) - e1) / norm : gauss()) * 40;
     for (let i = 0; i < d.length; i += 4) {
-        // sum of two uniforms: triangular distribution, closer to film than flat noise
-        const g = (rand() + rand() - 1) * 127;
+        const g = sample();
         if (chroma <= 0) { d[i] = d[i + 1] = d[i + 2] = 128 + g; }
         else {
             // luminance grain shared by all channels plus a per-channel part (colour negative films)
-            d[i] = 128 + g * (1 - chroma) + (rand() + rand() - 1) * 127 * chroma;
-            d[i + 1] = 128 + g * (1 - chroma) + (rand() + rand() - 1) * 127 * chroma;
-            d[i + 2] = 128 + g * (1 - chroma) + (rand() + rand() - 1) * 127 * chroma;
+            d[i] = 128 + g * (1 - chroma) + sample() * chroma;
+            d[i + 1] = 128 + g * (1 - chroma) + sample() * chroma;
+            d[i + 2] = 128 + g * (1 - chroma) + sample() * chroma;
         }
         d[i + 3] = 255;
     }
     nctx.putImageData(nd, 0, 0);
     const big = makeCanvas(W, H);
     const bctx = big.getContext("2d");
-    bctx.imageSmoothingEnabled = size > 1;
-    bctx.drawImage(noise, 0, 0, W, H);
+    let nz, center = 128, gain = 1.3;
+    if (info.plate && info.plate.width) {
+        // a real grain plate (scan of a uniformly exposed film) replaces the synthetic noise,
+        // tiled at plate_scale (1 = plate pixels 1:1) and centred on its mean
+        const sc = Math.max(0.1, (p.plate_scale ?? 1) * (info.scale || 1));
+        const pat = bctx.createPattern(info.plate, "repeat");
+        try { pat.setTransform(new DOMMatrix().scale(sc, sc)); } catch (_) { /* old browsers */ }
+        bctx.fillStyle = pat;
+        bctx.fillRect(0, 0, W, H);
+        nz = bctx.getImageData(0, 0, W, H).data;
+        center = info.plateMean ?? 128;
+        gain = 40 / Math.max(8, info.plateStd ?? 40);   // plates come with their own contrast: normalise to the synthetic level
+    } else {
+        bctx.imageSmoothingEnabled = size > 1;
+        bctx.drawImage(noise, 0, 0, W, H);
+        nz = bctx.getImageData(0, 0, W, H).data;
+    }
     const img = octx.getImageData(0, 0, W, H);
     const px = img.data;
-    const nz = bctx.getImageData(0, 0, W, H).data;
-    const k = amount * 0.9;
+    const k = amount * gain;
     for (let i = 0; i < px.length; i += 4) {
         // grain is strongest in the midtones, weaker in deep shadows and highlights
         const lum = (px[i] * 0.299 + px[i + 1] * 0.587 + px[i + 2] * 0.114) / 255;
         const w = k * (0.35 + 0.65 * (1 - Math.abs(2 * lum - 1)));
-        px[i] = clamp255(px[i] + (nz[i] - 128) * w);
-        px[i + 1] = clamp255(px[i + 1] + (nz[i + 1] - 128) * w);
-        px[i + 2] = clamp255(px[i + 2] + (nz[i + 2] - 128) * w);
+        px[i] = clamp255(px[i] + (nz[i] - center) * w);
+        px[i + 1] = clamp255(px[i + 1] + (nz[i + 1] - center) * w);
+        px[i + 2] = clamp255(px[i + 2] + (nz[i + 2] - center) * w);
     }
     octx.putImageData(img, 0, 0);
     return out;
+}
+
+/** Mean and high-pass standard deviation of a grain plate, from a 512 px sample (for centring and gain). */
+export function plateStats(img) {
+    const w = Math.min(512, img.naturalWidth || img.width), h = Math.min(512, img.naturalHeight || img.height);
+    const c = makeCanvas(w, h);
+    const ctx = c.getContext("2d");
+    ctx.drawImage(img, 0, 0, w, h, 0, 0, w, h);
+    const d = ctx.getImageData(0, 0, w, h).data;
+    let s = 0, s2 = 0, n = 0;
+    for (let i = 0; i < d.length; i += 4) { const l = d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114; s += l; s2 += l * l; n++; }
+    const mean = s / n;
+    return { mean, std: Math.sqrt(Math.max(0, s2 / n - mean * mean)) };
 }
 
 // ---------------------------------------------------------------------------
@@ -382,10 +416,13 @@ export const FILTERS = {
             { key: "preset", label: "Film", type: "select", options: GRAIN_PRESETS, default: "custom" },
             { key: "look_strength", label: "Look", min: 0, max: 100, step: 1, default: 100, unit: "%", keepPreset: true },
             { key: "amount", label: "Grain", min: 0, max: 100, step: 1, default: 25, unit: "%" },
-            { key: "size", label: "Size", min: 0.5, max: 6, step: 0.1, default: 1.5, unit: "px" },
-            { key: "chroma", label: "Colour", min: 0, max: 100, step: 1, default: 0, unit: "%" },
+            { key: "size", label: "Size", min: 0.5, max: 6, step: 0.1, default: 1.5, unit: "px", notWithPlate: true },
+            { key: "speckle", label: "Speckle", min: 0, max: 100, step: 1, default: 25, unit: "%", notWithPlate: true },
+            { key: "chroma", label: "Colour", min: 0, max: 100, step: 1, default: 0, unit: "%", notWithPlate: true },
+            { key: "plate_scale", label: "Plate", min: 0.25, max: 4, step: 0.05, default: 1, unit: "×", onlyWithPlate: true, keepPreset: true },
         ],
         presets: GRAIN_PRESETS,
+        plate: true,
         apply: applyGrain,
     },
     sharpen: {

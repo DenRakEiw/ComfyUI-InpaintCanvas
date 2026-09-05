@@ -14,7 +14,7 @@
 
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
-import { FILTERS, FILTER_IDS, filterDefaults, applyFilter, lutFromCube, lutToCanvas, lutFromImage } from "./inpaint_filters.js";
+import { FILTERS, FILTER_IDS, filterDefaults, applyFilter, lutFromCube, lutToCanvas, lutFromImage, plateStats } from "./inpaint_filters.js";
 
 const NODE_CLASS = "InpaintCanvas";
 const STITCH_CLASS = "InpaintCanvasStitch";
@@ -2787,7 +2787,7 @@ class InpaintEditor {
         if (step.kind === "layer") return { kind: "layer", id: layer.id, url: layer.canvas.toDataURL("image/png") };
         if (step.kind === "transform") return { kind: "transform", id: layer.id, x: layer.x, y: layer.y, w: layer.w, h: layer.h };
         if (step.kind === "mask") return { kind: "mask", id: layer.id, url: layer.mask ? layer.mask.toDataURL("image/png") : null, mw: layer.mask ? layer.mask.width : 0, mh: layer.mask ? layer.mask.height : 0 };
-        if (step.kind === "filter") return { kind: "filter", id: layer.id, filter: layer.filter, params: { ...(layer.params || {}) }, lut: layer.lut ? { ...layer.lut } : null, lutData: layer._lutData || null, name: layer.name };
+        if (step.kind === "filter") return { kind: "filter", id: layer.id, filter: layer.filter, params: { ...(layer.params || {}) }, lut: layer.lut ? { ...layer.lut } : null, lutData: layer._lutData || null, plate: layer.plate ? { ...layer.plate } : null, plateImg: layer._plateImg || null, name: layer.name };
         if (step.kind === "layerfull") return { kind: "layerfull", id: layer.id, url: layer.canvas.toDataURL("image/png"), cw: layer.canvas.width, ch: layer.canvas.height, x: layer.x, y: layer.y, w: layer.w, h: layer.h,
             mask: layer.mask ? layer.mask.toDataURL("image/png") : null, mw: layer.mask ? layer.mask.width : 0, mh: layer.mask ? layer.mask.height : 0 };
         return null;
@@ -2835,6 +2835,8 @@ class InpaintEditor {
                 layer.params = { ...snap.params };
                 layer.lut = snap.lut ? { ...snap.lut } : null;
                 layer._lutData = snap.lutData || null;
+                layer.plate = snap.plate ? { ...snap.plate } : null;
+                layer._plateImg = snap.plateImg || null;
                 layer.name = snap.name || layer.name;
                 this.markFilterChanged(layer);
                 this.renderLayers();
@@ -2987,9 +2989,40 @@ class InpaintEditor {
         }
     }
 
+    async loadPlateFile(layer, file) {
+        if (!file) return;
+        try {
+            this.setStatus(`Uploading ${file.name} ...`);
+            const ext = ((file.name || "").match(/\.[a-z0-9]+$/i) || [".png"])[0];
+            const stem = (file.name || "plate").replace(/\.[a-z0-9]+$/i, "").replace(/[^a-z0-9._-]/gi, "_") || "plate";
+            const ref = await uploadBlob(file, stem + ext, { overwrite: false });
+            const img = await loadImageEl(viewUrl(ref));
+            const st = plateStats(img);
+            this.pushUndo({ kind: "filter", id: layer.id });
+            layer.plate = { name: file.name, ref, w: img.naturalWidth, h: img.naturalHeight, mean: Math.round(st.mean * 10) / 10, std: Math.round(st.std * 10) / 10 };
+            layer._plateImg = img;
+            this.markFilterChanged(layer);
+            this.renderLayers();
+            this.setStatus(`${file.name} loaded as grain plate (${img.naturalWidth} × ${img.naturalHeight}, mean ${layer.plate.mean}, noise ${layer.plate.std}).`);
+        } catch (err) {
+            console.error(err);
+            this.setStatus("Could not load the plate: " + (err.message || err));
+        }
+    }
+
+    removePlate(layer) {
+        if (!layer.plate) return;
+        this.pushUndo({ kind: "filter", id: layer.id });
+        layer.plate = null;
+        layer._plateImg = null;
+        this.markFilterChanged(layer);
+        this.renderLayers();
+        this.setStatus(`${layer.name}: back to synthetic grain.`);
+    }
+
     /** Filtered copy of `below` for a filter layer, cached until the composite or the parameters change. */
     filteredCanvas(layer, below, forRun, preview) {
-        const key = JSON.stringify([layer.filter, layer.params, layer.lut && layer.lut.ref && layer.lut.ref.filename, !!forRun, !!preview, below.width, below.height]);
+        const key = JSON.stringify([layer.filter, layer.params, layer.lut && layer.lut.ref && layer.lut.ref.filename, layer.plate && layer.plate.ref && layer.plate.ref.filename, !!forRun, !!preview, below.width, below.height]);
         const c = layer._fcache;
         if (c && c.version === this.compositeVersion && c.key === key) return c.canvas;
         let input = below, scale = 1;
@@ -3004,7 +3037,7 @@ class InpaintEditor {
             }
         }
         let canvas = null;
-        try { canvas = applyFilter(layer.filter, input, layer.params, { scale, seed: layer.id, lut: layer._lutData }); }
+        try { canvas = applyFilter(layer.filter, input, layer.params, { scale, seed: layer.id, lut: layer._lutData, plate: layer._plateImg || null, plateMean: layer.plate && layer.plate.mean, plateStd: layer.plate && layer.plate.std }); }
         catch (err) { console.error(err); }
         layer._fcache = { version: this.compositeVersion, key, canvas };
         return canvas;
@@ -3251,7 +3284,7 @@ class InpaintEditor {
             scan(ed.lastValueString);
             try { scan(ed.getValue()); } catch (_) { /* ignore */ }
             scan(JSON.stringify(ed.uploaded));
-            scan(JSON.stringify(ed.layers.map((l) => [l.ref, l.maskRef, l.exportRef])));
+            scan(JSON.stringify(ed.layers.map((l) => [l.ref, l.maskRef, l.exportRef, l.lut && l.lut.ref, l.plate && l.plate.ref])));
             if (ed.base) scan(JSON.stringify(ed.base.ref));
         }
         try {
@@ -3691,9 +3724,29 @@ class InpaintEditor {
             lr.appendChild(el("span", null, layer.lut ? `${layer.lut.name} (${layer.lut.size}³)` : "no LUT loaded"));
             box.appendChild(lr);
         }
+        if (def.plate) {
+            // real grain plate (scan of a uniformly exposed film, e.g. fotokorn's): replaces the synthetic noise
+            const pr = el("div", "ipc-lutrow");
+            const input = document.createElement("input");
+            input.type = "file"; input.accept = "image/*"; input.style.display = "none";
+            input.addEventListener("change", () => { const f = input.files && input.files[0]; input.value = ""; if (f) this.loadPlateFile(layer, f); });
+            input.addEventListener("click", stop);
+            pr.appendChild(input);
+            const load = iconButton("image", "Load a real grain plate (a scan of uniformly exposed film, JPG/PNG). It replaces the synthetic grain; Grain sets its strength, Plate its scale (1 = plate pixels 1:1).", () => input.click(), "Plate");
+            load.classList.add("ipc-small");
+            pr.appendChild(load);
+            pr.appendChild(el("span", null, layer.plate ? `${layer.plate.name} (${layer.plate.w} × ${layer.plate.h})` : "synthetic grain"));
+            if (layer.plate) {
+                const rm = miniButton("trash", "Remove the plate (back to synthetic grain)", () => this.removePlate(layer), "ipc-del");
+                pr.appendChild(rm);
+            }
+            box.appendChild(pr);
+        }
         const fmt = (p, v) => (p.type === "bool" ? (v ? "on" : "off") : (Number.isInteger(p.step) ? Math.round(v) : (+v).toFixed(p.step < 0.1 ? 2 : 1)) + (p.unit || ""));
         let presetSel = null;
         for (const p of def.params) {
+            if (p.onlyWithPlate && !layer.plate) continue;
+            if (p.notWithPlate && layer.plate) continue;
             const lab = el("span", null, p.label);
             box.appendChild(lab);
             const cur = layer.params[p.key] ?? p.default;
@@ -4374,7 +4427,7 @@ class InpaintEditor {
             layers: this.layers.map((l) => ({
                 id: l.id, name: l.name, kind: l.kind, role: l.role || "none", blend: l.blend || "normal", ref: l.ref,
                 x: l.x, y: l.y, w: l.w, h: l.h, opacity: l.opacity, visible: l.visible, mask: l.maskRef || null,
-                ...(l.kind === "filter" ? { filter: l.filter, params: l.params, lut: l.lut || null } : {}),
+                ...(l.kind === "filter" ? { filter: l.filter, params: l.params, lut: l.lut || null, plate: l.plate || null } : {}),
             })),
             history: this.history.slice(-100).map((h) => ({ key: h.key, name: h.name, ref: h.ref, x: h.x, y: h.y, w: h.w, h: h.h, prompt: h.prompt, layerId: h.layerId, time: h.time, seed: h.seed, mode: h.mode, denoise: h.denoise })),
             selection: this.selectionDataUrl,
@@ -4432,12 +4485,18 @@ class InpaintEditor {
                             try { lutData = lutFromImage(await loadImageEl(viewUrl(l.lut.ref)), l.lut.size); } catch (err) { console.warn("Inpaint Canvas: LUT missing", l.lut, err); }
                             if (stale()) return;
                         }
+                        let plateImg = null;
+                        if (l.plate && l.plate.ref) {
+                            try { plateImg = await loadImageEl(viewUrl(l.plate.ref)); } catch (err) { console.warn("Inpaint Canvas: grain plate missing", l.plate, err); }
+                            if (stale()) return;
+                        }
                         const fid = FILTERS[l.filter] ? l.filter : "grain";
                         this.layers.push({
                             id: l.id, name: l.name, kind: "filter", role: "none", blend: l.blend || "normal", ref: null, canvas,
                             x: 0, y: 0, w: this.width, h: this.height, opacity: l.opacity ?? 1, visible: l.visible !== false, dirty: false,
                             mask, maskRef: mask ? l.mask : null, maskDirty: false, maskEdit: false,
                             filter: fid, params: { ...filterDefaults(fid), ...(l.params || {}) }, lut: l.lut || null, _lutData: lutData,
+                            plate: plateImg ? l.plate : null, _plateImg: plateImg,
                         });
                         this.filterCounter += 1;
                     } catch (err) {

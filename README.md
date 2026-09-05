@@ -170,7 +170,11 @@ size, hardness, opacity and the paint colour.
   and a parametric colour character whose strength the *Look* slider
   controls. These are approximations of how the stocks are described, not
   measurements; a real film LUT below the grain layer stays the faithful
-  route), *Sharpen* (unsharp mask with radius and
+  route. The grain itself follows what real grain scans measure: skewed,
+  bright specks on a darker ground, set by the *Speckle* slider. With
+  *Plate* you load a real grain plate, a scan of uniformly exposed film such
+  as the fotokorn.de packs, which then replaces the synthetic grain at the
+  chosen scale), *Sharpen* (unsharp mask with radius and
   threshold), *Levels* (input black / white, gamma, output black / white),
   *LUT* (load any 3D `.cube`, with a strength slider; the LUT is stored with
   the workflow) and *Vignette*. Sliders preview at reduced resolution while
