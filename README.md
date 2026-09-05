@@ -102,7 +102,17 @@ Editor
   model is reliable with short English requests; German requests sometimes
   lose a word in translation, so check the result. Like the segmentation, it
   runs as a small helper prompt and never triggers your generation chain.
-- **History**: every result with a preview and the prompt it was made with.
+- **Generate section and the API / Local switch**: the switch next to
+  Generate says which chain the result comes back from. *api* uses the
+  `result` input, *local* the `result_local` input, and only the chain wired
+  to the selected input runs (the other one is never executed, so a paid API
+  node stays idle while you work locally). The section holds *Denoise* (1.0
+  repaints the selection, lower values refine what is there) and the *Seed*
+  with a *random* toggle and a dice button; both leave the node on the
+  `denoise` and `seed` outputs for your local sampler. The Crop panel shows
+  which input the current mode expects and warns when nothing is wired there.
+- **History**: every result with a preview, the prompt it was made with, the
+  mode and the seed. Click the seed line to reuse that seed (random goes off).
   Click a preview (or the solo button) to show only that result, discard one
   to remove its layer, restore a discarded one later. The trash icon in the
   section header clears the whole list (after a confirmation); layers and
@@ -154,7 +164,9 @@ With `target_size` set, the scaled crop is rounded to the multiple. With
 
 Inputs
 
-- `result` (IMAGE, optional): wire the decoded inpaint result here.
+- `result` (IMAGE, optional): the result of your API chain (editor mode *api*).
+- `result_local` (IMAGE, optional): the decoded result of your local chain
+  (editor mode *local*).
 
 Outputs
 
@@ -168,6 +180,8 @@ Outputs
 - `prompt`: the text from the editor's prompt field.
 - `control_image`: the control layers on black, aligned with `crop_image`
   (black if there are none).
+- `denoise` / `seed` / `mode`: the editor's Generate settings, for a local
+  sampler (`mode` is "api" or "local").
 
 ### Helper nodes
 

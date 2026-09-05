@@ -54,8 +54,17 @@ Crop (`InpaintCanvas.run`): bbox = selection bounds + `padding`, clamped. With
 sides rounded to `multiple_of`. With `target_size == 0` the bbox itself is grown
 symmetrically to a multiple (`_fit_span_to_multiple`). `control_image` is the
 control PNG cropped/scaled identically (zeros if none). Outputs in order:
-`crop_image, crop_mask, image, mask, stitch_info, crop_width, crop_height, prompt, control_image`.
+`crop_image, crop_mask, image, mask, stitch_info, crop_width, crop_height, prompt, control_image, denoise, seed, mode`.
 Only ever append outputs; reordering breaks saved workflows.
+
+Two result inputs (2026-09-05): `result` (API chain) and `result_local`
+(local chain), both lazy and both removed from the prompt by the queuePrompt
+wrapper (`result_source`, `result_source_local`). `run()` picks the source
+by `canvas_state.gen.mode` and expands the stitch only for that one, so the
+other chain is never executed (its nodes are not ancestors of anything once
+the back-link is gone). `gen = {mode, denoise, seed, seedRandom}` lives in
+the state; the frontend rolls a new seed before every Generate when
+`seedRandom` is on and stores mode/seed/denoise in each history entry.
 
 ## 3. Frontend facts (comfyui-frontend-package 1.49.6)
 
@@ -395,6 +404,28 @@ Verified via the API (`InpaintCanvas` -> `ImageInvert` -> back, synthetic
 1024x768 base with a 120x90 ellipse selection): manual crop 249x219,
 auto crop 512x512, all five fill modes visually correct, composite opaque
 inside the selection.
+
+## 12. Ideas from the Krita AI plugin not taken yet (2026-09-05)
+
+Looked at `model.py` properties and `settings.py` of the installed plugin
+(`%APPDATA%/krita/pykrita/ai_diffusion`). Done here: strength (= denoise),
+seed / fixed seed, fill modes, auto grow/feather/padding, color match,
+history, control layers, prompt translation (via the upsampler). Not done,
+roughly by value for this node:
+- Refine workflow (WorkflowKind.refine / refine_region): re-run the selected
+  region at denoise < 1 without a mask edge; with the denoise setting this is
+  now "lower denoise + Generate", a dedicated button could also set the fill
+  to none and skip the mask feather.
+- Batch count: N results per Generate, all landing in the history (local
+  only; on the API that is N paid calls).
+- Styles: presets bundling prompt prefix/suffix, LoRAs (`<lora:name:1.0>`
+  syntax parsed out of the prompt), sampler settings; would become string
+  outputs here.
+- Negative prompt output (SDXL-class local models only).
+- Upscale workflow (tiled with refinement, `upscale_tiled`), live mode, and
+  regions (attention masks, local models only) are separate projects.
+- Strength-scaled selection modifiers (feather * strength) are a five-line
+  tweak once refine exists.
 
 ## 11. Prompt upsampling (2026-09-05)
 

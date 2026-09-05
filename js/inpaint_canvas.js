@@ -303,6 +303,10 @@ const SEGMENT_BACKENDS = [
 const MIN_AUTO_CROP = 512;          // keep in sync with nodes.py
 const CROP_DEFAULTS = { context: "auto", feather: "auto", fill: "none", colorMatch: true };
 const CROP_LEGACY = { context: "manual", feather: "manual", fill: "none", colorMatch: false };   // workflows saved before these existed
+// Generate settings: mode picks which result input the round trip uses ("api" =
+// result, "local" = result_local); denoise and seed are emitted as node outputs.
+const GEN_DEFAULTS = { mode: "api", denoise: 1.0, seed: 0, seedRandom: true };
+const randomSeed = () => Math.floor(Math.random() * 0xffffffff);
 
 /** Context padding, grow, feather and blend from the selection size (same formula as nodes.py). */
 function autoSelectionParams(selW, selH) {
@@ -471,6 +475,7 @@ const ICONS = {
     distort: '<path d="M5 6l14-2v14l-14 2z"/><circle cx="5" cy="6" r="1.6" fill="currentColor" stroke="none"/><circle cx="19" cy="4" r="1.6" fill="currentColor" stroke="none"/><circle cx="19" cy="18" r="1.6" fill="currentColor" stroke="none"/><circle cx="5" cy="20" r="1.6" fill="currentColor" stroke="none"/>',
     warp: '<path d="M4 6c4-3 12 3 16 0"/><path d="M4 12c4-3 12 3 16 0"/><path d="M4 18c4-3 12 3 16 0"/><path d="M8 4v16"/><path d="M16 4v16"/>',
     check: '<path d="M5 12l5 5 9-10"/>',
+    dice: '<rect x="4" y="4" width="16" height="16" rx="3"/><circle cx="9" cy="9" r="1.5" fill="currentColor" stroke="none"/><circle cx="15" cy="15" r="1.5" fill="currentColor" stroke="none"/><circle cx="15" cy="9" r="1.5" fill="currentColor" stroke="none"/><circle cx="9" cy="15" r="1.5" fill="currentColor" stroke="none"/>',
     magic: '<path d="M4 20l10-10"/><path d="M15 3l1 2 2 1-2 1-1 2-1-2-2-1 2-1z" fill="currentColor" stroke="none"/><path d="M19 9l.7 1.3L21 11l-1.3.7L19 13l-.7-1.3L17 11l1.3-.7z" fill="currentColor" stroke="none"/><path d="M14 8l2 2"/>',
     extend: '<rect x="8" y="8" width="8" height="8"/><path d="M12 2v4"/><path d="M12 18v4"/><path d="M2 12h4"/><path d="M18 12h4"/><path d="M10 4l2-2 2 2"/><path d="M10 20l2 2 2-2"/><path d="M4 10l-2 2 2 2"/><path d="M20 10l2 2-2 2"/>',
 };
@@ -599,6 +604,8 @@ const STYLE = `
 .ipc-hitem .ipc-htext span { display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .ipc-info { padding:8px 10px; color:#aaa; display:grid; grid-template-columns:auto 1fr; gap:3px 10px; }
 .ipc-upsample { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
+.ipc-gen { display:flex; flex-wrap:wrap; gap:6px 10px; align-items:center; }
+.ipc-mode { margin-right:6px; }
 .ipc-cropset { display:grid; grid-template-columns:auto 1fr; gap:4px 10px; align-items:center; }
 .ipc-cropset label { display:contents; }
 .ipc-info b { color:#ddd; font-weight:500; }
@@ -647,6 +654,7 @@ class InpaintEditor {
         this.promptText = "";
         this.cropSettings = { ...CROP_DEFAULTS };
         this.upsampleSettings = { useCase: "auto", backend: "auto" };
+        this.genSettings = { ...GEN_DEFAULTS, seed: randomSeed() };
         this.promptBackup = null;
         this.selectionLabel = "";       // what the selection is, when it came from "Select by text"
         this.undo = [];
@@ -787,6 +795,10 @@ class InpaintEditor {
         top.appendChild(colorLabel);
 
         top.appendChild(el("span", "ipc-grow"));
+        this.modeSel = selectInput(["api", "local"], "api", "Which chain the result comes back from: API = the result input, Local = the result_local input. Only that chain runs.");
+        this.modeSel.classList.add("ipc-mode");
+        this.modeSel.addEventListener("change", () => { this.genSettings.mode = this.modeSel.value; this.renderInfo(); this.notifyChanged(); });
+        top.appendChild(this.modeSel);
         this.generateBtn = iconButton("play", "Queue the workflow (Ctrl+Enter). The result comes back as a new layer.", () => this.generate(), "Generate");
         this.generateBtn.classList.add("ipc-primary");
         top.appendChild(this.generateBtn);
@@ -981,6 +993,36 @@ class InpaintEditor {
             this.upRevertBtn.disabled = true;
             up.appendChild(this.upRevertBtn);
             d.appendChild(up);
+        });
+
+        section("Generate", true, (d) => {
+            const sec = el("div", "ipc-sec ipc-gen");
+            const denLab = el("label", null, "Denoise");
+            denLab.title = "Denoise strength for a local sampler (denoise output). 1.0 repaints the selection completely, lower values keep more of what is there (refine).";
+            this.denoiseInput = numberInput(1.0, 0.05, 1.0, "Denoise strength, emitted on the node's denoise output", 60);
+            this.denoiseInput.step = 0.05;
+            this.denoiseInput.addEventListener("change", () => { this.genSettings.denoise = Math.min(1, Math.max(0.05, +this.denoiseInput.value || 1)); this.denoiseInput.value = this.genSettings.denoise; this.notifyChanged(); });
+            denLab.appendChild(this.denoiseInput);
+            sec.appendChild(denLab);
+            const seedLab = el("label", null, "Seed");
+            seedLab.title = "Seed emitted on the node's seed output";
+            this.seedInput = numberInput(0, 0, 4294967295, "Seed value", 96);
+            this.seedInput.addEventListener("change", () => { this.genSettings.seed = Math.max(0, Math.floor(+this.seedInput.value || 0)); this.genSettings.seedRandom = false; this.seedRandom.checked = false; this.notifyChanged(); });
+            seedLab.appendChild(this.seedInput);
+            sec.appendChild(seedLab);
+            const rndLab = el("label", null, "");
+            this.seedRandom = document.createElement("input");
+            this.seedRandom.type = "checkbox";
+            this.seedRandom.checked = true;
+            this.seedRandom.title = "New random seed for every Generate";
+            this.seedRandom.addEventListener("change", () => { this.genSettings.seedRandom = this.seedRandom.checked; this.notifyChanged(); });
+            rndLab.appendChild(this.seedRandom);
+            rndLab.appendChild(el("span", null, "random"));
+            sec.appendChild(rndLab);
+            const dice = iconButton("dice", "Roll a new seed now", () => { this.genSettings.seed = randomSeed(); this.seedInput.value = this.genSettings.seed; this.notifyChanged(); });
+            dice.classList.add("ipc-small");
+            sec.appendChild(dice);
+            d.appendChild(sec);
         });
 
         section("History", true, (d, sum) => {
@@ -2536,6 +2578,8 @@ class InpaintEditor {
             }
             const ctrl = this.layers.filter((l) => this.isControl(l) && l.visible).length;
             rows.push(["Control", ctrl ? `${ctrl} layer${ctrl > 1 ? "s" : ""}` : "none (black)"]);
+            const rs = this.resultInputState();
+            rows.push(["Result", `${this.genSettings.mode} → ${rs.name}${rs.wired ? "" : " (not wired!)"}`]);
         }
         this.infoEl.innerHTML = rows.map(([k, v]) => `<span>${k}</span><b>${v}</b>`).join("");
         if (this.canvasInfo) this.canvasInfo.textContent = this.base ? `now ${this.width} × ${this.height}` : "";
@@ -2655,7 +2699,8 @@ class InpaintEditor {
                 }
                 const n = this.history.length + 1;
                 const layer = this.addLayer({ name: "Result " + n, kind: "result", ref, canvas: imageToCanvas(img), x: r.x || 0, y: r.y || 0, w: r.width || img.naturalWidth, h: r.height || img.naturalHeight });
-                this.history.push({ key, name: layer.name, ref, x: layer.x, y: layer.y, w: layer.w, h: layer.h, prompt: this.promptText, layerId: layer.id, time: Date.now() });
+                this.history.push({ key, name: layer.name, ref, x: layer.x, y: layer.y, w: layer.w, h: layer.h, prompt: this.promptText, layerId: layer.id, time: Date.now(),
+                    seed: this.genSettings.seed, mode: this.genSettings.mode, denoise: this.genSettings.denoise });
                 this.renderHistory();
                 this.setStatus(`Result ${n} added (${r.width} × ${r.height} at ${r.x}, ${r.y})`);
             } catch (err) {
@@ -2764,6 +2809,13 @@ class InpaintEditor {
             const title = el("b", null, h.name + (layer ? "" : " (discarded)"));
             text.appendChild(title);
             text.appendChild(el("span", null, `${h.w} × ${h.h} at ${h.x}, ${h.y}`));
+            if (h.seed != null) {
+                const meta = el("span", null, `${h.mode || "api"} · seed ${h.seed}` + (h.mode === "local" && h.denoise != null ? ` · denoise ${h.denoise}` : ""));
+                meta.title = "Click to use this seed again";
+                meta.style.cursor = "pointer";
+                meta.addEventListener("click", (e) => { e.stopPropagation(); this.genSettings.seed = h.seed; this.genSettings.seedRandom = false; this.syncGenControls(); this.notifyChanged(); this.setStatus(`Seed ${h.seed} set (random off).`); });
+                text.appendChild(meta);
+            }
             if (h.prompt) { const p = el("span", null, h.prompt); p.title = h.prompt; text.appendChild(p); }
             item.appendChild(text);
             if (layer) {
@@ -3051,11 +3103,28 @@ class InpaintEditor {
 
     // ---- queue -------------------------------------------------------------
 
+    /** Name of the result input the current mode expects, and whether something is wired to it. */
+    resultInputState() {
+        const name = this.genSettings.mode === "local" ? "result_local" : "result";
+        const input = (this.node.inputs || []).find((i) => i.name === name);
+        return { name, wired: !!(input && input.link != null) };
+    }
+
+    syncGenControls() {
+        if (!this.modeSel) return;
+        this.modeSel.value = this.genSettings.mode === "local" ? "local" : "api";
+        this.denoiseInput.value = this.genSettings.denoise;
+        this.seedInput.value = this.genSettings.seed;
+        this.seedRandom.checked = !!this.genSettings.seedRandom;
+    }
+
     async generate() {
         if (!this.base) { this.setStatus("Load an image first."); return; }
+        if (this.genSettings.seedRandom) { this.genSettings.seed = randomSeed(); if (this.seedInput) this.seedInput.value = this.genSettings.seed; }
+        const { name, wired } = this.resultInputState();
         try {
             this.generateBtn.disabled = true;
-            this.setStatus("Queueing ...");
+            this.setStatus(wired ? `Queueing (${this.genSettings.mode}, seed ${this.genSettings.seed}) ...` : `Queueing, but nothing is wired into "${name}": the result will not come back into the canvas.`);
             try {
                 await app.queuePrompt(0);
             } catch (first) {
@@ -3095,11 +3164,12 @@ class InpaintEditor {
                 id: l.id, name: l.name, kind: l.kind, role: l.role || "none", blend: l.blend || "normal", ref: l.ref,
                 x: l.x, y: l.y, w: l.w, h: l.h, opacity: l.opacity, visible: l.visible,
             })),
-            history: this.history.slice(-100).map((h) => ({ key: h.key, name: h.name, ref: h.ref, x: h.x, y: h.y, w: h.w, h: h.h, prompt: h.prompt, layerId: h.layerId, time: h.time })),
+            history: this.history.slice(-100).map((h) => ({ key: h.key, name: h.name, ref: h.ref, x: h.x, y: h.y, w: h.w, h: h.h, prompt: h.prompt, layerId: h.layerId, time: h.time, seed: h.seed, mode: h.mode, denoise: h.denoise })),
             selection: this.selectionDataUrl,
             seen: Array.from(this.seenResults).slice(-200),
             crop: this.cropSettings,
             upsample: this.upsampleSettings,
+            gen: this.genSettings,
         });
     }
 
@@ -3123,6 +3193,8 @@ class InpaintEditor {
             this.syncCropControls();
             this.upsampleSettings = { useCase: "auto", backend: "auto", ...(state.upsample || {}) };
             this.refreshSegmentBackends();
+            this.genSettings = { ...GEN_DEFAULTS, seed: randomSeed(), ...(state.gen || {}) };
+            this.syncGenControls();
             for (const l of state.layers || []) {
                 if (!l.ref) continue;
                 try {
@@ -3204,6 +3276,7 @@ class InpaintEditor {
             prompt: this.promptText,
             layers: this.layers.length,
             crop: this.cropSettings,
+            gen: this.genSettings,
         });
     }
 
@@ -3304,12 +3377,14 @@ app.registerExtension({
             if (output) {
                 for (const node of Object.values(output)) {
                     if (node.class_type !== NODE_CLASS) continue;
-                    const link = node.inputs && node.inputs.result;
-                    if (Array.isArray(link)) {
-                        node.inputs.result_source = `${link[0]}:${link[1]}`;
-                        delete node.inputs.result;
-                    } else if (node.inputs) {
-                        delete node.inputs.result_source;
+                    for (const [input, key] of [["result", "result_source"], ["result_local", "result_source_local"]]) {
+                        const link = node.inputs && node.inputs[input];
+                        if (Array.isArray(link)) {
+                            node.inputs[key] = `${link[0]}:${link[1]}`;
+                            delete node.inputs[input];
+                        } else if (node.inputs) {
+                            delete node.inputs[key];
+                        }
                     }
                 }
             }

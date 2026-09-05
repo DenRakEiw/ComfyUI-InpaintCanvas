@@ -264,7 +264,8 @@ def _state_from_prompt(prompt, unique_id):
     except json.JSONDecodeError:
         state = {}
     result_source = inputs.get("result_source", "") or ""
-    return state, result_source
+    result_source_local = inputs.get("result_source_local", "") or ""
+    return state, result_source, result_source_local
 
 
 def _selection_bbox(mask, padding):
@@ -325,7 +326,9 @@ class InpaintCanvas:
             },
             "optional": {
                 "result": ("IMAGE", {"lazy": True,
-                                     "tooltip": "Wire the decoded inpaint result here. It is stitched back into the canvas as a new layer."}),
+                                     "tooltip": "Wire the inpaint result of your API chain here (editor mode API). It is stitched back into the canvas as a new layer."}),
+                "result_local": ("IMAGE", {"lazy": True,
+                                           "tooltip": "Wire the decoded result of your local chain here (editor mode Local). Only the chain of the selected mode runs."}),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -333,8 +336,8 @@ class InpaintCanvas:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "MASK", "STRING", "INT", "INT", "STRING", "IMAGE")
-    RETURN_NAMES = ("crop_image", "crop_mask", "image", "mask", "stitch_info", "crop_width", "crop_height", "prompt", "control_image")
+    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "MASK", "STRING", "INT", "INT", "STRING", "IMAGE", "FLOAT", "INT", "STRING")
+    RETURN_NAMES = ("crop_image", "crop_mask", "image", "mask", "stitch_info", "crop_width", "crop_height", "prompt", "control_image", "denoise", "seed", "mode")
     OUTPUT_TOOLTIPS = (
         "Selected region plus padding, scaled to target_size. Inpaint this.",
         "Selection mask matching crop_image (grown and feathered when the editor's Feather is auto).",
@@ -345,6 +348,9 @@ class InpaintCanvas:
         "Height of crop_image.",
         "The prompt typed into the editor.",
         "Layers marked as control (scribble, lineart, depth, pose) on black, cropped and scaled exactly like crop_image. Feed it to ControlNet.",
+        "Denoise strength from the editor's Generate section (1.0 = full repaint). Wire it into your local sampler.",
+        "Seed from the editor (random per run or fixed). Wire it into your local sampler.",
+        "\"api\" or \"local\": which result input the editor expects the result on.",
     )
     FUNCTION = "run"
     CATEGORY = "image/inpaint"
@@ -361,7 +367,13 @@ class InpaintCanvas:
         return float("nan")
 
     def run(self, padding=64, target_size=1024, feather=16, multiple_of=64, prompt=None, unique_id=None, **kwargs):
-        state, result_source = _state_from_prompt(prompt, unique_id)
+        state, result_source, result_source_local = _state_from_prompt(prompt, unique_id)
+        gen = state.get("gen") or {}
+        mode = "local" if gen.get("mode") == "local" else "api"
+        denoise = min(1.0, max(0.0, float(gen.get("denoise", 1.0) or 0.0)))
+        seed = int(gen.get("seed", 0) or 0)
+        # Only the chain wired to the selected mode's input is pulled in by the stitch expansion.
+        result_source = result_source_local if mode == "local" else result_source
         base_ref = state.get("base")
         if not base_ref:
             raise ValueError("Inpaint Canvas: load an image into the canvas first.")
@@ -438,7 +450,7 @@ class InpaintCanvas:
 
         outputs = (crop, crop_mask[None], image, mask[None], stitch_info,
                    int(crop.shape[2]), int(crop.shape[1]), str(state.get("prompt", "") or ""),
-                   control_crop)
+                   control_crop, denoise, seed, mode)
 
         if result_source:
             src_id, _, src_slot = result_source.partition(":")
