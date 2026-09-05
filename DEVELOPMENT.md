@@ -749,6 +749,18 @@ layers: `mono === false` -> 100, else 0); the noise is a luminance part
 shared by all channels plus a per-channel part weighted by chroma. The
 values are approximations of how the stocks are described, not measured.
 
+Performance (2026-09-05 late, after the user found the opacity slider on a
+grain layer "lahm"): a filter layer's own opacity or blend never invalidates
+its cache (the input below is unchanged), the noise field of the grain
+filter is cached per layer in `layer._fxCache` (key: size, speckle, chroma,
+seed, canvas size, or plate + scale), samples come from a 64k lookup table
+instead of exp/log per pixel, and slider `input` events draw once per
+animation frame (`drawSoon`, `markFilterChanged(layer, {soon: true})`);
+dragging the opacity of a layer *below* a filter sets `filterPreview = "*"`
+(all filters at preview size). Measured on the 1776×2368 photo: grain full
+107 ms (was 226), preview 17 ms (was 143), filter opacity drag 0 ms per
+event, 20 opacity events on a layer below the filter 527 ms in total.
+
 Measured on the 1776×2368 photo in headless Edge: grain 144 ms, sharpen
 75 ms, cached redraw 0 ms; invert LUT exact (mean 16.25 -> 238.75, strength
 50 -> 128); mask from selection limits the effect to the selection (outside

@@ -140,51 +140,67 @@ function applyGrain(src, p, info) {
         octx.putImageData(img0, 0, 0);
     }
     if (amount <= 0) return out;
-    // noise at grain resolution, scaled up with smoothing: soft, film-like clumps
-    const nw = Math.max(1, Math.round(W / size)), nh = Math.max(1, Math.round(H / size));
-    const noise = makeCanvas(nw, nh);
-    const nctx = noise.getContext("2d");
-    const nd = nctx.createImageData(nw, nh);
-    const d = nd.data;
-    const rand = rng(hashString(String(info.seed || "grain")));
-    // Real grain plates measure skewed and heavy-tailed (bright specks on a darker
-    // ground: skew 0.5-0.9, kurtosis 3.2-5.4 on fotokorn's scans, black-and-white
-    // stocks the most). A standardised lognormal reproduces that: sigma 0.3 gives
-    // skew ~0.95 / kurtosis ~4.6, sigma 0.12 stays close to gaussian.
+    // The noise field depends only on size, speckle, colour share, seed and the
+    // canvas size (or the plate and its scale), never on the picture: it is cached
+    // per layer (info.cache) so amount, look and opacity changes only pay for the
+    // final pixel loop.
+    const cache = info.cache || {};
+    const usePlate = !!(info.plate && info.plate.width);
     const sigma = Math.max(0, Math.min(0.5, (p.speckle ?? 25) / 100 * 0.5));
-    const e1 = Math.exp(sigma * sigma / 2), norm = Math.sqrt((Math.exp(sigma * sigma) - 1) * Math.exp(sigma * sigma)) || 1;
-    const gauss = () => { const u = Math.max(1e-12, rand()), v = rand(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
-    const sample = () => (sigma > 0.005 ? (Math.exp(sigma * gauss()) - e1) / norm : gauss()) * 40;
-    for (let i = 0; i < d.length; i += 4) {
-        const g = sample();
-        if (chroma <= 0) { d[i] = d[i + 1] = d[i + 2] = 128 + g; }
-        else {
-            // luminance grain shared by all channels plus a per-channel part (colour negative films)
-            d[i] = 128 + g * (1 - chroma) + sample() * chroma;
-            d[i + 1] = 128 + g * (1 - chroma) + sample() * chroma;
-            d[i + 2] = 128 + g * (1 - chroma) + sample() * chroma;
-        }
-        d[i + 3] = 255;
-    }
-    nctx.putImageData(nd, 0, 0);
-    const big = makeCanvas(W, H);
-    const bctx = big.getContext("2d");
+    const sc = Math.max(0.1, (p.plate_scale ?? 1) * (info.scale || 1));
+    const noiseKey = JSON.stringify(usePlate ? ["plate", info.plateKey || "", sc, W, H] : ["synth", size, sigma, chroma, String(info.seed || "grain"), W, H]);
     let nz, center = 128, gain = 1.3;
-    if (info.plate && info.plate.width) {
-        // a real grain plate (scan of a uniformly exposed film) replaces the synthetic noise,
-        // tiled at plate_scale (1 = plate pixels 1:1) and centred on its mean
-        const sc = Math.max(0.1, (p.plate_scale ?? 1) * (info.scale || 1));
-        const pat = bctx.createPattern(info.plate, "repeat");
-        try { pat.setTransform(new DOMMatrix().scale(sc, sc)); } catch (_) { /* old browsers */ }
-        bctx.fillStyle = pat;
-        bctx.fillRect(0, 0, W, H);
-        nz = bctx.getImageData(0, 0, W, H).data;
-        center = info.plateMean ?? 128;
-        gain = 40 / Math.max(8, info.plateStd ?? 40);   // plates come with their own contrast: normalise to the synthetic level
+    if (usePlate) { center = info.plateMean ?? 128; gain = 40 / Math.max(8, info.plateStd ?? 40); }   // plates come with their own contrast
+    if (cache.noiseKey === noiseKey && cache.noise) {
+        nz = cache.noise;
     } else {
-        bctx.imageSmoothingEnabled = size > 1;
-        bctx.drawImage(noise, 0, 0, W, H);
+        const big = makeCanvas(W, H);
+        const bctx = big.getContext("2d");
+        if (usePlate) {
+            // a real grain plate (scan of a uniformly exposed film) replaces the synthetic noise,
+            // tiled at plate_scale (1 = plate pixels 1:1) and centred on its mean
+            const pat = bctx.createPattern(info.plate, "repeat");
+            try { pat.setTransform(new DOMMatrix().scale(sc, sc)); } catch (_) { /* old browsers */ }
+            bctx.fillStyle = pat;
+            bctx.fillRect(0, 0, W, H);
+        } else {
+            // noise at grain resolution (never finer than a pixel), scaled up with smoothing: soft, film-like clumps
+            const gs = Math.max(1, size);
+            const nw = Math.max(1, Math.round(W / gs)), nh = Math.max(1, Math.round(H / gs));
+            const noise = makeCanvas(nw, nh);
+            const nctx = noise.getContext("2d");
+            const nd = nctx.createImageData(nw, nh);
+            const d = nd.data;
+            const rand = rng(hashString(String(info.seed || "grain")));
+            // Real grain plates measure skewed and heavy-tailed (bright specks on a darker
+            // ground: skew 0.5-0.9, kurtosis 3.2-5.4 on fotokorn's scans, black-and-white
+            // stocks the most). A standardised lognormal reproduces that: sigma 0.3 gives
+            // skew ~0.95 / kurtosis ~4.6, sigma 0.12 stays close to gaussian. Samples come
+            // from a 64k table so the per-pixel work is one random number and a lookup.
+            const e1 = Math.exp(sigma * sigma / 2), norm = Math.sqrt((Math.exp(sigma * sigma) - 1) * Math.exp(sigma * sigma)) || 1;
+            const gauss = () => { const u = Math.max(1e-12, rand()), v = rand(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+            const TN = 65536;
+            const table = new Float32Array(TN);
+            for (let i = 0; i < TN; i++) table[i] = (sigma > 0.005 ? (Math.exp(sigma * gauss()) - e1) / norm : gauss()) * 40;
+            const sample = () => table[(rand() * TN) | 0];
+            for (let i = 0; i < d.length; i += 4) {
+                const g = sample();
+                if (chroma <= 0) { d[i] = d[i + 1] = d[i + 2] = 128 + g; }
+                else {
+                    // luminance grain shared by all channels plus a per-channel part (colour negative films)
+                    d[i] = 128 + g * (1 - chroma) + sample() * chroma;
+                    d[i + 1] = 128 + g * (1 - chroma) + sample() * chroma;
+                    d[i + 2] = 128 + g * (1 - chroma) + sample() * chroma;
+                }
+                d[i + 3] = 255;
+            }
+            nctx.putImageData(nd, 0, 0);
+            bctx.imageSmoothingEnabled = gs > 1;
+            bctx.drawImage(noise, 0, 0, W, H);
+        }
         nz = bctx.getImageData(0, 0, W, H).data;
+        cache.noiseKey = noiseKey;
+        cache.noise = nz;
     }
     const img = octx.getImageData(0, 0, W, H);
     const px = img.data;

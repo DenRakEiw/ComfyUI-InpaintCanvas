@@ -2971,9 +2971,10 @@ class InpaintEditor {
         this.renderLayers();
     }
 
-    markFilterChanged(layer) {
+    markFilterChanged(layer, { soon = false } = {}) {
         layer._fcache = null;
         this.uploaded.baseHash = null;
+        if (soon) { this.drawSoon(); return; }   // slider drag: one draw per frame, thumbnail and save on release
         this.draw();
         this.drawThumb();
         this.notifyChanged();
@@ -3046,7 +3047,8 @@ class InpaintEditor {
             }
         }
         let canvas = null;
-        try { canvas = applyFilter(layer.filter, input, layer.params, { scale, seed: layer.id, lut: layer._lutData, plate: layer._plateImg || null, plateMean: layer.plate && layer.plate.mean, plateStd: layer.plate && layer.plate.std }); }
+        if (!layer._fxCache) layer._fxCache = {};
+        try { canvas = applyFilter(layer.filter, input, layer.params, { scale, seed: layer.id, lut: layer._lutData, plate: layer._plateImg || null, plateKey: layer.plate && layer.plate.ref && layer.plate.ref.filename, plateMean: layer.plate && layer.plate.mean, plateStd: layer.plate && layer.plate.std, cache: layer._fxCache }); }
         catch (err) { console.error(err); }
         layer._fcache = { version: this.compositeVersion, key, canvas };
         return canvas;
@@ -3064,7 +3066,7 @@ class InpaintEditor {
                 if (gi >= 0 && gi < index) return;
             }
         }
-        const preview = !forRun && this.filterPreview === layer.id;
+        const preview = !forRun && (this.filterPreview === layer.id || this.filterPreview === "*");
         const out = this.filteredCanvas(layer, ctx.canvas, forRun, preview);
         if (!out) return;
         let src = out;
@@ -3636,8 +3638,14 @@ class InpaintEditor {
             op.title = "Layer opacity";
             const pct = el("b", null, Math.round(layer.opacity * 100) + "%");
             op.addEventListener("click", (e) => e.stopPropagation());
-            op.addEventListener("input", () => { layer.opacity = op.value / 100; pct.textContent = op.value + "%"; this.uploaded.baseHash = null; this.uploaded.controlHash = null; this.draw(); });
-            op.addEventListener("change", () => { this.drawThumb(); this.notifyChanged(); });
+            op.addEventListener("input", () => {
+                layer.opacity = op.value / 100; pct.textContent = op.value + "%";
+                // A filter layer's own opacity does not change what it filters: keep its cache.
+                // Layers below a filter make every filter above recompute; do that at preview size while dragging.
+                if (layer.kind !== "filter") { this.filterPreview = "*"; this.uploaded.baseHash = null; this.uploaded.controlHash = null; }
+                this.drawSoon();
+            });
+            op.addEventListener("change", () => { this.filterPreview = null; this.uploaded.baseHash = null; this.uploaded.controlHash = null; this.draw(); this.drawThumb(); this.notifyChanged(); });
             opRow.appendChild(op);
             opRow.appendChild(pct);
             row.appendChild(opRow);
@@ -3819,7 +3827,7 @@ class InpaintEditor {
                 val.textContent = fmt(p, +range.value);
                 if (presetSel && !p.keepPreset && layer.params.preset !== "custom") { layer.params.preset = "custom"; presetSel.value = "custom"; }
                 this.filterPreview = layer.id;
-                this.markFilterChanged(layer);
+                this.markFilterChanged(layer, { soon: true });
             });
             range.addEventListener("change", () => {
                 this.filterPreview = null;
@@ -4051,6 +4059,13 @@ class InpaintEditor {
             }
         }
         this.notifyChanged();
+    }
+
+    /** Draw once on the next animation frame, however many slider events arrive before it. */
+    drawSoon() {
+        if (this._drawQueued) return;
+        this._drawQueued = true;
+        requestAnimationFrame(() => { this._drawQueued = false; this.draw(); });
     }
 
     /** Selection as a marching-ants outline: the mask shifted by a screen pixel in eight directions minus the mask, filled with a moving stripe pattern. */
