@@ -1318,7 +1318,7 @@ class InpaintEditor {
                     colorMatch: this.cropColorMatch.checked,
                     withOriginal: this.cropOriginal.checked,
                     align: this.cropAlign.checked,
-                    paste: this.cropPasteSel.value === "crop" ? "crop" : "selection",
+                    paste: this.cropPasteSel.value === "whole crop" ? "crop" : "selection",
                 };
                 this.renderInfo();
                 this.draw();
@@ -3473,6 +3473,7 @@ class InpaintEditor {
                 const distort = Math.abs((ew / eh) / (cw / ch) - 1) * 100;
                 const warn = distort >= 1.5 ? ` · aspect ${distort.toFixed(1)} % off, stretched back on stitch` : "";
                 rows.push(["Emitted", `${ew} × ${eh}${pair}${warn}`]);
+                rows.push(["Paste", this.cropSettings.paste === "crop" ? "whole crop" : "selection only"]);
             } else {
                 rows.push(["Emitted", `${Math.min(this.width, Math.ceil(cw / m) * m)} × ${Math.min(this.height, Math.ceil(ch / m) * m)}${pair}`]);
             }
