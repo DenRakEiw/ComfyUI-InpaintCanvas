@@ -157,6 +157,14 @@ size, hardness, opacity and the paint colour.
   mode (multiply, screen, overlay, ...), move up / down, delete (Delete key),
   plus button for an empty paint layer (Ctrl+Shift+N). Flatten bakes all
   visible layers into the base.
+- **Match** (per layer, non-destructive): shifts the layer's colours and
+  contrast towards the image below it, per channel by mean and spread like
+  the stitch's colour match, dosed by the slider. Source *surroundings*
+  measures a ring around the layer's opaque area, *underneath* the pixels
+  the layer covers (for results that replace what was there). Fixes a
+  result generated without colour match, a pasted cutout in a new scene or
+  an imported photo with a different white balance; applied in the
+  preview, in flatten, in the run and when saving.
 - **Control layers**: give a layer a role (scribble, lineart, depth, pose,
   canny, other). Such layers are left out of the image your chain sees and
   instead composited on black into the `control_image` output, cropped and

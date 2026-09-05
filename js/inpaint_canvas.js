@@ -740,6 +740,7 @@ const STYLE = `
 .ipc-layer .ipc-op input[type=range] { flex:1; margin:0; }
 .ipc-layer .ipc-op b { width:34px; text-align:right; font-weight:500; color:#bbb; }
 .ipc-layer .ipc-op label { display:flex; align-items:center; gap:4px; }
+.ipc-layer .ipc-op .ipc-sel.ipc-narrow { max-width:96px; }
 .ipc-prompt { padding:8px; }
 .ipc-prompt textarea { width:100%; box-sizing:border-box; min-height:80px; resize:vertical; background:#161616; color:#ddd; border:1px solid #3a3a3a;
   border-radius:6px; padding:6px 8px; font:13px/1.35 system-ui, sans-serif; }
@@ -2967,6 +2968,7 @@ class InpaintEditor {
         if (step.kind === "layer") return { kind: "layer", id: layer.id, url: layer.canvas.toDataURL("image/png") };
         if (step.kind === "transform") return { kind: "transform", id: layer.id, x: layer.x, y: layer.y, w: layer.w, h: layer.h };
         if (step.kind === "mask") return { kind: "mask", id: layer.id, url: layer.mask ? layer.mask.toDataURL("image/png") : null, mw: layer.mask ? layer.mask.width : 0, mh: layer.mask ? layer.mask.height : 0 };
+        if (step.kind === "match") return { kind: "match", id: layer.id, match: { ...(layer.match || { strength: 0, source: "surroundings" }) } };
         if (step.kind === "filter") return { kind: "filter", id: layer.id, filter: layer.filter, params: { ...(layer.params || {}) }, lut: layer.lut ? { ...layer.lut } : null, lutData: layer._lutData || null, plate: layer.plate ? { ...layer.plate } : null, plateImg: layer._plateImg || null, name: layer.name };
         if (step.kind === "layerfull") return { kind: "layerfull", id: layer.id, url: layer.canvas.toDataURL("image/png"), cw: layer.canvas.width, ch: layer.canvas.height, x: layer.x, y: layer.y, w: layer.w, h: layer.h,
             mask: layer.mask ? layer.mask.toDataURL("image/png") : null, mw: layer.mask ? layer.mask.width : 0, mh: layer.mask ? layer.mask.height : 0 };
@@ -3010,6 +3012,10 @@ class InpaintEditor {
                 this.renderLayers();
                 this.drawThumb();
                 this.notifyChanged();
+            } else if (snap.kind === "match") {
+                layer.match = { ...snap.match };
+                this.markMatchChanged(layer);
+                this.renderLayers();
             } else if (snap.kind === "filter") {
                 layer.filter = snap.filter;
                 layer.params = { ...snap.params };
@@ -3097,6 +3103,7 @@ class InpaintEditor {
     markLayerChanged(layer) {
         layer.dirty = true;
         layer._maskedValid = false;
+        layer._mcache = null;
         layer.exportRef = null;
         this.uploaded.baseHash = null;
         this.uploaded.controlHash = null;
@@ -3265,6 +3272,7 @@ class InpaintEditor {
         layer.maskDirty = !!layer.mask;
         if (!layer.mask) layer.maskRef = null;
         layer._maskedValid = false;
+        layer._mcache = null;
         layer.exportRef = null;
         this.uploaded.baseHash = null;
         this.uploaded.controlHash = null;
@@ -3704,6 +3712,7 @@ class InpaintEditor {
         if (!layer.role) layer.role = "none";
         if (layer.mask === undefined) layer.mask = null;
         if (!layer.mask) { layer.maskRef = null; layer.maskDirty = false; layer.maskEdit = false; }
+        if (!layer.match) layer.match = { strength: 0, source: "surroundings" };
         this.layers.push(layer);
         if (activate) this.activeLayerId = layer.id;
         this.uploaded.baseHash = null;
@@ -3832,6 +3841,32 @@ class InpaintEditor {
             row.appendChild(opRow);
 
             if (isFx) row.appendChild(this.buildFilterControls(layer));
+            if (!isFx) {
+                // colour match against the composite below, non-destructive
+                const mRow = el("div", "ipc-op");
+                mRow.appendChild(el("span", null, "Match"));
+                const mr = document.createElement("input");
+                mr.type = "range"; mr.min = 0; mr.max = 100; mr.value = Math.round((layer.match && layer.match.strength) || 0);
+                mr.title = "Colour match: shift this layer's colours and contrast towards the image below (0 = off). Non-destructive; applied in the preview, in flatten and in the run.";
+                const mpct = el("b", null, mr.value + "%");
+                mr.addEventListener("click", (e) => e.stopPropagation());
+                mr.addEventListener("pointerdown", (e) => e.stopPropagation());
+                mr.addEventListener("input", () => {
+                    if (!layer._matchUndo) layer._matchUndo = this.snapshot({ kind: "match", id: layer.id });
+                    layer.match = { ...(layer.match || { source: "surroundings" }), strength: +mr.value };
+                    mpct.textContent = mr.value + "%";
+                    this.markMatchChanged(layer);
+                    this.drawSoon();
+                });
+                mr.addEventListener("change", () => { if (layer._matchUndo) { this.pushUndoSnapshot(layer._matchUndo); layer._matchUndo = null; } this.draw(); this.drawThumb(); this.notifyChanged(); });
+                mRow.appendChild(mr);
+                mRow.appendChild(mpct);
+                const msrc = selectInput(["surroundings", "underneath"], (layer.match && layer.match.source) || "surroundings", "What to match against: the ring around the layer's opaque area in the image below (surroundings), or the pixels the layer covers (underneath, for results replacing what was there)");
+                msrc.classList.add("ipc-narrow");
+                msrc.addEventListener("change", () => { this.pushUndo({ kind: "match", id: layer.id }); layer.match = { ...(layer.match || { strength: 0 }), source: msrc.value }; this.markMatchChanged(layer); this.draw(); this.drawThumb(); this.notifyChanged(); });
+                mRow.appendChild(msrc);
+                row.appendChild(mRow);
+            }
 
             const modeRow = el("div", "ipc-op");
             const blendLab = el("label", null, "Blend");
@@ -4124,7 +4159,7 @@ class InpaintEditor {
 
     drawComposite(ctx, opts = {}) {
         if (!this.base) return;
-        const hasFilters = !opts.controlOnly && this.layers.some((l) => l.kind === "filter" && l.visible);
+        const hasFilters = !opts.controlOnly && this.layers.some((l) => l.visible && (l.kind === "filter" || this.matchActive(l)));
         if (!hasFilters) { this.drawLayersInto(ctx, opts); return; }
         // Filters need the composite below them at image resolution: build it offscreen first.
         if (!this.flatCanvas || this.flatCanvas.width !== this.width || this.flatCanvas.height !== this.height) this.flatCanvas = makeCanvas(this.width, this.height);
@@ -4179,7 +4214,95 @@ class InpaintEditor {
             }
             return;
         }
-        ctx.drawImage(this.layerPixels(layer), layer.x, layer.y, layer.w, layer.h);
+        const gesture = this.pointer && this.pointer.layer === layer;
+        const src = this.matchActive(layer) && !gesture && ctx.canvas.width === this.width && ctx.canvas.height === this.height
+            ? this.layerMatchedPixels(layer, ctx.canvas) : this.layerPixels(layer);
+        ctx.drawImage(src, layer.x, layer.y, layer.w, layer.h);
+    }
+
+    matchActive(layer) {
+        return !!(layer.match && layer.match.strength > 0 && layer.kind !== "filter" && !this.isControl(layer) && !this.isReference(layer));
+    }
+
+    markMatchChanged(layer) {
+        layer._mcache = null;
+        this.uploaded.baseHash = null;
+        this.uploaded.controlHash = null;
+    }
+
+    /**
+     * The layer's pixels with their colour statistics matched to the composite
+     * below (per-channel mean and spread, ratio clamped to 0.5..2, like the
+     * stitch's colour match). Source: the surroundings (a ring around the
+     * layer's opaque area) or the pixels underneath it. Cached per composite
+     * version and settings.
+     */
+    layerMatchedPixels(layer, below) {
+        const m = layer.match || {};
+        const strength = Math.min(1, Math.max(0, (m.strength || 0) / 100));
+        const px = this.layerPixels(layer);
+        const key = JSON.stringify([m.strength, m.source, layer.x, layer.y, layer.w, layer.h, px.width, px.height]);
+        const c = layer._mcache;
+        if (c && c.version === this.compositeVersion && c.key === key) return c.canvas;
+        const W = px.width, H = px.height;
+        const s = Math.min(1, 256 / Math.max(layer.w, layer.h));
+        const sw = Math.max(2, Math.round(layer.w * s)), sh = Math.max(2, Math.round(layer.h * s));
+        const pad = Math.max(4, Math.round(Math.max(sw, sh) * 0.08));
+        const pw = sw + 2 * pad, ph = sh + 2 * pad;
+        // layer alpha and the composite below, both padded, at statistics resolution
+        const lay = makeCanvas(pw, ph);
+        const lctx = lay.getContext("2d");
+        lctx.drawImage(px, 0, 0, W, H, pad, pad, sw, sh);
+        const ld = lctx.getImageData(0, 0, pw, ph).data;
+        const bel = makeCanvas(pw, ph);
+        const bctx = bel.getContext("2d");
+        const padImg = pad / s;
+        bctx.drawImage(below, layer.x - padImg, layer.y - padImg, layer.w + 2 * padImg, layer.h + 2 * padImg, 0, 0, pw, ph);
+        const bd = bctx.getImageData(0, 0, pw, ph).data;
+        // ring: blurred alpha reaches, alpha itself does not
+        const blur = makeCanvas(pw, ph);
+        const bl = blur.getContext("2d");
+        try { bl.filter = `blur(${pad * 0.6}px)`; } catch (_) { /* ignore */ }
+        bl.drawImage(lay, 0, 0);
+        bl.filter = "none";
+        const bld = bl.getImageData(0, 0, pw, ph).data;
+        const under = m.source === "underneath";
+        const sum = [0, 0, 0], sq = [0, 0, 0], tsum = [0, 0, 0], tsq = [0, 0, 0];
+        let ns = 0, nt = 0;
+        for (let i = 0; i < ld.length; i += 4) {
+            const a = ld[i + 3];
+            if (a > 127) {
+                for (let ch = 0; ch < 3; ch++) { const v = ld[i + ch]; tsum[ch] += v; tsq[ch] += v * v; }
+                nt++;
+                if (under && bd[i + 3] > 0) { for (let ch = 0; ch < 3; ch++) { const v = bd[i + ch]; sum[ch] += v; sq[ch] += v * v; } ns++; }
+            } else if (!under && bld[i + 3] > 6 && bd[i + 3] > 0) {
+                for (let ch = 0; ch < 3; ch++) { const v = bd[i + ch]; sum[ch] += v; sq[ch] += v * v; }
+                ns++;
+            }
+        }
+        let out = px;
+        if (ns >= 64 && nt >= 64 && strength > 0) {
+            const meanS = sum.map((v) => v / ns), meanT = tsum.map((v) => v / nt);
+            const stdS = sq.map((v, ch) => Math.sqrt(Math.max(1e-6, v / ns - meanS[ch] * meanS[ch])));
+            const stdT = tsq.map((v, ch) => Math.sqrt(Math.max(1e-6, v / nt - meanT[ch] * meanT[ch])));
+            const scale = stdS.map((v, ch) => Math.min(2, Math.max(0.5, v / stdT[ch])));
+            const oc = makeCanvas(W, H);
+            const octx = oc.getContext("2d");
+            octx.drawImage(px, 0, 0);
+            const img = octx.getImageData(0, 0, W, H);
+            const d = img.data;
+            for (let i = 0; i < d.length; i += 4) {
+                if (!d[i + 3]) continue;
+                for (let ch = 0; ch < 3; ch++) {
+                    const v = (d[i + ch] - meanT[ch]) * scale[ch] + meanS[ch];
+                    d[i + ch] = Math.max(0, Math.min(255, d[i + ch] + (v - d[i + ch]) * strength));
+                }
+            }
+            octx.putImageData(img, 0, 0);
+            out = oc;
+        }
+        layer._mcache = { version: this.compositeVersion, key, canvas: out };
+        return out;
     }
 
     flattenToCanvas(opts = {}) {
@@ -4653,6 +4776,7 @@ class InpaintEditor {
             layers: this.layers.map((l) => ({
                 id: l.id, name: l.name, kind: l.kind, role: l.role || "none", blend: l.blend || "normal", ref: l.ref,
                 x: l.x, y: l.y, w: l.w, h: l.h, opacity: l.opacity, visible: l.visible, mask: l.maskRef || null,
+                ...(l.match && l.match.strength > 0 ? { match: l.match } : {}),
                 ...(l.kind === "filter" ? { filter: l.filter, params: l.params, lut: l.lut || null, plate: l.plate || null } : {}),
             })),
             history: this.history.slice(-100).map((h) => ({ key: h.key, name: h.name, ref: h.ref, x: h.x, y: h.y, w: h.w, h: h.h, prompt: h.prompt, layerId: h.layerId, time: h.time, seed: h.seed, mode: h.mode, denoise: h.denoise })),
@@ -4745,6 +4869,7 @@ class InpaintEditor {
                         ref: l.ref, canvas,
                         x: l.x, y: l.y, w: l.w, h: l.h, opacity: l.opacity ?? 1, visible: l.visible !== false, dirty: false,
                         mask, maskRef: mask ? l.mask : null, maskDirty: false, maskEdit: false,
+                        match: l.match && typeof l.match === "object" ? { strength: +l.match.strength || 0, source: l.match.source === "underneath" ? "underneath" : "surroundings" } : { strength: 0, source: "surroundings" },
                     });
                     if (l.kind === "paint") this.paintCounter += 1;
                 } catch (err) {
