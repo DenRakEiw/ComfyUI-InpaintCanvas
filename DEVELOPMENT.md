@@ -186,6 +186,55 @@ excluded from run image and present on black, grow/shrink exact to the pixel,
 selection from layer, extend canvas (border selected), history discard /
 restore / solo, workflow reload without duplicate layers.
 
+## 6b. Helper prompts and "Select by text" (2026-09-05, untested in browser)
+
+Why a helper prompt: the editor needs model runs (segmentation) without
+running the user's main chain (Flux.2 API = money) and without custom HTTP
+routes. So the frontend queues a standalone prompt at the front of the queue:
+
+```
+seg_load: InpaintCanvasLoadRef {ref: JSON of the flattened base upload}
+<backend nodes>                       // see SEGMENT_BACKENDS in the JS
+seg_out:  InpaintCanvasMaskOut {mask: [.., idx], canvas_node: "<node id>", purpose: "segment"}
+```
+
+`api.queuePrompt(-1, {output, workflow: {nodes: [], links: [], version: 0.4,
+extra: {inpaint_canvas_helper: true}}})`. Node ids in helper prompts are
+strings like `seg_run`; ComfyUI accepts any string keys. The editor listens on
+`api` `executed` events for `output.inpaint_mask` and routes by `canvas_node`
+(`applyMaskFile`, modes replace / add / subtract, undo pushed). Errors are
+matched by `detail.prompt_id === editor.segmentPromptId`.
+
+Backends (`SEGMENT_BACKENDS`, availability = required node types registered
+in `LiteGraph.registered_node_types`, plus an optional `available()` check):
+
+- `dino_sam`: `GroundingDinoModelLoader (segment anything)` SwinT +
+  `SAMModelLoader (segment anything)` (vit_b, or vit_h with the HQ toggle) +
+  `GroundingDinoSAMSegment (segment anything)` -> mask output index 1.
+  Weights are on disk (`models/grounding-dino`, `models/sams`). Default.
+- `sam3_core`: `CheckpointLoaderSimple` (a `sam3*` file in
+  `models/checkpoints`; core loads SAM3 as a model type with its own CLIP,
+  see `comfy/supported_models.py`, `comfy/text_encoders/sam3_clip.py`) ->
+  `CLIPTextEncode` -> `SAM3_Detect` (threshold, refine_iterations 2,
+  individual_masks false) -> mask index 0. Only offered when such a checkpoint
+  exists. Weights are license-gated on Hugging Face (facebook/sam3); the user
+  downloads them manually.
+- `sam3_rmbg`: `SAM3Segment` from comfyui-rmbg (image, prompt, output_mode
+  Merged, confidence_threshold) -> mask index 1. Whether it has weights is
+  unknown.
+
+Why not LoadImage: its `image` widget is a combo validated against the
+top-level input listing, so files in `input/inpaint_canvas/` fail validation.
+Hence `InpaintCanvasLoadRef`.
+
+`InpaintCanvasMaskOut` saves to `temp/inpaint_canvas/`, merges a mask batch
+with max, and reports `coverage` (mean) in the ui payload.
+
+Florence-2 was considered and rejected for masks (polygon output is coarse);
+it would only serve as a detector in front of SAM2, which GroundingDINO does
+better. Comparison: SAM3 > GroundingDINO+SAM for text prompts; both beat
+Florence.
+
 ## 7. Known limitations
 
 - Base layer is not editable (no erase); painting on it creates a paint layer.
@@ -199,6 +248,27 @@ restore / solo, workflow reload without duplicate layers.
 - Painting on a scaled layer paints into its native resolution (fine), but
   brush size is scaled by the average of the two axes.
 - No LICENSE file yet (user has not chosen one).
+
+## 9. First thing to do next session
+
+Test "Select by text" in the browser (JS + nodes are in place, server has the
+nodes; nothing verified end to end yet):
+
+1. Reload the page, wait for the workflow restore (`.p-blockui-mask` gone).
+2. Open the editor on a canvas with a real photo (e.g. the user's earlier
+   upload `input/inpaint_canvas/ComfyUI_01940_.png`, 1776x2368).
+3. Selection section -> type "woman" (or "hair"), Go. Expected status:
+   `Segmenting "woman" with GroundingDINO + SAM ...` then `Selected "woman"
+   (NN% of the image, replace).` First run loads ~3 GB of models.
+4. Check `/history?max_items=1`: prompt keys `seg_load, seg_dino, seg_sam,
+   seg_run, seg_out`, outputs `seg_out` with `inpaint_mask`.
+5. Try Add / Subtract, undo, then a Generate to make sure the main chain is
+   untouched by the helper prompt.
+6. Failure modes to expect: the queue wrapper retry issue (first call after
+   load), validation errors for combo names (model_name strings were copied
+   from object_info on 2026-09-05), CUDA OOM if a big API job runs.
+
+Then commit as DenRakEiw and update this section.
 
 ## 8. Roadmap (from the user's own Krita list)
 

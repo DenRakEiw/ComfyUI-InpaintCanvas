@@ -21,6 +21,13 @@ Editor
   paint a closed ring and the inside is selected too.
 - **Selection** section: grow or shrink by n pixels (exact distance
   transform), or take the selection from the opaque area of the active layer.
+- **Select by text**: type what you want ("shirt", "hair", "the red car"),
+  press Go or Enter. A small helper prompt runs at the front of the queue
+  (only the segmentation nodes, never your generation chain) and the mask
+  comes back as the selection: Replace, Add or Subtract. Backends: GroundingDINO
+  + SAM (comfyui_segment_anything, HQ toggle picks the large SAM), SAM3 via the
+  core nodes once a `sam3*` checkpoint sits in `models/checkpoints`, or the
+  RMBG SAM3 node. Threshold: lower finds more.
 - **Layer** tools: paint (P), eraser (E), fill selection with color (Shift+F),
   transform (T), hand (H) to pan. Painting on the base creates a paint layer
   automatically; the base itself is never erased.
@@ -88,6 +95,12 @@ Outputs
 - `prompt`: the text from the editor's prompt field.
 - `control_image`: the control layers on black, aligned with `crop_image`
   (black if there are none).
+
+### Helper nodes
+
+`Inpaint Canvas Load Ref` loads an image by a `{filename, subfolder, type}`
+JSON reference and `Inpaint Canvas Mask Out` hands a MASK back to the editor.
+The editor uses both for "Select by text"; you can also wire them yourself.
 
 ### Inpaint Canvas Stitch (`InpaintCanvasStitch`)
 

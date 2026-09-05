@@ -14,8 +14,10 @@ Flux.2 [max] API node (returns RGBA, square unless width/height are wired).
 
 ## Layout
 
-- `nodes.py` — `InpaintCanvas` (OUTPUT_NODE, always re-executes) and
-  `InpaintCanvasStitch` (OUTPUT_NODE, also used ephemerally).
+- `nodes.py` — `InpaintCanvas` (OUTPUT_NODE, always re-executes),
+  `InpaintCanvasStitch` (OUTPUT_NODE, also used ephemerally), and the helpers
+  `InpaintCanvasLoadRef` (ref JSON -> IMAGE) and `InpaintCanvasMaskOut`
+  (MASK -> temp PNG + `ui.inpaint_mask`).
 - `js/inpaint_canvas.js` — the whole frontend: node thumbnail widget, the
   full-window editor (`InpaintEditor`), state persistence, prompt rewriting.
 - `pyproject.toml` + `.github/workflows/publish_action.yml` — Comfy Registry
@@ -46,6 +48,11 @@ Flux.2 [max] API node (returns RGBA, square unless width/height are wired).
    (autosave would wipe the canvas). It returns `lastValueString`.
 7. Layer pixels are never stored in the workflow. Dirty layers are uploaded on
    editor close and before every run (`syncLayers`).
+8. **Editor features that need a model run use helper prompts**, never the
+   user's graph: the frontend queues a tiny prompt (`api.queuePrompt(-1, ...)`,
+   front of the queue) made of loader/model nodes plus `InpaintCanvasMaskOut`,
+   and picks the result up from the `executed` event by `canvas_node`. The
+   user runs paid API nodes; a helper must never trigger the main chain.
 
 ## User preferences (stated explicitly)
 
@@ -55,6 +62,13 @@ Flux.2 [max] API node (returns RGBA, square unless width/height are wired).
 - One node, one window. No helper nodes for the round trip, no in-node canvas.
 - Icons, not text, for tools. Krita/Photoshop vocabulary. Answer in German.
 - The user asks for features by Krita name; the roadmap is in DEVELOPMENT.md.
+
+## Where things stand (2026-09-05)
+
+Done and browser-verified: everything in README up to and including the
+transform modes. **"Select by text" (segmentation) is implemented but not yet
+tested in a browser** - see DEVELOPMENT.md section 9 for the exact test to run
+first.
 
 ## Working on it
 

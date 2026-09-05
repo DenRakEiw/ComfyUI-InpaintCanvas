@@ -338,12 +338,81 @@ class InpaintCanvasStitch:
         }
 
 
+class InpaintCanvasLoadRef:
+    """Load an image by a {filename, subfolder, type} reference. Used by the editor's
+    helper prompts (text segmentation) because LoadImage only accepts top-level files."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "ref": ("STRING", {"default": "", "multiline": False,
+                                   "tooltip": "JSON {filename, subfolder, type} of a file in the ComfyUI input/output/temp directories."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "load"
+    CATEGORY = "image/inpaint"
+
+    @classmethod
+    def IS_CHANGED(cls, ref=""):
+        try:
+            return os.path.getmtime(_ref_path(json.loads(ref)))
+        except Exception:
+            return float("nan")
+
+    def load(self, ref=""):
+        return (_load_rgb(json.loads(ref)),)
+
+
+class InpaintCanvasMaskOut:
+    """Hand a mask back to the canvas editor (used by the editor's text segmentation)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mask": ("MASK",),
+                "canvas_node": ("STRING", {"default": "", "tooltip": "Id of the Inpaint Canvas node that asked for the mask."}),
+                "purpose": ("STRING", {"default": "segment"}),
+            },
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "send"
+    CATEGORY = "image/inpaint"
+    OUTPUT_NODE = True
+
+    def send(self, mask, canvas_node="", purpose="segment"):
+        m = mask
+        if m.dim() == 3:
+            m = m.max(dim=0).values if m.shape[0] > 1 else m[0]
+        m = m.detach().cpu().float().clamp(0, 1)
+        arr = (m.numpy() * 255).astype(np.uint8)
+        out_dir = os.path.join(folder_paths.get_temp_directory(), SUBFOLDER)
+        os.makedirs(out_dir, exist_ok=True)
+        filename = f"n{canvas_node or 'x'}_{purpose}_{time.strftime('%H%M%S')}_{int(time.time() * 1000) % 1000:03d}.png"
+        Image.fromarray(arr, "L").save(os.path.join(out_dir, filename), compress_level=1)
+        return {"ui": {"inpaint_mask": [{
+            "filename": filename, "subfolder": SUBFOLDER, "type": "temp",
+            "canvas_node": canvas_node, "purpose": purpose,
+            "width": int(arr.shape[1]), "height": int(arr.shape[0]),
+            "coverage": float(m.mean()),
+        }]}}
+
+
 NODE_CLASS_MAPPINGS = {
     "InpaintCanvas": InpaintCanvas,
     "InpaintCanvasStitch": InpaintCanvasStitch,
+    "InpaintCanvasLoadRef": InpaintCanvasLoadRef,
+    "InpaintCanvasMaskOut": InpaintCanvasMaskOut,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "InpaintCanvas": "Inpaint Canvas",
     "InpaintCanvasStitch": "Inpaint Canvas Stitch",
+    "InpaintCanvasLoadRef": "Inpaint Canvas Load Ref",
+    "InpaintCanvasMaskOut": "Inpaint Canvas Mask Out",
 }

@@ -248,6 +248,58 @@ function drawMesh(ctx, img, dst, nx, ny) {
 }
 
 // ---------------------------------------------------------------------------
+// text segmentation backends (each builds a small standalone prompt)
+// ---------------------------------------------------------------------------
+
+const SEGMENT_BACKENDS = [
+    {
+        id: "dino_sam",
+        label: "GroundingDINO + SAM",
+        needs: ["GroundingDinoModelLoader (segment anything)", "SAMModelLoader (segment anything)", "GroundingDinoSAMSegment (segment anything)"],
+        build: (load, text, threshold, opts) => ({
+            seg_dino: { class_type: "GroundingDinoModelLoader (segment anything)", inputs: { model_name: "GroundingDINO_SwinT_OGC (694MB)" } },
+            seg_sam: { class_type: "SAMModelLoader (segment anything)", inputs: { model_name: opts.quality ? "sam_vit_h (2.56GB)" : "sam_vit_b (375MB)" } },
+            seg_run: { class_type: "GroundingDinoSAMSegment (segment anything)", inputs: { sam_model: ["seg_sam", 0], grounding_dino_model: ["seg_dino", 0], image: [load, 0], prompt: text, threshold } },
+        }),
+        maskOut: ["seg_run", 1],
+    },
+    {
+        id: "sam3_core",
+        label: "SAM3 (core)",
+        needs: ["SAM3_Detect", "CheckpointLoaderSimple", "CLIPTextEncode"],
+        // The SAM3 checkpoint (sam3.safetensors from Hugging Face, license gated)
+        // goes into models/checkpoints and loads through the normal checkpoint loader.
+        checkpoint: () => {
+            const t = window.LiteGraph && LiteGraph.registered_node_types["CheckpointLoaderSimple"];
+            const list = t && t.nodeData && t.nodeData.input && t.nodeData.input.required && t.nodeData.input.required.ckpt_name;
+            const names = Array.isArray(list) && Array.isArray(list[0]) ? list[0] : [];
+            return names.find((n) => /sam3/i.test(n)) || null;
+        },
+        available: (b) => !!b.checkpoint(),
+        build: (load, text, threshold, opts, b) => ({
+            seg_ckpt: { class_type: "CheckpointLoaderSimple", inputs: { ckpt_name: b.checkpoint() } },
+            seg_text: { class_type: "CLIPTextEncode", inputs: { clip: ["seg_ckpt", 1], text } },
+            seg_run: { class_type: "SAM3_Detect", inputs: { model: ["seg_ckpt", 0], image: [load, 0], conditioning: ["seg_text", 0], threshold, refine_iterations: 2, individual_masks: false } },
+        }),
+        maskOut: ["seg_run", 0],
+    },
+    {
+        id: "sam3_rmbg",
+        label: "SAM3 (RMBG)",
+        needs: ["SAM3Segment"],
+        build: (load, text, threshold) => ({
+            seg_run: { class_type: "SAM3Segment", inputs: { image: [load, 0], prompt: text, output_mode: "Merged", confidence_threshold: Math.min(0.95, Math.max(0.05, threshold)) } },
+        }),
+        maskOut: ["seg_run", 1],
+    },
+];
+
+function availableSegmentBackends() {
+    const types = (window.LiteGraph && LiteGraph.registered_node_types) || {};
+    return SEGMENT_BACKENDS.filter((b) => b.needs.every((n) => !!types[n]) && (!b.available || b.available(b)));
+}
+
+// ---------------------------------------------------------------------------
 // icons (24x24, stroke based)
 // ---------------------------------------------------------------------------
 
@@ -287,6 +339,7 @@ const ICONS = {
     distort: '<path d="M5 6l14-2v14l-14 2z"/><circle cx="5" cy="6" r="1.6" fill="currentColor" stroke="none"/><circle cx="19" cy="4" r="1.6" fill="currentColor" stroke="none"/><circle cx="19" cy="18" r="1.6" fill="currentColor" stroke="none"/><circle cx="5" cy="20" r="1.6" fill="currentColor" stroke="none"/>',
     warp: '<path d="M4 6c4-3 12 3 16 0"/><path d="M4 12c4-3 12 3 16 0"/><path d="M4 18c4-3 12 3 16 0"/><path d="M8 4v16"/><path d="M16 4v16"/>',
     check: '<path d="M5 12l5 5 9-10"/>',
+    magic: '<path d="M4 20l10-10"/><path d="M15 3l1 2 2 1-2 1-1 2-1-2-2-1 2-1z" fill="currentColor" stroke="none"/><path d="M19 9l.7 1.3L21 11l-1.3.7L19 13l-.7-1.3L17 11l1.3-.7z" fill="currentColor" stroke="none"/><path d="M14 8l2 2"/>',
     extend: '<rect x="8" y="8" width="8" height="8"/><path d="M12 2v4"/><path d="M12 18v4"/><path d="M2 12h4"/><path d="M18 12h4"/><path d="M10 4l2-2 2 2"/><path d="M10 20l2 2 2-2"/><path d="M4 10l-2 2 2 2"/><path d="M20 10l2 2-2 2"/>',
 };
 
@@ -375,6 +428,11 @@ const STYLE = `
 .ipc-side h4 .ipc-grow, .ipc-side summary .ipc-grow { flex:1; }
 .ipc-side h4 .ipc-mini { width:24px; height:22px; }
 .ipc-sec { padding:8px 10px; display:flex; flex-wrap:wrap; gap:6px; align-items:center; color:#aaa; font-size:12px; }
+.ipc-sec .ipc-seg { display:flex; gap:6px; width:100%; align-items:center; }
+.ipc-sec .ipc-seg input[type=text] { flex:1; min-width:0; background:#161616; color:#ddd; border:1px solid #3a3a3a; border-radius:4px; padding:4px 6px; font:inherit; }
+.ipc-sec .ipc-seg input[type=text]:focus { outline:none; border-color:#4a90d9; }
+.ipc-sec .ipc-modes { display:flex; gap:2px; }
+.ipc-sec .ipc-modes .ipc-ib { padding:2px 7px; min-width:0; font-size:11px; border-radius:4px; }
 .ipc-sec .ipc-row4 { display:grid; grid-template-columns:auto 1fr auto 1fr; gap:4px 6px; align-items:center; width:100%; }
 .ipc-num { background:#161616; color:#ddd; border:1px solid #3a3a3a; border-radius:4px; padding:3px 5px; font:inherit; }
 .ipc-sel { background:#161616; color:#ccc; border:1px solid #3a3a3a; border-radius:4px; padding:2px 4px; font:11px system-ui, sans-serif; max-width:110px; }
@@ -677,6 +735,46 @@ class InpaintEditor {
             from.classList.add("ipc-small");
             sec.appendChild(from);
             d.appendChild(sec);
+
+            // select by text
+            const seg = el("div", "ipc-sec");
+            const row = el("div", "ipc-seg");
+            this.segInput = document.createElement("input");
+            this.segInput.type = "text";
+            this.segInput.placeholder = "Select by text, e.g. shirt";
+            this.segInput.spellcheck = false;
+            this.segInput.addEventListener("keydown", (e) => { e.stopPropagation(); if (e.key === "Enter") { e.preventDefault(); this.segmentByText(); } if (e.key === "Escape") { this.segInput.blur(); this.root.focus({ preventScroll: true }); } });
+            row.appendChild(this.segInput);
+            this.segBtn = iconButton("magic", "Run the segmentation model and turn the result into a selection (Enter in the field)", () => this.segmentByText(), "Go");
+            this.segBtn.classList.add("ipc-small", "ipc-primary");
+            row.appendChild(this.segBtn);
+            seg.appendChild(row);
+            const modes = el("div", "ipc-modes");
+            this.segModeButtons = {};
+            for (const [id, label, title] of [["replace", "Replace", "Replace the selection"], ["add", "Add", "Add to the selection"], ["subtract", "Subtract", "Remove from the selection"]]) {
+                const b = el("button", "ipc-ib", label); b.type = "button"; b.title = title;
+                b.addEventListener("click", (e) => { e.stopPropagation(); this.segMode = id; for (const [k, x] of Object.entries(this.segModeButtons)) x.classList.toggle("ipc-active", k === id); });
+                this.segModeButtons[id] = b;
+                modes.appendChild(b);
+            }
+            this.segMode = "replace";
+            this.segModeButtons.replace.classList.add("ipc-active");
+            seg.appendChild(modes);
+            const thrLab = el("label", null, "Threshold");
+            this.segThreshold = numberInput(0.3, 0.05, 0.95, "Detection threshold: lower finds more, higher is stricter", 56);
+            this.segThreshold.step = 0.05;
+            thrLab.appendChild(this.segThreshold);
+            seg.appendChild(thrLab);
+            const qualLab = el("label", null, "");
+            this.segQuality = document.createElement("input");
+            this.segQuality.type = "checkbox";
+            this.segQuality.title = "Use the large SAM model (slower, finer edges)";
+            qualLab.appendChild(this.segQuality);
+            qualLab.appendChild(el("span", null, "HQ"));
+            seg.appendChild(qualLab);
+            this.segBackendSel = selectInput(["auto"], "auto", "Segmentation backend");
+            seg.appendChild(this.segBackendSel);
+            d.appendChild(seg);
         });
 
         section("Canvas", false, (d) => {
@@ -970,6 +1068,7 @@ class InpaintEditor {
         };
         window.addEventListener("keydown", this._docKey, true);
         this.promptInput.value = this.promptText;
+        this.refreshSegmentBackends();
         this.root.focus({ preventScroll: true });
         this.resizeCanvas();
         this.fitView();
@@ -1562,6 +1661,100 @@ class InpaintEditor {
         this.markSelectionChanged();
         this.draw();
         this.setStatus(`Selection taken from ${layer.name}.`);
+    }
+
+    // ---- text segmentation -----------------------------------------------------
+
+    refreshSegmentBackends() {
+        if (!this.segBackendSel) return;
+        const avail = availableSegmentBackends();
+        const cur = this.segBackendSel.value;
+        this.segBackendSel.innerHTML = "";
+        for (const b of avail) { const o = document.createElement("option"); o.value = b.id; o.textContent = b.label; this.segBackendSel.appendChild(o); }
+        if (!avail.length) { const o = document.createElement("option"); o.value = ""; o.textContent = "no segmentation nodes installed"; this.segBackendSel.appendChild(o); }
+        if (avail.some((b) => b.id === cur)) this.segBackendSel.value = cur;
+        this.segBtn.disabled = !avail.length;
+    }
+
+    async segmentByText() {
+        if (!this.base) { this.setStatus("Load an image first."); return; }
+        const text = (this.segInput.value || "").trim();
+        if (!text) { this.setStatus("Type what to select, e.g. \"shirt\"."); this.segInput.focus(); return; }
+        const backend = SEGMENT_BACKENDS.find((b) => b.id === this.segBackendSel.value) || availableSegmentBackends()[0];
+        if (!backend) { this.setStatus("No segmentation nodes installed (comfyui_segment_anything or comfyui-rmbg)."); return; }
+        try {
+            this.segBtn.disabled = true;
+            this.setStatus(`Segmenting "${text}" with ${backend.label} ...`);
+            // The model sees what the inpaint chain would see: the flattened visible layers.
+            let ref = this.uploaded.baseRef;
+            if (!this.uploaded.baseHash || !ref) {
+                if (!this.layers.some((l) => l.visible && !this.isControl(l)) && this.base.ref) {
+                    ref = this.base.ref;
+                    this.uploaded.baseHash = "orig:" + this.base.ref.filename;
+                } else {
+                    const up = await uploadCanvas(this.flattenToCanvas({ forRun: true }), `n${this.node.id}_base`);
+                    ref = up.ref; this.uploaded.baseHash = up.hash;
+                }
+                this.uploaded.baseRef = ref;
+            }
+            const threshold = Math.min(0.95, Math.max(0.05, +this.segThreshold.value || 0.3));
+            const prompt = {
+                seg_load: { class_type: "InpaintCanvasLoadRef", inputs: { ref: JSON.stringify(ref) } },
+                ...backend.build("seg_load", text, threshold, { quality: this.segQuality.checked }, backend),
+                seg_out: { class_type: "InpaintCanvasMaskOut", inputs: { mask: backend.maskOut, canvas_node: String(this.node.id), purpose: "segment" } },
+            };
+            const res = await api.queuePrompt(-1, { output: prompt, workflow: { nodes: [], links: [], version: 0.4, extra: { inpaint_canvas_helper: true } } });
+            this.segmentPromptId = res && res.prompt_id;
+            this.segmentPending = { text, mode: this.segMode };
+            if (res && res.node_errors && Object.keys(res.node_errors).length) {
+                const first = Object.values(res.node_errors)[0];
+                throw new Error((first.errors && first.errors[0] && first.errors[0].message) || "prompt rejected");
+            }
+        } catch (err) {
+            console.error(err);
+            this.segmentPending = null;
+            this.segBtn.disabled = false;
+            this.setStatus("Segmentation failed: " + (err.message || err));
+        }
+    }
+
+    /** A mask came back from a helper prompt: merge it into the selection. */
+    async applyMaskFile(info) {
+        const pending = this.segmentPending || { mode: "replace", text: "" };
+        this.segmentPending = null;
+        this.segBtn.disabled = false;
+        try {
+            const img = await loadImageEl(viewUrl({ filename: info.filename, subfolder: info.subfolder || SUBFOLDER, type: info.type || "temp" }));
+            if (!this.selection) return;
+            this.pushUndo({ kind: "selection" });
+            const tmp = makeCanvas(this.width, this.height);
+            const tctx = tmp.getContext("2d");
+            tctx.drawImage(img, 0, 0, this.width, this.height);
+            const src = tctx.getImageData(0, 0, this.width, this.height).data;
+            const shape = makeCanvas(this.width, this.height);
+            const sh = shape.getContext("2d");
+            const out = sh.createImageData(this.width, this.height);
+            const d = out.data;
+            let count = 0;
+            for (let i = 0; i < src.length; i += 4) {
+                const on = src[i] > 127;
+                d[i] = 255; d[i + 1] = 0; d[i + 2] = 0; d[i + 3] = on ? 255 : 0;
+                if (on) count++;
+            }
+            sh.putImageData(out, 0, 0);
+            const sctx = this.selection.getContext("2d");
+            if (pending.mode === "replace") sctx.clearRect(0, 0, this.width, this.height);
+            sctx.globalCompositeOperation = pending.mode === "subtract" ? "destination-out" : "source-over";
+            sctx.drawImage(shape, 0, 0);
+            sctx.globalCompositeOperation = "source-over";
+            this.markSelectionChanged();
+            this.draw();
+            const pct = Math.round(100 * count / (this.width * this.height));
+            this.setStatus(count ? `Selected "${pending.text}" (${pct}% of the image, ${pending.mode}).` : `Nothing found for "${pending.text}". Lower the threshold or rephrase.`);
+        } catch (err) {
+            console.error(err);
+            this.setStatus("Could not apply the mask: " + (err.message || err));
+        }
     }
 
     // ---- outpainting ---------------------------------------------------------
@@ -2565,6 +2758,25 @@ app.registerExtension({
             const id = detail && (detail.node_id || "");
             const node = app.graph.getNodeById(+String(id).split(".")[0]);
             if (node && node.inpaintEditor) node.inpaintEditor.setStatus("Error: " + (detail.exception_message || "execution failed"));
+            // helper prompts (segmentation) carry ids that are not graph nodes
+            for (const n of app.graph._nodes) {
+                const ed = n.inpaintEditor;
+                if (ed && ed.segmentPromptId && detail && detail.prompt_id === ed.segmentPromptId) {
+                    ed.segmentPending = null;
+                    ed.segBtn.disabled = false;
+                    ed.setStatus("Segmentation failed: " + (detail.exception_message || "execution failed"));
+                }
+            }
+        });
+
+        // Masks produced by helper prompts are routed to their canvas by id.
+        api.addEventListener("executed", ({ detail }) => {
+            const out = detail && detail.output;
+            if (!out || !out.inpaint_mask) return;
+            for (const info of out.inpaint_mask) {
+                const node = app.graph.getNodeById(+info.canvas_node);
+                if (node && node.inpaintEditor) node.inpaintEditor.applyMaskFile(info);
+            }
         });
     },
 });
