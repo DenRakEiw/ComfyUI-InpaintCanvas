@@ -1098,6 +1098,9 @@ class InpaintEditor {
             const from = iconButton("fromLayer", "Replace the selection with the opaque area of the active layer", () => this.selectionFromLayer(), "From layer");
             from.classList.add("ipc-small");
             sec.appendChild(from);
+            const clr = iconButton("erase", "Clear: delete the selected pixels of the active layer (Del). Invert the selection first to keep only the selection.", () => this.clearSelectedPixels(), "Clear");
+            clr.classList.add("ipc-small");
+            sec.appendChild(clr);
             d.appendChild(sec);
 
             // select by text
@@ -1771,7 +1774,11 @@ class InpaintEditor {
             case "t": this.setTool("transform"); break;
             case "h": this.setTool("hand"); break;
             case "f": this.fitView(); break;
-            case "delete": case "backspace": { const l = this.activeLayer(); if (l) this.removeLayer(l.id); break; }
+            case "delete": case "backspace": {
+                // with a selection: clear the selected pixels of the active layer (Krita / Photoshop); without: delete the layer
+                if (this.getBounds()) { this.clearSelectedPixels(); break; }
+                const l = this.activeLayer(); if (l) this.removeLayer(l.id); break;
+            }
             case "[": this.setBrushSize(Math.round(this.brushSize / 1.2)); break;
             case "]": this.setBrushSize(Math.round(this.brushSize * 1.2)); break;
             case " ":
@@ -2305,6 +2312,26 @@ class InpaintEditor {
         ctx.restore();
         this.markLayerChanged(layer);
         this.draw();
+    }
+
+    /** Delete the selected pixels of the active layer (Krita "Clear"); on a mask in edit mode it hides them. */
+    clearSelectedPixels() {
+        if (!this.selection || !this.getBounds()) { this.setStatus("Nothing selected. Make a selection first, invert it to keep only the selected part."); return; }
+        const layer = this.activeLayer();
+        if (!layer) { this.setStatus("The base layer cannot be erased. Select a layer, or paint on the base first to get a layer."); return; }
+        const onMask = !!(layer.mask && layer.maskEdit);
+        if (layer.kind === "filter" && !onMask) { this.setStatus("Filter layers have no pixels. Use \"mask from selection\" to limit the filter instead."); return; }
+        this.pushUndo(onMask ? { kind: "mask", id: layer.id } : { kind: "layer", id: layer.id });
+        const target = onMask ? layer.mask : layer.canvas;
+        const ctx = target.getContext("2d");
+        ctx.save();
+        ctx.globalCompositeOperation = "destination-out";
+        ctx.setTransform(target.width / layer.w, 0, 0, target.height / layer.h, 0, 0);
+        ctx.drawImage(this.selection, -layer.x, -layer.y);
+        ctx.restore();
+        if (onMask) this.markMaskChanged(layer); else this.markLayerChanged(layer);
+        this.draw();
+        this.setStatus(`${layer.name}: selected ${onMask ? "part of the mask hidden" : "pixels cleared"}.`);
     }
 
     // ---- selection: grow / shrink / from layer ------------------------------

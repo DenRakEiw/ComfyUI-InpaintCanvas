@@ -125,7 +125,10 @@ size, hardness, opacity and the paint colour.
   can pick objects inside a result or paint layer without the base
   interfering. Applies to both select by text and object selection.
 - **Grow / Shrink** by n pixels (exact distance transform), **From layer**
-  takes the opaque area of the active layer. Clear (Ctrl+D), invert (Ctrl+I).
+  takes the opaque area of the active layer. Clear the selection (Ctrl+D),
+  invert it (Ctrl+I). **Clear** (Del) deletes the selected pixels of the
+  active layer, like Krita: select what you want to keep, invert, Del.
+  Without a selection, Del deletes the active layer.
 
 ### Layers
 
@@ -374,7 +377,8 @@ and files stay.
 | Ctrl+Z, Ctrl+Shift+Z, Ctrl+Y | undo, redo                               |
 | Ctrl+D, Ctrl+I               | clear, invert selection                  |
 | Shift+F                      | fill selection with colour               |
-| Ctrl+Shift+N, Delete         | new paint layer, delete active layer     |
+| Ctrl+Shift+N                 | new paint layer                          |
+| Delete                       | clear the selected pixels of the active layer; without a selection delete the layer |
 | Ctrl+U                       | upsample prompt                          |
 | Ctrl+S                       | save the finished image                  |
 | Ctrl+Enter                   | generate                                 |
