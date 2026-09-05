@@ -16,18 +16,33 @@ full-window editor.
 Editor
 
 - **Load** an image, paste one with Ctrl+V, or drop a file onto the canvas.
-- **Select** tools on the left: brush (B), rectangle (R), lasso (L), deselect
-  brush (D). The loop toggle below them closes brush strokes Photoshop-style:
-  paint a closed ring and the inside is selected too.
+- **Select** tools on the left: brush (B), rectangle (R), lasso (L), object
+  selection (O), deselect brush (D). The loop toggle below them closes brush
+  strokes Photoshop-style: paint a closed ring and the inside is selected too.
+- **Object selection (O)**: the first time you pick the tool, SAM2 finds every
+  object in the image once (a few seconds). After that, moving the mouse
+  highlights the object under the cursor; click adds it to the selection,
+  click again removes it, Shift always adds, Alt always subtracts. Small
+  objects win over the large ones that contain them (a face over the person).
+  The object map is refreshed automatically when the image changes. Needs
+  ComfyUI-segment-anything-2 (Kijai) with `sam2_hiera_base_plus` in
+  `models/sam2`.
 - **Selection** section: grow or shrink by n pixels (exact distance
   transform), or take the selection from the opaque area of the active layer.
 - **Select by text**: type what you want ("shirt", "hair", "the red car"),
   press Go or Enter. A small helper prompt runs at the front of the queue
   (only the segmentation nodes, never your generation chain) and the mask
-  comes back as the selection: Replace, Add or Subtract. Backends: GroundingDINO
-  + SAM (comfyui_segment_anything, HQ toggle picks the large SAM), SAM3 via the
-  core nodes once a `sam3*` checkpoint sits in `models/checkpoints`, or the
-  RMBG SAM3 node. Threshold: lower finds more.
+  comes back as the selection: Replace, Add or Subtract. Backends, best first:
+  SAM3 (comfyui-rmbg's node, weights `models/sam3/sam3.pt`), GroundingDINO
+  + SAM (comfyui_segment_anything, HQ toggle picks the large SAM), and the
+  core SAM3 nodes (experimental: on the machine this was built on they return
+  noise for text prompts). Threshold: lower finds more.
+- **Source** (Selection section): what the segmentation models look at.
+  *image* is the flattened visible layers, exactly what the inpaint chain
+  sees. *active layer* shows the model only that layer on neutral grey and
+  clips the result to the layer's pixels, so you can pick objects inside a
+  result or paint layer without the base interfering. Applies to both select
+  by text and object selection.
 - **Layer** tools: paint (P), eraser (E), fill selection with color (Shift+F),
   transform (T), hand (H) to pan. Painting on the base creates a paint layer
   automatically; the base itself is never erased.
@@ -100,7 +115,10 @@ Outputs
 
 `Inpaint Canvas Load Ref` loads an image by a `{filename, subfolder, type}`
 JSON reference and `Inpaint Canvas Mask Out` hands a MASK back to the editor.
-The editor uses both for "Select by text"; you can also wire them yourself.
+`Inpaint Canvas Object Map` runs SAM2's automatic mask generator (model from
+Kijai's `DownloadAndLoadSAM2Model` with segmentor `automaskgenerator`) and
+hands the editor an object label map. The editor uses them for "Select by
+text" and object selection; you can also wire them yourself.
 
 ### Inpaint Canvas Stitch (`InpaintCanvasStitch`)
 

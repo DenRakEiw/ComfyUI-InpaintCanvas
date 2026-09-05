@@ -368,7 +368,8 @@ class InpaintCanvasLoadRef:
 
 
 class InpaintCanvasMaskOut:
-    """Hand a mask back to the canvas editor (used by the editor's text segmentation)."""
+    """Hand a mask back to the canvas editor (text segmentation) or, with purpose
+    "segments", a whole mask batch encoded as an object label map (hover selection)."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -386,20 +387,113 @@ class InpaintCanvasMaskOut:
     OUTPUT_NODE = True
 
     def send(self, mask, canvas_node="", purpose="segment"):
-        m = mask
-        if m.dim() == 3:
-            m = m.max(dim=0).values if m.shape[0] > 1 else m[0]
-        m = m.detach().cpu().float().clamp(0, 1)
-        arr = (m.numpy() * 255).astype(np.uint8)
         out_dir = os.path.join(folder_paths.get_temp_directory(), SUBFOLDER)
         os.makedirs(out_dir, exist_ok=True)
         filename = f"n{canvas_node or 'x'}_{purpose}_{time.strftime('%H%M%S')}_{int(time.time() * 1000) % 1000:03d}.png"
+        info = {"filename": filename, "subfolder": SUBFOLDER, "type": "temp", "canvas_node": canvas_node, "purpose": purpose}
+        m = mask.detach().cpu().float().clamp(0, 1)
+        if m.dim() == 2:
+            m = m[None]
+        if purpose == "segments":
+            # Object map for the editor's hover selection: every mask of the batch
+            # becomes one label, small objects are painted over large ones so the
+            # smallest object under the cursor wins. Label id = R + 256 * G, 0 = none.
+            binary = m > 0.5
+            areas = binary.flatten(1).sum(dim=1)
+            order = torch.argsort(areas, descending=True)
+            labels = np.zeros((m.shape[1], m.shape[2]), dtype=np.uint16)
+            count = 0
+            for idx in order.tolist():
+                if areas[idx] <= 0:
+                    continue
+                count += 1
+                labels[binary[idx].numpy()] = count
+            rgb = np.zeros((labels.shape[0], labels.shape[1], 3), dtype=np.uint8)
+            rgb[..., 0] = labels & 255
+            rgb[..., 1] = labels >> 8
+            Image.fromarray(rgb, "RGB").save(os.path.join(out_dir, filename), compress_level=1)
+            info.update({"width": int(labels.shape[1]), "height": int(labels.shape[0]), "count": int(count)})
+            return {"ui": {"inpaint_mask": [info]}}
+        merged = m.max(dim=0).values if m.shape[0] > 1 else m[0]
+        arr = (merged.numpy() * 255).astype(np.uint8)
         Image.fromarray(arr, "L").save(os.path.join(out_dir, filename), compress_level=1)
+        info.update({"width": int(arr.shape[1]), "height": int(arr.shape[0]), "coverage": float(merged.mean())})
+        return {"ui": {"inpaint_mask": [info]}}
+
+
+class InpaintCanvasObjectMap:
+    """Find every object in an image with SAM2's automatic mask generator and hand the
+    editor an object label map for its hover selection tool.
+
+    `sam2_model` comes from ComfyUI-segment-anything-2 (Kijai), loaded with segmentor
+    "automaskgenerator". The label map is an RGB PNG with id = R + 256 * G, 0 = no
+    object; small objects are painted over large ones so the smallest object under
+    the cursor wins. Kijai's own auto-segmentation node only outputs the union mask."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "sam2_model": ("SAM2MODEL",),
+                "image": ("IMAGE",),
+                "canvas_node": ("STRING", {"default": "", "tooltip": "Id of the Inpaint Canvas node that asked for the objects."}),
+                "points_per_side": ("INT", {"default": 32, "min": 8, "max": 64, "tooltip": "Sampling grid; more points find smaller objects and take longer."}),
+                "pred_iou_thresh": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "stability_score_thresh": ("FLOAT", {"default": 0.92, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "min_area": ("FLOAT", {"default": 0.0002, "min": 0.0, "max": 0.5, "step": 0.0001, "tooltip": "Objects smaller than this fraction of the image are dropped."}),
+            },
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "run"
+    CATEGORY = "image/inpaint"
+    OUTPUT_NODE = True
+
+    def run(self, sam2_model, image, canvas_node="", points_per_side=32, pred_iou_thresh=0.8, stability_score_thresh=0.92, min_area=0.0002):
+        from contextlib import nullcontext
+        import comfy.model_management as mm
+
+        if sam2_model.get("segmentor") != "automaskgenerator":
+            raise ValueError("Load the SAM2 model with segmentor = automaskgenerator for the object map.")
+        model = sam2_model["model"]
+        device = sam2_model["device"]
+        dtype = sam2_model["dtype"]
+        model.points_per_side = int(points_per_side)
+        model.points_per_batch = 64
+        model.pred_iou_thresh = float(pred_iou_thresh)
+        model.stability_score_thresh = float(stability_score_thresh)
+        model.stability_score_offset = 1.0
+        model.crop_n_layers = 0
+        model.box_nms_thresh = 0.7
+        model.min_mask_region_area = 0
+        model.use_m2m = False
+        model.mask_threshold = 0.0
+        model.predictor.model.to(device)
+
+        img_np = (image[0:1].contiguous() * 255).byte().cpu().numpy()[0]
+        H, W = img_np.shape[:2]
+        ctx = torch.autocast(mm.get_autocast_device(device), dtype=dtype) if not mm.is_device_mps(device) else nullcontext()
+        with ctx:
+            results = model.generate(img_np)
+
+        min_px = max(1, int(min_area * H * W))
+        results = [r for r in results if int(r.get("area", r["segmentation"].sum())) >= min_px]
+        results.sort(key=lambda r: int(r.get("area", r["segmentation"].sum())), reverse=True)
+        labels = np.zeros((H, W), dtype=np.uint16)
+        for i, r in enumerate(results):
+            labels[np.asarray(r["segmentation"], dtype=bool)] = i + 1
+        rgb = np.zeros((H, W, 3), dtype=np.uint8)
+        rgb[..., 0] = labels & 255
+        rgb[..., 1] = labels >> 8
+
+        out_dir = os.path.join(folder_paths.get_temp_directory(), SUBFOLDER)
+        os.makedirs(out_dir, exist_ok=True)
+        filename = f"n{canvas_node or 'x'}_segments_{time.strftime('%H%M%S')}_{int(time.time() * 1000) % 1000:03d}.png"
+        Image.fromarray(rgb, "RGB").save(os.path.join(out_dir, filename), compress_level=1)
         return {"ui": {"inpaint_mask": [{
             "filename": filename, "subfolder": SUBFOLDER, "type": "temp",
-            "canvas_node": canvas_node, "purpose": purpose,
-            "width": int(arr.shape[1]), "height": int(arr.shape[0]),
-            "coverage": float(m.mean()),
+            "canvas_node": canvas_node, "purpose": "segments",
+            "width": int(W), "height": int(H), "count": len(results),
         }]}}
 
 
@@ -408,6 +502,7 @@ NODE_CLASS_MAPPINGS = {
     "InpaintCanvasStitch": InpaintCanvasStitch,
     "InpaintCanvasLoadRef": InpaintCanvasLoadRef,
     "InpaintCanvasMaskOut": InpaintCanvasMaskOut,
+    "InpaintCanvasObjectMap": InpaintCanvasObjectMap,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -415,4 +510,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "InpaintCanvasStitch": "Inpaint Canvas Stitch",
     "InpaintCanvasLoadRef": "Inpaint Canvas Load Ref",
     "InpaintCanvasMaskOut": "Inpaint Canvas Mask Out",
+    "InpaintCanvasObjectMap": "Inpaint Canvas Object Map",
 }

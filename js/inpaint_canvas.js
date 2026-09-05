@@ -253,6 +253,21 @@ function drawMesh(ctx, img, dst, nx, ny) {
 
 const SEGMENT_BACKENDS = [
     {
+        id: "sam3_rmbg",
+        label: "SAM3",
+        needs: ["SAM3Segment"],
+        // comfyui-rmbg's SAM3 node. Its optional inputs have no defaults in the
+        // Python signature, so every one of them must be sent. Weights: models/sam3/sam3.pt.
+        build: (load, text, threshold) => ({
+            seg_run: { class_type: "SAM3Segment", inputs: {
+                image: [load, 0], prompt: text, output_mode: "Merged", confidence_threshold: Math.min(0.95, Math.max(0.05, threshold)),
+                max_segments: 0, segment_pick: 0, mask_blur: 0, mask_offset: 0, device: "Auto", invert_output: false, unload_model: false,
+                background: "Alpha", background_color: "#222222",
+            } },
+        }),
+        maskOut: ["seg_run", 1],
+    },
+    {
         id: "dino_sam",
         label: "GroundingDINO + SAM",
         needs: ["GroundingDinoModelLoader (segment anything)", "SAMModelLoader (segment anything)", "GroundingDinoSAMSegment (segment anything)"],
@@ -265,7 +280,7 @@ const SEGMENT_BACKENDS = [
     },
     {
         id: "sam3_core",
-        label: "SAM3 (core)",
+        label: "SAM3 (core, experimental)",
         needs: ["SAM3_Detect", "CheckpointLoaderSimple", "CLIPTextEncode"],
         // The SAM3 checkpoint (sam3.safetensors from Hugging Face, license gated)
         // goes into models/checkpoints and loads through the normal checkpoint loader.
@@ -283,20 +298,33 @@ const SEGMENT_BACKENDS = [
         }),
         maskOut: ["seg_run", 0],
     },
-    {
-        id: "sam3_rmbg",
-        label: "SAM3 (RMBG)",
-        needs: ["SAM3Segment"],
-        build: (load, text, threshold) => ({
-            seg_run: { class_type: "SAM3Segment", inputs: { image: [load, 0], prompt: text, output_mode: "Merged", confidence_threshold: Math.min(0.95, Math.max(0.05, threshold)) } },
-        }),
-        maskOut: ["seg_run", 1],
-    },
 ];
 
 function availableSegmentBackends() {
     const types = (window.LiteGraph && LiteGraph.registered_node_types) || {};
     return SEGMENT_BACKENDS.filter((b) => b.needs.every((n) => !!types[n]) && (!b.available || b.available(b)));
+}
+
+// Object map for the hover selection tool: SAM2's automatic mask generator
+// (ComfyUI-segment-anything-2 by Kijai) finds every object once, the editor then
+// picks objects under the cursor without further model runs.
+const OBJECT_BACKEND = {
+    label: "SAM2",
+    // Kijai's loader gives the automatic mask generator; our own node runs it and
+    // encodes the label map (Kijai's auto node only outputs the union mask).
+    needs: ["DownloadAndLoadSAM2Model", "InpaintCanvasObjectMap"],
+    build: (load, canvasNode) => ({
+        obj_model: { class_type: "DownloadAndLoadSAM2Model", inputs: { model: "sam2_hiera_base_plus.safetensors", segmentor: "automaskgenerator", device: "cuda", precision: "fp16" } },
+        obj_run: { class_type: "InpaintCanvasObjectMap", inputs: {
+            sam2_model: ["obj_model", 0], image: [load, 0], canvas_node: canvasNode,
+            points_per_side: 32, pred_iou_thresh: 0.8, stability_score_thresh: 0.92, min_area: 0.0002,
+        } },
+    }),
+};
+
+function objectBackendAvailable() {
+    const types = (window.LiteGraph && LiteGraph.registered_node_types) || {};
+    return OBJECT_BACKEND.needs.every((n) => !!types[n]);
 }
 
 // ---------------------------------------------------------------------------
@@ -309,6 +337,7 @@ const ICONS = {
     loop: '<circle cx="12" cy="12" r="7" stroke-dasharray="3 2"/><circle cx="12" cy="12" r="3.5" fill="currentColor" stroke="none"/>',
     rect: '<rect x="4" y="5" width="16" height="14" rx="1" stroke-dasharray="3 2"/>',
     lasso: '<path d="M12 4c4.4 0 8 2.2 8 5s-3.6 5-8 5-8-2.2-8-5 3.6-5 8-5z"/><path d="M6 12.5c-1 2 0 3.5 2 3.5s3 1.5 2 4"/>',
+    object: '<path d="M4 9c0-3 3-5 6-5s6 1 6 4-2 3-2 5 1 3-1 4-4 1-6-1-3-4-3-7z" stroke-dasharray="3 2"/><path d="M13 12l7 3-3 1-1 3z" fill="currentColor" stroke="none"/>',
     paint: '<path d="M14 4l6 6-9 9H5v-6z"/><path d="M12 6l6 6"/><path d="M5 19c-1 0-2-1-2-2"/>',
     erase: '<path d="M4 15l8-8 6 6-5 5H8z"/><path d="M13 21h7"/>',
     fill: '<path d="M5 11l7-7 7 7-7 7z"/><path d="M12 4v6"/><path d="M19 15c0 2-1 3-2 4-1-1-2-2-2-4 0-1 2-3 2-3s2 2 2 3z" fill="currentColor" stroke="none"/>',
@@ -522,6 +551,11 @@ class InpaintEditor {
         this.pointer = null;
         this.lassoPoints = null;
         this.hover = null;
+        this.objects = null;            // {hash, w, h, ids: Uint16Array, count, layerId}
+        this.objectsPending = null;
+        this.objectShapeCache = new Map();
+        this.hoverObjectId = 0;
+        this.hoverObjectCanvas = null;
         this.status = "No image loaded.";
         this.isOpen = false;
 
@@ -665,6 +699,7 @@ class InpaintEditor {
         addTool("select", "Paint selection (B)");
         addTool("rect", "Rectangle selection (R)");
         addTool("lasso", "Lasso selection (L)");
+        addTool("object", "Object selection (O): hover to see objects, click to select, click again to deselect. Shift adds, Alt subtracts.");
         addTool("deselect", "Erase from selection (D)");
         this.loopBtn = iconButton("loop", "Close loops: a brush stroke that encloses an area selects the inside too (Photoshop-style)", () => {
             this.fillEnclosed = !this.fillEnclosed;
@@ -772,6 +807,11 @@ class InpaintEditor {
             qualLab.appendChild(this.segQuality);
             qualLab.appendChild(el("span", null, "HQ"));
             seg.appendChild(qualLab);
+            const srcLab = el("label", null, "Source");
+            this.segSourceSel = selectInput(["image", "active layer"], "image", "What the model sees: the flattened image, or only the active layer (the result is clipped to that layer)");
+            this.segSourceSel.addEventListener("change", () => { if (this.tool === "object") this.ensureObjects(); });
+            srcLab.appendChild(this.segSourceSel);
+            seg.appendChild(srcLab);
             this.segBackendSel = selectInput(["auto"], "auto", "Segmentation backend");
             seg.appendChild(this.segBackendSel);
             d.appendChild(seg);
@@ -1136,7 +1176,7 @@ class InpaintEditor {
         this.canvas.addEventListener("pointermove", (e) => this.onPointerMove(e));
         this.canvas.addEventListener("pointerup", (e) => this.onPointerUp(e));
         this.canvas.addEventListener("pointercancel", (e) => this.onPointerUp(e));
-        this.canvas.addEventListener("pointerleave", () => { this.hover = null; this.draw(); });
+        this.canvas.addEventListener("pointerleave", () => { this.hover = null; this.hoverObjectId = 0; this.hoverObjectCanvas = null; this.draw(); });
     }
 
     setStatus(text) {
@@ -1152,6 +1192,8 @@ class InpaintEditor {
         this.viewEl.classList.toggle("ipc-pan", tool === "hand");
         this.viewEl.classList.toggle("ipc-move", tool === "transform");
         if (tool !== "transform") this.viewEl.classList.remove("ipc-scale", "ipc-scale-x", "ipc-scale-y", "ipc-rotate");
+        if (tool !== "object") { this.hoverObjectId = 0; this.hoverObjectCanvas = null; }
+        else this.ensureObjects();
         this.updateSubbar();
         this.draw();
     }
@@ -1185,6 +1227,7 @@ class InpaintEditor {
             case "b": this.setTool("select"); break;
             case "r": this.setTool("rect"); break;
             case "l": this.setTool("lasso"); break;
+            case "o": this.setTool("object"); break;
             case "d": this.setTool("deselect"); break;
             case "p": this.setTool("paint"); break;
             case "e": this.setTool("erase"); break;
@@ -1339,6 +1382,8 @@ class InpaintEditor {
             this.pushUndo({ kind: "selection" });
             this.pointer = { kind: "lasso" };
             this.lassoPoints = [[ix, iy]];
+        } else if (this.tool === "object") {
+            this.pointer = { kind: "object", start: [cx, cy], moved: false, shift: e.shiftKey, alt: e.altKey };
         } else if (this.tool === "paint" || this.tool === "erase") {
             let layer = this.activeLayer();
             if (!layer) {
@@ -1372,8 +1417,14 @@ class InpaintEditor {
         const p = this.pointer;
         if (!p) {
             if (this.tool === "transform") this.updateTransformCursor(ix, iy);
+            if (this.tool === "object") this.updateObjectHover(ix, iy);
             this.draw();
             return;
+        }
+        if (p.kind === "object") {
+            const [cx, cy] = this.toCanvasPx(e);
+            if (Math.hypot(cx - p.start[0], cy - p.start[1]) > 4) p.moved = true;
+            this.updateObjectHover(ix, iy);
         }
         if (p.kind === "pan") {
             const [cx, cy] = this.toCanvasPx(e);
@@ -1454,6 +1505,8 @@ class InpaintEditor {
         } else if (p.kind === "selpaint") {
             if (this.tool === "select" && this.fillEnclosed) this.fillEnclosedAreas();
             this.markSelectionChanged();
+        } else if (p.kind === "object") {
+            if (!p.moved) this.toggleObjectAt(...this.toImage(e), p);
         } else if (p.kind === "layerpaint") {
             this.commitStroke(p);
             this.markLayerChanged(p.layer);
@@ -1685,18 +1738,7 @@ class InpaintEditor {
         try {
             this.segBtn.disabled = true;
             this.setStatus(`Segmenting "${text}" with ${backend.label} ...`);
-            // The model sees what the inpaint chain would see: the flattened visible layers.
-            let ref = this.uploaded.baseRef;
-            if (!this.uploaded.baseHash || !ref) {
-                if (!this.layers.some((l) => l.visible && !this.isControl(l)) && this.base.ref) {
-                    ref = this.base.ref;
-                    this.uploaded.baseHash = "orig:" + this.base.ref.filename;
-                } else {
-                    const up = await uploadCanvas(this.flattenToCanvas({ forRun: true }), `n${this.node.id}_base`);
-                    ref = up.ref; this.uploaded.baseHash = up.hash;
-                }
-                this.uploaded.baseRef = ref;
-            }
+            const { ref, layer } = await this.segmentSource();
             const threshold = Math.min(0.95, Math.max(0.05, +this.segThreshold.value || 0.3));
             const prompt = {
                 seg_load: { class_type: "InpaintCanvasLoadRef", inputs: { ref: JSON.stringify(ref) } },
@@ -1705,7 +1747,7 @@ class InpaintEditor {
             };
             const res = await api.queuePrompt(-1, { output: prompt, workflow: { nodes: [], links: [], version: 0.4, extra: { inpaint_canvas_helper: true } } });
             this.segmentPromptId = res && res.prompt_id;
-            this.segmentPending = { text, mode: this.segMode };
+            this.segmentPending = { text, mode: this.segMode, layer };
             if (res && res.node_errors && Object.keys(res.node_errors).length) {
                 const first = Object.values(res.node_errors)[0];
                 throw new Error((first.errors && first.errors[0] && first.errors[0].message) || "prompt rejected");
@@ -1716,6 +1758,163 @@ class InpaintEditor {
             this.segBtn.disabled = false;
             this.setStatus("Segmentation failed: " + (err.message || err));
         }
+    }
+
+    /**
+     * What a segmentation model should look at, as an uploaded reference.
+     * "image": the flattened visible layers (what the inpaint chain sees).
+     * "active layer": only that layer on neutral grey; results are clipped to its alpha.
+     */
+    async segmentSource() {
+        const layerMode = this.segSourceSel && this.segSourceSel.value === "active layer";
+        if (layerMode) {
+            const layer = this.activeLayer();
+            if (!layer) throw new Error("no active layer: pick a layer in the list or set Source to image");
+            const c = makeCanvas(this.width, this.height);
+            const ctx = c.getContext("2d");
+            ctx.fillStyle = "#808080";
+            ctx.fillRect(0, 0, this.width, this.height);
+            ctx.drawImage(layer.canvas, layer.x, layer.y, layer.w, layer.h);
+            const up = await uploadCanvas(c, `n${this.node.id}_segsrc`);
+            return { ref: up.ref, hash: `layer:${layer.id}:${up.hash}`, layer };
+        }
+        let ref = this.uploaded.baseRef;
+        if (!this.uploaded.baseHash || !ref) {
+            if (!this.layers.some((l) => l.visible && !this.isControl(l)) && this.base.ref) {
+                ref = this.base.ref;
+                this.uploaded.baseHash = "orig:" + this.base.ref.filename;
+            } else {
+                const up = await uploadCanvas(this.flattenToCanvas({ forRun: true }), `n${this.node.id}_base`);
+                ref = up.ref; this.uploaded.baseHash = up.hash;
+            }
+            this.uploaded.baseRef = ref;
+        }
+        return { ref, hash: this.uploaded.baseHash, layer: null };
+    }
+
+    /** Uint8Array (W*H) with 1 where the layer is opaque, in image coordinates. */
+    layerAlpha(layer) {
+        const c = makeCanvas(this.width, this.height);
+        const ctx = c.getContext("2d");
+        ctx.drawImage(layer.canvas, layer.x, layer.y, layer.w, layer.h);
+        const a = ctx.getImageData(0, 0, this.width, this.height).data;
+        const out = new Uint8Array(this.width * this.height);
+        for (let i = 3, j = 0; i < a.length; i += 4, j++) out[j] = a[i] > 0 ? 1 : 0;
+        return out;
+    }
+
+    // ---- object selection (hover) ---------------------------------------------
+
+    /** Make sure the object map matches the current source; run SAM2 if not. */
+    async ensureObjects() {
+        if (!this.base || this.objectsPending) return;
+        if (!objectBackendAvailable()) { this.setStatus("Object selection needs ComfyUI-segment-anything-2 (Kijai) for the SAM2 automatic mask generator."); return; }
+        this.objectsPending = { stage: "upload" };
+        try {
+            const { ref, hash, layer } = await this.segmentSource();
+            if (this.objects && this.objects.hash === hash && this.objects.w === this.width && this.objects.h === this.height) { this.objectsPending = null; return; }
+            this.setStatus(`Finding objects with ${OBJECT_BACKEND.label} ...`);
+            const prompt = {
+                obj_load: { class_type: "InpaintCanvasLoadRef", inputs: { ref: JSON.stringify(ref) } },
+                ...OBJECT_BACKEND.build("obj_load", String(this.node.id)),
+            };
+            const res = await api.queuePrompt(-1, { output: prompt, workflow: { nodes: [], links: [], version: 0.4, extra: { inpaint_canvas_helper: true } } });
+            if (res && res.node_errors && Object.keys(res.node_errors).length) {
+                const first = Object.values(res.node_errors)[0];
+                throw new Error((first.errors && first.errors[0] && first.errors[0].message) || "prompt rejected");
+            }
+            this.objectsPending = { stage: "run", hash, layer, promptId: res && res.prompt_id };
+            this.objectsPromptId = res && res.prompt_id;
+        } catch (err) {
+            console.error(err);
+            this.objectsPending = null;
+            this.setStatus("Object detection failed: " + (err.message || err));
+        }
+    }
+
+    /** The label map came back: decode R + 256*G into object ids. */
+    async applySegmentsFile(info) {
+        const pending = this.objectsPending || {};
+        this.objectsPending = null;
+        try {
+            const img = await loadImageEl(viewUrl({ filename: info.filename, subfolder: info.subfolder || SUBFOLDER, type: info.type || "temp" }));
+            const w = info.width || img.naturalWidth, h = info.height || img.naturalHeight;
+            const c = makeCanvas(w, h);
+            const ctx = c.getContext("2d");
+            ctx.drawImage(img, 0, 0);
+            const d = ctx.getImageData(0, 0, w, h).data;
+            const ids = new Uint16Array(w * h);
+            for (let i = 0, j = 0; i < d.length; i += 4, j++) ids[j] = d[i] + (d[i + 1] << 8);
+            if (pending.layer && w === this.width && h === this.height) {
+                const clip = this.layerAlpha(pending.layer);
+                for (let j = 0; j < ids.length; j++) if (!clip[j]) ids[j] = 0;
+            }
+            this.objects = { hash: pending.hash, w, h, ids, count: info.count || 0, layerId: pending.layer ? pending.layer.id : null };
+            this.objectShapeCache.clear();
+            this.hoverObjectId = 0; this.hoverObjectCanvas = null;
+            this.setStatus(`${info.count || 0} objects found. Hover to preview, click to select, click again to deselect (Shift adds, Alt subtracts).`);
+            if (this.hover) this.updateObjectHover(this.hover[0], this.hover[1]);
+            this.draw();
+        } catch (err) {
+            console.error(err);
+            this.setStatus("Could not read the object map: " + (err.message || err));
+        }
+    }
+
+    objectIdAt(ix, iy) {
+        const o = this.objects;
+        if (!o || o.w !== this.width || o.h !== this.height) return 0;
+        const x = Math.floor(ix), y = Math.floor(iy);
+        if (x < 0 || y < 0 || x >= o.w || y >= o.h) return 0;
+        return o.ids[y * o.w + x];
+    }
+
+    /** Red shape canvas of one object (cached, selection color so it can be drawn straight into the selection). */
+    objectShape(id) {
+        const cached = this.objectShapeCache.get(id);
+        if (cached) return cached;
+        const o = this.objects;
+        const c = makeCanvas(o.w, o.h);
+        const ctx = c.getContext("2d");
+        const out = ctx.createImageData(o.w, o.h);
+        const d = out.data;
+        for (let j = 0, i = 0; j < o.ids.length; j++, i += 4) {
+            if (o.ids[j] === id) { d[i] = 255; d[i + 3] = 255; }
+        }
+        ctx.putImageData(out, 0, 0);
+        if (this.objectShapeCache.size > 12) this.objectShapeCache.delete(this.objectShapeCache.keys().next().value);
+        this.objectShapeCache.set(id, c);
+        return c;
+    }
+
+    updateObjectHover(ix, iy) {
+        if (!this.objects || (this.objects.layerId === null && this.uploaded.baseHash === null)) {
+            // nothing computed yet, or the image changed since: refresh once
+            if (!this.objectsPending) this.ensureObjects();
+            return;
+        }
+        const id = this.objectIdAt(ix, iy);
+        if (id === this.hoverObjectId) return;
+        this.hoverObjectId = id;
+        this.hoverObjectCanvas = id ? this.objectShape(id) : null;
+    }
+
+    /** Click in the object tool: toggle the object under the cursor in the selection. */
+    toggleObjectAt(ix, iy, p = {}) {
+        if (!this.objects) { this.ensureObjects(); return; }
+        const id = this.objectIdAt(ix, iy);
+        if (!id) { this.setStatus("No object here. Use the brush or lasso for this spot."); return; }
+        const x = Math.floor(ix), y = Math.floor(iy);
+        const already = this.selection.getContext("2d").getImageData(x, y, 1, 1).data[3] > 0;
+        const subtract = p.alt ? true : (p.shift ? false : already);
+        this.pushUndo({ kind: "selection" });
+        const sctx = this.selection.getContext("2d");
+        sctx.globalCompositeOperation = subtract ? "destination-out" : "source-over";
+        sctx.drawImage(this.objectShape(id), 0, 0);
+        sctx.globalCompositeOperation = "source-over";
+        this.markSelectionChanged();
+        this.draw();
+        this.setStatus(subtract ? "Object removed from the selection." : "Object added to the selection.");
     }
 
     /** A mask came back from a helper prompt: merge it into the selection. */
@@ -1731,13 +1930,14 @@ class InpaintEditor {
             const tctx = tmp.getContext("2d");
             tctx.drawImage(img, 0, 0, this.width, this.height);
             const src = tctx.getImageData(0, 0, this.width, this.height).data;
+            const clip = pending.layer ? this.layerAlpha(pending.layer) : null;
             const shape = makeCanvas(this.width, this.height);
             const sh = shape.getContext("2d");
             const out = sh.createImageData(this.width, this.height);
             const d = out.data;
             let count = 0;
-            for (let i = 0; i < src.length; i += 4) {
-                const on = src[i] > 127;
+            for (let i = 0, j = 0; i < src.length; i += 4, j++) {
+                const on = src[i] > 127 && (!clip || clip[j]);
                 d[i] = 255; d[i + 1] = 0; d[i + 2] = 0; d[i + 3] = on ? 255 : 0;
                 if (on) count++;
             }
@@ -2398,6 +2598,15 @@ class InpaintEditor {
         ctx.drawImage(this.selection, 0, 0);
         ctx.globalAlpha = 1;
 
+        if (this.tool === "object" && this.hoverObjectCanvas && !this.spaceDown) {
+            // the object under the cursor, red shape shown in cyan
+            ctx.save();
+            ctx.globalAlpha = 0.5;
+            try { ctx.filter = "hue-rotate(180deg)"; } catch (_) { /* old canvas */ }
+            ctx.drawImage(this.hoverObjectCanvas, 0, 0);
+            ctx.restore();
+        }
+
         if (this.getBounds()) {
             const [x, y, w, h] = this.cropRect();
             ctx.save();
@@ -2766,6 +2975,10 @@ app.registerExtension({
                     ed.segBtn.disabled = false;
                     ed.setStatus("Segmentation failed: " + (detail.exception_message || "execution failed"));
                 }
+                if (ed && ed.objectsPromptId && detail && detail.prompt_id === ed.objectsPromptId) {
+                    ed.objectsPending = null;
+                    ed.setStatus("Object detection failed: " + (detail.exception_message || "execution failed"));
+                }
             }
         });
 
@@ -2775,7 +2988,9 @@ app.registerExtension({
             if (!out || !out.inpaint_mask) return;
             for (const info of out.inpaint_mask) {
                 const node = app.graph.getNodeById(+info.canvas_node);
-                if (node && node.inpaintEditor) node.inpaintEditor.applyMaskFile(info);
+                if (!node || !node.inpaintEditor) continue;
+                if (info.purpose === "segments") node.inpaintEditor.applySegmentsFile(info);
+                else node.inpaintEditor.applyMaskFile(info);
             }
         });
     },

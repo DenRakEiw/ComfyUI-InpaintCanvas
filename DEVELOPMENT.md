@@ -186,7 +186,7 @@ excluded from run image and present on black, grow/shrink exact to the pixel,
 selection from layer, extend canvas (border selected), history discard /
 restore / solo, workflow reload without duplicate layers.
 
-## 6b. Helper prompts and "Select by text" (2026-09-05, untested in browser)
+## 6b. Helper prompts, "Select by text" and object selection (2026-09-05, browser-verified)
 
 Why a helper prompt: the editor needs model runs (segmentation) without
 running the user's main chain (Flux.2 API = money) and without custom HTTP
@@ -205,23 +205,80 @@ strings like `seg_run`; ComfyUI accepts any string keys. The editor listens on
 (`applyMaskFile`, modes replace / add / subtract, undo pushed). Errors are
 matched by `detail.prompt_id === editor.segmentPromptId`.
 
-Backends (`SEGMENT_BACKENDS`, availability = required node types registered
-in `LiteGraph.registered_node_types`, plus an optional `available()` check):
+Backends (`SEGMENT_BACKENDS`, in order of preference; availability = required
+node types registered in `LiteGraph.registered_node_types`, plus an optional
+`available()` check). Measured on 2026-09-05 with the user's 1776x2368 photo:
 
+- `sam3_rmbg` (default): `SAM3Segment` from comfyui-rmbg -> mask index 1.
+  Clean "woman" mask (19 % coverage), ~8 s cold, ~2 s warm. **Every optional
+  input must be sent** (`device`, `max_segments`, ... ) because the Python
+  signature has no defaults for them; a prompt without `device` fails with
+  "missing 1 required positional argument". Weights: `models/sam3/sam3.pt`
+  (the node would download that file from `1038lab/sam3` itself). The user
+  downloaded the official `sam3.pt` (3.45 GB, facebook/sam3, license gated) to
+  `models/checkpoints/sam3.pt`; `models/sam3/sam3.pt` is a hardlink to it
+  (`mklink /H`), so core and RMBG share one file.
 - `dino_sam`: `GroundingDinoModelLoader (segment anything)` SwinT +
   `SAMModelLoader (segment anything)` (vit_b, or vit_h with the HQ toggle) +
   `GroundingDinoSAMSegment (segment anything)` -> mask output index 1.
-  Weights are on disk (`models/grounding-dino`, `models/sams`). Default.
-- `sam3_core`: `CheckpointLoaderSimple` (a `sam3*` file in
-  `models/checkpoints`; core loads SAM3 as a model type with its own CLIP,
-  see `comfy/supported_models.py`, `comfy/text_encoders/sam3_clip.py`) ->
-  `CLIPTextEncode` -> `SAM3_Detect` (threshold, refine_iterations 2,
-  individual_masks false) -> mask index 0. Only offered when such a checkpoint
-  exists. Weights are license-gated on Hugging Face (facebook/sam3); the user
-  downloads them manually.
-- `sam3_rmbg`: `SAM3Segment` from comfyui-rmbg (image, prompt, output_mode
-  Merged, confidence_threshold) -> mask index 1. Whether it has weights is
-  unknown.
+  Weights are on disk (`models/grounding-dino`, `models/sams`).
+- `sam3_core` (experimental, last): `CheckpointLoaderSimple` (`sam3.pt` shows
+  up in the checkpoint list) -> `CLIPTextEncode` -> `SAM3_Detect` -> mask 0.
+  **Text prompts return noise here**: for "woman", "person", "face", "legs"
+  and even "white rectangle" on the 512x384 test image the mask is scattered
+  speckles, independent of threshold and refine_iterations, and the coverage
+  is nearly identical for different prompts. The point-prompt path of the same
+  node (`positive_coords`) segments the test rectangle correctly, so the
+  detector/text path is what is broken (core picks fp16 for SAM3; bf16/fp32
+  was not tried because it needs a restart flag). Revisit after a ComfyUI
+  update; until then the backend is offered but not default.
+
+Florence-2 was rejected for masks (polygon output is coarse); it would only
+serve as a detector in front of SAM2, which GroundingDINO does better.
+
+### Object selection tool (`object`, key O)
+
+Photoshop "object selection" style hover: one model run per image, then
+instant hover in the browser.
+
+- Backend: `InpaintCanvasObjectMap` takes Kijai's `SAM2MODEL` (loaded by
+  `DownloadAndLoadSAM2Model` with segmentor `automaskgenerator`,
+  `sam2_hiera_base_plus.safetensors`, fp16) and an IMAGE, runs
+  `model.generate()` (the SAM2AutomaticMaskGenerator instance Kijai's loader
+  returns), drops masks under `min_area` (0.02 % of the image), sorts by area
+  descending and paints ids into a uint16 label map; it is saved as RGB PNG
+  with `id = R + 256 * G` (0 = none) to `temp/inpaint_canvas/` and reported
+  as `ui.inpaint_mask` with `purpose: "segments"` and `count`. Kijai's own
+  `Sam2AutoSegmentation` node only outputs the union mask (its per-mask data
+  ends up in a random-color preview image), which is why the node exists.
+  36 objects on the test photo (background, person, face, swimsuit, hair,
+  coral pieces, floor), ~4 s warm, ~20 s cold after a restart.
+- Frontend: `OBJECT_BACKEND` builds `obj_load` (LoadRef) + `obj_model` +
+  `obj_run`; `ensureObjects()` uploads the source, skips the run when
+  `objects.hash` already matches, otherwise queues the helper prompt (front of
+  queue). `applySegmentsFile()` decodes the PNG into `objects.ids`
+  (Uint16Array). `updateObjectHover()` reads the id under the cursor and
+  builds a cached red shape canvas (`objectShape`, LRU of 12);
+  `draw()` paints it with `ctx.filter = "hue-rotate(180deg)"` (cyan) at 50 %.
+  Click (`toggleObjectAt`, only when the pointer moved < 4 px) adds the shape
+  to the selection, or removes it when the pixel under the cursor is already
+  selected; Shift forces add, Alt forces subtract; each click pushes a
+  selection undo step.
+- Staleness: the object map is keyed by the source hash. For source *image*
+  that is `uploaded.baseHash`, which every layer edit sets to null, so the next
+  hover in the tool triggers a refresh. For *active layer* the hash contains
+  the layer id and the upload hash, checked when the tool or source changes.
+
+### Source switch (image / active layer)
+
+`segmentSource()` is used by both text segmentation and the object tool.
+*image* = the flattened visible non-control layers (reuses `uploaded.baseRef`).
+*active layer* = only that layer drawn on #808080 at its rect, uploaded as
+`n{id}_segsrc_{hash}.png`; the returned mask (`applyMaskFile`) or label map
+(`applySegmentsFile`) is clipped with `layerAlpha(layer)` (alpha > 0 in image
+coordinates). Verified: a red brush blob on a paint layer gives 2 objects
+(grey + blob), hovering outside the blob gives id 0, "red shape" via SAM3
+selects only the blob.
 
 Why not LoadImage: its `image` widget is a combo validated against the
 top-level input listing, so files in `input/inpaint_canvas/` fail validation.
@@ -249,26 +306,24 @@ Florence.
   brush size is scaled by the average of the two axes.
 - No LICENSE file yet (user has not chosen one).
 
-## 9. First thing to do next session
+## 9. State at the end of 2026-09-05
 
-Test "Select by text" in the browser (JS + nodes are in place, server has the
-nodes; nothing verified end to end yet):
+Browser-verified on the user's photo (`input/inpaint_canvas/ComfyUI_01940_.png`):
+select by text with SAM3 (RMBG), object tool hover / click / toggle / Shift /
+Alt with undo, source switch for both, helper prompts only (`/history` shows
+`seg_*` and `obj_*` keys, never the main chain). Test recipe for the editor
+from the console: build the graph as in section 6, `ed = c.inpaintEditor`,
+`ed.setTool("object")`, then dispatch `PointerEvent`s on `ed.canvas` (map
+image coords with `ed.view` and the canvas bounding rect; `buttons: 0` for
+hover, pointerdown + pointerup at the same spot for a click).
 
-1. Reload the page, wait for the workflow restore (`.p-blockui-mask` gone).
-2. Open the editor on a canvas with a real photo (e.g. the user's earlier
-   upload `input/inpaint_canvas/ComfyUI_01940_.png`, 1776x2368).
-3. Selection section -> type "woman" (or "hair"), Go. Expected status:
-   `Segmenting "woman" with GroundingDINO + SAM ...` then `Selected "woman"
-   (NN% of the image, replace).` First run loads ~3 GB of models.
-4. Check `/history?max_items=1`: prompt keys `seg_load, seg_dino, seg_sam,
-   seg_run, seg_out`, outputs `seg_out` with `inpaint_mask`.
-5. Try Add / Subtract, undo, then a Generate to make sure the main chain is
-   untouched by the helper prompt.
-6. Failure modes to expect: the queue wrapper retry issue (first call after
-   load), validation errors for combo names (model_name strings were copied
-   from object_info on 2026-09-05), CUDA OOM if a big API job runs.
+Note: `.p-blockui-mask` can stay in the DOM with size 0x0 after the restore;
+check `offsetWidth` rather than existence.
 
-Then commit as DenRakEiw and update this section.
+Ideas not done: a "detail" slider for the object tool (points_per_side 48/64
+finds smaller parts), showing all object outlines while hovering, SAM3 point
+prompts for click-to-segment without the precomputed map (core's point path
+works), and cleanup of `temp/inpaint_canvas/`.
 
 ## 8. Roadmap (from the user's own Krita list)
 

@@ -16,8 +16,10 @@ Flux.2 [max] API node (returns RGBA, square unless width/height are wired).
 
 - `nodes.py` — `InpaintCanvas` (OUTPUT_NODE, always re-executes),
   `InpaintCanvasStitch` (OUTPUT_NODE, also used ephemerally), and the helpers
-  `InpaintCanvasLoadRef` (ref JSON -> IMAGE) and `InpaintCanvasMaskOut`
-  (MASK -> temp PNG + `ui.inpaint_mask`).
+  `InpaintCanvasLoadRef` (ref JSON -> IMAGE), `InpaintCanvasMaskOut`
+  (MASK -> temp PNG + `ui.inpaint_mask`; purpose `segments` encodes a batch as
+  a label map) and `InpaintCanvasObjectMap` (SAM2 automask -> label map for the
+  hover object tool).
 - `js/inpaint_canvas.js` — the whole frontend: node thumbnail widget, the
   full-window editor (`InpaintEditor`), state persistence, prompt rewriting.
 - `pyproject.toml` + `.github/workflows/publish_action.yml` — Comfy Registry
@@ -65,10 +67,11 @@ Flux.2 [max] API node (returns RGBA, square unless width/height are wired).
 
 ## Where things stand (2026-09-05)
 
-Done and browser-verified: everything in README up to and including the
-transform modes. **"Select by text" (segmentation) is implemented but not yet
-tested in a browser** - see DEVELOPMENT.md section 9 for the exact test to run
-first.
+Done and browser-verified: everything in README, including "Select by text"
+(SAM3 via comfyui-rmbg as default), the object selection tool (hover/click,
+SAM2 object map) and the Source switch (image / active layer). SAM3 weights
+are at `models/checkpoints/sam3.pt` with a hardlink at `models/sam3/sam3.pt`.
+The core SAM3 text path returns noise on this machine (DEVELOPMENT.md 6b).
 
 ## Working on it
 
