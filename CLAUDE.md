@@ -75,9 +75,9 @@ Flux.2 [max] API node (returns RGBA, square unless width/height are wired).
 ## Where things stand (2026-09-05, late)
 
 Everything described in README.md is built and verified. The latest additions
-(DEVELOPMENT.md 12): reference layers with the `reference_images` batch
-output, layer masks / cutouts through the installed RMBG nodes, and the file
-cleanup route. DEVELOPMENT.md 8 has the session state and test recipes,
+(DEVELOPMENT.md 12-14): reference layers (appended to the crop_image
+batch), layer masks / cutouts through the installed RMBG nodes, the file
+cleanup route, filter layers and export. DEVELOPMENT.md 8 has the session state and test recipes,
 DEVELOPMENT.md 9 the roadmap (batch / variants with an A/B staging area,
 styles, regions, object tool details, live preview). Start a new feature from
 that list or from what the user asks for by Krita / Photoshop name.
@@ -109,4 +109,4 @@ Qwen3-VL 2B is in `models/LLM/Qwen-VL` (prompt upsampling). SAM2 base_plus in
   node widgets (invariant 5). New node outputs are appended only in the
   backend; in the frontend they go into `TAIL_OUTPUTS` (shown after the
   visible setting slots, slot remapped by the `queuePrompt` wrapper, see
-  DEVELOPMENT.md 12).
+  DEVELOPMENT.md 12; empty since references ride in crop_image).

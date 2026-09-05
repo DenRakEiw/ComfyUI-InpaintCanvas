@@ -91,41 +91,25 @@ def _border_color(img):
     return ring.mean(dim=0)
 
 
-def _reference_batch(images, size=1024, fit="pad"):
-    """Stack reference images of different sizes into one [N, H, W, 3] batch.
-
-    Each image is first scaled down so its long side is at most ``size`` (0 =
-    native). The batch size is the largest width and height that remain; the
-    others are padded with their own border colour (``pad``, default), scaled
-    to cover and center-cropped (``crop``) or simply stretched (``stretch``).
-    """
-    if not images:
-        return torch.zeros((0, 64, 64, 3), dtype=torch.float32)
-    scaled = []
-    for img in images:
-        h, w = img.shape[1], img.shape[2]
-        if size > 0 and max(w, h) > size:
-            s = size / max(w, h)
-            img = _resize_image(img, max(1, int(round(w * s))), max(1, int(round(h * s))))
-        scaled.append(img)
-    W = max(img.shape[2] for img in scaled)
-    H = max(img.shape[1] for img in scaled)
-    out = []
-    for img in scaled:
-        h, w = img.shape[1], img.shape[2]
-        if w == W and h == H:
-            out.append(img)
-        elif fit == "stretch":
-            out.append(_resize_image(img, W, H))
-        elif fit == "crop":
-            out.append(_resize_image(img, W, H, crop="center"))
-        else:
-            canvas = _border_color(img).view(1, 1, 1, 3).expand(1, H, W, 3).clone()
-            x0 = (W - w) // 2
-            y0 = (H - h) // 2
-            canvas[:, y0:y0 + h, x0:x0 + w] = img
-            out.append(canvas)
-    return torch.cat(out, dim=0).clamp(0, 1)
+def _fit_image(img, W, H, fit="pad"):
+    """Bring a [1, h, w, 3] image to exactly W x H: ``pad`` scales it to fit and
+    fills the rest with its own border colour, ``crop`` scales it to cover and
+    center-crops, ``stretch`` distorts."""
+    h, w = img.shape[1], img.shape[2]
+    if w == W and h == H:
+        return img
+    if fit == "stretch":
+        return _resize_image(img, W, H)
+    if fit == "crop":
+        return _resize_image(img, W, H, crop="center")
+    s = min(W / w, H / h)
+    nw, nh = max(1, int(round(w * s))), max(1, int(round(h * s)))
+    scaled = _resize_image(img, nw, nh)
+    canvas = _border_color(img).view(1, 1, 1, 3).expand(1, H, W, 3).clone()
+    x0 = (W - nw) // 2
+    y0 = (H - nh) // 2
+    canvas[:, y0:y0 + nh, x0:x0 + nw] = scaled
+    return canvas.clamp(0, 1)
 
 
 def _prune_temp(max_age=TEMP_MAX_AGE):
@@ -499,10 +483,10 @@ class InpaintCanvas:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "MASK", "STRING", "INT", "INT", "STRING", "IMAGE", "FLOAT", "INT", "STRING", "STRING") + ("*",) * SETTING_SLOTS + ("IMAGE",)
-    RETURN_NAMES = ("crop_image", "crop_mask", "image", "mask", "stitch_info", "crop_width", "crop_height", "prompt", "control_image", "denoise", "seed", "mode", "negative") + tuple(f"setting_{i}" for i in range(1, SETTING_SLOTS + 1)) + ("reference_images",)
+    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "MASK", "STRING", "INT", "INT", "STRING", "IMAGE", "FLOAT", "INT", "STRING", "STRING") + ("*",) * SETTING_SLOTS
+    RETURN_NAMES = ("crop_image", "crop_mask", "image", "mask", "stitch_info", "crop_width", "crop_height", "prompt", "control_image", "denoise", "seed", "mode", "negative") + tuple(f"setting_{i}" for i in range(1, SETTING_SLOTS + 1))
     OUTPUT_TOOLTIPS = (
-        "Selected region plus padding, scaled to target_size. Inpaint this. With the editor's Crop option \"Original\" and a fill mode it is a batch of two: the filled crop first, the untouched crop second (edit models see what was under the fill).",
+        "Selected region plus padding, scaled to target_size. Inpaint this. It becomes a batch when there is more to send: the untouched crop after the filled one (Crop option \"Original\" with a fill mode), then every visible reference layer fitted to the crop size (multi-reference editing with Flux.2 / Kontext, which flatten the batch into their image inputs).",
         "Selection mask matching crop_image (grown and feathered when the editor's Feather is auto).",
         "The flattened canvas at full size.",
         "Selection mask at full size.",
@@ -515,9 +499,7 @@ class InpaintCanvas:
         "Seed from the editor (random per run or fixed). Wire it into your local sampler.",
         "\"api\" or \"local\": which result input the editor expects the result on.",
         "Negative prompt from the editor (shown in local mode; for SDXL-class models).",
-    ) + tuple("Editor-driven setting: wire it into any widget input (lora_name, ckpt_name, steps, ...) and a matching control appears in the editor. The next free slot shows up once this one is connected." for _ in range(SETTING_SLOTS)) + (
-        "Layers with the role \"reference\" as one image batch (top of the layer list first), for multi-reference editing with Flux.2 / Kontext. Empty batch without reference layers.",
-    )
+    ) + tuple("Editor-driven setting: wire it into any widget input (lora_name, ckpt_name, steps, ...) and a matching control appears in the editor. The next free slot shows up once this one is connected." for _ in range(SETTING_SLOTS))
     FUNCTION = "run"
     CATEGORY = "image/inpaint"
     OUTPUT_NODE = True
@@ -619,6 +601,20 @@ class InpaintCanvas:
             crop_mask = _resize_mask(crop_mask, nw, nh)
             control_crop = _resize_image(control_crop, nw, nh)
 
+        # Reference layers ride along in the crop_image batch, fitted to the crop
+        # size (the Flux.2 API nodes flatten batches into their image inputs; no
+        # reference layers = no change to crop_image, so nothing downstream breaks).
+        ref_settings = state.get("refs") or {}
+        ref_fit = ref_settings.get("fit") if ref_settings.get("fit") in REFERENCE_FITS else "pad"
+        refs = []
+        for entry in state.get("references") or []:
+            try:
+                refs.append(_fit_image(_load_rgb(entry, background=(255, 255, 255)), int(crop.shape[2]), int(crop.shape[1]), ref_fit))
+            except (ValueError, FileNotFoundError, OSError) as err:
+                print(f"[Inpaint Canvas] reference skipped: {err}")
+        if refs:
+            crop = torch.cat([crop] + refs, dim=0)
+
         stitch_info = json.dumps({
             "canvas_node": str(unique_id),
             "base": base_ref,
@@ -636,25 +632,9 @@ class InpaintCanvas:
         settings = state.get("settings") or {}
         setting_values = tuple(_cast_setting(settings.get(str(i))) for i in range(1, SETTING_SLOTS + 1))
 
-        # Reference layers: uploaded at their native size (cutout masks already
-        # applied, transparency on white), batched for the API node.
-        ref_settings = state.get("refs") or {}
-        ref_images = []
-        for entry in state.get("references") or []:
-            try:
-                ref_images.append(_load_rgb(entry, background=(255, 255, 255)))
-            except (ValueError, FileNotFoundError, OSError) as err:
-                print(f"[Inpaint Canvas] reference skipped: {err}")
-        try:
-            ref_size = int(ref_settings.get("size", 1024) or 0)
-        except (TypeError, ValueError):
-            ref_size = 1024
-        ref_fit = ref_settings.get("fit") if ref_settings.get("fit") in REFERENCE_FITS else "pad"
-        references = _reference_batch(ref_images, ref_size, ref_fit)
-
         outputs = (crop, crop_mask[None], image, mask[None], stitch_info,
                    int(crop.shape[2]), int(crop.shape[1]), str(state.get("prompt", "") or ""),
-                   control_crop, denoise, seed, mode, str(state.get("negative", "") or "")) + setting_values + (references,)
+                   control_crop, denoise, seed, mode, str(state.get("negative", "") or "")) + setting_values
 
         if result_source:
             src_id, _, src_slot = result_source.partition(":")

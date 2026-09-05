@@ -14,7 +14,7 @@ Highlights
   SAM), grow / shrink, layers with blend modes, paint and erase, transform
   with rotate, distort and warp, control layers for ControlNet, outpainting.
 - Reference layers for Flux.2 / Kontext multi-reference editing: drop images
-  onto the canvas, they leave the node as one `reference_images` batch.
+  onto the canvas, they travel with `crop_image` as extra batch images.
 - Layer masks and cutouts: background removal with the installed RMBG nodes
   (RMBG-2.0, BiRefNet, BEN2, BRIA) becomes an editable transparency mask.
 - Filter layers to finish the picture: grain, sharpen, levels, LUT (.cube)
@@ -143,15 +143,16 @@ size, hardness, opacity and the paint colour.
   role *reference* (dropping files onto the layer list, or onto the canvas
   with Shift, does the same). Reference layers are shown on the canvas with a
   cyan frame and their batch number, but they are not part of the image your
-  chain sees. Instead they go out as one IMAGE batch on `reference_images`,
-  top of the list first, at their native resolution (cutout masks applied,
-  transparency on white). Wire that batch into the Flux.2 API node's
-  `images` / `image_1` input; the node flattens batches, so one link carries
-  all references. Any layer can be turned into a reference through its role
-  select, and a hidden reference layer is left out of the batch. *References*
-  in the Canvas section sets the long side (0 = native) and how images of
-  different sizes become one batch: *pad* with the image's border colour,
-  *crop* to cover, or *stretch*.
+  chain sees. Instead they are appended to the `crop_image` batch, top of the
+  list first, fitted to the crop's size (cutout masks applied, transparency
+  on white). The Flux.2 API nodes flatten batches into their image inputs,
+  so the one link you already have carries the crop and all references;
+  without reference layers `crop_image` stays a single image and nothing
+  downstream changes. Any layer can be turned into a reference through its
+  role select, a hidden reference layer is left out. *References* in the
+  Canvas section chooses how a reference is fitted to the crop size: *pad*
+  with the image's border colour, *crop* to cover, or *stretch*. Not for
+  chains that VAE-encode `crop_image`, they would encode the references too.
 - **Filter layers** (the fx button in the Layers header): a layer without
   pixels that filters everything below it. Types: *Grain* (film-like, mono or
   colour, strongest in the midtones), *Sharpen* (unsharp mask with radius and
@@ -360,7 +361,7 @@ Outputs
 
 | Output                       | Content                                                                 |
 | ---------------------------- | ----------------------------------------------------------------------- |
-| `crop_image` / `crop_mask`   | the region to inpaint, scaled, with fill and grown / feathered mask applied when on; with **Original** on and a fill mode, `crop_image` is a batch of two (filled, untouched) |
+| `crop_image` / `crop_mask`   | the region to inpaint, scaled, with fill and grown / feathered mask applied when on. `crop_image` becomes a batch when there is more to send: the untouched crop (**Original** with a fill mode), then the visible reference layers fitted to the crop size |
 | `image` / `mask`             | the flattened canvas and the raw selection at full size                 |
 | `stitch_info`                | parameters for the standalone stitch node                               |
 | `crop_width` / `crop_height` | size of `crop_image`, for generators that take an explicit size         |
@@ -368,11 +369,11 @@ Outputs
 | `control_image`              | control layers on black, aligned with `crop_image` (black if none)      |
 | `denoise` / `seed` / `mode`  | the Generate settings (`mode` is "api" or "local")                      |
 | `setting_1` ... `setting_8`  | wildcard outputs driven from the editor's Settings section              |
-| `reference_images`           | the visible reference layers as one IMAGE batch, top of the list first; an empty batch without any |
 
 Only ever appended, so saved workflows keep working. The node shows only the
-connected setting slots plus one free one, with `reference_images` right after
-them; the visible slot is mapped to the backend slot when the prompt is queued.
+connected setting slots plus one free one. (A `reference_images` output
+existed for a few hours on 2026-09-05; references now ride in `crop_image`,
+and the old output is removed from loaded workflows.)
 
 ### Inpaint Canvas Stitch (`InpaintCanvasStitch`)
 

@@ -23,11 +23,13 @@ const MAX_UNDO = 30;
 const HANDLE_PX = 9;
 const BLEND_MODES = ["normal", "multiply", "screen", "overlay", "darken", "lighten", "soft-light", "hard-light", "difference"];
 const ROLES = ["none", "reference", "scribble", "lineart", "depth", "pose", "canny", "other"];
-// Outputs after the setting slots. The backend declares them after setting_8, the
-// frontend shows them right after the connected settings (see syncSettingOutputs);
-// the queuePrompt wrapper maps the visible slot to the backend slot.
-const TAIL_OUTPUTS = [{ name: "reference_images", type: "IMAGE", label: "reference images" }];
-const REF_DEFAULTS = { size: 1024, fit: "pad" };
+// Outputs after the setting slots (none at the moment). The backend would declare
+// them after setting_8, the frontend shows them right after the connected settings
+// (see syncSettingOutputs) and the queuePrompt wrapper maps the visible slot to the
+// backend slot. Outputs that are neither fixed, setting nor tail (e.g. the former
+// reference_images) are removed from loaded workflows.
+const TAIL_OUTPUTS = [];
+const REF_DEFAULTS = { fit: "pad" };
 const REF_FITS = ["pad", "crop", "stretch"];
 
 // ---------------------------------------------------------------------------
@@ -1042,7 +1044,7 @@ class InpaintEditor {
             if (files.length) this.addImageLayers(files, "reference");
         });
         layersHead.appendChild(this.refInput);
-        layersHead.appendChild(miniButton("image", "Add reference images (one layer per file, role \"reference\"). They are not part of the image; they go out as the reference_images batch. Dropping files on this list does the same.", () => this.refInput.click()));
+        layersHead.appendChild(miniButton("image", "Add reference images (one layer per file, role \"reference\"). They are not part of the image; they travel with crop_image as extra batch images for Flux.2 / Kontext. Dropping files on this list does the same.", () => this.refInput.click()));
         layersHead.appendChild(miniButton("fx", "Add a filter layer (grain, sharpen, levels, LUT, vignette). It filters everything below it; give it a mask to limit where it applies.", () => this.addFilterLayer()));
         layersHead.appendChild(miniButton("plus", "Add a paint layer (Ctrl+Shift+N)", () => this.addPaintLayer()));
         side.appendChild(layersHead);
@@ -1145,18 +1147,11 @@ class InpaintEditor {
             sec.appendChild(this.canvasInfo);
             d.appendChild(sec);
 
-            // reference batch
+            // reference layers ride along in crop_image, fitted to the crop size
             const refs = el("div", "ipc-sec");
             refs.appendChild(el("span", null, "References"));
-            const sizeLab = el("label", null, "size");
-            sizeLab.title = "Long side of every reference in the reference_images batch (0 = native). Larger references are scaled down, smaller ones stay.";
-            this.refSizeInput = numberInput(REF_DEFAULTS.size, 0, 4096, "Long side of the references (0 = native)", 64);
-            this.refSizeInput.step = 64;
-            this.refSizeInput.addEventListener("change", () => { this.refSettings.size = Math.max(0, Math.floor(+this.refSizeInput.value || 0)); this.refSizeInput.value = this.refSettings.size; this.notifyChanged(); });
-            sizeLab.appendChild(this.refSizeInput);
-            refs.appendChild(sizeLab);
             const fitLab = el("label", null, "fit");
-            this.refFitSel = selectInput(REF_FITS, REF_DEFAULTS.fit, "A batch needs one size: pad fills the difference with the image's border colour, crop scales to cover and cuts the middle, stretch distorts.");
+            this.refFitSel = selectInput(REF_FITS, REF_DEFAULTS.fit, "Reference layers are added to the crop_image batch at the crop's size: pad scales them to fit and fills the rest with the image's border colour, crop scales to cover and cuts the middle, stretch distorts.");
             this.refFitSel.addEventListener("change", () => { this.refSettings.fit = this.refFitSel.value; this.notifyChanged(); });
             fitLab.appendChild(this.refFitSel);
             refs.appendChild(fitLab);
@@ -3192,7 +3187,6 @@ class InpaintEditor {
     // ---- reference images -----------------------------------------------------------
 
     syncRefControls() {
-        if (this.refSizeInput) this.refSizeInput.value = this.refSettings.size;
         if (this.refFitSel) this.refFitSel.value = REF_FITS.includes(this.refSettings.fit) ? this.refSettings.fit : "pad";
         this.refreshCutoutBackends();
     }
@@ -3227,7 +3221,7 @@ class InpaintEditor {
         }
         if (last) {
             const refs = this.referenceLayers().length;
-            this.setStatus(role === "reference" ? `${files.length} reference image${files.length > 1 ? "s" : ""} added (${refs} in the reference_images batch). They are not part of the image.` : `${files.length} image layer${files.length > 1 ? "s" : ""} added.`);
+            this.setStatus(role === "reference" ? `${files.length} reference image${files.length > 1 ? "s" : ""} added (${refs} will travel with crop_image). They are not part of the image.` : `${files.length} image layer${files.length > 1 ? "s" : ""} added.`);
         }
     }
 
@@ -3401,7 +3395,8 @@ class InpaintEditor {
             if (ap) rows.push(["Edge", this.cropSettings.feather === "auto" ? `grow ${ap.grow}, feather ${ap.feather}, blend ${ap.blend} px` : `feather ${this.widgetValue("feather", 0)} px`]);
             const target = this.widgetValue("target_size", 0);
             const m = Math.max(1, this.widgetValue("multiple_of", 64) || 64);
-            const pair = b && this.cropSettings.withOriginal && this.cropSettings.fill && this.cropSettings.fill !== "none" ? " ×2 (filled + original)" : "";
+            const nBatch = 1 + (b && this.cropSettings.withOriginal && this.cropSettings.fill && this.cropSettings.fill !== "none" ? 1 : 0) + this.referenceLayers().length;
+            const pair = nBatch > 1 ? ` ×${nBatch} (batch)` : "";
             if (target > 0) {
                 const s = target / Math.max(cw, ch);
                 rows.push(["Emitted", `${Math.max(m, Math.round(cw * s / m) * m)} × ${Math.max(m, Math.round(ch * s / m) * m)}${pair}`]);
@@ -3411,7 +3406,7 @@ class InpaintEditor {
             const ctrl = this.layers.filter((l) => this.isControl(l) && l.visible).length;
             rows.push(["Control", ctrl ? `${ctrl} layer${ctrl > 1 ? "s" : ""}` : "none (black)"]);
             const refs = this.referenceLayers().length;
-            rows.push(["References", refs ? `${refs} image${refs > 1 ? "s" : ""} (${this.refSettings.size || "native"}, ${this.refSettings.fit})` : "none (empty batch)"]);
+            rows.push(["References", refs ? `${refs} image${refs > 1 ? "s" : ""} in crop_image (${this.refSettings.fit})` : "none"]);
             const rs = this.resultInputState();
             rows.push(["Result", `${this.genSettings.mode} → ${rs.name}${rs.wired ? (rs.fallback ? " (only input wired)" : "") : " (not wired!)"}` + (this.genSettings.mode === "local" && this.genSettings.refine ? " · refine" : "")]);
         }
@@ -3600,7 +3595,7 @@ class InpaintEditor {
             blendLab.appendChild(blend);
             modeRow.appendChild(blendLab);
             const roleLab = el("label", null, "Role");
-            const role = selectInput(ROLES, layer.role || "none", "Role: none = part of the image; reference = not in the image, emitted in the reference_images batch (Flux.2 / Kontext multi-reference); scribble, lineart, depth, pose, canny, other = control_image on black");
+            const role = selectInput(ROLES, layer.role || "none", "Role: none = part of the image; reference = not in the image, sent along with crop_image as an extra batch image (Flux.2 / Kontext multi-reference); scribble, lineart, depth, pose, canny, other = control_image on black");
             role.addEventListener("change", () => {
                 layer.role = role.value;
                 layer.exportRef = null;
@@ -4489,11 +4484,15 @@ app.registerExtension({
                 for (const t of TAIL_OUTPUTS) if (!node.outputs.some((o) => o && o.name === t.name)) node.addOutput(t.name, t.type, { label: t.label });
                 for (let n = 1; n <= want; n++) if (!node.outputs.some((o) => isSettingOutput(o) && settingIndex(o) === n)) node.addOutput(`setting_${n}`, "*");
                 // order: fixed, settings by number, tail; then point every link at its slot
+                // outputs from older versions that no longer exist (reference_images) go away
+                for (let i = node.outputs.length - 1; i >= FIXED_OUTPUTS; i--) {
+                    const o = node.outputs[i];
+                    if (!isSettingOutput(o) && !TAIL_OUTPUTS.some((t) => o && o.name === t.name)) node.removeOutput(i);
+                }
                 const fixed = node.outputs.slice(0, FIXED_OUTPUTS);
                 const settings = node.outputs.filter(isSettingOutput).sort((a, b) => settingIndex(a) - settingIndex(b));
                 const tail = TAIL_OUTPUTS.map((t) => node.outputs.find((o) => o && o.name === t.name)).filter(Boolean);
-                const rest = node.outputs.slice(FIXED_OUTPUTS).filter((o) => !isSettingOutput(o) && !tail.includes(o));
-                const ordered = fixed.concat(settings, tail, rest);
+                const ordered = fixed.concat(settings, tail);
                 if (ordered.some((o, i) => node.outputs[i] !== o) || ordered.length !== node.outputs.length) {
                     node.outputs.splice(0, node.outputs.length, ...ordered);
                 }

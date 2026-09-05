@@ -54,7 +54,7 @@ Crop (`InpaintCanvas.run`): bbox = selection bounds + `padding`, clamped. With
 sides rounded to `multiple_of`. With `target_size == 0` the bbox itself is grown
 symmetrically to a multiple (`_fit_span_to_multiple`). `control_image` is the
 control PNG cropped/scaled identically (zeros if none). Outputs in order:
-`crop_image, crop_mask, image, mask, stitch_info, crop_width, crop_height, prompt, control_image, denoise, seed, mode, negative, setting_1..setting_8, reference_images`.
+`crop_image, crop_mask, image, mask, stitch_info, crop_width, crop_height, prompt, control_image, denoise, seed, mode, negative, setting_1..setting_8`.
 Only ever append outputs; reordering breaks saved workflows (section 12 for
 how outputs after the setting slots are shown and remapped).
 
@@ -141,7 +141,7 @@ the state; the frontend rolls a new seed before every Generate when
   upsample: { useCase, backend },
   gen: { mode: "api"|"local", denoise, seed, seedRandom, refine },
   settings: { "1": { value, type, label, target }, ... },   // setting_n outputs
-  refs: { size: 1024, fit: "pad"|"crop"|"stretch" },         // reference_images batch
+  refs: { fit: "pad"|"crop"|"stretch" },                     // how references are fitted to the crop size
   cutout: { backend: "auto"|"rmbg2"|"birefnet"|"ben2"|"bria14" } }
 ```
 
@@ -568,7 +568,18 @@ and reverted the canvas state.
 
 ## 12. Reference layers, layer masks / cutouts, file cleanup (2026-09-05, late)
 
-### Reference layers and the `reference_images` output
+### Reference layers (in the `crop_image` batch)
+
+**Changed the same evening:** the separate `reference_images` output is gone.
+Wired into a node with no reference layers present it was an empty batch,
+and everything downstream (PreviewImage, the API node's preview) failed with
+"index 0 is out of bounds". References are now appended to `crop_image`
+after the crop (and after the untouched crop when "Original" is on), each
+fitted to the crop's size with `_fit_image(img, W, H, fit)` (pad with the
+border colour / cover-crop / stretch). Without reference layers
+`crop_image` is unchanged. `TAIL_OUTPUTS` is empty; `syncSettingOutputs`
+removes leftover non-setting outputs from saved workflows. The mechanism
+below is kept for the record and for future tail outputs.
 
 Role `reference` on a layer (`ROLES` now has it between none and the control
 roles). `isControl()` excludes it, `isReference()` / `referenceLayers()` (visible
