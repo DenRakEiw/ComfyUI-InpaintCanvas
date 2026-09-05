@@ -22,9 +22,16 @@ Editor
 - **Selection** section: grow or shrink by n pixels (exact distance
   transform), or take the selection from the opaque area of the active layer.
 - **Layer** tools: paint (P), eraser (E), fill selection with color (Shift+F),
-  transform (T) to move a layer or drag its corners to scale it (Shift for free
-  aspect), hand (H) to pan. Painting on the base creates a paint layer
+  transform (T), hand (H) to pan. Painting on the base creates a paint layer
   automatically; the base itself is never erased.
+- **Transform** has four modes in a small bar above the canvas. *Scale*: drag
+  inside to move, corners scale proportionally (Shift for free aspect), the
+  round handles in the middle of each edge scale one axis, arrow keys nudge
+  (Shift: 10 px). *Rotate*: drag around the center or type an angle (Shift
+  snaps to 15°). *Distort*: drag the four corners freely (perspective).
+  *Warp*: drag the points of a 3–6 grid to bend the layer. Rotate, distort and
+  warp preview live and are baked into the layer with Enter or Apply; Esc
+  cancels. Undo restores the layer completely.
 - Brush **size**, **hardness** (soft edge) and **opacity** sit in the top bar
   next to the color. Opacity applies per stroke, not per dab.
 - Undo / redo (Ctrl+Z / Ctrl+Shift+Z) cover selection, strokes and transforms.

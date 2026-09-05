@@ -165,6 +165,89 @@ function distanceTransform(feature, W, H) {
 }
 
 // ---------------------------------------------------------------------------
+// geometry helpers for the transform tool
+// ---------------------------------------------------------------------------
+
+/** 3x3 homography mapping four source points onto four destination points. */
+function homography(src, dst) {
+    const A = [];
+    const b = [];
+    for (let i = 0; i < 4; i++) {
+        const [x, y] = src[i], [X, Y] = dst[i];
+        A.push([x, y, 1, 0, 0, 0, -X * x, -X * y]); b.push(X);
+        A.push([0, 0, 0, x, y, 1, -Y * x, -Y * y]); b.push(Y);
+    }
+    const n = 8;
+    for (let c = 0; c < n; c++) {
+        let piv = c;
+        for (let r = c + 1; r < n; r++) if (Math.abs(A[r][c]) > Math.abs(A[piv][c])) piv = r;
+        [A[c], A[piv]] = [A[piv], A[c]]; [b[c], b[piv]] = [b[piv], b[c]];
+        const d = A[c][c] || 1e-12;
+        for (let r = 0; r < n; r++) {
+            if (r === c) continue;
+            const f = A[r][c] / d;
+            if (!f) continue;
+            for (let k = c; k < n; k++) A[r][k] -= f * A[c][k];
+            b[r] -= f * b[c];
+        }
+    }
+    const h = b.map((v, i) => v / (A[i][i] || 1e-12));
+    return (x, y) => {
+        const w = h[6] * x + h[7] * y + 1;
+        return [(h[0] * x + h[1] * y + h[2]) / w, (h[3] * x + h[4] * y + h[5]) / w];
+    };
+}
+
+/** Draw `img` so that source triangle s0..s2 lands on destination triangle d0..d2. */
+function drawTriangle(ctx, img, s0, s1, s2, d0, d1, d2) {
+    const [x0, y0] = s0, [x1, y1] = s1, [x2, y2] = s2;
+    const [u0, v0] = d0, [u1, v1] = d1, [u2, v2] = d2;
+    const det = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+    if (Math.abs(det) < 1e-9) return;
+    const a = ((u1 - u0) * (y2 - y0) - (u2 - u0) * (y1 - y0)) / det;
+    const b = ((v1 - v0) * (y2 - y0) - (v2 - v0) * (y1 - y0)) / det;
+    const c = ((u2 - u0) * (x1 - x0) - (u1 - u0) * (x2 - x0)) / det;
+    const d = ((v2 - v0) * (x1 - x0) - (v1 - v0) * (x2 - x0)) / det;
+    const e = u0 - a * x0 - c * y0;
+    const f = v0 - b * x0 - d * y0;
+    // Expand the clip a hair from the centroid so neighbouring triangles leave no seams.
+    const cx = (u0 + u1 + u2) / 3, cy = (v0 + v1 + v2) / 3;
+    const grow = (px, py) => { const dx = px - cx, dy = py - cy, l = Math.hypot(dx, dy) || 1; return [px + dx / l * 0.7, py + dy / l * 0.7]; };
+    const g0 = grow(u0, v0), g1 = grow(u1, v1), g2 = grow(u2, v2);
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(g0[0], g0[1]); ctx.lineTo(g1[0], g1[1]); ctx.lineTo(g2[0], g2[1]);
+    ctx.closePath();
+    ctx.clip();
+    ctx.transform(a, b, c, d, e, f);
+    ctx.drawImage(img, 0, 0);
+    ctx.restore();
+}
+
+/**
+ * Draw `img` through a deformation: `dst(u, v)` gives the destination point for
+ * the normalised source position (u, v) in [0, 1]. The image is split into an
+ * nx by ny mesh of triangle pairs.
+ */
+function drawMesh(ctx, img, dst, nx, ny) {
+    const W = img.width, H = img.height;
+    const pts = [];
+    for (let j = 0; j <= ny; j++) {
+        const row = [];
+        for (let i = 0; i <= nx; i++) row.push(dst(i / nx, j / ny));
+        pts.push(row);
+    }
+    for (let j = 0; j < ny; j++) {
+        for (let i = 0; i < nx; i++) {
+            const sx0 = i / nx * W, sx1 = (i + 1) / nx * W, sy0 = j / ny * H, sy1 = (j + 1) / ny * H;
+            const d00 = pts[j][i], d10 = pts[j][i + 1], d01 = pts[j + 1][i], d11 = pts[j + 1][i + 1];
+            drawTriangle(ctx, img, [sx0, sy0], [sx1, sy0], [sx0, sy1], d00, d10, d01);
+            drawTriangle(ctx, img, [sx1, sy0], [sx1, sy1], [sx0, sy1], d10, d11, d01);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // icons (24x24, stroke based)
 // ---------------------------------------------------------------------------
 
@@ -200,6 +283,10 @@ const ICONS = {
     grow: '<circle cx="12" cy="12" r="4"/><circle cx="12" cy="12" r="8" stroke-dasharray="3 2"/><path d="M12 2v3"/><path d="M12 19v3"/><path d="M2 12h3"/><path d="M19 12h3"/>',
     shrink: '<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="4" stroke-dasharray="3 2"/><path d="M12 5v3"/><path d="M12 16v3"/><path d="M5 12h3"/><path d="M16 12h3"/>',
     fromLayer: '<path d="M12 4l8 4-8 4-8-4z"/><path d="M4 14l8 4 8-4" stroke-dasharray="3 2"/>',
+    rotate: '<path d="M20 12a8 8 0 11-2.3-5.7"/><path d="M20 3v5h-5"/>',
+    distort: '<path d="M5 6l14-2v14l-14 2z"/><circle cx="5" cy="6" r="1.6" fill="currentColor" stroke="none"/><circle cx="19" cy="4" r="1.6" fill="currentColor" stroke="none"/><circle cx="19" cy="18" r="1.6" fill="currentColor" stroke="none"/><circle cx="5" cy="20" r="1.6" fill="currentColor" stroke="none"/>',
+    warp: '<path d="M4 6c4-3 12 3 16 0"/><path d="M4 12c4-3 12 3 16 0"/><path d="M4 18c4-3 12 3 16 0"/><path d="M8 4v16"/><path d="M16 4v16"/>',
+    check: '<path d="M5 12l5 5 9-10"/>',
     extend: '<rect x="8" y="8" width="8" height="8"/><path d="M12 2v4"/><path d="M12 18v4"/><path d="M2 12h4"/><path d="M18 12h4"/><path d="M10 4l2-2 2 2"/><path d="M10 20l2 2 2-2"/><path d="M4 10l-2 2 2 2"/><path d="M20 10l2 2-2 2"/>',
 };
 
@@ -242,6 +329,7 @@ const STYLE = `
 .ipc-node .ipc-open:hover { background:#3a70b8; }
 .ipc-node .ipc-status { color:#888; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 
+.ipc-modal [hidden] { display:none !important; }
 .ipc-modal { position:fixed; inset:0; z-index:10000; display:flex; flex-direction:column; background:#181818; color:#ddd;
   font:13px/1.3 system-ui, sans-serif; outline:none; }
 .ipc-top { display:flex; align-items:center; gap:10px; padding:6px 10px; background:#242424; border-bottom:1px solid #0d0d0d; flex-wrap:wrap; }
@@ -323,6 +411,15 @@ const STYLE = `
 .ipc-info b { color:#ddd; font-weight:500; }
 .ipc-bottom { padding:5px 10px; background:#242424; border-top:1px solid #0d0d0d; color:#999; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; display:flex; }
 .ipc-kbd { color:#777; margin-left:auto; }
+.ipc-view.ipc-scale-x { cursor:ew-resize; }
+.ipc-view.ipc-scale-y { cursor:ns-resize; }
+.ipc-view.ipc-rotate { cursor:alias; }
+.ipc-subbar { position:absolute; top:8px; left:8px; z-index:2; display:flex; align-items:center; gap:6px; padding:5px 8px;
+  background:rgba(30,30,30,.92); border:1px solid #3a3a3a; border-radius:8px; color:#ccc; font-size:12px; }
+.ipc-subbar .ipc-ib { padding:3px 8px; min-width:0; font-size:12px; }
+.ipc-subbar .ipc-sep { width:1px; height:18px; background:#444; margin:0 2px; }
+.ipc-subbar label { display:flex; align-items:center; gap:4px; color:#aaa; }
+.ipc-subbar .ipc-hint { color:#888; }
 `;
 
 function injectStyle() {
@@ -542,6 +639,7 @@ class InpaintEditor {
         this.viewEl.appendChild(this.canvas);
         this.dropHint = el("div", "ipc-drop", "Load an image, paste it (Ctrl+V) or drop it here.\nThen paint a selection and press Generate.");
         this.viewEl.appendChild(this.dropHint);
+        this.buildSubbar();
         body.appendChild(this.viewEl);
 
         // side panel
@@ -643,6 +741,222 @@ class InpaintEditor {
         this.resizeObserver.observe(this.viewEl);
     }
 
+    buildSubbar() {
+        const bar = el("div", "ipc-subbar");
+        bar.hidden = true;
+        this.subbar = bar;
+        this.subModeButtons = {};
+        const modes = [
+            ["scale", "transform", "Move / scale: drag inside to move, corners keep aspect (Shift: free), edges scale one axis"],
+            ["rotate", "rotate", "Rotate around the center (Shift snaps to 15°)"],
+            ["distort", "distort", "Distort: drag the four corners freely (perspective)"],
+            ["warp", "warp", "Warp: drag grid points to bend the layer"],
+        ];
+        for (const [id, ic, title] of modes) {
+            const b = iconButton(ic, title, () => this.setTransformMode(id), id[0].toUpperCase() + id.slice(1));
+            this.subModeButtons[id] = b;
+            bar.appendChild(b);
+        }
+        bar.appendChild(el("span", "ipc-sep"));
+        const gridLab = el("label", null, "Grid");
+        this.warpGridSel = selectInput(["3", "4", "5", "6"], "4", "Warp grid size");
+        this.warpGridSel.addEventListener("change", () => { if (this.pending && this.pending.mode === "warp") { this.cancelPending(); this.startPending("warp"); } });
+        gridLab.appendChild(this.warpGridSel);
+        bar.appendChild(gridLab);
+        const angleLab = el("label", null, "Angle");
+        this.angleInput = numberInput(0, -360, 360, "Rotation in degrees", 60);
+        this.angleInput.step = 1;
+        this.angleInput.addEventListener("input", () => { if (this.pending && this.pending.mode === "rotate") { this.pending.angle = (+this.angleInput.value || 0) * Math.PI / 180; this.draw(); } });
+        angleLab.appendChild(this.angleInput);
+        bar.appendChild(angleLab);
+        bar.appendChild(el("span", "ipc-sep"));
+        this.applyBtn = iconButton("check", "Apply the transform (Enter)", () => this.applyPending(), "Apply");
+        this.applyBtn.classList.add("ipc-primary");
+        bar.appendChild(this.applyBtn);
+        this.cancelBtn = iconButton("close", "Cancel the transform (Esc)", () => this.cancelPending(), "Cancel");
+        bar.appendChild(this.cancelBtn);
+        this.subHint = el("span", "ipc-hint", "");
+        bar.appendChild(this.subHint);
+        for (const type of ["pointerdown", "pointermove", "pointerup", "wheel"]) bar.addEventListener(type, (e) => e.stopPropagation());
+        this.viewEl.appendChild(bar);
+        this.transformMode = "scale";
+        this.updateSubbar();
+    }
+
+    updateSubbar() {
+        if (!this.subbar) return;
+        const on = this.tool === "transform";
+        this.subbar.hidden = !on;
+        if (!on) return;
+        const mode = this.pending ? this.pending.mode : this.transformMode;
+        for (const [id, b] of Object.entries(this.subModeButtons)) b.classList.toggle("ipc-active", id === mode);
+        const pending = !!this.pending;
+        this.applyBtn.hidden = !pending;
+        this.cancelBtn.hidden = !pending;
+        this.warpGridSel.parentElement.hidden = mode !== "warp";
+        this.angleInput.parentElement.hidden = mode !== "rotate";
+        if (this.pending && this.pending.mode === "rotate") this.angleInput.value = Math.round(this.pending.angle * 180 / Math.PI);
+        const active = this.activeLayer();
+        this.subHint.textContent = !active ? "Select a layer first" : (pending ? "Enter applies, Esc cancels" : (mode === "scale" ? "Arrow keys nudge" : "Click a mode to start"));
+    }
+
+    setTransformMode(mode) {
+        if (this.pending && this.pending.mode !== mode) this.cancelPending();
+        this.transformMode = mode;
+        if (mode !== "scale" && !this.pending && this.activeLayer()) this.startPending(mode);
+        this.updateSubbar();
+        this.draw();
+    }
+
+    // ---- pending transforms (rotate / distort / warp) ------------------------
+
+    startPending(mode) {
+        const layer = this.activeLayer();
+        if (!layer) { this.setStatus("Select a layer to transform. The base stays put."); return; }
+        const p = { mode, layer, angle: 0 };
+        const { x, y, w, h } = layer;
+        if (mode === "distort") {
+            p.points = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]];
+        } else if (mode === "warp") {
+            const n = +this.warpGridSel.value || 4;
+            p.n = n;
+            p.points = [];
+            for (let j = 0; j <= n; j++) for (let i = 0; i <= n; i++) p.points.push([x + w * i / n, y + h * j / n]);
+        }
+        this.pending = p;
+        this.updateSubbar();
+        this.draw();
+    }
+
+    cancelPending() {
+        this.pending = null;
+        this.updateSubbar();
+        this.draw();
+    }
+
+    /** Destination (image coords) of the normalised layer position (u, v). */
+    pendingDst(p, u, v) {
+        const l = p.layer;
+        if (p.mode === "rotate") {
+            const cx = l.x + l.w / 2, cy = l.y + l.h / 2;
+            const px = l.x + u * l.w - cx, py = l.y + v * l.h - cy;
+            const c = Math.cos(p.angle), s = Math.sin(p.angle);
+            return [cx + px * c - py * s, cy + px * s + py * c];
+        }
+        if (p.mode === "distort") {
+            if (!p.H) p.H = homography([[0, 0], [1, 0], [1, 1], [0, 1]], p.points);
+            return p.H(u, v);
+        }
+        if (p.mode === "warp") {
+            const n = p.n;
+            const fi = Math.min(n - 1e-9, u * n), fj = Math.min(n - 1e-9, v * n);
+            const i = Math.floor(fi), j = Math.floor(fj);
+            const fu = fi - i, fv = fj - j;
+            const P = (a, b) => p.points[b * (n + 1) + a];
+            const p00 = P(i, j), p10 = P(i + 1, j), p01 = P(i, j + 1), p11 = P(i + 1, j + 1);
+            return [
+                (1 - fv) * ((1 - fu) * p00[0] + fu * p10[0]) + fv * ((1 - fu) * p01[0] + fu * p11[0]),
+                (1 - fv) * ((1 - fu) * p00[1] + fu * p10[1]) + fv * ((1 - fu) * p01[1] + fu * p11[1]),
+            ];
+        }
+        return [l.x + u * l.w, l.y + v * l.h];
+    }
+
+    pendingSubdivisions(p, fine) {
+        if (p.mode === "rotate") return 1;
+        if (p.mode === "distort") return fine ? 24 : 12;
+        return fine ? p.n * 6 : p.n * 3;
+    }
+
+    pendingPointAt(p, ix, iy) {
+        if (!p.points) return -1;
+        const r = HANDLE_PX / this.view.scale;
+        let best = -1, bestD = r * r;
+        p.points.forEach(([px, py], i) => {
+            const d = (px - ix) ** 2 + (py - iy) ** 2;
+            if (d <= bestD) { best = i; bestD = d; }
+        });
+        return best;
+    }
+
+    pendingPointerDown(ix, iy, e) {
+        const p = this.pending;
+        if (p.mode === "rotate") {
+            const cx = p.layer.x + p.layer.w / 2, cy = p.layer.y + p.layer.h / 2;
+            this.pointer = { kind: "pending", start: Math.atan2(iy - cy, ix - cx), startAngle: p.angle, snap: e.shiftKey };
+            return;
+        }
+        const idx = this.pendingPointAt(p, ix, iy);
+        if (idx >= 0) {
+            this.pointer = { kind: "pending", index: idx, start: [ix, iy], orig: [...p.points[idx]] };
+        } else {
+            this.pointer = { kind: "pending", index: -1, start: [ix, iy], orig: p.points.map((q) => [...q]) };
+        }
+    }
+
+    pendingPointerMove(ix, iy, e) {
+        const p = this.pending, g = this.pointer;
+        if (!p || !g) return;
+        if (p.mode === "rotate") {
+            const cx = p.layer.x + p.layer.w / 2, cy = p.layer.y + p.layer.h / 2;
+            let a = g.startAngle + (Math.atan2(iy - cy, ix - cx) - g.start);
+            if (e.shiftKey || g.snap) a = Math.round(a / (Math.PI / 12)) * (Math.PI / 12);
+            p.angle = a;
+            this.updateSubbar();
+            return;
+        }
+        const dx = ix - g.start[0], dy = iy - g.start[1];
+        if (g.index >= 0) {
+            p.points[g.index] = [g.orig[0] + dx, g.orig[1] + dy];
+        } else {
+            p.points = g.orig.map(([x, y]) => [x + dx, y + dy]);
+        }
+        p.H = null;
+    }
+
+    /** Bake the pending transform into the layer's pixels. */
+    applyPending() {
+        const p = this.pending;
+        if (!p) return;
+        const layer = p.layer;
+        if (p.mode === "rotate" && Math.abs(p.angle) < 1e-6) { this.cancelPending(); return; }
+        this.pushUndo({ kind: "layerfull", id: layer.id });
+        const n = this.pendingSubdivisions(p, true);
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (let j = 0; j <= n; j++) for (let i = 0; i <= n; i++) {
+            const [X, Y] = this.pendingDst(p, i / n, j / n);
+            minX = Math.min(minX, X); minY = Math.min(minY, Y); maxX = Math.max(maxX, X); maxY = Math.max(maxY, Y);
+        }
+        minX = Math.floor(minX); minY = Math.floor(minY); maxX = Math.ceil(maxX); maxY = Math.ceil(maxY);
+        const bw = Math.max(1, maxX - minX), bh = Math.max(1, maxY - minY);
+        // Keep the layer's native resolution (pixels per image unit).
+        const res = Math.max(layer.canvas.width / layer.w, layer.canvas.height / layer.h, 1);
+        const out = makeCanvas(Math.round(bw * res), Math.round(bh * res));
+        const ctx = out.getContext("2d");
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = "high";
+        const dst = (u, v) => { const [X, Y] = this.pendingDst(p, u, v); return [(X - minX) * res, (Y - minY) * res]; };
+        if (p.mode === "rotate") {
+            const [X, Y] = dst(0, 0);
+            ctx.save();
+            ctx.translate(X, Y);
+            ctx.rotate(p.angle);
+            ctx.scale(layer.w * res / layer.canvas.width, layer.h * res / layer.canvas.height);
+            ctx.drawImage(layer.canvas, 0, 0);
+            ctx.restore();
+        } else {
+            drawMesh(ctx, layer.canvas, dst, n, n);
+        }
+        layer.canvas = out;
+        layer.x = minX; layer.y = minY; layer.w = bw; layer.h = bh;
+        this.pending = null;
+        this.markLayerChanged(layer);
+        this.renderLayers();
+        this.updateSubbar();
+        this.draw();
+        this.setStatus(`${layer.name}: ${p.mode} applied (${bw} × ${bh}).`);
+    }
+
     open() {
         if (this.isOpen) return;
         this.isOpen = true;
@@ -650,7 +964,8 @@ class InpaintEditor {
         this._docKey = (e) => {
             if (e.key === "Escape" && this.isOpen) {
                 if (e.target === this.promptInput) return;
-                e.stopPropagation(); e.preventDefault(); this.close();
+                e.stopPropagation(); e.preventDefault();
+                if (this.pending) this.cancelPending(); else this.close();
             }
         };
         window.addEventListener("keydown", this._docKey, true);
@@ -665,6 +980,7 @@ class InpaintEditor {
 
     close() {
         if (!this.isOpen) return;
+        if (this.pending) this.cancelPending();
         this.isOpen = false;
         this.pointer = null;
         this.lassoPoints = null;
@@ -731,17 +1047,34 @@ class InpaintEditor {
     }
 
     setTool(tool) {
+        if (this.pending && tool !== "transform") this.cancelPending();
         this.tool = tool;
         for (const [id, b] of Object.entries(this.toolButtons)) b.classList.toggle("ipc-active", id === tool);
         this.viewEl.classList.toggle("ipc-pan", tool === "hand");
         this.viewEl.classList.toggle("ipc-move", tool === "transform");
+        if (tool !== "transform") this.viewEl.classList.remove("ipc-scale", "ipc-scale-x", "ipc-scale-y", "ipc-rotate");
+        this.updateSubbar();
         this.draw();
     }
 
     onKey(e) {
         const k = e.key.toLowerCase();
-        if (e.key === "Escape") { e.preventDefault(); this.close(); return; }
+        if (e.key === "Escape") { e.preventDefault(); if (this.pending) this.cancelPending(); else this.close(); return; }
         if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); this.generate(); return; }
+        if (e.key === "Enter" && this.pending) { e.preventDefault(); this.applyPending(); return; }
+        if (this.tool === "transform" && !this.pending && e.key.startsWith("Arrow")) {
+            const l = this.activeLayer();
+            if (l) {
+                e.preventDefault();
+                const step = e.shiftKey ? 10 : 1;
+                this.pushUndo({ kind: "transform", id: l.id });
+                if (e.key === "ArrowLeft") l.x -= step; if (e.key === "ArrowRight") l.x += step;
+                if (e.key === "ArrowUp") l.y -= step; if (e.key === "ArrowDown") l.y += step;
+                this.uploaded.baseHash = null; this.uploaded.controlHash = null;
+                this.renderLayers(); this.draw(); this.drawThumb(); this.notifyChanged();
+            }
+            return;
+        }
         if ((e.ctrlKey || e.metaKey) && e.shiftKey && k === "n") { e.preventDefault(); this.addPaintLayer(); return; }
         if ((e.ctrlKey || e.metaKey) && k === "z") { e.preventDefault(); e.shiftKey ? this.redoStep() : this.undoStep(); return; }
         if ((e.ctrlKey || e.metaKey) && k === "y") { e.preventDefault(); this.redoStep(); return; }
@@ -849,16 +1182,35 @@ class InpaintEditor {
         return !!(layer.role && layer.role !== "none");
     }
 
-    /** Which corner handle of the active layer is under image point (ix, iy)? */
+    /** Handles of a layer: corners (nw, ne, sw, se) and edge midpoints (n, e, s, w). */
+    layerHandles(l) {
+        return {
+            nw: [l.x, l.y], ne: [l.x + l.w, l.y], sw: [l.x, l.y + l.h], se: [l.x + l.w, l.y + l.h],
+            n: [l.x + l.w / 2, l.y], s: [l.x + l.w / 2, l.y + l.h], w: [l.x, l.y + l.h / 2], e: [l.x + l.w, l.y + l.h / 2],
+        };
+    }
+
+    /** Which handle of the active layer is under image point (ix, iy)? */
     handleAt(ix, iy) {
         const l = this.activeLayer();
         if (!l) return null;
         const r = HANDLE_PX / this.view.scale;
-        const corners = { nw: [l.x, l.y], ne: [l.x + l.w, l.y], sw: [l.x, l.y + l.h], se: [l.x + l.w, l.y + l.h] };
-        for (const [name, [cx, cy]] of Object.entries(corners)) {
+        const handles = this.layerHandles(l);
+        for (const name of ["nw", "ne", "sw", "se", "n", "s", "w", "e"]) {
+            const [cx, cy] = handles[name];
             if (Math.abs(ix - cx) <= r && Math.abs(iy - cy) <= r) return name;
         }
         return null;
+    }
+
+    updateTransformCursor(ix, iy) {
+        const cls = this.viewEl.classList;
+        cls.remove("ipc-scale", "ipc-scale-x", "ipc-scale-y", "ipc-rotate");
+        if (this.pending) { if (this.pending.mode === "rotate") cls.add("ipc-rotate"); return; }
+        const h = this.handleAt(ix, iy);
+        if (h === "n" || h === "s") cls.add("ipc-scale-y");
+        else if (h === "e" || h === "w") cls.add("ipc-scale-x");
+        else if (h) cls.add("ipc-scale");
     }
 
     // ---- pointer gestures --------------------------------------------------
@@ -901,11 +1253,12 @@ class InpaintEditor {
         } else if (this.tool === "transform") {
             const layer = this.activeLayer();
             if (!layer) { this.setStatus("Select a layer to move or scale it. The base stays put."); return; }
+            if (this.pending) { this.pendingPointerDown(ix, iy, e); this.draw(); return; }
             const handle = this.handleAt(ix, iy);
             this.pushUndo({ kind: "transform", id: layer.id });
             if (handle) {
-                this.pointer = { kind: "scale", layer, handle, start: [ix, iy], orig: { x: layer.x, y: layer.y, w: layer.w, h: layer.h }, keepAspect: !e.shiftKey };
-                this.viewEl.classList.add("ipc-scale");
+                const corner = handle.length === 2;
+                this.pointer = { kind: "scale", layer, handle, start: [ix, iy], orig: { x: layer.x, y: layer.y, w: layer.w, h: layer.h }, keepAspect: corner && !e.shiftKey };
             } else {
                 this.pointer = { kind: "move", layer, start: [ix, iy], orig: { x: layer.x, y: layer.y } };
             }
@@ -919,7 +1272,7 @@ class InpaintEditor {
         this.hover = [ix, iy];
         const p = this.pointer;
         if (!p) {
-            if (this.tool === "transform") this.viewEl.classList.toggle("ipc-scale", !!this.handleAt(ix, iy));
+            if (this.tool === "transform") this.updateTransformCursor(ix, iy);
             this.draw();
             return;
         }
@@ -943,6 +1296,8 @@ class InpaintEditor {
             p.layer.y = Math.round(p.orig.y + (iy - p.start[1]));
         } else if (p.kind === "scale") {
             this.applyScale(p, ix, iy);
+        } else if (p.kind === "pending") {
+            this.pendingPointerMove(ix, iy, e);
         }
         this.draw();
     }
@@ -950,11 +1305,14 @@ class InpaintEditor {
     applyScale(p, ix, iy) {
         const o = p.orig;
         const l = p.layer;
-        const anchorX = p.handle.includes("w") ? o.x + o.w : o.x;
-        const anchorY = p.handle.includes("n") ? o.y + o.h : o.y;
-        let nw = Math.abs(ix - anchorX);
-        let nh = Math.abs(iy - anchorY);
-        if (p.keepAspect) {
+        const h = p.handle;
+        const horizontal = h.includes("e") || h.includes("w");
+        const vertical = h.includes("n") || h.includes("s");
+        const anchorX = h.includes("w") ? o.x + o.w : o.x;
+        const anchorY = h.includes("n") ? o.y + o.h : o.y;
+        let nw = horizontal ? Math.abs(ix - anchorX) : o.w;
+        let nh = vertical ? Math.abs(iy - anchorY) : o.h;
+        if (p.keepAspect && horizontal && vertical) {
             const aspect = o.w / o.h;
             if (nw / aspect > nh) nh = nw / aspect; else nw = nh * aspect;
         }
@@ -962,8 +1320,8 @@ class InpaintEditor {
         nh = Math.max(4, nh);
         l.w = Math.round(nw);
         l.h = Math.round(nh);
-        l.x = Math.round(p.handle.includes("w") ? anchorX - nw : anchorX);
-        l.y = Math.round(p.handle.includes("n") ? anchorY - nh : anchorY);
+        l.x = Math.round(h.includes("w") ? anchorX - nw : (horizontal ? anchorX : o.x));
+        l.y = Math.round(h.includes("n") ? anchorY - nh : (vertical ? anchorY : o.y));
     }
 
     onPointerUp(e) {
@@ -971,7 +1329,6 @@ class InpaintEditor {
         if (!p) return;
         this.pointer = null;
         this.viewEl.classList.remove("ipc-panning");
-        this.viewEl.classList.remove("ipc-scale");
         try { this.canvas.releasePointerCapture(e.pointerId); } catch (_) { /* ignore */ }
         if (p.kind === "rect") {
             const [x0, y0] = p.start;
@@ -1283,6 +1640,7 @@ class InpaintEditor {
         if (!layer) return null;
         if (step.kind === "layer") return { kind: "layer", id: layer.id, url: layer.canvas.toDataURL("image/png") };
         if (step.kind === "transform") return { kind: "transform", id: layer.id, x: layer.x, y: layer.y, w: layer.w, h: layer.h };
+        if (step.kind === "layerfull") return { kind: "layerfull", id: layer.id, url: layer.canvas.toDataURL("image/png"), cw: layer.canvas.width, ch: layer.canvas.height, x: layer.x, y: layer.y, w: layer.w, h: layer.h };
         return null;
     }
 
@@ -1320,12 +1678,19 @@ class InpaintEditor {
                 this.renderLayers();
                 this.drawThumb();
                 this.notifyChanged();
+            } else if (snap.kind === "layerfull") {
+                const img = await loadImageEl(snap.url);
+                layer.canvas = imageToCanvas(img, snap.cw, snap.ch);
+                Object.assign(layer, { x: snap.x, y: snap.y, w: snap.w, h: snap.h });
+                this.markLayerChanged(layer);
+                this.renderLayers();
             }
         }
         this.draw();
     }
 
     async undoStep() {
+        if (this.pending) this.cancelPending();
         const snap = this.undo.pop();
         if (!snap) return;
         const current = this.snapshot(snap);
@@ -1334,6 +1699,7 @@ class InpaintEditor {
     }
 
     async redoStep() {
+        if (this.pending) this.cancelPending();
         const snap = this.redo.pop();
         if (!snap) return;
         const current = this.snapshot(snap);
@@ -1521,6 +1887,7 @@ class InpaintEditor {
     }
 
     removeLayer(id) {
+        if (this.pending && this.pending.layer.id === id) this.cancelPending();
         this.layers = this.layers.filter((l) => l.id !== id);
         if (this.activeLayerId === id) this.activeLayerId = null;
         this.uploaded.baseHash = null;
@@ -1578,7 +1945,7 @@ class InpaintEditor {
         for (let i = this.layers.length - 1; i >= 0; i--) {
             const layer = this.layers[i];
             const row = el("div", "ipc-layer" + (layer.id === this.activeLayerId ? " ipc-selected" : ""));
-            row.addEventListener("click", () => { this.activeLayerId = layer.id; this.renderLayers(); this.draw(); });
+            row.addEventListener("click", () => { if (this.pending) this.cancelPending(); this.activeLayerId = layer.id; this.renderLayers(); this.updateSubbar(); this.draw(); });
             const top = el("div", "ipc-row");
             top.appendChild(miniButton(layer.visible ? "eye" : "eyeOff", "Toggle visibility", () => {
                 layer.visible = !layer.visible;
@@ -1742,10 +2109,30 @@ class InpaintEditor {
             if (forRun && ctrl) continue;
             ctx.globalAlpha = layer.opacity;
             ctx.globalCompositeOperation = (!controlOnly && layer.blend && layer.blend !== "normal") ? layer.blend : "source-over";
-            ctx.drawImage(this.layerWithStroke(layer), layer.x, layer.y, layer.w, layer.h);
+            this.drawLayer(ctx, layer);
         }
         ctx.globalAlpha = 1;
         ctx.globalCompositeOperation = "source-over";
+    }
+
+    drawLayer(ctx, layer) {
+        const p = this.pending;
+        if (p && p.layer === layer) {
+            const fine = !this.pointer;
+            const n = this.pendingSubdivisions(p, fine);
+            if (p.mode === "rotate") {
+                const cx = layer.x + layer.w / 2, cy = layer.y + layer.h / 2;
+                ctx.save();
+                ctx.translate(cx, cy);
+                ctx.rotate(p.angle);
+                ctx.drawImage(layer.canvas, -layer.w / 2, -layer.h / 2, layer.w, layer.h);
+                ctx.restore();
+            } else {
+                drawMesh(ctx, layer.canvas, (u, v) => this.pendingDst(p, u, v), n, n);
+            }
+            return;
+        }
+        ctx.drawImage(this.layerWithStroke(layer), layer.x, layer.y, layer.w, layer.h);
     }
 
     flattenToCanvas(opts = {}) {
@@ -1829,7 +2216,38 @@ class InpaintEditor {
         }
 
         const active = this.activeLayer();
-        if (active && (this.tool === "transform" || this.tool === "paint" || this.tool === "erase")) {
+        const pend = this.pending;
+        if (pend && pend.layer) {
+            ctx.save();
+            ctx.lineWidth = 1 / s;
+            ctx.strokeStyle = "#ffb347";
+            ctx.fillStyle = "#ffb347";
+            const r = HANDLE_PX / s / 2;
+            if (pend.mode === "rotate") {
+                const l = pend.layer;
+                const corners = [[0, 0], [1, 0], [1, 1], [0, 1]].map(([u, v]) => this.pendingDst(pend, u, v));
+                ctx.beginPath();
+                corners.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
+                ctx.closePath();
+                ctx.stroke();
+                const cx = l.x + l.w / 2, cy = l.y + l.h / 2;
+                ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke();
+            } else if (pend.mode === "distort") {
+                ctx.beginPath();
+                pend.points.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
+                ctx.closePath();
+                ctx.stroke();
+                for (const [x, y] of pend.points) ctx.fillRect(x - r, y - r, r * 2, r * 2);
+            } else if (pend.mode === "warp") {
+                const n = pend.n;
+                ctx.setLineDash([3 / s, 3 / s]);
+                for (let j = 0; j <= n; j++) { ctx.beginPath(); for (let i = 0; i <= n; i++) { const [x, y] = pend.points[j * (n + 1) + i]; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); } ctx.stroke(); }
+                for (let i = 0; i <= n; i++) { ctx.beginPath(); for (let j = 0; j <= n; j++) { const [x, y] = pend.points[j * (n + 1) + i]; j ? ctx.lineTo(x, y) : ctx.moveTo(x, y); } ctx.stroke(); }
+                ctx.setLineDash([]);
+                for (const [x, y] of pend.points) { ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill(); }
+            }
+            ctx.restore();
+        } else if (active && (this.tool === "transform" || this.tool === "paint" || this.tool === "erase")) {
             ctx.save();
             ctx.lineWidth = 1 / s;
             ctx.strokeStyle = "#ffb347";
@@ -1838,9 +2256,10 @@ class InpaintEditor {
             if (this.tool === "transform") {
                 const r = HANDLE_PX / s / 2;
                 ctx.fillStyle = "#ffb347";
-                for (const [cx, cy] of [[active.x, active.y], [active.x + active.w, active.y], [active.x, active.y + active.h], [active.x + active.w, active.y + active.h]]) {
-                    ctx.fillRect(cx - r, cy - r, r * 2, r * 2);
-                }
+                const handles = this.layerHandles(active);
+                for (const name of ["nw", "ne", "sw", "se"]) { const [cx, cy] = handles[name]; ctx.fillRect(cx - r, cy - r, r * 2, r * 2); }
+                ctx.fillStyle = "#1e1e1e";
+                for (const name of ["n", "s", "w", "e"]) { const [cx, cy] = handles[name]; ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); }
             }
             ctx.restore();
         }

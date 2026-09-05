@@ -124,8 +124,19 @@ Painting maps image coords into layer pixels (`sx = canvas.width / w`).
 - `drawComposite(ctx, {forRun, controlOnly})`: `forRun` skips control layers,
   `controlOnly` draws only them on black. Blend modes map straight to
   `globalCompositeOperation`.
-- Undo stack entries: `{kind: "selection"|"layer"|"transform", ...}` with PNG
-  data URLs for pixels (MAX_UNDO 30).
+- Undo stack entries: `{kind: "selection"|"layer"|"transform"|"layerfull", ...}`
+  with PNG data URLs for pixels (MAX_UNDO 30). `layerfull` stores pixels and
+  rect together; it is what rotate/distort/warp push before baking.
+- Transform tool: scale mode is live and non-destructive (x, y, w, h). Rotate,
+  distort and warp use `this.pending` (`{mode, layer, angle | points, n}`);
+  `pendingDst(p, u, v)` maps the normalised layer position to image coords
+  (rotation about the center, a homography for distort, bilinear control-grid
+  interpolation for warp). `drawLayer` renders the preview through `drawMesh`
+  (triangle pairs, affine per triangle, clip grown 0.7 px to hide seams);
+  `applyPending` bakes into a new canvas at the layer's native resolution and
+  updates the rect. The sub-toolbar (`buildSubbar`/`updateSubbar`) lives inside
+  `.ipc-view`; `.ipc-modal [hidden]` needs `display:none !important` because
+  the flex rules would otherwise override the attribute.
 - `extendCanvas()` bakes visible non-control layers into a new base (edge
   pixels stretched into the border), keeps control layers (shifted / resized),
   sets the border as selection.
@@ -200,6 +211,15 @@ Open, in the order suggested:
 2. **Refine pass**: re-run a result at low denoise without reselecting
    (probably a "refine" flag in canvas_state that makes `crop_mask` the whole
    patch and a `denoise` hint output).
-3. Rotation in transform, soft-edged selection (feather preview), brush
-   presets, keyboard color picker.
-4. Registry publish once the user adds `REGISTRY_ACCESS_TOKEN`.
+3. Soft-edged selection (feather preview), brush presets, keyboard color
+   picker. (Rotation, distort and warp exist since 2026-09-05.)
+4. From the Krita plugin analysis (2026-09-05, see chat notes below):
+   fill modes before diffusion (blur / neutral / border / green for Flux.2
+   edit models), auto grow/feather/blend relative to selection diagonal
+   (feather 10 % of diagonal, min 32 px; grow 4 + feather/2; blend ≤ 25),
+   auto context padding `max(longest_side/16, avg_selection_side/2)` with a
+   512 px minimum and square balancing, color match in the stitch, regions via
+   the installed comfyui-tooling-nodes (`ETN_BackgroundRegion`,
+   `ETN_DefineRegion`, `ETN_AttentionMask`). Krita is GPL-3: reimplement the
+   formulas, do not copy code.
+5. Registry publish once the user adds `REGISTRY_ACCESS_TOKEN`.
