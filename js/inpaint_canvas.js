@@ -375,23 +375,31 @@ function availableUpsampleBackends() {
 
 const UPSAMPLE_CASES = ["auto", "fill", "add", "remove", "edit", "outpaint"];
 
-function upsampleInstruction(useCase, text, region) {
+/** Short noun phrase for a segmentation model, derived from the user's prompt by a VLM. */
+function segmentTermInstruction(promptText) {
+    // Two explicit steps: with a single question the 2B model copies German words unchanged.
+    return `Step 1: translate this request to English: "${promptText}". Step 2: name the one object in the picture that the request is about, as it looks now, in English, 1 to 3 words, plain nouns only (examples: swimsuit, hair, wooden chair, background). Output only the words of step 2, nothing else.`;
+}
+
+function upsampleInstruction(useCase, text, region, hint) {
     // Kept short and with the request repeated at the end: small VLMs (Qwen3-VL 2B)
     // drop the request when it is buried in a long preamble.
     const req = text ? `"${text}"` : "(no request given: infer the most plausible content from the picture)";
+    // what the selection contains, when it came from a text segmentation
+    const look = `Look at the image.${hint ? ` ${region[0].toUpperCase()}${region.slice(1)} currently shows: ${hint}.` : ""}`;
     const rules = `Rules: obey the request exactly and translate it to English if needed (Seide = silk, Leder = leather); if the request names a colour or material, the prompt must use exactly that colour and material even though the picture currently shows something else; describe only the final content as a direct description of what is seen; the ${region.includes("green") ? "green area" : "magenta outline"} is only a marker, never mention it, the region or the image; no lists, no preamble, no quotes, no negative prompt. Output only the prompt text.`;
     const tail = `Request again: ${req}`;
     switch (useCase) {
         case "add":
-            return `Look at the image. Something new will be painted into ${region} according to this request: ${req}. Write the image-generation prompt for it: one English paragraph of 40 to 80 words, starting with the requested object, then its shape, material and colour, then how it sits in the scene (size relative to the surroundings, contact with surfaces, cast shadows) under the same lighting and perspective as the rest of the picture. ${rules} ${tail}`;
+            return `${look} Something new will be painted into ${region} according to this request: ${req}. Write the image-generation prompt for it: one English paragraph of 40 to 80 words, starting with the requested object, then its shape, material and colour, then how it sits in the scene (size relative to the surroundings, contact with surfaces, cast shadows) under the same lighting and perspective as the rest of the picture. ${rules} ${tail}`;
         case "remove":
-            return `Look at the image. Whatever is inside ${region} will be erased as if it had never been there${text ? `; request: ${req}` : ""}. Write the image-generation prompt for that spot: one English paragraph of 30 to 60 words describing only what would be visible with the object gone, the background, surfaces, body or textures continuing naturally from the surroundings. The object that is there now must not appear in the prompt and the word remove must not be used. ${rules}`;
+            return `${look} Whatever ${region} contains will be erased as if it had never been there${text ? `; request: ${req}` : ""}. Write the image-generation prompt for that spot: one English paragraph of 30 to 60 words describing only what would be visible with the object gone, the background, surfaces, body or textures continuing naturally from the surroundings. The object that is there now must not appear in the prompt and the word remove must not be used. ${rules}`;
         case "edit":
-            return `Look at the image. ${region} will be changed according to this request: ${req}. Write an editing instruction for an image editing model: one or two English sentences of at most 50 words, starting with a verb, naming exactly what changes (keep the requested colours and materials) and what must stay the same (identity, pose, lighting, composition). ${rules} ${tail}`;
+            return `${look} ${region[0].toUpperCase()}${region.slice(1)} will be changed according to this request: ${req}. Write an editing instruction for an image editing model: one or two English sentences of at most 50 words, starting with a verb, naming exactly what changes (keep the requested colours and materials) and what must stay the same (identity, pose, lighting, composition). ${rules} ${tail}`;
         case "outpaint":
-            return `Look at the image. ${region} lies at the border and the scene will be extended beyond it${text ? `; request: ${req}` : ""}. Write the image-generation prompt for the extension: one English paragraph of 40 to 80 words describing what appears further out, continuing the same environment, perspective, lighting and style without a visible seam. ${rules} ${tail}`;
+            return `${look} ${region[0].toUpperCase()}${region.slice(1)} lies at the border and the scene will be extended beyond it${text ? `; request: ${req}` : ""}. Write the image-generation prompt for the extension: one English paragraph of 40 to 80 words describing what appears further out, continuing the same environment, perspective, lighting and style without a visible seam. ${rules} ${tail}`;
         default:
-            return `Look at the image. ${region} will be repainted according to this request: ${req}. Write the image-generation prompt for that area: one English paragraph of 40 to 80 words, starting with the requested subject, then its materials and colours, then how its lighting, perspective and scale match the surroundings so the result blends in. ${rules} ${tail}`;
+            return `${look} ${region[0].toUpperCase()}${region.slice(1)} will be repainted according to this request: ${req}. Write the image-generation prompt for that area: one English paragraph of 40 to 80 words, starting with the requested subject, then its materials and colours, then how its lighting, perspective and scale match the surroundings so the result blends in. ${rules} ${tail}`;
     }
 }
 
@@ -640,6 +648,7 @@ class InpaintEditor {
         this.cropSettings = { ...CROP_DEFAULTS };
         this.upsampleSettings = { useCase: "auto", backend: "auto" };
         this.promptBackup = null;
+        this.selectionLabel = "";       // what the selection is, when it came from "Select by text"
         this.undo = [];
         this.redo = [];
         this.selectionDirty = true;
@@ -802,10 +811,10 @@ class InpaintEditor {
         addTool("lasso", "Lasso selection (L)");
         addTool("object", "Object selection (O): hover to see objects, click to select, click again to deselect. Shift adds, Alt subtracts.");
         addTool("deselect", "Erase from selection (D)");
-        this.loopBtn = iconButton("loop", "Close loops: a brush stroke that encloses an area selects the inside too (Photoshop-style)", () => {
+        this.loopBtn = iconButton("loop", "Close loops (Photoshop-style): end a brush stroke where it started and the inside is filled too. Also for the subtract brush.", () => {
             this.fillEnclosed = !this.fillEnclosed;
             this.loopBtn.classList.toggle("ipc-toggle-on", this.fillEnclosed);
-            this.setStatus(this.fillEnclosed ? "Close loops on: enclosed areas get selected." : "Close loops off.");
+            this.setStatus(this.fillEnclosed ? "Close loops on: end a stroke where it started to fill the inside." : "Close loops off.");
         });
         this.loopBtn.classList.toggle("ipc-toggle-on", this.fillEnclosed);
         tools.appendChild(this.loopBtn);
@@ -877,7 +886,7 @@ class InpaintEditor {
             const row = el("div", "ipc-seg");
             this.segInput = document.createElement("input");
             this.segInput.type = "text";
-            this.segInput.placeholder = "Select by text, e.g. shirt";
+            this.segInput.placeholder = "Select by text, e.g. shirt (empty: from the prompt)";
             this.segInput.spellcheck = false;
             this.segInput.addEventListener("keydown", (e) => { e.stopPropagation(); if (e.key === "Enter") { e.preventDefault(); this.segmentByText(); } if (e.key === "Escape") { this.segInput.blur(); this.root.focus({ preventScroll: true }); } });
             row.appendChild(this.segInput);
@@ -902,9 +911,10 @@ class InpaintEditor {
             thrLab.appendChild(this.segThreshold);
             seg.appendChild(thrLab);
             const qualLab = el("label", null, "");
+            this.segQualityLab = qualLab;
             this.segQuality = document.createElement("input");
             this.segQuality.type = "checkbox";
-            this.segQuality.title = "Use the large SAM model (slower, finer edges)";
+            this.segQuality.title = "HQ: use the large SAM model with GroundingDINO + SAM (slower, finer edges). Not used by SAM3.";
             qualLab.appendChild(this.segQuality);
             qualLab.appendChild(el("span", null, "HQ"));
             seg.appendChild(qualLab);
@@ -914,6 +924,7 @@ class InpaintEditor {
             srcLab.appendChild(this.segSourceSel);
             seg.appendChild(srcLab);
             this.segBackendSel = selectInput(["auto"], "auto", "Segmentation backend");
+            this.segBackendSel.addEventListener("change", () => this.updateSegQuality());
             seg.appendChild(this.segBackendSel);
             d.appendChild(seg);
         });
@@ -1538,7 +1549,7 @@ class InpaintEditor {
 
         if (this.tool === "select" || this.tool === "deselect") {
             this.pushUndo({ kind: "selection" });
-            this.pointer = { kind: "selpaint", last: [ix, iy] };
+            this.pointer = { kind: "selpaint", last: [ix, iy], path: [[ix, iy]] };
             this.selectionDab(ix, iy, ix, iy);
         } else if (this.tool === "rect") {
             this.pushUndo({ kind: "selection" });
@@ -1599,6 +1610,7 @@ class InpaintEditor {
         } else if (p.kind === "selpaint") {
             this.selectionDab(p.last[0], p.last[1], ix, iy);
             p.last = [ix, iy];
+            p.path.push([ix, iy]);
         } else if (p.kind === "layerpaint") {
             this.layerDab(p, p.last[0], p.last[1], ix, iy);
             p.last = [ix, iy];
@@ -1668,7 +1680,7 @@ class InpaintEditor {
                 this.markSelectionChanged();
             }
         } else if (p.kind === "selpaint") {
-            if (this.tool === "select" && this.fillEnclosed) this.fillEnclosedAreas();
+            if (this.fillEnclosed) this.closeStrokeLoop(p.path, this.tool === "deselect");
             this.markSelectionChanged();
         } else if (p.kind === "object") {
             if (!p.moved) this.toggleObjectAt(...this.toImage(e), p);
@@ -1703,32 +1715,34 @@ class InpaintEditor {
      * Photoshop-style loop closing: every unselected region that cannot reach
      * the image border (i.e. is fully enclosed by the selection) gets selected.
      */
-    fillEnclosedAreas() {
-        const W = this.width, H = this.height;
+    /**
+     * Photoshop-style loop closing for the selection brush: when a stroke comes
+     * back to where it started, the path is closed with a straight line and its
+     * inside is filled (nonzero winding, so a figure-eight fills both lobes and
+     * a loop against the image border counts too). Works for the subtract brush
+     * as well. Returns true when something was filled.
+     */
+    closeStrokeLoop(path, subtract) {
+        if (!path || path.length < 8) return false;
+        const [x0, y0] = path[0];
+        const [x1, y1] = path[path.length - 1];
+        const tol = Math.max(this.brushSize, 24 / this.view.scale);
+        if (Math.hypot(x1 - x0, y1 - y0) > tol) return false;
+        // ignore tiny scribbles: the loop must span more than the brush itself
+        let minX = x0, maxX = x0, minY = y0, maxY = y0;
+        for (const [x, y] of path) { if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y; }
+        if (Math.max(maxX - minX, maxY - minY) < this.brushSize * 1.5) return false;
         const sctx = this.selection.getContext("2d");
-        const img = sctx.getImageData(0, 0, W, H);
-        const d = img.data;
-        const reach = new Uint8Array(W * H);
-        const stack = [];
-        const push = (i) => { if (!reach[i] && d[i * 4 + 3] <= 127) { reach[i] = 1; stack.push(i); } };
-        for (let x = 0; x < W; x++) { push(x); push((H - 1) * W + x); }
-        for (let y = 0; y < H; y++) { push(y * W); push(y * W + W - 1); }
-        while (stack.length) {
-            const i = stack.pop();
-            const x = i % W, y = (i - x) / W;
-            if (x > 0) push(i - 1);
-            if (x < W - 1) push(i + 1);
-            if (y > 0) push(i - W);
-            if (y < H - 1) push(i + W);
-        }
-        let filled = 0;
-        for (let i = 0; i < W * H; i++) {
-            if (!reach[i] && d[i * 4 + 3] <= 127) {
-                d[i * 4] = 255; d[i * 4 + 1] = 0; d[i * 4 + 2] = 0; d[i * 4 + 3] = 255;
-                filled++;
-            }
-        }
-        if (filled) sctx.putImageData(img, 0, 0);
+        sctx.save();
+        sctx.globalCompositeOperation = subtract ? "destination-out" : "source-over";
+        sctx.fillStyle = "#ff0000";
+        sctx.beginPath();
+        sctx.moveTo(x0, y0);
+        for (let i = 1; i < path.length; i++) sctx.lineTo(path[i][0], path[i][1]);
+        sctx.closePath();
+        sctx.fill("nonzero");
+        sctx.restore();
+        return true;
     }
 
     /**
@@ -1892,6 +1906,7 @@ class InpaintEditor {
         if (!avail.length) { const o = document.createElement("option"); o.value = ""; o.textContent = "no segmentation nodes installed"; this.segBackendSel.appendChild(o); }
         if (avail.some((b) => b.id === cur)) this.segBackendSel.value = cur;
         this.segBtn.disabled = !avail.length;
+        this.updateSegQuality();
         if (this.upBackendSel) {
             const ups = availableUpsampleBackends();
             const curUp = this.upsampleSettings.backend;
@@ -1904,25 +1919,40 @@ class InpaintEditor {
         if (this.upCaseSel) this.upCaseSel.value = this.upsampleSettings.useCase || "auto";
     }
 
+    /** The HQ toggle (large SAM) only applies to the GroundingDINO + SAM backend. */
+    updateSegQuality() {
+        if (this.segQualityLab) this.segQualityLab.hidden = this.segBackendSel.value !== "dino_sam";
+    }
+
     async segmentByText() {
         if (!this.base) { this.setStatus("Load an image first."); return; }
-        const text = (this.segInput.value || "").trim();
-        if (!text) { this.setStatus("Type what to select, e.g. \"shirt\"."); this.segInput.focus(); return; }
+        let text = (this.segInput.value || "").trim();
+        // Empty field but a prompt: let the language model name the object the prompt is about.
+        const fromPrompt = !text && !!(this.promptInput.value || "").trim();
+        const llm = fromPrompt ? (UPSAMPLE_BACKENDS.find((b) => b.id === this.upBackendSel.value) || availableUpsampleBackends()[0]) : null;
+        if (!text && !fromPrompt) { this.setStatus("Type what to select, e.g. \"shirt\", or write a prompt and press Go to select what it is about."); this.segInput.focus(); return; }
+        if (fromPrompt && !llm) { this.setStatus("Type what to select: no language model nodes installed to derive it from the prompt."); this.segInput.focus(); return; }
         const backend = SEGMENT_BACKENDS.find((b) => b.id === this.segBackendSel.value) || availableSegmentBackends()[0];
         if (!backend) { this.setStatus("No segmentation nodes installed (comfyui_segment_anything or comfyui-rmbg)."); return; }
         try {
             this.segBtn.disabled = true;
-            this.setStatus(`Segmenting "${text}" with ${backend.label} ...`);
+            this.setStatus(fromPrompt ? `Asking ${llm.label} what the prompt is about, then segmenting with ${backend.label} ...` : `Segmenting "${text}" with ${backend.label} ...`);
             const { ref, layer } = await this.segmentSource();
             const threshold = Math.min(0.95, Math.max(0.05, +this.segThreshold.value || 0.3));
             const prompt = {
                 seg_load: { class_type: "InpaintCanvasLoadRef", inputs: { ref: JSON.stringify(ref) } },
-                ...backend.build("seg_load", text, threshold, { quality: this.segQuality.checked }, backend),
-                seg_out: { class_type: "InpaintCanvasMaskOut", inputs: { mask: backend.maskOut, canvas_node: String(this.node.id), purpose: "segment" } },
             };
+            if (fromPrompt) {
+                // term_run: VLM -> STRING, linked straight into the segmentation node's prompt input
+                Object.assign(prompt, llm.build("seg_load", segmentTermInstruction(this.promptInput.value.trim())));
+                prompt.term_run = prompt.up_run; delete prompt.up_run;
+                text = ["term_run", llm.textOut[1]];
+            }
+            Object.assign(prompt, backend.build("seg_load", text, threshold, { quality: this.segQuality.checked }, backend));
+            prompt.seg_out = { class_type: "InpaintCanvasMaskOut", inputs: { mask: backend.maskOut, canvas_node: String(this.node.id), purpose: "segment", ...(fromPrompt ? { label: text } : {}) } };
             const res = await api.queuePrompt(-1, { output: prompt, workflow: { nodes: [], links: [], version: 0.4, extra: { inpaint_canvas_helper: true } } });
             this.segmentPromptId = res && res.prompt_id;
-            this.segmentPending = { text, mode: this.segMode, layer };
+            this.segmentPending = { text: fromPrompt ? "" : text, mode: this.segMode, layer, fromPrompt };
             if (res && res.node_errors && Object.keys(res.node_errors).length) {
                 const first = Object.values(res.node_errors)[0];
                 throw new Error((first.errors && first.errors[0] && first.errors[0].message) || "prompt rejected");
@@ -2040,7 +2070,7 @@ class InpaintEditor {
             const { ref } = await uploadCanvas(this.promptContextCanvas(), `n${this.node.id}_promptctx`);
             const prompt = {
                 up_load: { class_type: "InpaintCanvasLoadRef", inputs: { ref: JSON.stringify(ref) } },
-                ...backend.build("up_load", upsampleInstruction(useCase, text, region)),
+                ...backend.build("up_load", upsampleInstruction(useCase, text, region, this.getBounds() ? this.selectionLabel : "")),
                 up_out: { class_type: "InpaintCanvasTextOut", inputs: { text: backend.textOut, canvas_node: String(this.node.id), purpose: "upsample" } },
             };
             const res = await api.queuePrompt(-1, { output: prompt, workflow: { nodes: [], links: [], version: 0.4, extra: { inpaint_canvas_helper: true } } });
@@ -2229,7 +2259,10 @@ class InpaintEditor {
             this.markSelectionChanged();
             this.draw();
             const pct = Math.round(100 * count / (this.width * this.height));
-            this.setStatus(count ? `Selected "${pending.text}" (${pct}% of the image, ${pending.mode}).` : `Nothing found for "${pending.text}". Lower the threshold or rephrase.`);
+            const term = (info.label || pending.text || "").trim();
+            if (pending.fromPrompt && term && !this.segInput.value.trim()) this.segInput.value = term;
+            if (count) this.selectionLabel = pending.mode === "replace" ? term : [this.selectionLabel, term].filter(Boolean).join(", ");
+            this.setStatus(count ? `Selected "${term}" (${pct}% of the image, ${pending.mode}${pending.fromPrompt ? ", derived from the prompt" : ""}).` : `Nothing found for "${term}". Lower the threshold or rephrase.`);
         } catch (err) {
             console.error(err);
             this.setStatus("Could not apply the mask: " + (err.message || err));
@@ -2383,6 +2416,7 @@ class InpaintEditor {
 
     clearSelection() {
         if (!this.selection) return;
+        this.selectionLabel = "";
         this.pushUndo({ kind: "selection" });
         this.selection.getContext("2d").clearRect(0, 0, this.width, this.height);
         this.markSelectionChanged();

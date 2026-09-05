@@ -18,7 +18,10 @@ Editor
 - **Load** an image, paste one with Ctrl+V, or drop a file onto the canvas.
 - **Select** tools on the left: brush (B), rectangle (R), lasso (L), object
   selection (O), deselect brush (D). The loop toggle below them closes brush
-  strokes Photoshop-style: paint a closed ring and the inside is selected too.
+  strokes the way Photoshop's Selection Brush does: end a stroke where it
+  started and the inside is filled as well (a small gap is bridged with a
+  straight line, a loop against the image border counts, and the deselect
+  brush cuts out loops the same way).
 - **Object selection (O)**: the first time you pick the tool, SAM2 finds every
   object in the image once (a few seconds). After that, moving the mouse
   highlights the object under the cursor; click adds it to the selection,
@@ -32,7 +35,11 @@ Editor
 - **Select by text**: type what you want ("shirt", "hair", "the red car"),
   press Go or Enter. A small helper prompt runs at the front of the queue
   (only the segmentation nodes, never your generation chain) and the mask
-  comes back as the selection: Replace, Add or Subtract. Backends, best first:
+  comes back as the selection: Replace, Add or Subtract. Leave the field
+  empty and press Go with a prompt written below: the language model names
+  the object the prompt is about ("roter Seiden-Badeanzug" gives "bathing
+  suit"), that term is segmented and shown in the field. The HQ toggle only
+  applies to GroundingDINO + SAM (large SAM model). Backends, best first:
   SAM3 (comfyui-rmbg's node, weights `models/sam3/sam3.pt`), GroundingDINO
   + SAM (comfyui_segment_anything, HQ toggle picks the large SAM), and the
   core SAM3 nodes (experimental: on the machine this was built on they return
@@ -85,7 +92,10 @@ Editor
   should appear, never naming the object), *edit* (a verb-first instruction
   for editing models such as Flux.2), *outpaint* (the scene continued beyond
   the border). *auto* picks outpaint when the selection touches the border
-  and fill otherwise. Revert puts the previous prompt back. Backends: Qwen3-VL
+  and fill otherwise. When the selection came from "Select by text", the
+  model is also told what the outline contains ("it currently contains:
+  swimsuit"), which helps especially with *remove*. Revert puts the previous
+  prompt back. Backends: Qwen3-VL
   2B locally through ComfyUI-QwenVL (weights in `models/LLM/Qwen-VL`),
   Qwen3-VL 4B (downloaded on first use, about 8 GB, noticeably better at
   *remove* and at translating), or Gemini through ComfyUI's API node. The 2B

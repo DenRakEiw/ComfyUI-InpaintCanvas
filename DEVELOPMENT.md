@@ -113,8 +113,15 @@ Painting maps image coords into layer pixels (`sx = canvas.width / w`).
 - Tools: `select`, `rect`, `lasso`, `deselect` (selection); `paint`, `erase`,
   `transform`, `hand` (layers). Selection is a canvas with red pixels; the
   mask export reads alpha.
-- `fillEnclosedAreas()` = flood fill from the border after a selection brush
-  stroke; unreached unselected pixels become selected ("close loops").
+- `closeStrokeLoop(path, subtract)` = Photoshop Selection Brush loop closing
+  (2026-09-05, replaced the border flood fill): the stroke's path points are
+  recorded, and when the last point is within `max(brushSize, 24 / scale)` of
+  the first, the path is closed with a straight line and filled with nonzero
+  winding (subtract brush: destination-out). Tiny scribbles (bbox < 1.5 brush
+  sizes) are ignored. Adobe's own description: "close a freehand stroke into
+  a lasso shape by connecting back to your starting point, and Photoshop fills
+  the area automatically". The old flood fill needed a pixel-tight ring and
+  never filled loops that touched the image border.
 - `growSelection(n)` uses an exact Euclidean distance transform
   (Felzenszwalb, `distanceTransform`); negative n shrinks.
 - Layer strokes go into a per-gesture stroke buffer (`pointer.stroke`) and are
@@ -428,6 +435,23 @@ model cannot imagine it gone. Hence the 4B backend option (downloads on
 first use) and Gemini for quality.
 Settings persist in `canvas_state.upsample = {useCase, backend}`; the backend
 list is filled in `refreshSegmentBackends()` from the registered node types.
+
+Two-way link with "Select by text" (user request, 2026-09-05):
+- Segmentation -> upsampling: `selectionLabel` remembers the term of the last
+  text segmentation (replace sets it, add/subtract append, `clearSelection`
+  resets it) and `upsampleInstruction` gets it as `hint`: the region is
+  described as "... (it currently contains: swimsuit)".
+- Prompt -> segmentation: Go with an empty Select-by-text field and a prompt
+  present chains, inside one helper prompt, `term_run` (the upsample backend
+  with `segmentTermInstruction`, a two-step "translate, then name the object"
+  instruction; a single question made the 2B model copy German words) ->
+  the segmentation node's `prompt` input (STRING link) -> `InpaintCanvasMaskOut`
+  with the optional `label` input linked to the same text, echoed as
+  `info.label` so the editor can show the derived term in the field. Measured
+  with Qwen3-VL 2B: "roter Seiden-Badeanzug" -> bathing suit, "eine goldene
+  Kette um den Hals" -> necklace (not in the picture yet, SAM3 then finds
+  nothing), "entferne die Korallen an den Armen" -> coral branches.
+- The HQ toggle is hidden unless the GroundingDINO + SAM backend is chosen.
 
 Key handling: the window keydown listener (capture phase, registered in
 `open()`, removed in `close()`) now handles every key while the editor is

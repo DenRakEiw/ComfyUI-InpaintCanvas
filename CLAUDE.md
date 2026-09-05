@@ -80,6 +80,9 @@ SAM3 weights are at `models/checkpoints/sam3.pt` with a hardlink at
 ## Working on it
 
 - Python changes need a ComfyUI restart; JS changes only need a page reload.
+  (ComfyUI-HotReloadHack is installed and does reload `nodes.py` on save, the
+  log says "Reloaded module ComfyUI-InpaintCanvas", but do not rely on it for
+  new node classes or changed INPUT_TYPES; restart to be sure.)
   Restart only when `GET /queue` shows nothing running or pending (the user
   runs paid API workflows), then `Start-Process run_nvidia_gpu.bat`.
 - Check syntax with `python -m py_compile nodes.py` and `node --check js/inpaint_canvas.js`.

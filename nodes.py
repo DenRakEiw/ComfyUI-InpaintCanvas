@@ -569,6 +569,10 @@ class InpaintCanvasMaskOut:
                 "canvas_node": ("STRING", {"default": "", "tooltip": "Id of the Inpaint Canvas node that asked for the mask."}),
                 "purpose": ("STRING", {"default": "segment"}),
             },
+            "optional": {
+                "label": ("STRING", {"default": "", "forceInput": True,
+                                     "tooltip": "Text that describes the mask (e.g. the object name a language model derived from the prompt); echoed back to the editor."}),
+            },
         }
 
     RETURN_TYPES = ()
@@ -576,11 +580,14 @@ class InpaintCanvasMaskOut:
     CATEGORY = "image/inpaint"
     OUTPUT_NODE = True
 
-    def send(self, mask, canvas_node="", purpose="segment"):
+    def send(self, mask, canvas_node="", purpose="segment", label=""):
         out_dir = os.path.join(folder_paths.get_temp_directory(), SUBFOLDER)
         os.makedirs(out_dir, exist_ok=True)
         filename = f"n{canvas_node or 'x'}_{purpose}_{time.strftime('%H%M%S')}_{int(time.time() * 1000) % 1000:03d}.png"
-        info = {"filename": filename, "subfolder": SUBFOLDER, "type": "temp", "canvas_node": canvas_node, "purpose": purpose}
+        if isinstance(label, (list, tuple)):
+            label = " ".join(str(t) for t in label)
+        label = " ".join(str(label or "").strip().strip("\"'.").split())
+        info = {"filename": filename, "subfolder": SUBFOLDER, "type": "temp", "canvas_node": canvas_node, "purpose": purpose, "label": label}
         m = mask.detach().cpu().float().clamp(0, 1)
         if m.dim() == 2:
             m = m[None]
