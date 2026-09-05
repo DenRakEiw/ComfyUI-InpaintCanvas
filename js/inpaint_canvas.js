@@ -984,9 +984,9 @@ class InpaintEditor {
             tools.appendChild(b);
         };
         tools.appendChild(el("div", "ipc-grp", "Select"));
-        addTool("select", "Paint selection (B)");
-        addTool("rect", "Rectangle selection (R)");
-        addTool("lasso", "Lasso selection (L)");
+        addTool("select", "Paint selection (B): adds to the selection, Alt subtracts");
+        addTool("rect", "Rectangle selection (R): replaces the selection, Shift adds, Alt subtracts");
+        addTool("lasso", "Lasso selection (L): replaces the selection, Shift adds, Alt subtracts");
         addTool("object", "Object selection (O): hover to see objects, click to select, click again to deselect. Shift adds, Alt subtracts.");
         addTool("deselect", "Erase from selection (D)");
         this.loopBtn = iconButton("loop", "Close loops (Photoshop-style): end a brush stroke where it started and the inside is filled too. Also for the subtract brush.", () => {
@@ -1936,16 +1936,18 @@ class InpaintEditor {
         if (e.button !== 0) return;
         const [ix, iy] = this.toImage(e);
 
+        // Krita / Photoshop modifiers: Shift adds, Alt subtracts; rectangle and lasso replace otherwise.
+        const selMode = e.altKey ? "subtract" : (e.shiftKey ? "add" : "replace");
         if (this.tool === "select" || this.tool === "deselect") {
             this.pushUndo({ kind: "selection" });
-            this.pointer = { kind: "selpaint", last: [ix, iy], path: [[ix, iy]] };
+            this.pointer = { kind: "selpaint", last: [ix, iy], path: [[ix, iy]], subtract: this.tool === "deselect" || e.altKey };
             this.selectionDab(ix, iy, ix, iy);
         } else if (this.tool === "rect") {
             this.pushUndo({ kind: "selection" });
-            this.pointer = { kind: "rect", start: [ix, iy], cur: [ix, iy] };
+            this.pointer = { kind: "rect", start: [ix, iy], cur: [ix, iy], mode: selMode };
         } else if (this.tool === "lasso") {
             this.pushUndo({ kind: "selection" });
-            this.pointer = { kind: "lasso" };
+            this.pointer = { kind: "lasso", mode: selMode };
             this.lassoPoints = [[ix, iy]];
         } else if (this.tool === "object") {
             this.pointer = { kind: "object", start: [cx, cy], moved: false, shift: e.shiftKey, alt: e.altKey };
@@ -2016,8 +2018,10 @@ class InpaintEditor {
             p.last = [ix, iy];
         } else if (p.kind === "rect") {
             p.cur = [ix, iy];
+            p.mode = e.altKey ? "subtract" : (e.shiftKey ? "add" : p.mode === "replace" && !e.shiftKey ? "replace" : "add");
         } else if (p.kind === "lasso") {
             this.lassoPoints.push([ix, iy]);
+            p.mode = e.altKey ? "subtract" : (e.shiftKey ? "add" : p.mode === "replace" && !e.shiftKey ? "replace" : "add");
         } else if (p.kind === "move") {
             p.layer.x = Math.round(p.orig.x + (ix - p.start[0]));
             p.layer.y = Math.round(p.orig.y + (iy - p.start[1]));
@@ -2061,26 +2065,30 @@ class InpaintEditor {
             const [x0, y0] = p.start;
             const [x1, y1] = p.cur;
             const sctx = this.selection.getContext("2d");
-            sctx.globalCompositeOperation = "source-over";
+            if (p.mode === "replace") { sctx.globalCompositeOperation = "source-over"; sctx.clearRect(0, 0, this.width, this.height); this.selectionLabel = ""; }
+            sctx.globalCompositeOperation = p.mode === "subtract" ? "destination-out" : "source-over";
             sctx.fillStyle = "#ff0000";
             sctx.fillRect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0));
+            sctx.globalCompositeOperation = "source-over";
             this.markSelectionChanged();
         } else if (p.kind === "lasso") {
             const pts = this.lassoPoints;
             this.lassoPoints = null;
             if (pts && pts.length > 2) {
                 const sctx = this.selection.getContext("2d");
-                sctx.globalCompositeOperation = "source-over";
+                if (p.mode === "replace") { sctx.globalCompositeOperation = "source-over"; sctx.clearRect(0, 0, this.width, this.height); this.selectionLabel = ""; }
+                sctx.globalCompositeOperation = p.mode === "subtract" ? "destination-out" : "source-over";
                 sctx.fillStyle = "#ff0000";
                 sctx.beginPath();
                 sctx.moveTo(pts[0][0], pts[0][1]);
                 for (let i = 1; i < pts.length; i++) sctx.lineTo(pts[i][0], pts[i][1]);
                 sctx.closePath();
                 sctx.fill();
+                sctx.globalCompositeOperation = "source-over";
                 this.markSelectionChanged();
             }
         } else if (p.kind === "selpaint") {
-            if (this.fillEnclosed) this.closeStrokeLoop(p.path, this.tool === "deselect");
+            if (this.fillEnclosed) this.closeStrokeLoop(p.path, !!p.subtract);
             this.markSelectionChanged();
         } else if (p.kind === "object") {
             if (!p.moved) this.toggleObjectAt(...this.toImage(e), p);
@@ -2102,7 +2110,8 @@ class InpaintEditor {
 
     selectionDab(x0, y0, x1, y1) {
         const sctx = this.selection.getContext("2d");
-        sctx.globalCompositeOperation = this.tool === "deselect" ? "destination-out" : "source-over";
+        const subtract = this.pointer && this.pointer.kind === "selpaint" ? !!this.pointer.subtract : this.tool === "deselect";
+        sctx.globalCompositeOperation = subtract ? "destination-out" : "source-over";
         sctx.strokeStyle = "#ff0000";
         sctx.lineCap = "round";
         sctx.lineJoin = "round";

@@ -91,6 +91,9 @@ Photoshop; the dashed-square button in the toolbar switches to a red tint
 (useful to see a soft or grown selection as an area). The blue dashed
 rectangle is the crop that leaves the node, not the selection.
 
+Rectangle and lasso replace the selection like in Krita and Photoshop; hold
+Shift to add, Alt to subtract. The brush adds, with Alt it subtracts.
+
 Tools on the left: brush (B), rectangle (R), lasso (L), object selection
 (O), deselect brush (D). `[` and `]` change the brush size, the top bar holds
 size, hardness, opacity and the paint colour.
