@@ -717,6 +717,13 @@ is uploaded like any layer file (`n{id}_lut_{hash}.png`, so the cleanup keeps
 it), `lutFromImage` reads it back on restore. Applying is trilinear in a
 pixel loop, `strength` mixes with the input.
 
+Grain presets (`GRAIN_PRESETS`, param type `select`): a preset copies its
+`amount`, `size`, `chroma` into the params; any slider input sets the preset
+back to `custom`. `chroma` replaced the `mono` flag the same evening (old
+layers: `mono === false` -> 100, else 0); the noise is a luminance part
+shared by all channels plus a per-channel part weighted by chroma. The
+values are approximations of how the stocks are described, not measured.
+
 Measured on the 1776×2368 photo in headless Edge: grain 144 ms, sharpen
 75 ms, cached redraw 0 ms; invert LUT exact (mean 16.25 -> 238.75, strength
 50 -> 128); mask from selection limits the effect to the selection (outside

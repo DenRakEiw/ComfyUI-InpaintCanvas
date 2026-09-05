@@ -38,11 +38,34 @@ const clamp255 = (v) => (v < 0 ? 0 : v > 255 ? 255 : v);
 // grain
 // ---------------------------------------------------------------------------
 
+// Film stocks as grain characters only (amount, grain size in px on a ~2000 px
+// image, colour share of the noise). Approximations from how the stocks are
+// usually described, not measurements; colour rendering is a LUT's job.
+export const GRAIN_PRESETS = [
+    { id: "custom", label: "Custom" },
+    { id: "ektar100", label: "Kodak Ektar 100", amount: 10, size: 1.1, chroma: 20 },
+    { id: "portra160", label: "Kodak Portra 160", amount: 12, size: 1.2, chroma: 25 },
+    { id: "portra400", label: "Kodak Portra 400", amount: 18, size: 1.5, chroma: 30 },
+    { id: "portra800", label: "Kodak Portra 800", amount: 28, size: 1.9, chroma: 35 },
+    { id: "gold200", label: "Kodak Gold 200", amount: 20, size: 1.5, chroma: 45 },
+    { id: "kodachrome64", label: "Kodachrome 64", amount: 12, size: 1.1, chroma: 10 },
+    { id: "velvia50", label: "Fuji Velvia 50", amount: 9, size: 1.0, chroma: 15 },
+    { id: "pro400h", label: "Fuji Pro 400H", amount: 18, size: 1.5, chroma: 25 },
+    { id: "superia400", label: "Fuji Superia 400", amount: 24, size: 1.6, chroma: 50 },
+    { id: "cinestill800t", label: "CineStill 800T", amount: 34, size: 2.1, chroma: 45 },
+    { id: "tmax100", label: "Kodak T-Max 100", amount: 10, size: 1.1, chroma: 0 },
+    { id: "acros100", label: "Fuji Neopan Acros 100", amount: 9, size: 1.0, chroma: 0 },
+    { id: "trix400", label: "Kodak Tri-X 400", amount: 32, size: 1.9, chroma: 0 },
+    { id: "hp5", label: "Ilford HP5 Plus 400", amount: 28, size: 1.8, chroma: 0 },
+    { id: "delta3200", label: "Ilford Delta 3200", amount: 55, size: 2.8, chroma: 0 },
+];
+
 function applyGrain(src, p, info) {
     const W = src.width, H = src.height;
     const amount = (p.amount ?? 25) / 100;
     const size = Math.max(0.5, (p.size ?? 1.5) * (info.scale || 1));
-    const mono = p.mono !== false;
+    // chroma: 0 = luminance grain only, 100 = independent noise per channel (old layers stored a "mono" flag)
+    const chroma = Math.min(1, Math.max(0, (p.chroma ?? (p.mono === false ? 100 : 0)) / 100));
     const out = makeCanvas(W, H);
     const octx = out.getContext("2d");
     octx.drawImage(src, 0, 0);
@@ -57,8 +80,13 @@ function applyGrain(src, p, info) {
     for (let i = 0; i < d.length; i += 4) {
         // sum of two uniforms: triangular distribution, closer to film than flat noise
         const g = (rand() + rand() - 1) * 127;
-        if (mono) { d[i] = d[i + 1] = d[i + 2] = 128 + g; }
-        else { d[i] = 128 + g; d[i + 1] = 128 + (rand() + rand() - 1) * 127; d[i + 2] = 128 + (rand() + rand() - 1) * 127; }
+        if (chroma <= 0) { d[i] = d[i + 1] = d[i + 2] = 128 + g; }
+        else {
+            // luminance grain shared by all channels plus a per-channel part (colour negative films)
+            d[i] = 128 + g * (1 - chroma) + (rand() + rand() - 1) * 127 * chroma;
+            d[i + 1] = 128 + g * (1 - chroma) + (rand() + rand() - 1) * 127 * chroma;
+            d[i + 2] = 128 + g * (1 - chroma) + (rand() + rand() - 1) * 127 * chroma;
+        }
         d[i + 3] = 255;
     }
     nctx.putImageData(nd, 0, 0);
@@ -281,10 +309,12 @@ export const FILTERS = {
     grain: {
         label: "Grain",
         params: [
+            { key: "preset", label: "Film", type: "select", options: GRAIN_PRESETS, default: "custom" },
             { key: "amount", label: "Amount", min: 0, max: 100, step: 1, default: 25, unit: "%" },
             { key: "size", label: "Size", min: 0.5, max: 6, step: 0.1, default: 1.5, unit: "px" },
-            { key: "mono", label: "Mono", type: "bool", default: true },
+            { key: "chroma", label: "Colour", min: 0, max: 100, step: 1, default: 0, unit: "%" },
         ],
+        presets: GRAIN_PRESETS,
         apply: applyGrain,
     },
     sharpen: {

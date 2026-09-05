@@ -3678,10 +3678,34 @@ class InpaintEditor {
             box.appendChild(lr);
         }
         const fmt = (p, v) => (p.type === "bool" ? (v ? "on" : "off") : (Number.isInteger(p.step) ? Math.round(v) : (+v).toFixed(p.step < 0.1 ? 2 : 1)) + (p.unit || ""));
+        let presetSel = null;
         for (const p of def.params) {
             const lab = el("span", null, p.label);
             box.appendChild(lab);
             const cur = layer.params[p.key] ?? p.default;
+            if (p.type === "select") {
+                // a preset fills the other parameters; touching a slider turns it back to "custom"
+                const sel = document.createElement("select");
+                sel.className = "ipc-sel";
+                sel.style.gridColumn = "2 / -1";
+                sel.title = "Film stock: sets amount, grain size and colour share (grain character only, the colour look is a LUT's job). Values assume a picture of about 2000 px.";
+                for (const o of p.options) { const opt = document.createElement("option"); opt.value = o.id; opt.textContent = o.label; sel.appendChild(opt); }
+                sel.value = p.options.some((o) => o.id === cur) ? cur : p.options[0].id;
+                sel.addEventListener("click", stop);
+                sel.addEventListener("keydown", stop);
+                sel.addEventListener("change", () => {
+                    const preset = p.options.find((o) => o.id === sel.value);
+                    if (!preset) return;
+                    this.pushUndo({ kind: "filter", id: layer.id });
+                    layer.params[p.key] = preset.id;
+                    for (const [k, v] of Object.entries(preset)) if (k !== "id" && k !== "label") layer.params[k] = v;
+                    this.markFilterChanged(layer);
+                    this.renderLayers();
+                });
+                presetSel = sel;
+                box.appendChild(sel);
+                continue;
+            }
             const val = el("b", null, fmt(p, cur));
             if (p.type === "bool") {
                 const cb = document.createElement("input");
@@ -3707,6 +3731,7 @@ class InpaintEditor {
                 if (!layer._undoPending) layer._undoPending = this.snapshot({ kind: "filter", id: layer.id });
                 layer.params[p.key] = +range.value;
                 val.textContent = fmt(p, +range.value);
+                if (presetSel && layer.params.preset !== "custom") { layer.params.preset = "custom"; presetSel.value = "custom"; }
                 this.filterPreview = layer.id;
                 this.markFilterChanged(layer);
             });
