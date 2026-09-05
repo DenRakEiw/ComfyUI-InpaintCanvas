@@ -13,8 +13,17 @@ Highlights
   object selection by hovering (SAM2), select by text (SAM3 or GroundingDINO +
   SAM), grow / shrink, layers with blend modes, paint and erase, transform
   with rotate, distort and warp, control layers for ControlNet, outpainting.
+- Reference layers for Flux.2 / Kontext multi-reference editing: drop images
+  onto the canvas, they leave the node as one `reference_images` batch.
+- Layer masks and cutouts: background removal with the installed RMBG nodes
+  (RMBG-2.0, BiRefNet, BEN2, BRIA) becomes an editable transparency mask.
+- Filter layers to finish the picture: grain, sharpen, levels, LUT (.cube)
+  and vignette, non-destructive, with masks and undo.
 - Prompt upsampling with a local vision-language model (Qwen3-VL) or Gemini,
-  tuned per use case: fill, add, remove, edit, outpaint.
+  tuned per use case: an edit instruction for Flux.2 / Kontext by default,
+  or fill, add, remove, outpaint descriptions.
+- Save the finished image with the workflow embedded, and clean up the
+  node's working files from inside the editor.
 - Auto context and auto feather derived from the selection size, fill modes
   for the masked area, colour matching when the result is stitched back.
 - An API / Local switch with two result inputs: only the chain of the chosen
@@ -317,6 +326,7 @@ and files stay.
 | Shift+F                      | fill selection with colour               |
 | Ctrl+Shift+N, Delete         | new paint layer, delete active layer     |
 | Ctrl+U                       | upsample prompt                          |
+| Ctrl+S                       | save the finished image                  |
 | Ctrl+Enter                   | generate                                 |
 | F                            | fit to view                              |
 | Space / middle mouse / right mouse | pan (wheel zooms)                  |
