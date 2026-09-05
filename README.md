@@ -75,6 +75,23 @@ Editor
   border, and the border becomes the selection. Press Generate to fill it.
 - **Prompt**: the text field is stored with the workflow and comes out of the
   node as the `prompt` output.
+- **Prompt upsampling**: type a short request (any language) into the prompt
+  field, pick a use case and press Upsample (Ctrl+U). A vision-language model
+  looks at the crop with the selection tinted red (solid green when Fill is
+  green, with the selection marked by a magenta outline) and rewrites the
+  request into a proper English prompt: *fill* (what
+  the area should show, matching the surroundings), *add* (a new object with
+  scale, contact shadows and lighting), *remove* (only the background that
+  should appear, never naming the object), *edit* (a verb-first instruction
+  for editing models such as Flux.2), *outpaint* (the scene continued beyond
+  the border). *auto* picks outpaint when the selection touches the border
+  and fill otherwise. Revert puts the previous prompt back. Backends: Qwen3-VL
+  2B locally through ComfyUI-QwenVL (weights in `models/LLM/Qwen-VL`),
+  Qwen3-VL 4B (downloaded on first use, about 8 GB, noticeably better at
+  *remove* and at translating), or Gemini through ComfyUI's API node. The 2B
+  model is reliable with short English requests; German requests sometimes
+  lose a word in translation, so check the result. Like the segmentation, it
+  runs as a small helper prompt and never triggers your generation chain.
 - **History**: every result with a preview and the prompt it was made with.
   Click a preview (or the solo button) to show only that result, discard one
   to remove its layer, restore a discarded one later. The trash icon in the
@@ -148,8 +165,9 @@ Outputs
 JSON reference and `Inpaint Canvas Mask Out` hands a MASK back to the editor.
 `Inpaint Canvas Object Map` runs SAM2's automatic mask generator (model from
 Kijai's `DownloadAndLoadSAM2Model` with segmentor `automaskgenerator`) and
-hands the editor an object label map. The editor uses them for "Select by
-text" and object selection; you can also wire them yourself.
+hands the editor an object label map. `Inpaint Canvas Text Out` hands a
+STRING back (prompt upsampling). The editor uses them for "Select by text",
+object selection and upsampling; you can also wire them yourself.
 
 ### Inpaint Canvas Stitch (`InpaintCanvasStitch`)
 

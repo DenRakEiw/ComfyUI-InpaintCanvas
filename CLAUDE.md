@@ -18,8 +18,9 @@ Flux.2 [max] API node (returns RGBA, square unless width/height are wired).
   `InpaintCanvasStitch` (OUTPUT_NODE, also used ephemerally), and the helpers
   `InpaintCanvasLoadRef` (ref JSON -> IMAGE), `InpaintCanvasMaskOut`
   (MASK -> temp PNG + `ui.inpaint_mask`; purpose `segments` encodes a batch as
-  a label map) and `InpaintCanvasObjectMap` (SAM2 automask -> label map for the
-  hover object tool).
+  a label map), `InpaintCanvasObjectMap` (SAM2 automask -> label map for the
+  hover object tool) and `InpaintCanvasTextOut` (STRING -> `ui.inpaint_text`,
+  prompt upsampling).
 - `js/inpaint_canvas.js` — the whole frontend: node thumbnail widget, the
   full-window editor (`InpaintEditor`), state persistence, prompt rewriting.
 - `pyproject.toml` + `.github/workflows/publish_action.yml` — Comfy Registry
@@ -70,7 +71,8 @@ Flux.2 [max] API node (returns RGBA, square unless width/height are wired).
 Done and verified: everything in README, including "Select by text" (SAM3 via
 comfyui-rmbg as default), the object selection tool (hover/click, SAM2 object
 map), the Source switch (image / active layer), the Crop settings (auto
-context, auto feather, fill modes, color match; DEVELOPMENT.md 10) and the
+context, auto feather, fill modes, color match; DEVELOPMENT.md 10), prompt
+upsampling (Qwen3-VL local / Gemini API, DEVELOPMENT.md 11) and the
 window-capture key handling (Ctrl+Z never reaches ComfyUI's workflow undo).
 SAM3 weights are at `models/checkpoints/sam3.pt` with a hardlink at
 `models/sam3/sam3.pt`. The core SAM3 text path returns noise here (6b).

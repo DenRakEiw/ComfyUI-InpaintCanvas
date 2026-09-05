@@ -326,6 +326,75 @@ function ensureMinSpan(a0, a1, limit, minSize) {
     return [Math.max(0, a0), a1];
 }
 
+// Prompt upsampling: a vision-language model sees the crop (selection tinted
+// red, or solid green when Fill is green) and rewrites the user's short request
+// into a prompt for the chosen use case. Runs as a helper prompt like the
+// segmentation, never through the user's chain.
+const UPSAMPLE_BACKENDS = [
+    {
+        id: "qwenvl",
+        label: "Qwen3-VL 2B (local)",
+        needs: ["AILab_QwenVL"],
+        build: (load, instruction) => ({
+            up_run: { class_type: "AILab_QwenVL", inputs: {
+                model_name: "Qwen3-VL-2B-Instruct", quantization: "None (FP16)", attention_mode: "auto",
+                preset_prompt: "\u{1F5BC}\uFE0F Detailed Description", custom_prompt: instruction,
+                max_tokens: 220, keep_model_loaded: true, seed: 1, image: [load, 0],
+            } },
+        }),
+        textOut: ["up_run", 0],
+    },
+    {
+        id: "qwenvl4b",
+        label: "Qwen3-VL 4B (local, downloads ~8 GB once)",
+        needs: ["AILab_QwenVL"],
+        build: (load, instruction) => ({
+            up_run: { class_type: "AILab_QwenVL", inputs: {
+                model_name: "Qwen3-VL-4B-Instruct", quantization: "None (FP16)", attention_mode: "auto",
+                preset_prompt: "\u{1F5BC}\uFE0F Detailed Description", custom_prompt: instruction,
+                max_tokens: 220, keep_model_loaded: true, seed: 1, image: [load, 0],
+            } },
+        }),
+        textOut: ["up_run", 0],
+    },
+    {
+        id: "gemini",
+        label: "Gemini (Comfy API)",
+        needs: ["GeminiNode"],
+        build: (load, instruction) => ({
+            up_run: { class_type: "GeminiNode", inputs: { prompt: instruction, model: "gemini-2.5-flash", seed: 1, images: [load, 0] } },
+        }),
+        textOut: ["up_run", 0],
+    },
+];
+
+function availableUpsampleBackends() {
+    const types = (window.LiteGraph && LiteGraph.registered_node_types) || {};
+    return UPSAMPLE_BACKENDS.filter((b) => b.needs.every((n) => !!types[n]));
+}
+
+const UPSAMPLE_CASES = ["auto", "fill", "add", "remove", "edit", "outpaint"];
+
+function upsampleInstruction(useCase, text, region) {
+    // Kept short and with the request repeated at the end: small VLMs (Qwen3-VL 2B)
+    // drop the request when it is buried in a long preamble.
+    const req = text ? `"${text}"` : "(no request given: infer the most plausible content from the picture)";
+    const rules = `Rules: obey the request exactly and translate it to English if needed (Seide = silk, Leder = leather); if the request names a colour or material, the prompt must use exactly that colour and material even though the picture currently shows something else; describe only the final content as a direct description of what is seen; the ${region.includes("green") ? "green area" : "magenta outline"} is only a marker, never mention it, the region or the image; no lists, no preamble, no quotes, no negative prompt. Output only the prompt text.`;
+    const tail = `Request again: ${req}`;
+    switch (useCase) {
+        case "add":
+            return `Look at the image. Something new will be painted into ${region} according to this request: ${req}. Write the image-generation prompt for it: one English paragraph of 40 to 80 words, starting with the requested object, then its shape, material and colour, then how it sits in the scene (size relative to the surroundings, contact with surfaces, cast shadows) under the same lighting and perspective as the rest of the picture. ${rules} ${tail}`;
+        case "remove":
+            return `Look at the image. Whatever is inside ${region} will be erased as if it had never been there${text ? `; request: ${req}` : ""}. Write the image-generation prompt for that spot: one English paragraph of 30 to 60 words describing only what would be visible with the object gone, the background, surfaces, body or textures continuing naturally from the surroundings. The object that is there now must not appear in the prompt and the word remove must not be used. ${rules}`;
+        case "edit":
+            return `Look at the image. ${region} will be changed according to this request: ${req}. Write an editing instruction for an image editing model: one or two English sentences of at most 50 words, starting with a verb, naming exactly what changes (keep the requested colours and materials) and what must stay the same (identity, pose, lighting, composition). ${rules} ${tail}`;
+        case "outpaint":
+            return `Look at the image. ${region} lies at the border and the scene will be extended beyond it${text ? `; request: ${req}` : ""}. Write the image-generation prompt for the extension: one English paragraph of 40 to 80 words describing what appears further out, continuing the same environment, perspective, lighting and style without a visible seam. ${rules} ${tail}`;
+        default:
+            return `Look at the image. ${region} will be repainted according to this request: ${req}. Write the image-generation prompt for that area: one English paragraph of 40 to 80 words, starting with the requested subject, then its materials and colours, then how its lighting, perspective and scale match the surroundings so the result blends in. ${rules} ${tail}`;
+    }
+}
+
 function availableSegmentBackends() {
     const types = (window.LiteGraph && LiteGraph.registered_node_types) || {};
     return SEGMENT_BACKENDS.filter((b) => b.needs.every((n) => !!types[n]) && (!b.available || b.available(b)));
@@ -521,6 +590,7 @@ const STYLE = `
 .ipc-hitem .ipc-htext b { display:block; color:#ddd; font-weight:500; }
 .ipc-hitem .ipc-htext span { display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .ipc-info { padding:8px 10px; color:#aaa; display:grid; grid-template-columns:auto 1fr; gap:3px 10px; }
+.ipc-upsample { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
 .ipc-cropset { display:grid; grid-template-columns:auto 1fr; gap:4px 10px; align-items:center; }
 .ipc-cropset label { display:contents; }
 .ipc-info b { color:#ddd; font-weight:500; }
@@ -568,6 +638,8 @@ class InpaintEditor {
         this.fillEnclosed = true;
         this.promptText = "";
         this.cropSettings = { ...CROP_DEFAULTS };
+        this.upsampleSettings = { useCase: "auto", backend: "auto" };
+        this.promptBackup = null;
         this.undo = [];
         this.redo = [];
         this.selectionDirty = true;
@@ -875,9 +947,29 @@ class InpaintEditor {
                 e.stopPropagation();
                 if (e.key === "Escape") { this.promptInput.blur(); this.root.focus({ preventScroll: true }); }
                 if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); this.generate(); }
+                if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "u") { e.preventDefault(); this.upsamplePrompt(); }
             });
             wrap.appendChild(this.promptInput);
             d.appendChild(wrap);
+
+            // prompt upsampling
+            const up = el("div", "ipc-sec ipc-upsample");
+            const caseLab = el("label", null, "Use case");
+            this.upCaseSel = selectInput(UPSAMPLE_CASES, "auto", "What the rewritten prompt is for. auto = fill, or outpaint when the selection touches the border.");
+            this.upCaseSel.addEventListener("change", () => { this.upsampleSettings.useCase = this.upCaseSel.value; this.notifyChanged(); });
+            caseLab.appendChild(this.upCaseSel);
+            up.appendChild(caseLab);
+            this.upBackendSel = selectInput(["auto"], "auto", "Language model used for upsampling");
+            this.upBackendSel.addEventListener("change", () => { this.upsampleSettings.backend = this.upBackendSel.value; this.notifyChanged(); });
+            up.appendChild(this.upBackendSel);
+            this.upBtn = iconButton("magic", "Upsample (Ctrl+U): a vision-language model rewrites the prompt for the selected area and use case. Short requests work best; the small local model is most reliable with English.", () => this.upsamplePrompt(), "Upsample");
+            this.upBtn.classList.add("ipc-small", "ipc-primary");
+            up.appendChild(this.upBtn);
+            this.upRevertBtn = iconButton("restore", "Put the previous prompt back", () => this.revertPrompt(), "Revert");
+            this.upRevertBtn.classList.add("ipc-small");
+            this.upRevertBtn.disabled = true;
+            up.appendChild(this.upRevertBtn);
+            d.appendChild(up);
         });
 
         section("History", true, (d, sum) => {
@@ -1292,6 +1384,7 @@ class InpaintEditor {
         if ((e.ctrlKey || e.metaKey) && k === "z") { e.preventDefault(); e.shiftKey ? this.redoStep() : this.undoStep(); return; }
         if ((e.ctrlKey || e.metaKey) && k === "y") { e.preventDefault(); this.redoStep(); return; }
         if ((e.ctrlKey || e.metaKey) && k === "d") { e.preventDefault(); this.clearSelection(); return; }
+        if ((e.ctrlKey || e.metaKey) && k === "u") { e.preventDefault(); this.upsamplePrompt(); return; }
         if ((e.ctrlKey || e.metaKey) && k === "i") { e.preventDefault(); this.invertSelection(); return; }
         if (e.ctrlKey || e.metaKey || e.altKey) return;
         if (e.shiftKey && k === "f") { this.fillSelection(); return; }
@@ -1799,6 +1892,16 @@ class InpaintEditor {
         if (!avail.length) { const o = document.createElement("option"); o.value = ""; o.textContent = "no segmentation nodes installed"; this.segBackendSel.appendChild(o); }
         if (avail.some((b) => b.id === cur)) this.segBackendSel.value = cur;
         this.segBtn.disabled = !avail.length;
+        if (this.upBackendSel) {
+            const ups = availableUpsampleBackends();
+            const curUp = this.upsampleSettings.backend;
+            this.upBackendSel.innerHTML = "";
+            for (const b of ups) { const o = document.createElement("option"); o.value = b.id; o.textContent = b.label; this.upBackendSel.appendChild(o); }
+            if (!ups.length) { const o = document.createElement("option"); o.value = ""; o.textContent = "no language model nodes installed"; this.upBackendSel.appendChild(o); }
+            if (ups.some((b) => b.id === curUp)) this.upBackendSel.value = curUp;
+            this.upBtn.disabled = !ups.length;
+        }
+        if (this.upCaseSel) this.upCaseSel.value = this.upsampleSettings.useCase || "auto";
     }
 
     async segmentByText() {
@@ -1873,6 +1976,110 @@ class InpaintEditor {
         const out = new Uint8Array(this.width * this.height);
         for (let i = 3, j = 0; i < a.length; i += 4, j++) out[j] = a[i] > 0 ? 1 : 0;
         return out;
+    }
+
+    // ---- prompt upsampling -----------------------------------------------------
+
+    /** The crop the model will see, with the selection tinted red (or solid green when Fill is green), long side <= 1024. */
+    promptContextCanvas() {
+        const [x, y, w, h] = this.cropRect();
+        const flat = this.flattenToCanvas({ forRun: true });
+        const scale = Math.min(1, 1024 / Math.max(w, h));
+        const c = makeCanvas(Math.max(1, Math.round(w * scale)), Math.max(1, Math.round(h * scale)));
+        const ctx = c.getContext("2d");
+        ctx.imageSmoothingEnabled = true;
+        ctx.drawImage(flat, x, y, w, h, 0, 0, c.width, c.height);
+        if (this.getBounds()) {
+            if (this.cropSettings.fill === "green") {
+                // what the generator sees: the area solid green
+                const tmp = makeCanvas(c.width, c.height);
+                const t = tmp.getContext("2d");
+                t.drawImage(this.selection, x, y, w, h, 0, 0, c.width, c.height);
+                t.globalCompositeOperation = "source-in";
+                t.fillStyle = "#00ff00";
+                t.fillRect(0, 0, c.width, c.height);
+                ctx.drawImage(tmp, 0, 0);
+            } else {
+                // a magenta outline around the selection: a tint would change the
+                // colours the model is asked to describe
+                const ring = makeCanvas(c.width, c.height);
+                const r = ring.getContext("2d");
+                const px = Math.max(2, Math.round(c.width / 300));
+                for (let dx = -px; dx <= px; dx += px) for (let dy = -px; dy <= px; dy += px) r.drawImage(this.selection, x, y, w, h, dx, dy, c.width, c.height);
+                r.globalCompositeOperation = "destination-out";
+                r.drawImage(this.selection, x, y, w, h, 0, 0, c.width, c.height);
+                r.globalCompositeOperation = "source-in";
+                r.fillStyle = "#ff00ff";
+                r.fillRect(0, 0, c.width, c.height);
+                ctx.drawImage(ring, 0, 0);
+            }
+        }
+        return c;
+    }
+
+    resolveUseCase() {
+        const uc = this.upsampleSettings.useCase || "auto";
+        if (uc !== "auto") return uc;
+        const b = this.getBounds();
+        if (b && (b[0] <= 0 || b[1] <= 0 || b[2] >= this.width || b[3] >= this.height)) return "outpaint";
+        return "fill";
+    }
+
+    async upsamplePrompt() {
+        if (!this.base) { this.setStatus("Load an image first."); return; }
+        if (this.upsamplePending) { this.setStatus("Upsampling is already running."); return; }
+        const backend = UPSAMPLE_BACKENDS.find((b) => b.id === this.upBackendSel.value) || availableUpsampleBackends()[0];
+        if (!backend) { this.setStatus("No language model nodes installed (ComfyUI-QwenVL, or the Gemini API node)."); return; }
+        const text = (this.promptInput.value || "").trim();
+        const useCase = this.resolveUseCase();
+        const region = this.getBounds() ? (this.cropSettings.fill === "green" ? "the solid green area" : "the area inside the magenta outline") : "the whole image";
+        try {
+            this.upBtn.disabled = true;
+            this.upsamplePending = { previous: this.promptInput.value, useCase };
+            this.setStatus(`Upsampling the prompt for "${useCase}" with ${backend.label} ...`);
+            const { ref } = await uploadCanvas(this.promptContextCanvas(), `n${this.node.id}_promptctx`);
+            const prompt = {
+                up_load: { class_type: "InpaintCanvasLoadRef", inputs: { ref: JSON.stringify(ref) } },
+                ...backend.build("up_load", upsampleInstruction(useCase, text, region)),
+                up_out: { class_type: "InpaintCanvasTextOut", inputs: { text: backend.textOut, canvas_node: String(this.node.id), purpose: "upsample" } },
+            };
+            const res = await api.queuePrompt(-1, { output: prompt, workflow: { nodes: [], links: [], version: 0.4, extra: { inpaint_canvas_helper: true } } });
+            this.upsamplePromptId = res && res.prompt_id;
+            if (res && res.node_errors && Object.keys(res.node_errors).length) {
+                const first = Object.values(res.node_errors)[0];
+                throw new Error((first.errors && first.errors[0] && first.errors[0].message) || "prompt rejected");
+            }
+        } catch (err) {
+            console.error(err);
+            this.upsamplePending = null;
+            this.upBtn.disabled = false;
+            this.setStatus("Upsampling failed: " + (err.message || err));
+        }
+    }
+
+    /** The rewritten prompt came back from the helper prompt. */
+    applyTextResult(info) {
+        const pending = this.upsamplePending || { previous: this.promptInput.value, useCase: "?" };
+        this.upsamplePending = null;
+        this.upBtn.disabled = false;
+        const text = (info.text || "").trim();
+        if (!text) { this.setStatus("The model returned an empty prompt."); return; }
+        this.promptBackup = pending.previous;
+        this.upRevertBtn.disabled = false;
+        this.promptInput.value = text;
+        this.promptText = text;
+        this.notifyChanged();
+        this.setStatus(`Prompt upsampled for "${pending.useCase}" (${text.split(/\s+/).length} words). Revert puts the old one back.`);
+    }
+
+    revertPrompt() {
+        if (this.promptBackup === null) return;
+        const current = this.promptInput.value;
+        this.promptInput.value = this.promptBackup;
+        this.promptText = this.promptBackup;
+        this.promptBackup = current;   // revert twice = redo
+        this.notifyChanged();
+        this.setStatus("Prompt reverted.");
     }
 
     // ---- object selection (hover) ---------------------------------------------
@@ -2858,6 +3065,7 @@ class InpaintEditor {
             selection: this.selectionDataUrl,
             seen: Array.from(this.seenResults).slice(-200),
             crop: this.cropSettings,
+            upsample: this.upsampleSettings,
         });
     }
 
@@ -2879,6 +3087,8 @@ class InpaintEditor {
             if (this.promptInput) this.promptInput.value = this.promptText;
             this.cropSettings = state.crop ? { ...CROP_DEFAULTS, ...state.crop } : { ...CROP_LEGACY };
             this.syncCropControls();
+            this.upsampleSettings = { useCase: "auto", backend: "auto", ...(state.upsample || {}) };
+            this.refreshSegmentBackends();
             for (const l of state.layers || []) {
                 if (!l.ref) continue;
                 try {
@@ -3088,12 +3298,23 @@ app.registerExtension({
                     ed.objectsPending = null;
                     ed.setStatus("Object detection failed: " + (detail.exception_message || "execution failed"));
                 }
+                if (ed && ed.upsamplePromptId && detail && detail.prompt_id === ed.upsamplePromptId) {
+                    ed.upsamplePending = null;
+                    ed.upBtn.disabled = false;
+                    ed.setStatus("Upsampling failed: " + (detail.exception_message || "execution failed"));
+                }
             }
         });
 
-        // Masks produced by helper prompts are routed to their canvas by id.
+        // Masks and texts produced by helper prompts are routed to their canvas by id.
         api.addEventListener("executed", ({ detail }) => {
             const out = detail && detail.output;
+            if (out && out.inpaint_text) {
+                for (const info of out.inpaint_text) {
+                    const node = app.graph.getNodeById(+info.canvas_node);
+                    if (node && node.inpaintEditor) node.inpaintEditor.applyTextResult(info);
+                }
+            }
             if (!out || !out.inpaint_mask) return;
             for (const info of out.inpaint_mask) {
                 const node = app.graph.getNodeById(+info.canvas_node);

@@ -389,6 +389,46 @@ Verified via the API (`InpaintCanvas` -> `ImageInvert` -> back, synthetic
 auto crop 512x512, all five fill modes visually correct, composite opaque
 inside the selection.
 
+## 11. Prompt upsampling (2026-09-05)
+
+Helper prompt: `up_load` (LoadRef of the context image) -> backend -> `up_out`
+(`InpaintCanvasTextOut`, `ui.inpaint_text = [{text, canvas_node, purpose}]`),
+routed in the `executed` listener to `applyTextResult`. The node strips
+wrapping quotes and a "Prompt:" prefix.
+
+Context image (`promptContextCanvas`): the crop rect of the flattened image,
+long side <= 1024, with the selection marked by a magenta outline (about
+1/300 of the width; a red tint was tried first and made the model describe
+the tint instead of the requested colour), or solid green when
+`cropSettings.fill === "green"` (so the model sees what the generator sees).
+Uploaded as `n{id}_promptctx_{hash}.png`.
+
+Backends (`UPSAMPLE_BACKENDS`): `qwenvl` = `AILab_QwenVL` from ComfyUI-QwenVL
+with `Qwen3-VL-2B-Instruct` (on disk in `models/LLM/Qwen-VL`, fp16;
+`custom_prompt` replaces the preset entirely; the preset combo value must
+still be a valid option, it is the emoji-prefixed "Detailed Description"),
+~9 s cold. `gemini` = core `GeminiNode` (Comfy API, `gemini-2.5-flash`,
+`images` input) for users with API credits.
+
+Instructions (`upsampleInstruction`): deliberately short, "Look at the
+image ..." + the request, the task paragraph per use case (fill 40-80 words
+blending with the surroundings; add = object + scale, contact, shadows;
+remove = only what is visible with the object gone; edit = verb-first
+instruction <= 50 words; outpaint = continuation beyond the border), a rules
+sentence (translate, keep requested colours/materials, never mention the
+marker/region/image, prompt text only) and the request repeated at the end.
+A long preamble made Qwen3-VL 2B drop the request entirely. `resolveUseCase()`
+maps auto to outpaint when the selection touches a canvas edge, else fill.
+
+Measured with Qwen3-VL 2B (2-5 s warm): fill/edit/add follow English requests
+well ("red silk swimsuit" -> correct colour and material); the German
+"roter Seiden-Badeanzug" kept the swimsuit black in fill (edit got it
+right); remove keeps describing the object that should disappear, the 2B
+model cannot imagine it gone. Hence the 4B backend option (downloads on
+first use) and Gemini for quality.
+Settings persist in `canvas_state.upsample = {useCase, backend}`; the backend
+list is filled in `refreshSegmentBackends()` from the registered node types.
+
 Key handling: the window keydown listener (capture phase, registered in
 `open()`, removed in `close()`) now handles every key while the editor is
 open and calls `stopImmediatePropagation()`, except for keys typed into the

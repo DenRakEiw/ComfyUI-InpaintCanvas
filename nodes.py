@@ -687,12 +687,44 @@ class InpaintCanvasObjectMap:
         }]}}
 
 
+class InpaintCanvasTextOut:
+    """Hand a text back to the canvas editor (used by the editor's prompt upsampling)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text": ("STRING", {"forceInput": True}),
+                "canvas_node": ("STRING", {"default": "", "tooltip": "Id of the Inpaint Canvas node that asked for the text."}),
+                "purpose": ("STRING", {"default": "upsample"}),
+            },
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "send"
+    CATEGORY = "image/inpaint"
+    OUTPUT_NODE = True
+
+    def send(self, text, canvas_node="", purpose="upsample"):
+        if isinstance(text, (list, tuple)):
+            text = " ".join(str(t) for t in text)
+        text = str(text or "").strip()
+        # strip wrapping quotes and a "Prompt:" prefix that small models like to add
+        if len(text) > 1 and text[0] == text[-1] and text[0] in "\"'":
+            text = text[1:-1].strip()
+        for prefix in ("Prompt:", "prompt:", "PROMPT:"):
+            if text.startswith(prefix):
+                text = text[len(prefix):].strip()
+        return {"ui": {"inpaint_text": [{"text": text, "canvas_node": canvas_node, "purpose": purpose}]}}
+
+
 NODE_CLASS_MAPPINGS = {
     "InpaintCanvas": InpaintCanvas,
     "InpaintCanvasStitch": InpaintCanvasStitch,
     "InpaintCanvasLoadRef": InpaintCanvasLoadRef,
     "InpaintCanvasMaskOut": InpaintCanvasMaskOut,
     "InpaintCanvasObjectMap": InpaintCanvasObjectMap,
+    "InpaintCanvasTextOut": InpaintCanvasTextOut,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -701,4 +733,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "InpaintCanvasLoadRef": "Inpaint Canvas Load Ref",
     "InpaintCanvasMaskOut": "Inpaint Canvas Mask Out",
     "InpaintCanvasObjectMap": "Inpaint Canvas Object Map",
+    "InpaintCanvasTextOut": "Inpaint Canvas Text Out",
 }
