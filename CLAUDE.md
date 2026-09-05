@@ -18,9 +18,10 @@ Flux.2 [max] API node (returns RGBA, square unless width/height are wired).
   `InpaintCanvasStitch` (OUTPUT_NODE, also used ephemerally), and the helpers
   `InpaintCanvasLoadRef` (ref JSON -> IMAGE), `InpaintCanvasMaskOut`
   (MASK -> temp PNG + `ui.inpaint_mask`; purpose `segments` encodes a batch as
-  a label map), `InpaintCanvasObjectMap` (SAM2 automask -> label map for the
-  hover object tool) and `InpaintCanvasTextOut` (STRING -> `ui.inpaint_text`,
-  prompt upsampling).
+  a label map, purpose `cutout` is a layer mask), `InpaintCanvasObjectMap`
+  (SAM2 automask -> label map for the hover object tool) and
+  `InpaintCanvasTextOut` (STRING -> `ui.inpaint_text`, prompt upsampling).
+  One HTTP route, `POST /inpaint_canvas/cleanup` (file housekeeping).
 - `js/inpaint_canvas.js` — the whole frontend: node thumbnail widget, the
   full-window editor (`InpaintEditor`), state persistence, prompt rewriting.
 - `pyproject.toml` + `.github/workflows/publish_action.yml` — Comfy Registry
@@ -68,15 +69,15 @@ Flux.2 [max] API node (returns RGBA, square unless width/height are wired).
 - Icons, not text, for tools. Krita/Photoshop vocabulary. Answer in German.
 - The user asks for features by Krita name; the roadmap is in DEVELOPMENT.md.
 
-## Where things stand (end of 2026-09-05)
+## Where things stand (2026-09-05, late)
 
-Everything described in README.md is built, verified and pushed (latest
-commit "README rewritten ..."). No half-finished work. DEVELOPMENT.md 8 has
-the session state and test recipes, DEVELOPMENT.md 9 the roadmap with the
-researched ideas (reference layers, batch / variants with an A/B staging
-area, layer masks / background removal, styles, regions, object tool details,
-live preview, housekeeping). Start a new feature from that list or from what
-the user asks for by Krita / Photoshop name.
+Everything described in README.md is built and verified. The latest additions
+(DEVELOPMENT.md 12): reference layers with the `reference_images` batch
+output, layer masks / cutouts through the installed RMBG nodes, and the file
+cleanup route. DEVELOPMENT.md 8 has the session state and test recipes,
+DEVELOPMENT.md 9 the roadmap (batch / variants with an A/B staging area,
+styles, regions, object tool details, live preview). Start a new feature from
+that list or from what the user asks for by Krita / Photoshop name.
 
 Environment facts that matter: SAM3 weights are `models/checkpoints/sam3.pt`
 with a hardlink at `models/sam3/sam3.pt` (comfyui-rmbg's SAM3 node is the
@@ -100,6 +101,9 @@ Qwen3-VL 2B is in `models/LLM/Qwen-VL` (prompt upsampling). SAM2 base_plus in
 - README screenshots: `docs/shots.py` (headless Edge over DevTools, see
   DEVELOPMENT.md 8). Re-run after UI changes and commit `docs/img/*.jpg`.
 - Every state addition goes into the `canvas_state` JSON (keys so far: width,
-  height, base, prompt, negative, layers, history, selection, seen, crop,
-  upsample, gen, settings), never into node widgets (invariant 5). New node
-  outputs are appended only.
+  height, base, prompt, negative, layers (with `mask` refs), history,
+  selection, seen, crop, upsample, gen, settings, refs, cutout), never into
+  node widgets (invariant 5). New node outputs are appended only in the
+  backend; in the frontend they go into `TAIL_OUTPUTS` (shown after the
+  visible setting slots, slot remapped by the `queuePrompt` wrapper, see
+  DEVELOPMENT.md 12).

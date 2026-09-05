@@ -74,6 +74,8 @@ return { status: ed.status, hover: ed.hoverObjectId };
 """),
     ("result", r"""
 const ed = window.__ed;
+// the local-settings scene left the editor in local mode, where the result is expected on result_local
+ed.modeSel.value = 'api'; ed.modeSel.dispatchEvent(new Event('change'));
 ed.setTool('select'); ed.clearSelection();
 ed.segInput.value = 'swimsuit'; ed.segMode = 'replace'; ed.segmentByText();
 await window.__until(async () => !ed.segmentPending && ed.getBounds(), 90000);

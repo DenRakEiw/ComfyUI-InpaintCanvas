@@ -54,8 +54,9 @@ Crop (`InpaintCanvas.run`): bbox = selection bounds + `padding`, clamped. With
 sides rounded to `multiple_of`. With `target_size == 0` the bbox itself is grown
 symmetrically to a multiple (`_fit_span_to_multiple`). `control_image` is the
 control PNG cropped/scaled identically (zeros if none). Outputs in order:
-`crop_image, crop_mask, image, mask, stitch_info, crop_width, crop_height, prompt, control_image, denoise, seed, mode, negative, setting_1..setting_8`.
-Only ever append outputs; reordering breaks saved workflows.
+`crop_image, crop_mask, image, mask, stitch_info, crop_width, crop_height, prompt, control_image, denoise, seed, mode, negative, setting_1..setting_8, reference_images`.
+Only ever append outputs; reordering breaks saved workflows (section 12 for
+how outputs after the setting slots are shown and remapped).
 
 Setting outputs (2026-09-05): eight wildcard (`"*"`) outputs after `negative`
 (`FIXED_OUTPUTS` = 13 in the JS must equal the number of outputs before
@@ -124,8 +125,9 @@ the state; the frontend rolls a new seed before every Generate when
 { width, height,
   base: {filename, subfolder, type},          // input/inpaint_canvas/...
   prompt: "...",
-  layers: [{ id, name, kind: "result"|"paint", role: "none"|"scribble"|...,
-             blend: "normal"|"multiply"|..., ref, x, y, w, h, opacity, visible }],
+  layers: [{ id, name, kind: "result"|"paint"|"image", role: "none"|"reference"|"scribble"|...,
+             blend: "normal"|"multiply"|..., ref, x, y, w, h, opacity, visible,
+             mask: {filename, subfolder, type} | null }],   // transparency mask PNG (alpha = visible)
   history: [{ key, name, ref, x, y, w, h, prompt, layerId, time, seed, mode, denoise }],
   selection: "data:image/png;base64,...",     // red where selected
   seen: ["subfolder/filename", ...],           // results already added
@@ -134,14 +136,17 @@ the state; the frontend rolls a new seed before every Generate when
           fill: "none"|"neutral"|"blur"|"border"|"green", colorMatch, extendFill },
   upsample: { useCase, backend },
   gen: { mode: "api"|"local", denoise, seed, seedRandom, refine },
-  settings: { "1": { value, type, label, target }, ... } }   // setting_n outputs
+  settings: { "1": { value, type, label, target }, ... },   // setting_n outputs
+  refs: { size: 1024, fit: "pad"|"crop"|"stretch" },         // reference_images batch
+  cutout: { backend: "auto"|"rmbg2"|"birefnet"|"ben2"|"bria14" } }
 ```
 
 Prompt-time JSON (what the backend sees, from `serializeForPrompt`):
-`{ width, height, base, mask, control, prompt, negative, layers, crop, gen, settings }` where `base` is the
-flattened visible non-control layers (or the original ref when no layer is
-visible), `mask` the selection as grayscale PNG, `control` the control layers
-on black (or null). Files are named `n{nodeId}_{base|mask|control|layer}_{sha1[:12]}.png`
+`{ width, height, base, mask, control, prompt, negative, layers, crop, gen, settings, references, refs }` where `base` is the
+flattened visible non-control, non-reference layers (or the original ref when
+no layer is visible), `mask` the selection as grayscale PNG, `control` the
+control layers on black (or null), `references` the list of file refs of the
+visible reference layers (top of the list first). Files are named `n{nodeId}_{base|mask|control|layer}_{sha1[:12]}.png`
 and uploaded with `overwrite=true`; unchanged content is not re-uploaded
 (`this.uploaded.*Hash`).
 
@@ -347,9 +352,11 @@ Florence.
 
 - Base layer is not editable (no erase); painting on it creates a paint layer.
 - History thumbnails come from the layer canvas or the output file; discarded
-  results keep their file in `output/inpaint_canvas/` forever, uploads
-  accumulate in `input/inpaint_canvas/` (hash-named, deduplicated per content),
-  helper results in `temp/inpaint_canvas/`. No cleanup anywhere yet.
+  results keep their file in `output/inpaint_canvas/` until the user runs
+  "Clean up files" (section 12); uploads accumulate in `input/inpaint_canvas/`
+  (hash-named, deduplicated per content) the same way.
+- Transforming a layer that has a mask (rotate / distort / warp / scale bake)
+  applies the mask first; the mask is not transformed separately.
 - Very large canvases: `selectionBounds`, `layerAlpha`, the object map and the
   distance transform are O(W*H) in JS; a 4K canvas takes a few hundred ms per
   op.
@@ -394,18 +401,12 @@ editor-driven setting outputs.
 
 Open, roughly by value for the user's workflow (Flux.2 API plus local Klein):
 
-1. **Reference layers** (Flux.2 / Kontext multi-reference editing): a layer
-   role "reference" that is excluded from the image and emitted as a batch on
-   a new `reference_images` output (append!), so a product shot or a face can
-   be dropped onto the canvas as a layer and used as a reference by the API
-   node. Same mechanism as control layers.
+1. **Reference layers**: done (section 12).
 2. **Batch / variants**: N results per Generate landing in the history, plus
    an A/B compare (InvokeAI's staging area idea: accept or discard before the
    layer stays). Local only by default; on the API it is N paid calls, so ask
    for confirmation.
-3. **Layer masks and cutouts**: a "remove background" action on a layer via
-   the installed RMBG nodes (helper prompt, mask -> layer alpha), and an
-   optional alpha mask per layer. LayerForge and Krita both have it.
+3. **Layer masks and cutouts**: done (section 12).
 4. **Styles**: presets bundling prompt prefix / suffix, `<lora:name:1.0>`
    syntax parsed out of the prompt, sampler settings (Krita's new "Style &
    Prompt" node does this for custom workflows); here they would become
@@ -421,10 +422,12 @@ Open, roughly by value for the user's workflow (Flux.2 API plus local Klein):
 7. **Live preview**: Krita's live mode (continuous low-step generation while
    painting) is a separate project; a cheap first step is "auto-generate on
    selection change" with a local model.
-8. **Housekeeping**: cleanup of `temp/`, `output/` and `input/` files older
-   than N days or not referenced by any history entry; LICENSE; Comfy Registry
-   publish once `REGISTRY_ACCESS_TOKEN` exists; soft-edged selection preview;
-   brush presets; keyboard colour picker.
+8. **Housekeeping**: LICENSE; Comfy Registry publish once
+   `REGISTRY_ACCESS_TOKEN` exists; soft-edged selection preview; brush
+   presets; keyboard colour picker. (File cleanup is done, section 12.)
+
+Done since (2026-09-05, late): 1 reference layers, 3 layer masks / cutouts,
+file cleanup from 8. See section 12.
 
 Sources looked at on 2026-09-05: the installed Krita AI plugin (`%APPDATA%/
 krita/pykrita/ai_diffusion`, GPL-3: reimplement, never copy), its 1.49 / 1.53
@@ -504,7 +507,21 @@ instruction <= 50 words; outpaint = continuation beyond the border), a rules
 sentence (translate, keep requested colours/materials, never mention the
 marker/region/image, prompt text only) and the request repeated at the end.
 A long preamble made Qwen3-VL 2B drop the request entirely. `resolveUseCase()`
-maps auto to outpaint when the selection touches a canvas edge, else fill.
+maps auto to outpaint when the selection touches a canvas edge, else **edit**
+(changed 2026-09-05 late: the user's chains are edit models, and the fill
+description that auto produced before read like an image caption, e.g.
+"change her haircolor to light blue" -> a paragraph about a surreal portrait).
+The edit instruction is its own template: role sentence, the request first,
+the rewrite rules (15-35 words, verb first, name the subject as seen, exact
+colours / materials, end with what stays unchanged, no description of the
+picture or its current state), two worked examples (one German), the request
+again at the end. Measured with Qwen3-VL 2B (2-6 s warm): "change her
+haircolor to light blue" -> "Change the woman's hair color to light blue,
+maintaining her facial features, expression, skin tone, makeup, clothing,
+posture, setting, and all other elements that remain constant."; "mach den
+Badeanzug rot mit weißen Punkten" -> "Change the swimsuit to red with white
+dots, keeping the woman's posture, ..."; "remove the corals on her arms" ->
+"Remove the coral decorations from the woman's arms, preserving ...".
 
 Measured with Qwen3-VL 2B (2-5 s warm): fill/edit/add follow English requests
 well ("red silk swimsuit" -> correct colour and material); the German
@@ -537,3 +554,106 @@ Key handling: the window keydown listener (capture phase, registered in
 open and calls `stopImmediatePropagation()`, except for keys typed into the
 editor's own inputs. Before, Ctrl+Z reached ComfyUI's workflow undo as well
 and reverted the canvas state.
+
+## 12. Reference layers, layer masks / cutouts, file cleanup (2026-09-05, late)
+
+### Reference layers and the `reference_images` output
+
+Role `reference` on a layer (`ROLES` now has it between none and the control
+roles). `isControl()` excludes it, `isReference()` / `referenceLayers()` (visible
+ones, panel order = array reversed, so the top of the list is reference 1)
+select it. `drawComposite({forRun})` skips control *and* reference layers;
+`controlOnly` skips them as well. In the editor they are drawn normally plus a
+cyan dashed frame with "ref n" (`draw()`), the layer badge says "ref n" or
+"ref (hidden)". Upload: image button in the Layers header (`refInput`,
+multiple), drop on the layer list, or drop on the canvas with Shift / with
+several files (`addImageLayers(files, role)`): the original file is uploaded
+with `overwrite: false` and *is* the layer's `ref` (kind `image`, `dirty`
+false), the layer is shown at a third of the canvas, cascaded from the top
+left. `extendCanvas()` and `flatten()` keep reference layers.
+
+`serializeForPrompt` adds `references: [ref, ...]`: the file itself when the
+layer is untouched and has no mask, otherwise `layer.exportRef`, an upload of
+`layerPixels(layer)` (mask applied), invalidated by `markLayerChanged` /
+`markMaskChanged` / role change. Plus `refs: {size, fit}` from the Canvas
+section.
+
+Backend: `_reference_batch(images, size, fit)` scales every image down to the
+long side `size` (0 = native; small images are never upscaled), takes the
+largest remaining width and height as the batch size and pads (border mean
+colour, `_border_color`), crops (`common_upscale` with `crop="center"`) or
+stretches the others. Transparent PNGs are composited on white
+(`_load_rgb(ref, background=(255, 255, 255))`). No references -> a
+`[0, 64, 64, 3]` batch, which the Flux.2 API nodes treat as "no reference"
+(`get_number_of_images` = 0). Verified in `comfy_api_nodes/nodes_bfl.py`
+(v0.33.2): `Flux2ImageNode` flattens 4-D tensors of every `image_n` input, and
+`Flux2ProImageNode` / `Flux2MaxImageNode` iterate `images.shape[0]`; both cap
+at 8 / 9 references and downscale each to 2048² pixels themselves.
+
+**Output slot mapping.** The backend appends `reference_images` after
+`setting_8` (slot 21 = `FIXED_OUTPUTS + SETTING_SLOTS`). The frontend keeps
+its "connected settings plus one free slot" behaviour, so it cannot show slot
+21 at index 21. `TAIL_OUTPUTS` lists such outputs; `syncSettingOutputs`
+orders the node's outputs as fixed (13), settings by number, tail, and rewrites
+`link.origin_slot` for every link (`linkOf(graph, id)` covers `getLink`,
+`_links.get` and `links[id]`; litegraph's `removeOutput` decrements
+`origin_slot` of later links itself, `addOutput` only appends). The
+`api.queuePrompt` wrapper then maps every prompt input `[canvasId, slot]`
+whose visible output is a tail output to the backend slot by name.
+`isSettingOutput` (`/^setting_\d+$/`) is what tells setting slots from tail
+outputs everywhere (`settingTargets`, `onConnectionsChange`). Saved
+workflows without the tail output get it appended on load (the `onConfigure`
+timeout calls `syncSettingOutputs`); setting links keep their slots.
+
+### Layer masks and cutouts
+
+Per layer: `mask` (canvas at `layer.canvas` size, alpha = visible, colour
+white), `maskRef` (uploaded `n{id}_lmask_{hash}.png`, RGBA so the alpha
+survives), `maskDirty`, `maskEdit`. `layerPixels(layer)` is the one accessor
+for a layer's composited pixels: `layerWithStroke` (pixels + live pixel
+stroke) `destination-in` `maskWithStroke` (mask + live mask stroke), cached in
+`layer._masked` / `_maskedValid` when no stroke is live. It replaced
+`layer.canvas` in `drawLayer` (also the pending-transform preview),
+`layerAlpha`, `selectionFromLayer`, `segmentSource` (active layer),
+`drawHistoryThumb` and the reference export. Strokes: `onPointerDown` routes
+paint / erase to `{kind: "maskpaint", white: true}` when the active layer has
+`maskEdit`; `layerDab` paints white, `commitStroke` targets the mask, paint =
+source-over (reveal), erase = destination-out (hide). `fillSelection` on a
+mask in edit mode reveals the selection. Undo: kind `mask` (data URL or
+null); `layerfull` snapshots carry the mask too, and `applyPending` bakes the
+mask (`applyMask(layer, {silent, undo: false})`) before transforming.
+
+Mask row in the layer panel: cutout (scissors), backend select (on the active
+layer only, `cutoutSel`, persisted in `cutout.backend`), mask from selection,
+state text, edit toggle (`ipc-on`, pencil), apply (check), remove (trash).
+`toggleMaskEdit` switches to the paint tool and turns the other layers' edit
+off; the edited layer gets a magenta dashed frame in `draw()`.
+
+Cutout helper prompt (`cutoutLayer`): `cut_load` (LoadRef of
+`n{id}_cutsrc_{hash}.png` = `layer.canvas`, transparent pixels turn black on
+the way to RGB) -> backend -> `cut_out` (`InpaintCanvasMaskOut`, purpose
+`cutout`). `CUTOUT_BACKENDS`: `rmbg2` (comfyui-rmbg `RMBG` with model
+RMBG-2.0; every optional input is sent, same as SAM3), `birefnet`
+(`BiRefNetRMBG`, BiRefNet-general), `ben2` (`RMBG`, BEN2), `bria14`
+(`BRIA_RMBG_ModelLoader_Zho` + `BRIA_RMBG_Zho`, weights ship with the node).
+comfyui-rmbg downloads its weights into `models/RMBG/<model>` on first use
+(`1038lab/*` mirrors, not gated). The `executed` listener routes purpose
+`cutout` to `applyCutoutFile`, which reads the grayscale PNG into the mask's
+alpha; `execution_error` with `cutoutPromptId` clears `cutoutPending`.
+
+### File cleanup
+
+`POST /inpaint_canvas/cleanup` with `{keep: [filenames], dry_run, min_age}`
+(`_register_routes` at import; `PromptServer.instance` exists when custom
+nodes load). `_cleanup_files` lists the three `inpaint_canvas` folders,
+scans every `*.json` under `folder_paths.get_user_directory()` (saved
+workflows of every user; files over 50 MB skipped) for the file names, keeps
+those, the `keep` list and anything younger than `min_age` (default 120 s),
+and deletes or only counts the rest. The editor (`cleanupFiles`) collects
+`keep` with `InpaintEditor.referencedFiles()`: every open editor's state
+(`lastValueString`, `getValue()`, `uploaded`, layer / mask / export refs),
+every open workflow tab (`app.extensionManager.workflow.openWorkflows`:
+`content`, `activeState`, `initialState`) and every `localStorage` value
+(the frontend keeps unsaved workflows there). Flow: dry run -> confirm with
+counts and sizes -> real run -> status. `_prune_temp()` in `MaskOut.send` and
+`ObjectMap.run` deletes helper results older than an hour.

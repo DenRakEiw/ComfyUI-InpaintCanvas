@@ -33,6 +33,9 @@ from comfy_execution.graph_utils import GraphBuilder
 SUBFOLDER = "inpaint_canvas"
 MIN_AUTO_CROP = 512   # auto context never emits a region smaller than this (image permitting)
 SETTING_SLOTS = 8     # wildcard "setting_n" outputs the editor can drive (LoRA names, steps, ...)
+REFERENCE_FITS = ("pad", "crop", "stretch")   # how reference layers of different sizes become one batch
+TEMP_MAX_AGE = 3600   # helper results in temp/inpaint_canvas older than this are pruned on the next helper run
+CLEANUP_MIN_AGE = 120  # the cleanup route never deletes files younger than this (a run may still need them)
 
 
 # ---------------------------------------------------------------------------
@@ -63,11 +66,140 @@ def _ref_path(ref):
     return path
 
 
-def _load_rgb(ref):
-    """Load an image reference as a [1, H, W, 3] float tensor."""
-    img = Image.open(_ref_path(ref)).convert("RGB")
+def _load_rgb(ref, background=None):
+    """Load an image reference as a [1, H, W, 3] float tensor. With ``background``
+    (an RGB tuple) a transparent image is composited onto that colour first;
+    without it PIL simply drops the alpha channel."""
+    img = Image.open(_ref_path(ref))
+    if background is not None and (img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)):
+        img = img.convert("RGBA")
+        bg = Image.new("RGBA", img.size, tuple(background) + (255,))
+        img = Image.alpha_composite(bg, img)
+    img = img.convert("RGB")
     arr = np.asarray(img).astype(np.float32) / 255.0
     return torch.from_numpy(arr)[None]
+
+
+def _border_color(img):
+    """Mean colour of the outermost pixel ring of a [1, H, W, 3] tensor."""
+    h, w = img.shape[1], img.shape[2]
+    ring = torch.cat([img[0, 0, :, :], img[0, h - 1, :, :], img[0, :, 0, :], img[0, :, w - 1, :]], dim=0)
+    return ring.mean(dim=0)
+
+
+def _reference_batch(images, size=1024, fit="pad"):
+    """Stack reference images of different sizes into one [N, H, W, 3] batch.
+
+    Each image is first scaled down so its long side is at most ``size`` (0 =
+    native). The batch size is the largest width and height that remain; the
+    others are padded with their own border colour (``pad``, default), scaled
+    to cover and center-cropped (``crop``) or simply stretched (``stretch``).
+    """
+    if not images:
+        return torch.zeros((0, 64, 64, 3), dtype=torch.float32)
+    scaled = []
+    for img in images:
+        h, w = img.shape[1], img.shape[2]
+        if size > 0 and max(w, h) > size:
+            s = size / max(w, h)
+            img = _resize_image(img, max(1, int(round(w * s))), max(1, int(round(h * s))))
+        scaled.append(img)
+    W = max(img.shape[2] for img in scaled)
+    H = max(img.shape[1] for img in scaled)
+    out = []
+    for img in scaled:
+        h, w = img.shape[1], img.shape[2]
+        if w == W and h == H:
+            out.append(img)
+        elif fit == "stretch":
+            out.append(_resize_image(img, W, H))
+        elif fit == "crop":
+            out.append(_resize_image(img, W, H, crop="center"))
+        else:
+            canvas = _border_color(img).view(1, 1, 1, 3).expand(1, H, W, 3).clone()
+            x0 = (W - w) // 2
+            y0 = (H - h) // 2
+            canvas[:, y0:y0 + h, x0:x0 + w] = img
+            out.append(canvas)
+    return torch.cat(out, dim=0).clamp(0, 1)
+
+
+def _prune_temp(max_age=TEMP_MAX_AGE):
+    """Delete helper results (masks, label maps) older than ``max_age`` seconds.
+    They are consumed by the editor right after they are produced."""
+    out_dir = os.path.join(folder_paths.get_temp_directory(), SUBFOLDER)
+    now = time.time()
+    try:
+        names = os.listdir(out_dir)
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(out_dir, name)
+        try:
+            if os.path.isfile(path) and now - os.path.getmtime(path) > max_age:
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def _cleanup_files(keep, dry_run=True, min_age=CLEANUP_MIN_AGE):
+    """Remove files in the input/output/temp ``inpaint_canvas`` folders that no
+    workflow references.
+
+    ``keep`` is the list of filenames the open editors still use (base, layers,
+    masks, history). On top of that every ``*.json`` under the user directory
+    (saved workflows, incl. other users) is scanned for the file names, so a
+    canvas saved in another workflow keeps its files. Files younger than
+    ``min_age`` seconds are kept as well: a queued run may still need them.
+    """
+    files = []
+    for kind in ("input", "output", "temp"):
+        folder = os.path.join(_dir_for_type(kind), SUBFOLDER)
+        if not os.path.isdir(folder):
+            continue
+        for name in os.listdir(folder):
+            path = os.path.join(folder, name)
+            if os.path.isfile(path):
+                files.append((kind, name, path))
+    names = {name for _, name, _ in files}
+    referenced = set(str(k) for k in (keep or []))
+    user_dir = folder_paths.get_user_directory()
+    for root, _dirs, fnames in os.walk(user_dir):
+        for fn in fnames:
+            if not fn.lower().endswith(".json"):
+                continue
+            path = os.path.join(root, fn)
+            try:
+                if os.path.getsize(path) > 50 * 1024 * 1024:
+                    continue
+                with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            if SUBFOLDER not in text:
+                continue
+            for name in names:
+                if name in text:
+                    referenced.add(name)
+    now = time.time()
+    result = {"removed": 0, "kept": 0, "bytes": 0, "by_type": {"input": 0, "output": 0, "temp": 0}, "dry_run": bool(dry_run), "files": []}
+    for kind, name, path in files:
+        try:
+            if name in referenced or now - os.path.getmtime(path) < min_age:
+                result["kept"] += 1
+                continue
+            size = os.path.getsize(path)
+            if not dry_run:
+                os.remove(path)
+        except OSError:
+            result["kept"] += 1
+            continue
+        result["removed"] += 1
+        result["bytes"] += size
+        result["by_type"][kind] += 1
+        if len(result["files"]) < 500:
+            result["files"].append(f"{kind}/{name}")
+    return result
 
 
 def _load_mask(ref, height, width):
@@ -358,8 +490,8 @@ class InpaintCanvas:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "MASK", "STRING", "INT", "INT", "STRING", "IMAGE", "FLOAT", "INT", "STRING", "STRING") + ("*",) * SETTING_SLOTS
-    RETURN_NAMES = ("crop_image", "crop_mask", "image", "mask", "stitch_info", "crop_width", "crop_height", "prompt", "control_image", "denoise", "seed", "mode", "negative") + tuple(f"setting_{i}" for i in range(1, SETTING_SLOTS + 1))
+    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "MASK", "STRING", "INT", "INT", "STRING", "IMAGE", "FLOAT", "INT", "STRING", "STRING") + ("*",) * SETTING_SLOTS + ("IMAGE",)
+    RETURN_NAMES = ("crop_image", "crop_mask", "image", "mask", "stitch_info", "crop_width", "crop_height", "prompt", "control_image", "denoise", "seed", "mode", "negative") + tuple(f"setting_{i}" for i in range(1, SETTING_SLOTS + 1)) + ("reference_images",)
     OUTPUT_TOOLTIPS = (
         "Selected region plus padding, scaled to target_size. Inpaint this.",
         "Selection mask matching crop_image (grown and feathered when the editor's Feather is auto).",
@@ -374,7 +506,9 @@ class InpaintCanvas:
         "Seed from the editor (random per run or fixed). Wire it into your local sampler.",
         "\"api\" or \"local\": which result input the editor expects the result on.",
         "Negative prompt from the editor (shown in local mode; for SDXL-class models).",
-    ) + tuple("Editor-driven setting: wire it into any widget input (lora_name, ckpt_name, steps, ...) and a matching control appears in the editor. The next free slot shows up once this one is connected." for _ in range(SETTING_SLOTS))
+    ) + tuple("Editor-driven setting: wire it into any widget input (lora_name, ckpt_name, steps, ...) and a matching control appears in the editor. The next free slot shows up once this one is connected." for _ in range(SETTING_SLOTS)) + (
+        "Layers with the role \"reference\" as one image batch (top of the layer list first), for multi-reference editing with Flux.2 / Kontext. Empty batch without reference layers.",
+    )
     FUNCTION = "run"
     CATEGORY = "image/inpaint"
     OUTPUT_NODE = True
@@ -482,9 +616,26 @@ class InpaintCanvas:
 
         settings = state.get("settings") or {}
         setting_values = tuple(_cast_setting(settings.get(str(i))) for i in range(1, SETTING_SLOTS + 1))
+
+        # Reference layers: uploaded at their native size (cutout masks already
+        # applied, transparency on white), batched for the API node.
+        ref_settings = state.get("refs") or {}
+        ref_images = []
+        for entry in state.get("references") or []:
+            try:
+                ref_images.append(_load_rgb(entry, background=(255, 255, 255)))
+            except (ValueError, FileNotFoundError, OSError) as err:
+                print(f"[Inpaint Canvas] reference skipped: {err}")
+        try:
+            ref_size = int(ref_settings.get("size", 1024) or 0)
+        except (TypeError, ValueError):
+            ref_size = 1024
+        ref_fit = ref_settings.get("fit") if ref_settings.get("fit") in REFERENCE_FITS else "pad"
+        references = _reference_batch(ref_images, ref_size, ref_fit)
+
         outputs = (crop, crop_mask[None], image, mask[None], stitch_info,
                    int(crop.shape[2]), int(crop.shape[1]), str(state.get("prompt", "") or ""),
-                   control_crop, denoise, seed, mode, str(state.get("negative", "") or "")) + setting_values
+                   control_crop, denoise, seed, mode, str(state.get("negative", "") or "")) + setting_values + (references,)
 
         if result_source:
             src_id, _, src_slot = result_source.partition(":")
@@ -629,6 +780,7 @@ class InpaintCanvasMaskOut:
     def send(self, mask, canvas_node="", purpose="segment", label=""):
         out_dir = os.path.join(folder_paths.get_temp_directory(), SUBFOLDER)
         os.makedirs(out_dir, exist_ok=True)
+        _prune_temp()
         filename = f"n{canvas_node or 'x'}_{purpose}_{time.strftime('%H%M%S')}_{int(time.time() * 1000) % 1000:03d}.png"
         if isinstance(label, (list, tuple)):
             label = " ".join(str(t) for t in label)
@@ -731,6 +883,7 @@ class InpaintCanvasObjectMap:
 
         out_dir = os.path.join(folder_paths.get_temp_directory(), SUBFOLDER)
         os.makedirs(out_dir, exist_ok=True)
+        _prune_temp()
         filename = f"n{canvas_node or 'x'}_segments_{time.strftime('%H%M%S')}_{int(time.time() * 1000) % 1000:03d}.png"
         Image.fromarray(rgb, "RGB").save(os.path.join(out_dir, filename), compress_level=1)
         return {"ui": {"inpaint_mask": [{
@@ -769,6 +922,39 @@ class InpaintCanvasTextOut:
             if text.startswith(prefix):
                 text = text[len(prefix):].strip()
         return {"ui": {"inpaint_text": [{"text": text, "canvas_node": canvas_node, "purpose": purpose}]}}
+
+
+# ---------------------------------------------------------------------------
+# HTTP route: file cleanup (the editor's "Clean up files" button)
+# ---------------------------------------------------------------------------
+
+def _register_routes():
+    try:
+        from aiohttp import web
+        from server import PromptServer
+    except Exception:
+        return
+    server = getattr(PromptServer, "instance", None)
+    if server is None:
+        return
+
+    @server.routes.post("/inpaint_canvas/cleanup")
+    async def _cleanup_route(request):
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        keep = data.get("keep") if isinstance(data, dict) else None
+        dry_run = bool(data.get("dry_run", True)) if isinstance(data, dict) else True
+        try:
+            min_age = float(data.get("min_age", CLEANUP_MIN_AGE)) if isinstance(data, dict) else CLEANUP_MIN_AGE
+        except (TypeError, ValueError):
+            min_age = CLEANUP_MIN_AGE
+        result = _cleanup_files(keep if isinstance(keep, list) else [], dry_run=dry_run, min_age=max(0.0, min_age))
+        return web.json_response(result)
+
+
+_register_routes()
 
 
 NODE_CLASS_MAPPINGS = {

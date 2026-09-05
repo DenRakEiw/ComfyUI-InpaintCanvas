@@ -4,7 +4,7 @@
 // full-window overlay so it never fights litegraph for pointer or wheel
 // events. Responsibilities of this file:
 //   * the editor (layers, selection tools, paint tools, transform, pan/zoom, undo,
-//     control layers, outpainting, result history)
+//     control layers, reference layers, layer masks / cutouts, outpainting, result history)
 //   * persisting the canvas state in the workflow (widget value)
 //   * on queue: flatten visible layers + selection mask (+ control layers), upload
 //     them, and put a small JSON into the prompt as `canvas_state`
@@ -21,7 +21,13 @@ const SUBFOLDER = "inpaint_canvas";
 const MAX_UNDO = 30;
 const HANDLE_PX = 9;
 const BLEND_MODES = ["normal", "multiply", "screen", "overlay", "darken", "lighten", "soft-light", "hard-light", "difference"];
-const ROLES = ["none", "scribble", "lineart", "depth", "pose", "canny", "other"];
+const ROLES = ["none", "reference", "scribble", "lineart", "depth", "pose", "canny", "other"];
+// Outputs after the setting slots. The backend declares them after setting_8, the
+// frontend shows them right after the connected settings (see syncSettingOutputs);
+// the queuePrompt wrapper maps the visible slot to the backend slot.
+const TAIL_OUTPUTS = [{ name: "reference_images", type: "IMAGE", label: "reference images" }];
+const REF_DEFAULTS = { size: 1024, fit: "pad" };
+const REF_FITS = ["pad", "crop", "stretch"];
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -404,7 +410,7 @@ function upsampleInstruction(useCase, text, region, hint) {
         case "remove":
             return `${look} Whatever ${region} contains will be erased as if it had never been there${text ? `; request: ${req}` : ""}. Write the image-generation prompt for that spot: one English paragraph of 30 to 60 words describing only what would be visible with the object gone, the background, surfaces, body or textures continuing naturally from the surroundings. The object that is there now must not appear in the prompt and the word remove must not be used. ${rules}`;
         case "edit":
-            return `${look} ${region[0].toUpperCase()}${region.slice(1)} will be changed according to this request: ${req}. Write an editing instruction for an image editing model: one or two English sentences of at most 50 words, starting with a verb, naming exactly what changes (keep the requested colours and materials) and what must stay the same (identity, pose, lighting, composition). ${rules} ${tail}`;
+            return `You write instructions for an image editing model. Request: ${req}. ${look} Rewrite the request as one English instruction of 15 to 35 words for the editing model: start with a verb, name the subject as it appears in the picture (the woman, the red car, the wall), apply exactly the requested change with the exact colours, materials or objects named in the request, and end with what must stay unchanged. Do not describe the picture, do not describe the current state, do not add a story or mood. Examples: request "change her haircolor to light blue" -> "Change the woman's hair color to light blue, keeping her hairstyle, face, expression, skin, clothing, pose, lighting and background exactly as they are." Request "mach den Stuhl aus Holz" -> "Make the chair out of natural wood with visible grain, keeping its shape, position, the person sitting on it and the rest of the scene unchanged." Output only the instruction. Request again: ${req}`;
         case "outpaint":
             return `${look} ${region[0].toUpperCase()}${region.slice(1)} lies at the border and the scene will be extended beyond it${text ? `; request: ${req}` : ""}. Write the image-generation prompt for the extension: one English paragraph of 40 to 80 words describing what appears further out, continuing the same environment, perspective, lighting and style without a visible seam. ${rules} ${tail}`;
         default:
@@ -415,6 +421,75 @@ function upsampleInstruction(useCase, text, region, hint) {
 function availableSegmentBackends() {
     const types = (window.LiteGraph && LiteGraph.registered_node_types) || {};
     return SEGMENT_BACKENDS.filter((b) => b.needs.every((n) => !!types[n]) && (!b.available || b.available(b)));
+}
+
+// Background removal for layer cutouts (Krita "remove background", LayerForge).
+// One helper prompt per layer: LoadRef(layer pixels) -> model -> InpaintCanvasMaskOut
+// (purpose "cutout"); the mask becomes the layer's transparency mask.
+const CUTOUT_BACKENDS = [
+    {
+        id: "rmbg2",
+        label: "RMBG-2.0",
+        needs: ["RMBG"],
+        // comfyui-rmbg: every optional input is read from **params, so all of them are sent.
+        build: (load) => ({
+            cut_run: { class_type: "RMBG", inputs: {
+                image: [load, 0], model: "RMBG-2.0", sensitivity: 1.0, process_res: 1024, mask_blur: 0, mask_offset: 0,
+                invert_output: false, refine_foreground: false, background: "Alpha", background_color: "#222222",
+            } },
+        }),
+        maskOut: ["cut_run", 1],
+    },
+    {
+        id: "birefnet",
+        label: "BiRefNet",
+        needs: ["BiRefNetRMBG"],
+        build: (load) => ({
+            cut_run: { class_type: "BiRefNetRMBG", inputs: {
+                image: [load, 0], model: "BiRefNet-general", mask_blur: 0, mask_offset: 0,
+                invert_output: false, refine_foreground: false, background: "Alpha", background_color: "#222222",
+            } },
+        }),
+        maskOut: ["cut_run", 1],
+    },
+    {
+        id: "ben2",
+        label: "BEN2",
+        needs: ["RMBG"],
+        build: (load) => ({
+            cut_run: { class_type: "RMBG", inputs: {
+                image: [load, 0], model: "BEN2", sensitivity: 1.0, process_res: 1024, mask_blur: 0, mask_offset: 0,
+                invert_output: false, refine_foreground: false, background: "Alpha", background_color: "#222222",
+            } },
+        }),
+        maskOut: ["cut_run", 1],
+    },
+    {
+        id: "bria14",
+        label: "BRIA RMBG 1.4",
+        needs: ["BRIA_RMBG_ModelLoader_Zho", "BRIA_RMBG_Zho"],
+        build: (load) => ({
+            cut_model: { class_type: "BRIA_RMBG_ModelLoader_Zho", inputs: {} },
+            cut_run: { class_type: "BRIA_RMBG_Zho", inputs: { rmbgmodel: ["cut_model", 0], image: [load, 0] } },
+        }),
+        maskOut: ["cut_run", 1],
+    },
+];
+
+function availableCutoutBackends() {
+    const types = (window.LiteGraph && LiteGraph.registered_node_types) || {};
+    return CUTOUT_BACKENDS.filter((b) => b.needs.every((n) => !!types[n]));
+}
+
+const isSettingOutput = (o) => !!(o && typeof o.name === "string" && /^setting_\d+$/.test(o.name));
+const settingIndex = (o) => parseInt(o.name.slice(8), 10);
+
+/** A link by id, whatever the litegraph version stores links in. */
+function linkOf(graph, id) {
+    if (!graph || id == null) return null;
+    if (typeof graph.getLink === "function") { const l = graph.getLink(id); if (l) return l; }
+    if (graph._links && typeof graph._links.get === "function") { const l = graph._links.get(id); if (l) return l; }
+    return (graph.links && graph.links[id]) || null;
 }
 
 // Object map for the hover selection tool: SAM2's automatic mask generator
@@ -483,6 +558,11 @@ const ICONS = {
     refine: '<path d="M20 12a8 8 0 11-2.3-5.7"/><path d="M20 3v5h-5"/><circle cx="12" cy="12" r="2.5" fill="currentColor" stroke="none"/>',
     dice: '<rect x="4" y="4" width="16" height="16" rx="3"/><circle cx="9" cy="9" r="1.5" fill="currentColor" stroke="none"/><circle cx="15" cy="15" r="1.5" fill="currentColor" stroke="none"/><circle cx="15" cy="9" r="1.5" fill="currentColor" stroke="none"/><circle cx="9" cy="15" r="1.5" fill="currentColor" stroke="none"/>',
     magic: '<path d="M4 20l10-10"/><path d="M15 3l1 2 2 1-2 1-1 2-1-2-2-1 2-1z" fill="currentColor" stroke="none"/><path d="M19 9l.7 1.3L21 11l-1.3.7L19 13l-.7-1.3L17 11l1.3-.7z" fill="currentColor" stroke="none"/><path d="M14 8l2 2"/>',
+    scissors: '<circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M20 4L8.3 15.7"/><path d="M8.3 8.3L20 20"/>',
+    image: '<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10" r="1.6" fill="currentColor" stroke="none"/><path d="M21 16l-5-5-8 8"/>',
+    mask: '<rect x="4" y="4" width="16" height="16" rx="2"/><circle cx="12" cy="12" r="4.5" fill="currentColor" stroke="none"/>',
+    maskEdit: '<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 16l6-6 2 2-6 6H8z" fill="currentColor" stroke="none"/><path d="M15 9l1-1 2 2-1 1"/>',
+    broom: '<path d="M14 3l7 7"/><path d="M17.5 6.5L9 15"/><path d="M9 15l-5 5"/><path d="M6 12l6 6"/><path d="M11 13l-4 8"/>',
     extend: '<rect x="8" y="8" width="8" height="8"/><path d="M12 2v4"/><path d="M12 18v4"/><path d="M2 12h4"/><path d="M18 12h4"/><path d="M10 4l2-2 2 2"/><path d="M10 20l2 2 2-2"/><path d="M4 10l-2 2 2 2"/><path d="M20 10l2 2-2 2"/>',
 };
 
@@ -579,7 +659,7 @@ const STYLE = `
 .ipc-sec .ipc-row4 { display:grid; grid-template-columns:auto 1fr auto 1fr; gap:4px 6px; align-items:center; width:100%; }
 .ipc-num { background:#161616; color:#ddd; border:1px solid #3a3a3a; border-radius:4px; padding:3px 5px; font:inherit; }
 .ipc-sel { background:#161616; color:#ccc; border:1px solid #3a3a3a; border-radius:4px; padding:2px 4px; font:11px system-ui, sans-serif; max-width:110px; }
-.ipc-list { overflow:auto; min-height:90px; max-height:34vh; }
+.ipc-list { overflow:auto; flex:none; min-height:90px; max-height:42vh; }
 .ipc-layer { display:flex; flex-direction:column; gap:4px; padding:6px 8px; border-bottom:1px solid #161616; cursor:pointer; }
 .ipc-layer:hover { background:#262b33; }
 .ipc-layer.ipc-selected { background:#2b3a4f; box-shadow: inset 3px 0 0 #4a90d9; }
@@ -587,6 +667,12 @@ const STYLE = `
 .ipc-layer .ipc-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .ipc-layer .ipc-kind { font-size:10px; color:#777; text-transform:uppercase; }
 .ipc-layer .ipc-kind.ipc-ctrl { color:#ffb347; }
+.ipc-layer .ipc-kind.ipc-ref { color:#7cc7ff; }
+.ipc-layer .ipc-maskrow { display:flex; align-items:center; gap:2px; color:#888; font-size:11px; }
+.ipc-layer .ipc-maskrow .ipc-sel { max-width:96px; }
+.ipc-layer .ipc-maskrow .ipc-grow { flex:1; }
+.ipc-mini.ipc-on { background:#2b3a4f; color:#7cc7ff; }
+.ipc-list.ipc-dropping { outline:2px dashed #7cc7ff; outline-offset:-2px; }
 .ipc-mini { display:inline-flex; align-items:center; justify-content:center; width:26px; height:24px; border-radius:4px;
   cursor:pointer; color:#bbb; background:transparent; border:none; padding:0; flex:none; }
 .ipc-mini:hover { background:#3a3a3a; color:#fff; }
@@ -611,6 +697,9 @@ const STYLE = `
 .ipc-info { padding:8px 10px; color:#aaa; display:grid; grid-template-columns:auto 1fr; gap:3px 10px; }
 .ipc-upsample { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
 .ipc-gen { display:flex; flex-wrap:wrap; gap:6px 10px; align-items:center; }
+.ipc-gen label { display:flex; align-items:center; gap:6px; }
+.ipc-gen input[type=range] { width:120px; margin:0; }
+.ipc-gen b { min-width:32px; font-weight:500; color:#ccc; }
 .ipc-settings { display:grid; grid-template-columns:auto 1fr; gap:4px 10px; align-items:center; }
 .ipc-settings label { display:contents; }
 .ipc-settings .ipc-sel, .ipc-settings input[type=text] { min-width:0; width:100%; }
@@ -649,7 +738,8 @@ class InpaintEditor {
         this.width = 0;
         this.height = 0;
         this.base = null;            // { ref, img }
-        this.layers = [];            // { id, name, kind, role, blend, ref, canvas, x, y, w, h, opacity, visible, dirty }
+        this.layers = [];            // { id, name, kind, role, blend, ref, canvas, x, y, w, h, opacity, visible, dirty,
+                                     //   mask (canvas, alpha = visible) | null, maskRef, maskDirty, maskEdit }
         this.activeLayerId = null;   // null = base
         this.selection = null;       // canvas WxH, red pixels where selected
         this.history = [];           // { key, ref, x, y, w, h, prompt, layerId, thumb }
@@ -666,6 +756,9 @@ class InpaintEditor {
         this.genSettings = { ...GEN_DEFAULTS, seed: randomSeed() };
         this.negativeText = "";
         this.settings = {};             // {"1": {value, type, label}, ...} for the setting_n outputs
+        this.refSettings = { ...REF_DEFAULTS };   // reference_images batch: long side, fit
+        this.cutoutSettings = { backend: "auto" };
+        this.cutoutPending = null;      // {layer, backend} while a background removal runs
         this.promptBackup = null;
         this.selectionLabel = "";       // what the selection is, when it came from "Select by text"
         this.undo = [];
@@ -863,7 +956,7 @@ class InpaintEditor {
         this.canvas = document.createElement("canvas");
         this.ctx = this.canvas.getContext("2d");
         this.viewEl.appendChild(this.canvas);
-        this.dropHint = el("div", "ipc-drop", "Load an image, paste it (Ctrl+V) or drop it here.\nThen paint a selection and press Generate.");
+        this.dropHint = el("div", "ipc-drop", "Load an image, paste it (Ctrl+V) or drop it here.\nThen paint a selection and press Generate.\nDrop with Shift, or onto the layer list, to add reference images.");
         this.viewEl.appendChild(this.dropHint);
         this.buildSubbar();
         body.appendChild(this.viewEl);
@@ -882,9 +975,29 @@ class InpaintEditor {
 
         const layersHead = el("h4", null, "Layers");
         layersHead.appendChild(el("span", "ipc-grow"));
+        this.refInput = document.createElement("input");
+        this.refInput.type = "file";
+        this.refInput.accept = "image/*";
+        this.refInput.multiple = true;
+        this.refInput.style.display = "none";
+        this.refInput.addEventListener("change", () => {
+            const files = Array.from(this.refInput.files || []);
+            this.refInput.value = "";
+            if (files.length) this.addImageLayers(files, "reference");
+        });
+        layersHead.appendChild(this.refInput);
+        layersHead.appendChild(miniButton("image", "Add reference images (one layer per file, role \"reference\"). They are not part of the image; they go out as the reference_images batch. Dropping files on this list does the same.", () => this.refInput.click()));
         layersHead.appendChild(miniButton("plus", "Add a paint layer (Ctrl+Shift+N)", () => this.addPaintLayer()));
         side.appendChild(layersHead);
         this.layerList = el("div", "ipc-list");
+        this.layerList.addEventListener("dragover", (e) => { e.preventDefault(); e.stopPropagation(); this.layerList.classList.add("ipc-dropping"); });
+        this.layerList.addEventListener("dragleave", () => this.layerList.classList.remove("ipc-dropping"));
+        this.layerList.addEventListener("drop", (e) => {
+            e.preventDefault(); e.stopPropagation();
+            this.layerList.classList.remove("ipc-dropping");
+            const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []).filter((f) => f.type.startsWith("image/"));
+            if (files.length) this.addImageLayers(files, "reference");
+        });
         side.appendChild(this.layerList);
 
         section("Selection", true, (d) => {
@@ -974,6 +1087,32 @@ class InpaintEditor {
             this.canvasInfo = el("span", null, "");
             sec.appendChild(this.canvasInfo);
             d.appendChild(sec);
+
+            // reference batch
+            const refs = el("div", "ipc-sec");
+            refs.appendChild(el("span", null, "References"));
+            const sizeLab = el("label", null, "size");
+            sizeLab.title = "Long side of every reference in the reference_images batch (0 = native). Larger references are scaled down, smaller ones stay.";
+            this.refSizeInput = numberInput(REF_DEFAULTS.size, 0, 4096, "Long side of the references (0 = native)", 64);
+            this.refSizeInput.step = 64;
+            this.refSizeInput.addEventListener("change", () => { this.refSettings.size = Math.max(0, Math.floor(+this.refSizeInput.value || 0)); this.refSizeInput.value = this.refSettings.size; this.notifyChanged(); });
+            sizeLab.appendChild(this.refSizeInput);
+            refs.appendChild(sizeLab);
+            const fitLab = el("label", null, "fit");
+            this.refFitSel = selectInput(REF_FITS, REF_DEFAULTS.fit, "A batch needs one size: pad fills the difference with the image's border colour, crop scales to cover and cuts the middle, stretch distorts.");
+            this.refFitSel.addEventListener("change", () => { this.refSettings.fit = this.refFitSel.value; this.notifyChanged(); });
+            fitLab.appendChild(this.refFitSel);
+            refs.appendChild(fitLab);
+            d.appendChild(refs);
+
+            // files
+            const files = el("div", "ipc-sec");
+            const clean = iconButton("broom", "Delete files in input/output/temp inpaint_canvas that no workflow uses: not this or any open editor, not any saved workflow, not younger than two minutes. Asks before deleting.", () => this.cleanupFiles(), "Clean up files");
+            clean.classList.add("ipc-small");
+            files.appendChild(clean);
+            this.cleanupInfo = el("span", null, "");
+            files.appendChild(this.cleanupInfo);
+            d.appendChild(files);
         });
 
         section("Prompt", true, (d) => {
@@ -1003,7 +1142,7 @@ class InpaintEditor {
             // prompt upsampling
             const up = el("div", "ipc-sec ipc-upsample");
             const caseLab = el("label", null, "Use case");
-            this.upCaseSel = selectInput(UPSAMPLE_CASES, "auto", "What the rewritten prompt is for. auto = fill, or outpaint when the selection touches the border.");
+            this.upCaseSel = selectInput(UPSAMPLE_CASES, "auto", "What the rewritten prompt is for. auto = an editing instruction (Flux.2, Kontext, Klein), or outpaint when the selection touches the border. fill / add / remove write a description of the finished area for inpaint models.");
             this.upCaseSel.addEventListener("change", () => { this.upsampleSettings.useCase = this.upCaseSel.value; this.notifyChanged(); });
             caseLab.appendChild(this.upCaseSel);
             up.appendChild(caseLab);
@@ -1024,10 +1163,21 @@ class InpaintEditor {
             const sec = el("div", "ipc-sec ipc-gen");
             const denLab = el("label", null, "Denoise");
             denLab.title = "Denoise strength for a local sampler (denoise output). 1.0 repaints the selection completely, lower values keep more of what is there (refine).";
-            this.denoiseInput = numberInput(1.0, 0.05, 1.0, "Denoise strength, emitted on the node's denoise output", 60);
-            this.denoiseInput.step = 0.05;
-            this.denoiseInput.addEventListener("change", () => { this.genSettings.denoise = Math.min(1, Math.max(0.05, +this.denoiseInput.value || 1)); this.denoiseInput.value = this.genSettings.denoise; this.renderInfo(); this.draw(); this.notifyChanged(); });
+            this.denoiseInput = document.createElement("input");
+            this.denoiseInput.type = "range";
+            this.denoiseInput.min = 0.05; this.denoiseInput.max = 1; this.denoiseInput.step = 0.05; this.denoiseInput.value = 1;
+            this.denoiseInput.title = "Denoise strength, emitted on the node's denoise output";
+            this.denoiseInput.addEventListener("keydown", (e) => e.stopPropagation());
+            this.denoiseInput.addEventListener("click", (e) => e.stopPropagation());
+            this.denoiseVal = el("b", null, "1.00");
+            this.denoiseInput.addEventListener("input", () => {
+                this.genSettings.denoise = Math.min(1, Math.max(0.05, Math.round((+this.denoiseInput.value || 1) * 100) / 100));
+                this.denoiseVal.textContent = this.genSettings.denoise.toFixed(2);
+                this.renderInfo(); this.draw();
+            });
+            this.denoiseInput.addEventListener("change", () => this.notifyChanged());
             denLab.appendChild(this.denoiseInput);
+            denLab.appendChild(this.denoiseVal);
             sec.appendChild(denLab);
             const seedLab = el("label", null, "Seed");
             seedLab.title = "Seed emitted on the node's seed output";
@@ -1307,6 +1457,7 @@ class InpaintEditor {
         const layer = p.layer;
         if (p.mode === "rotate" && Math.abs(p.angle) < 1e-6) { this.cancelPending(); return; }
         this.pushUndo({ kind: "layerfull", id: layer.id });
+        if (layer.mask) this.applyMask(layer, { silent: true, undo: false });
         const n = this.pendingSubdivisions(p, true);
         let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
         for (let j = 0; j <= n; j++) for (let i = 0; i <= n; i++) {
@@ -1368,6 +1519,7 @@ class InpaintEditor {
         window.addEventListener("keydown", this._docKey, true);
         this.promptInput.value = this.promptText;
         this.refreshSegmentBackends();
+        this.syncRefControls();
         this.root.focus({ preventScroll: true });
         this.resizeCanvas();
         this.fitView();
@@ -1425,8 +1577,11 @@ class InpaintEditor {
         this.viewEl.addEventListener("dragover", (e) => { e.preventDefault(); e.stopPropagation(); });
         this.viewEl.addEventListener("drop", (e) => {
             e.preventDefault(); e.stopPropagation();
-            const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
-            if (f && f.type.startsWith("image/")) this.loadFile(f);
+            const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []).filter((f) => f.type.startsWith("image/"));
+            if (!files.length) return;
+            // Shift, several files, or a base that already exists plus Shift: reference layers.
+            if (this.width && (e.shiftKey || files.length > 1)) { this.addImageLayers(files, "reference"); return; }
+            this.loadFile(files[0]);
         });
         this.canvas.addEventListener("pointerdown", (e) => this.onPointerDown(e));
         this.canvas.addEventListener("pointermove", (e) => this.onPointerMove(e));
@@ -1578,7 +1733,66 @@ class InpaintEditor {
     }
 
     isControl(layer) {
-        return !!(layer.role && layer.role !== "none");
+        return !!(layer.role && layer.role !== "none" && layer.role !== "reference");
+    }
+
+    isReference(layer) {
+        return layer.role === "reference";
+    }
+
+    /** Visible reference layers in panel order (top of the list = reference 1). */
+    referenceLayers() {
+        return this.layers.filter((l) => this.isReference(l) && l.visible && l.canvas).reverse();
+    }
+
+    /**
+     * The layer's pixels as they are composited: the canvas with the in-progress
+     * stroke and, when the layer has a transparency mask, multiplied by it. The
+     * masked result is cached until pixels or mask change.
+     */
+    layerPixels(layer) {
+        if (!layer.mask) return this.layerWithStroke(layer);
+        const p = this.pointer;
+        const live = !!(p && (p.kind === "layerpaint" || p.kind === "maskpaint") && p.layer === layer);
+        if (!live && layer._masked && layer._maskedValid) return layer._masked;
+        const base = this.layerWithStroke(layer);
+        const mask = this.maskWithStroke(layer);
+        let out;
+        if (live) {
+            if (!this.maskedPreview || this.maskedPreview.width !== base.width || this.maskedPreview.height !== base.height) this.maskedPreview = makeCanvas(base.width, base.height);
+            out = this.maskedPreview;
+        } else {
+            if (!layer._masked || layer._masked.width !== base.width || layer._masked.height !== base.height) layer._masked = makeCanvas(base.width, base.height);
+            out = layer._masked;
+        }
+        const ctx = out.getContext("2d");
+        ctx.globalCompositeOperation = "source-over";
+        ctx.globalAlpha = 1;
+        ctx.clearRect(0, 0, out.width, out.height);
+        ctx.drawImage(base, 0, 0);
+        ctx.globalCompositeOperation = "destination-in";
+        ctx.drawImage(mask, 0, 0, out.width, out.height);
+        ctx.globalCompositeOperation = "source-over";
+        if (!live) layer._maskedValid = true;
+        return out;
+    }
+
+    /** The layer's mask with the in-progress mask stroke applied (white = visible). */
+    maskWithStroke(layer) {
+        const p = this.pointer;
+        if (!p || p.kind !== "maskpaint" || p.layer !== layer) return layer.mask;
+        if (!this.maskPreview || this.maskPreview.width !== layer.mask.width || this.maskPreview.height !== layer.mask.height) this.maskPreview = makeCanvas(layer.mask.width, layer.mask.height);
+        const ctx = this.maskPreview.getContext("2d");
+        ctx.globalCompositeOperation = "source-over";
+        ctx.globalAlpha = 1;
+        ctx.clearRect(0, 0, this.maskPreview.width, this.maskPreview.height);
+        ctx.drawImage(layer.mask, 0, 0);
+        ctx.globalAlpha = this.brushOpacity;
+        ctx.globalCompositeOperation = p.erase ? "destination-out" : "source-over";
+        ctx.drawImage(p.stroke, 0, 0);
+        ctx.globalAlpha = 1;
+        ctx.globalCompositeOperation = "source-over";
+        return this.maskPreview;
     }
 
     /** Handles of a layer: corners (nw, ne, sw, se) and edge midpoints (n, e, s, w). */
@@ -1643,6 +1857,15 @@ class InpaintEditor {
             this.pointer = { kind: "object", start: [cx, cy], moved: false, shift: e.shiftKey, alt: e.altKey };
         } else if (this.tool === "paint" || this.tool === "erase") {
             let layer = this.activeLayer();
+            if (layer && layer.mask && layer.maskEdit) {
+                // Painting on the transparency mask: paint reveals, erase hides.
+                this.pushUndo({ kind: "mask", id: layer.id });
+                const stroke = makeCanvas(layer.mask.width, layer.mask.height);
+                this.pointer = { kind: "maskpaint", layer, stroke, erase: this.tool === "erase", white: true, last: [ix, iy] };
+                this.layerDab(this.pointer, ix, iy, ix, iy);
+                this.draw();
+                return;
+            }
             if (!layer) {
                 if (this.tool === "erase") { this.setStatus("The base layer cannot be erased. Select a layer or add a paint layer."); return; }
                 layer = this.addPaintLayer();
@@ -1692,7 +1915,7 @@ class InpaintEditor {
             this.selectionDab(p.last[0], p.last[1], ix, iy);
             p.last = [ix, iy];
             p.path.push([ix, iy]);
-        } else if (p.kind === "layerpaint") {
+        } else if (p.kind === "layerpaint" || p.kind === "maskpaint") {
             this.layerDab(p, p.last[0], p.last[1], ix, iy);
             p.last = [ix, iy];
         } else if (p.kind === "rect") {
@@ -1768,6 +1991,9 @@ class InpaintEditor {
         } else if (p.kind === "layerpaint") {
             this.commitStroke(p);
             this.markLayerChanged(p.layer);
+        } else if (p.kind === "maskpaint") {
+            this.commitStroke(p);
+            this.markMaskChanged(p.layer);
         } else if (p.kind === "move" || p.kind === "scale") {
             this.uploaded.baseHash = null;
             this.uploaded.controlHash = null;
@@ -1839,7 +2065,7 @@ class InpaintEditor {
         const lx0 = (x0 - layer.x) * sx, ly0 = (y0 - layer.y) * sy;
         const lx1 = (x1 - layer.x) * sx, ly1 = (y1 - layer.y) * sy;
         const radius = this.brushSize * (sx + sy) / 4;
-        const color = p.erase ? "#000000" : this.color;
+        const color = p.white ? "#ffffff" : (p.erase ? "#000000" : this.color);
         ctx.globalCompositeOperation = "source-over";
         if (this.hardness >= 0.98) {
             ctx.strokeStyle = color;
@@ -1877,9 +2103,9 @@ class InpaintEditor {
         }
     }
 
-    /** Apply the stroke buffer to the layer with the brush opacity. */
+    /** Apply the stroke buffer to the layer (or its mask) with the brush opacity. */
     commitStroke(p) {
-        const ctx = p.layer.canvas.getContext("2d");
+        const ctx = (p.kind === "maskpaint" ? p.layer.mask : p.layer.canvas).getContext("2d");
         ctx.save();
         ctx.globalAlpha = this.brushOpacity;
         ctx.globalCompositeOperation = p.erase ? "destination-out" : "source-over";
@@ -1911,13 +2137,27 @@ class InpaintEditor {
         if (!this.selection || !this.getBounds()) { this.setStatus("Nothing selected to fill."); return; }
         let layer = this.activeLayer();
         if (!layer) layer = this.addPaintLayer();
-        this.pushUndo({ kind: "layer", id: layer.id });
+        const onMask = !!(layer.mask && layer.maskEdit);
+        this.pushUndo(onMask ? { kind: "mask", id: layer.id } : { kind: "layer", id: layer.id });
         const shape = makeCanvas(this.width, this.height);
         const sctx = shape.getContext("2d");
         sctx.drawImage(this.selection, 0, 0);
         sctx.globalCompositeOperation = "source-in";
-        sctx.fillStyle = this.color;
+        sctx.fillStyle = onMask ? "#ffffff" : this.color;
         sctx.fillRect(0, 0, this.width, this.height);
+        if (onMask) {
+            const m = layer.mask;
+            const mctx = m.getContext("2d");
+            mctx.save();
+            mctx.globalAlpha = this.brushOpacity;
+            mctx.setTransform(m.width / layer.w, 0, 0, m.height / layer.h, 0, 0);
+            mctx.drawImage(shape, -layer.x, -layer.y);
+            mctx.restore();
+            this.markMaskChanged(layer);
+            this.draw();
+            this.setStatus(`${layer.name}: selection revealed on the mask.`);
+            return;
+        }
         const c = layer.canvas;
         const ctx = c.getContext("2d");
         ctx.save();
@@ -1962,7 +2202,7 @@ class InpaintEditor {
         if (!layer) { this.setStatus("Select a layer first (the base is fully opaque)."); return; }
         this.pushUndo({ kind: "selection" });
         const tmp = makeCanvas(this.width, this.height);
-        tmp.getContext("2d").drawImage(layer.canvas, layer.x, layer.y, layer.w, layer.h);
+        tmp.getContext("2d").drawImage(this.layerPixels(layer), layer.x, layer.y, layer.w, layer.h);
         const src = tmp.getContext("2d").getImageData(0, 0, this.width, this.height).data;
         const sctx = this.selection.getContext("2d");
         const img = sctx.createImageData(this.width, this.height);
@@ -2060,7 +2300,7 @@ class InpaintEditor {
             const ctx = c.getContext("2d");
             ctx.fillStyle = "#808080";
             ctx.fillRect(0, 0, this.width, this.height);
-            ctx.drawImage(layer.canvas, layer.x, layer.y, layer.w, layer.h);
+            ctx.drawImage(this.layerPixels(layer), layer.x, layer.y, layer.w, layer.h);
             const up = await uploadCanvas(c, `n${this.node.id}_segsrc`);
             return { ref: up.ref, hash: `layer:${layer.id}:${up.hash}`, layer };
         }
@@ -2082,7 +2322,7 @@ class InpaintEditor {
     layerAlpha(layer) {
         const c = makeCanvas(this.width, this.height);
         const ctx = c.getContext("2d");
-        ctx.drawImage(layer.canvas, layer.x, layer.y, layer.w, layer.h);
+        ctx.drawImage(this.layerPixels(layer), layer.x, layer.y, layer.w, layer.h);
         const a = ctx.getImageData(0, 0, this.width, this.height).data;
         const out = new Uint8Array(this.width * this.height);
         for (let i = 3, j = 0; i < a.length; i += 4, j++) out[j] = a[i] > 0 ? 1 : 0;
@@ -2133,7 +2373,9 @@ class InpaintEditor {
         if (uc !== "auto") return uc;
         const b = this.getBounds();
         if (b && (b[0] <= 0 || b[1] <= 0 || b[2] >= this.width || b[3] >= this.height)) return "outpaint";
-        return "fill";
+        // Edit models (Flux.2, Kontext, Klein) want an instruction, not a description.
+        // "fill" stays available for latent inpaint models that want a description.
+        return "edit";
     }
 
     async upsamplePrompt() {
@@ -2401,8 +2643,8 @@ class InpaintEditor {
             const { ref } = await uploadCanvas(nb, `n${this.node.id}_base`);
             const img = await loadImageEl(viewUrl(ref));
 
-            // Everything visible was baked into the new base; keep only control layers.
-            const kept = this.layers.filter((l) => this.isControl(l));
+            // Everything visible was baked into the new base; keep control and reference layers.
+            const kept = this.layers.filter((l) => this.isControl(l) || this.isReference(l));
             for (const l of kept) {
                 if (l.kind === "paint" && l.canvas.width === W && l.canvas.height === H && l.w === W && l.h === H) {
                     const c = makeCanvas(nw, nh);
@@ -2447,7 +2689,9 @@ class InpaintEditor {
         if (!layer) return null;
         if (step.kind === "layer") return { kind: "layer", id: layer.id, url: layer.canvas.toDataURL("image/png") };
         if (step.kind === "transform") return { kind: "transform", id: layer.id, x: layer.x, y: layer.y, w: layer.w, h: layer.h };
-        if (step.kind === "layerfull") return { kind: "layerfull", id: layer.id, url: layer.canvas.toDataURL("image/png"), cw: layer.canvas.width, ch: layer.canvas.height, x: layer.x, y: layer.y, w: layer.w, h: layer.h };
+        if (step.kind === "mask") return { kind: "mask", id: layer.id, url: layer.mask ? layer.mask.toDataURL("image/png") : null, mw: layer.mask ? layer.mask.width : 0, mh: layer.mask ? layer.mask.height : 0 };
+        if (step.kind === "layerfull") return { kind: "layerfull", id: layer.id, url: layer.canvas.toDataURL("image/png"), cw: layer.canvas.width, ch: layer.canvas.height, x: layer.x, y: layer.y, w: layer.w, h: layer.h,
+            mask: layer.mask ? layer.mask.toDataURL("image/png") : null, mw: layer.mask ? layer.mask.width : 0, mh: layer.mask ? layer.mask.height : 0 };
         return null;
     }
 
@@ -2485,10 +2729,20 @@ class InpaintEditor {
                 this.renderLayers();
                 this.drawThumb();
                 this.notifyChanged();
+            } else if (snap.kind === "mask") {
+                layer.mask = snap.url ? imageToCanvas(await loadImageEl(snap.url), snap.mw, snap.mh) : null;
+                if (!layer.mask) layer.maskEdit = false;
+                this.markMaskChanged(layer);
+                this.renderLayers();
             } else if (snap.kind === "layerfull") {
                 const img = await loadImageEl(snap.url);
                 layer.canvas = imageToCanvas(img, snap.cw, snap.ch);
                 Object.assign(layer, { x: snap.x, y: snap.y, w: snap.w, h: snap.h });
+                layer.mask = snap.mask ? imageToCanvas(await loadImageEl(snap.mask), snap.mw, snap.mh) : null;
+                if (!layer.mask) layer.maskEdit = false;
+                layer.maskDirty = !!layer.mask;
+                layer._maskedValid = false;
+                layer.exportRef = null;
                 this.markLayerChanged(layer);
                 this.renderLayers();
             }
@@ -2551,10 +2805,263 @@ class InpaintEditor {
 
     markLayerChanged(layer) {
         layer.dirty = true;
+        layer._maskedValid = false;
+        layer.exportRef = null;
         this.uploaded.baseHash = null;
         this.uploaded.controlHash = null;
         this.drawThumb();
         this.notifyChanged();
+    }
+
+    markMaskChanged(layer) {
+        layer.maskDirty = !!layer.mask;
+        if (!layer.mask) layer.maskRef = null;
+        layer._maskedValid = false;
+        layer.exportRef = null;
+        this.uploaded.baseHash = null;
+        this.uploaded.controlHash = null;
+        this.drawThumb();
+        this.notifyChanged();
+    }
+
+    // ---- layer masks and cutouts ------------------------------------------------
+
+    refreshCutoutBackends() {
+        if (!this.cutoutSel) return;
+        const avail = availableCutoutBackends();
+        const cur = this.cutoutSettings.backend;
+        this.cutoutSel.innerHTML = "";
+        for (const b of avail) { const o = document.createElement("option"); o.value = b.id; o.textContent = b.label; this.cutoutSel.appendChild(o); }
+        if (!avail.length) { const o = document.createElement("option"); o.value = ""; o.textContent = "no RMBG nodes"; this.cutoutSel.appendChild(o); }
+        this.cutoutSel.value = avail.some((b) => b.id === cur) ? cur : (avail[0] ? avail[0].id : "");
+    }
+
+    /** Remove the background of a layer with an RMBG node; the result becomes its transparency mask. */
+    async cutoutLayer(layer) {
+        if (!layer || !layer.canvas) return;
+        const backend = CUTOUT_BACKENDS.find((b) => b.id === this.cutoutSettings.backend && availableCutoutBackends().includes(b)) || availableCutoutBackends()[0];
+        if (!backend) { this.setStatus("No background removal nodes installed (comfyui-rmbg or ComfyUI-BRIA_AI-RMBG)."); return; }
+        if (this.cutoutPending) { this.setStatus(`Still removing the background of ${this.cutoutPending.layer.name} ...`); return; }
+        try {
+            this.cutoutPending = { layer, backend };
+            this.renderLayers();
+            this.setStatus(`Removing the background of ${layer.name} with ${backend.label} ...`);
+            // The layer's own pixels (transparent parts turn black on the way to RGB).
+            const up = await uploadCanvas(layer.canvas, `n${this.node.id}_cutsrc`);
+            const prompt = {
+                cut_load: { class_type: "InpaintCanvasLoadRef", inputs: { ref: JSON.stringify(up.ref) } },
+                ...backend.build("cut_load"),
+                cut_out: { class_type: "InpaintCanvasMaskOut", inputs: { mask: backend.maskOut, canvas_node: String(this.node.id), purpose: "cutout" } },
+            };
+            const res = await api.queuePrompt(-1, { output: prompt, workflow: { nodes: [], links: [], version: 0.4, extra: { inpaint_canvas_helper: true } } });
+            this.cutoutPromptId = res && res.prompt_id;
+            if (res && res.node_errors && Object.keys(res.node_errors).length) {
+                const first = Object.values(res.node_errors)[0];
+                throw new Error((first.errors && first.errors[0] && first.errors[0].message) || "prompt rejected");
+            }
+        } catch (err) {
+            console.error(err);
+            this.cutoutPending = null;
+            this.renderLayers();
+            this.setStatus("Background removal failed: " + (err.message || err));
+        }
+    }
+
+    /** The RMBG mask came back: grayscale PNG at the layer's pixel size -> transparency mask. */
+    async applyCutoutFile(info) {
+        const pending = this.cutoutPending;
+        if (!pending) return;
+        const layer = pending.layer;
+        if (!this.layers.includes(layer)) { this.cutoutPending = null; this.renderLayers(); return; }
+        try {
+            const img = await loadImageEl(viewUrl({ filename: info.filename, subfolder: info.subfolder || SUBFOLDER, type: info.type || "temp" }));
+            const W = layer.canvas.width, H = layer.canvas.height;
+            const tmp = makeCanvas(W, H);
+            const tctx = tmp.getContext("2d");
+            tctx.drawImage(img, 0, 0, W, H);
+            const src = tctx.getImageData(0, 0, W, H).data;
+            const m = makeCanvas(W, H);
+            const mctx = m.getContext("2d");
+            const out = mctx.createImageData(W, H);
+            const d = out.data;
+            let sum = 0;
+            for (let i = 0; i < src.length; i += 4) { d[i] = 255; d[i + 1] = 255; d[i + 2] = 255; d[i + 3] = src[i]; sum += src[i]; }
+            mctx.putImageData(out, 0, 0);
+            this.pushUndo({ kind: "mask", id: layer.id });
+            layer.mask = m;
+            layer.maskEdit = false;
+            this.markMaskChanged(layer);
+            this.renderLayers();
+            this.draw();
+            const pct = Math.round(100 * sum / (255 * W * H));
+            this.setStatus(`${layer.name}: background removed with ${pending.backend.label}, ${pct}% kept. Enable mask editing to touch it up with P / E.`);
+        } catch (err) {
+            console.error(err);
+            this.setStatus("Could not apply the cutout: " + (err.message || err));
+        } finally {
+            // cleared only now: the mask is applied before the row's spinner state goes away
+            if (this.cutoutPending === pending) this.cutoutPending = null;
+            this.renderLayers();
+        }
+    }
+
+    /** Transparency mask from the selection (Krita: "add transparency mask" from selection). */
+    maskFromSelection(layer) {
+        if (!layer || !this.selection) return;
+        if (!this.getBounds()) { this.setStatus("Select the area to keep first."); return; }
+        this.pushUndo({ kind: "mask", id: layer.id });
+        const m = makeCanvas(layer.canvas.width, layer.canvas.height);
+        const ctx = m.getContext("2d");
+        ctx.setTransform(m.width / layer.w, 0, 0, m.height / layer.h, 0, 0);
+        ctx.drawImage(this.selection, -layer.x, -layer.y);
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.globalCompositeOperation = "source-in";
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, m.width, m.height);
+        ctx.globalCompositeOperation = "source-over";
+        layer.mask = m;
+        layer.maskEdit = false;
+        this.markMaskChanged(layer);
+        this.renderLayers();
+        this.draw();
+        this.setStatus(`${layer.name}: mask from selection. Only the selected part stays visible.`);
+    }
+
+    /** Bake the mask into the layer's alpha. */
+    applyMask(layer, { silent = false, undo = true } = {}) {
+        if (!layer || !layer.mask) return;
+        if (undo) this.pushUndo({ kind: "layerfull", id: layer.id });
+        const px = this.layerPixels(layer);
+        const out = makeCanvas(layer.canvas.width, layer.canvas.height);
+        out.getContext("2d").drawImage(px, 0, 0);
+        layer.canvas = out;
+        layer.mask = null;
+        layer.maskRef = null;
+        layer.maskDirty = false;
+        layer.maskEdit = false;
+        this.markLayerChanged(layer);
+        if (!silent) { this.renderLayers(); this.draw(); this.setStatus(`${layer.name}: mask applied to the pixels.`); }
+    }
+
+    removeMask(layer) {
+        if (!layer || !layer.mask) return;
+        this.pushUndo({ kind: "mask", id: layer.id });
+        layer.mask = null;
+        layer.maskEdit = false;
+        this.markMaskChanged(layer);
+        this.renderLayers();
+        this.draw();
+        this.setStatus(`${layer.name}: mask removed, the whole layer is visible again.`);
+    }
+
+    toggleMaskEdit(layer) {
+        if (!layer || !layer.mask) return;
+        layer.maskEdit = !layer.maskEdit;
+        for (const l of this.layers) if (l !== layer) l.maskEdit = false;
+        this.activeLayerId = layer.id;
+        if (layer.maskEdit && this.tool !== "paint" && this.tool !== "erase") this.setTool("paint");
+        this.renderLayers();
+        this.draw();
+        this.setStatus(layer.maskEdit ? `${layer.name}: editing the mask. Paint (P) reveals, erase (E) hides, Shift+F reveals the selection.` : `${layer.name}: editing pixels again.`);
+    }
+
+    // ---- reference images -----------------------------------------------------------
+
+    syncRefControls() {
+        if (this.refSizeInput) this.refSizeInput.value = this.refSettings.size;
+        if (this.refFitSel) this.refFitSel.value = REF_FITS.includes(this.refSettings.fit) ? this.refSettings.fit : "pad";
+        this.refreshCutoutBackends();
+    }
+
+    /** Upload image files and add each as a layer (role "reference" by default). */
+    async addImageLayers(files, role = "reference") {
+        files = Array.from(files || []).filter((f) => f && f.type && f.type.startsWith("image/"));
+        if (!files.length) return;
+        if (!this.width) {
+            await this.loadFile(files.shift());
+            if (!files.length || !this.width) return;
+        }
+        let n = this.layers.filter((l) => this.isReference(l)).length;
+        let last = null;
+        for (const file of files) {
+            try {
+                this.setStatus(`Uploading ${file.name || "image"} ...`);
+                const ext = ((file.name || "").match(/\.[a-z0-9]+$/i) || [".png"])[0];
+                const stem = (file.name || "image").replace(/\.[a-z0-9]+$/i, "").replace(/[^a-z0-9._-]/gi, "_") || "image";
+                const ref = await uploadBlob(file, stem + ext, { overwrite: false });
+                const img = await loadImageEl(viewUrl(ref));
+                // Shown at a third of the canvas, cascaded from the top left; the file itself stays the reference.
+                const s = Math.min(1, (Math.max(this.width, this.height) / 3) / Math.max(img.naturalWidth, img.naturalHeight));
+                const w = Math.max(1, Math.round(img.naturalWidth * s)), h = Math.max(1, Math.round(img.naturalHeight * s));
+                const off = 16 + (n % 8) * 24;
+                last = this.addLayer({ name: (file.name || "image").replace(/\.[a-z0-9]+$/i, ""), kind: "image", role, ref, canvas: imageToCanvas(img), x: off, y: off, w, h, dirty: false });
+                n++;
+            } catch (err) {
+                console.error(err);
+                this.setStatus(String(err.message || err));
+            }
+        }
+        if (last) {
+            const refs = this.referenceLayers().length;
+            this.setStatus(role === "reference" ? `${files.length} reference image${files.length > 1 ? "s" : ""} added (${refs} in the reference_images batch). They are not part of the image.` : `${files.length} image layer${files.length > 1 ? "s" : ""} added.`);
+        }
+    }
+
+    // ---- file cleanup ---------------------------------------------------------------
+
+    /** File names every open editor and every open workflow tab still reference. */
+    static referencedFiles() {
+        const keep = new Set();
+        const scan = (text) => { for (const m of String(text || "").matchAll(/"filename"\s*:\s*"([^"]+)"/g)) keep.add(m[1]); };
+        for (const n of (app.graph && app.graph._nodes) || []) {
+            const ed = n.inpaintEditor;
+            if (!ed) continue;
+            scan(ed.lastValueString);
+            try { scan(ed.getValue()); } catch (_) { /* ignore */ }
+            scan(JSON.stringify(ed.uploaded));
+            scan(JSON.stringify(ed.layers.map((l) => [l.ref, l.maskRef, l.exportRef])));
+            if (ed.base) scan(JSON.stringify(ed.base.ref));
+        }
+        try {
+            const wf = app.extensionManager && app.extensionManager.workflow;
+            for (const w of (wf && wf.openWorkflows) || []) {
+                scan(w.content || w.originalContent || "");
+                if (w.activeState) scan(JSON.stringify(w.activeState));
+                if (w.initialState) scan(JSON.stringify(w.initialState));
+            }
+        } catch (_) { /* ignore */ }
+        try { for (let i = 0; i < localStorage.length; i++) scan(localStorage.getItem(localStorage.key(i))); } catch (_) { /* ignore */ }
+        return Array.from(keep);
+    }
+
+    async cleanupFiles() {
+        const fmt = (b) => b >= 1e6 ? (b / 1e6).toFixed(1) + " MB" : Math.round(b / 1e3) + " kB";
+        try {
+            const keep = InpaintEditor.referencedFiles();
+            const call = async (dry) => {
+                const r = await api.fetchApi("/inpaint_canvas/cleanup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ keep, dry_run: dry }) });
+                if (r.status !== 200) throw new Error(`cleanup route answered ${r.status} (restart ComfyUI after updating the node)`);
+                return r.json();
+            };
+            this.setStatus("Checking files ...");
+            const plan = await call(true);
+            if (!plan.removed) {
+                this.setStatus(`Nothing to clean up: ${plan.kept} file${plan.kept === 1 ? "" : "s"} still in use.`);
+                if (this.cleanupInfo) this.cleanupInfo.textContent = `${plan.kept} in use`;
+                return;
+            }
+            const t = plan.by_type || {};
+            const msg = `Delete ${plan.removed} file${plan.removed === 1 ? "" : "s"} (${fmt(plan.bytes)}) from the inpaint_canvas folders?\n` +
+                `input ${t.input || 0} · output ${t.output || 0} · temp ${t.temp || 0}\n\n` +
+                `Kept: ${plan.kept} file${plan.kept === 1 ? "" : "s"} used by open editors, open workflow tabs or saved workflows, and anything younger than two minutes. Discarded history results that are deleted cannot be restored.`;
+            if (!window.confirm(msg)) { this.setStatus("Cleanup cancelled."); return; }
+            const res = await call(false);
+            this.setStatus(`Cleanup: ${res.removed} file${res.removed === 1 ? "" : "s"} deleted (${fmt(res.bytes)}), ${res.kept} kept.`);
+            if (this.cleanupInfo) this.cleanupInfo.textContent = `${res.removed} deleted, ${fmt(res.bytes)}`;
+        } catch (err) {
+            console.error(err);
+            this.setStatus("Cleanup failed: " + (err.message || err));
+        }
     }
 
     selectionBounds() {
@@ -2640,6 +3147,8 @@ class InpaintEditor {
             }
             const ctrl = this.layers.filter((l) => this.isControl(l) && l.visible).length;
             rows.push(["Control", ctrl ? `${ctrl} layer${ctrl > 1 ? "s" : ""}` : "none (black)"]);
+            const refs = this.referenceLayers().length;
+            rows.push(["References", refs ? `${refs} image${refs > 1 ? "s" : ""} (${this.refSettings.size || "native"}, ${this.refSettings.fit})` : "none (empty batch)"]);
             const rs = this.resultInputState();
             rows.push(["Result", `${this.genSettings.mode} → ${rs.name}${rs.wired ? "" : " (not wired!)"}` + (this.genSettings.mode === "local" && this.genSettings.refine ? " · refine" : "")]);
         }
@@ -2697,6 +3206,8 @@ class InpaintEditor {
         if (!layer.kind) layer.kind = "result";
         if (!layer.blend) layer.blend = "normal";
         if (!layer.role) layer.role = "none";
+        if (layer.mask === undefined) layer.mask = null;
+        if (!layer.mask) { layer.maskRef = null; layer.maskDirty = false; layer.maskEdit = false; }
         this.layers.push(layer);
         if (activate) this.activeLayerId = layer.id;
         this.uploaded.baseHash = null;
@@ -2790,7 +3301,9 @@ class InpaintEditor {
             const name = el("span", "ipc-name", layer.name);
             name.title = `${layer.w} × ${layer.h} at ${layer.x}, ${layer.y}`;
             top.appendChild(name);
-            top.appendChild(el("span", "ipc-kind" + (this.isControl(layer) ? " ipc-ctrl" : ""), this.isControl(layer) ? layer.role : layer.kind));
+            const refIndex = this.isReference(layer) ? this.referenceLayers().indexOf(layer) : -1;
+            const kindText = this.isControl(layer) ? layer.role : (this.isReference(layer) ? (refIndex >= 0 ? `ref ${refIndex + 1}` : "ref (hidden)") : layer.kind);
+            top.appendChild(el("span", "ipc-kind" + (this.isControl(layer) ? " ipc-ctrl" : (this.isReference(layer) ? " ipc-ref" : "")), kindText));
             const up = miniButton("up", "Move layer up", () => this.moveLayer(layer.id, +1));
             up.disabled = i === this.layers.length - 1;
             top.appendChild(up);
@@ -2820,10 +3333,11 @@ class InpaintEditor {
             blend.addEventListener("change", () => { layer.blend = blend.value; this.uploaded.baseHash = null; this.draw(); this.drawThumb(); this.notifyChanged(); });
             blendLab.appendChild(blend);
             modeRow.appendChild(blendLab);
-            const roleLab = el("label", null, "Control");
-            const role = selectInput(ROLES, layer.role || "none", "Control role: layers with a role go to the control_image output instead of the image");
+            const roleLab = el("label", null, "Role");
+            const role = selectInput(ROLES, layer.role || "none", "Role: none = part of the image; reference = not in the image, emitted in the reference_images batch (Flux.2 / Kontext multi-reference); scribble, lineart, depth, pose, canny, other = control_image on black");
             role.addEventListener("change", () => {
                 layer.role = role.value;
+                layer.exportRef = null;
                 this.uploaded.baseHash = null;
                 this.uploaded.controlHash = null;
                 this.renderLayers(); this.renderInfo(); this.draw(); this.drawThumb(); this.notifyChanged();
@@ -2831,6 +3345,33 @@ class InpaintEditor {
             roleLab.appendChild(role);
             modeRow.appendChild(roleLab);
             row.appendChild(modeRow);
+
+            // transparency mask: cutout (RMBG), from selection, edit, apply, remove
+            const maskRow = el("div", "ipc-maskrow");
+            const busy = !!(this.cutoutPending && this.cutoutPending.layer === layer);
+            const cut = miniButton("scissors", busy ? "Removing the background ..." : "Cutout: remove the background with the model on the right (RMBG). The result is a transparency mask you can edit.", () => this.cutoutLayer(layer));
+            cut.disabled = busy || !availableCutoutBackends().length;
+            maskRow.appendChild(cut);
+            if (layer.id === this.activeLayerId) {
+                const sel = selectInput(["auto"], "auto", "Background removal model");
+                this.cutoutSel = sel;
+                this.refreshCutoutBackends();
+                sel.addEventListener("change", () => { this.cutoutSettings.backend = sel.value; this.notifyChanged(); });
+                maskRow.appendChild(sel);
+            }
+            maskRow.appendChild(miniButton("mask", "Mask from selection: only the selected part of the layer stays visible", () => this.maskFromSelection(layer)));
+            maskRow.appendChild(el("span", "ipc-grow"));
+            maskRow.appendChild(el("span", null, layer.mask ? (layer.maskEdit ? "mask ✎" : "mask") : "no mask"));
+            const editBtn = miniButton("maskEdit", "Edit the mask with the paint (reveal) and erase (hide) tools", () => this.toggleMaskEdit(layer), layer.maskEdit ? "ipc-on" : "");
+            editBtn.disabled = !layer.mask;
+            maskRow.appendChild(editBtn);
+            const applyBtn = miniButton("check", "Apply the mask to the pixels", () => this.applyMask(layer));
+            applyBtn.disabled = !layer.mask;
+            maskRow.appendChild(applyBtn);
+            const delMask = miniButton("trash", "Remove the mask (the pixels stay)", () => this.removeMask(layer), "ipc-del");
+            delMask.disabled = !layer.mask;
+            maskRow.appendChild(delMask);
+            row.appendChild(maskRow);
             list.appendChild(row);
         }
         const row = el("div", "ipc-layer" + (this.activeLayerId === null ? " ipc-selected" : ""));
@@ -2899,7 +3440,7 @@ class InpaintEditor {
             ctx.drawImage(img, (canvas.width - w) / 2, (canvas.height - hh) / 2, w, hh);
         };
         const layer = this.layers.find((l) => l.id === h.layerId);
-        if (layer && layer.canvas) { paint(layer.canvas); return; }
+        if (layer && layer.canvas) { paint(this.layerPixels(layer)); return; }
         if (h.thumbImg) { paint(h.thumbImg); return; }
         loadImageEl(viewUrl(h.ref)).then((img) => { h.thumbImg = img; paint(img); }).catch(() => { /* ignore */ });
     }
@@ -2959,7 +3500,7 @@ class InpaintEditor {
             if (!layer.visible || !layer.canvas) continue;
             const ctrl = this.isControl(layer);
             if (controlOnly && !ctrl) continue;
-            if (forRun && ctrl) continue;
+            if (forRun && (ctrl || this.isReference(layer))) continue;
             ctx.globalAlpha = layer.opacity;
             ctx.globalCompositeOperation = (!controlOnly && layer.blend && layer.blend !== "normal") ? layer.blend : "source-over";
             this.drawLayer(ctx, layer);
@@ -2973,19 +3514,20 @@ class InpaintEditor {
         if (p && p.layer === layer) {
             const fine = !this.pointer;
             const n = this.pendingSubdivisions(p, fine);
+            const px = this.layerPixels(layer);
             if (p.mode === "rotate") {
                 const cx = layer.x + layer.w / 2, cy = layer.y + layer.h / 2;
                 ctx.save();
                 ctx.translate(cx, cy);
                 ctx.rotate(p.angle);
-                ctx.drawImage(layer.canvas, -layer.w / 2, -layer.h / 2, layer.w, layer.h);
+                ctx.drawImage(px, -layer.w / 2, -layer.h / 2, layer.w, layer.h);
                 ctx.restore();
             } else {
-                drawMesh(ctx, layer.canvas, (u, v) => this.pendingDst(p, u, v), n, n);
+                drawMesh(ctx, px, (u, v) => this.pendingDst(p, u, v), n, n);
             }
             return;
         }
-        ctx.drawImage(this.layerWithStroke(layer), layer.x, layer.y, layer.w, layer.h);
+        ctx.drawImage(this.layerPixels(layer), layer.x, layer.y, layer.w, layer.h);
     }
 
     flattenToCanvas(opts = {}) {
@@ -3014,7 +3556,7 @@ class InpaintEditor {
             this.setStatus("Flattening ...");
             const { ref, hash } = await uploadCanvas(this.flattenToCanvas({ forRun: true }), `n${this.node.id}_base`);
             const img = await loadImageEl(viewUrl(ref));
-            this.layers = this.layers.filter((l) => this.isControl(l));
+            this.layers = this.layers.filter((l) => this.isControl(l) || this.isReference(l));
             this.activeLayerId = null;
             this.base = { ref, img };
             this.uploaded.baseHash = hash;
@@ -3024,7 +3566,7 @@ class InpaintEditor {
             this.draw();
             this.drawThumb();
             this.notifyChanged();
-            this.setStatus("Flattened into base layer (control layers kept).");
+            this.setStatus("Flattened into base layer (control and reference layers kept).");
         } catch (err) {
             console.error(err);
             this.setStatus(String(err.message || err));
@@ -3034,10 +3576,16 @@ class InpaintEditor {
     /** Upload every edited layer so its pixels survive a reload. */
     async syncLayers() {
         for (const layer of this.layers) {
-            if (!layer.dirty || !layer.canvas) continue;
-            const { ref } = await uploadCanvas(layer.canvas, `n${this.node.id}_layer`);
-            layer.ref = ref;
-            layer.dirty = false;
+            if (layer.dirty && layer.canvas) {
+                const { ref } = await uploadCanvas(layer.canvas, `n${this.node.id}_layer`);
+                layer.ref = ref;
+                layer.dirty = false;
+            }
+            if (layer.maskDirty && layer.mask) {
+                const { ref } = await uploadCanvas(layer.mask, `n${this.node.id}_lmask`);
+                layer.maskRef = ref;
+                layer.maskDirty = false;
+            }
         }
         this.notifyChanged();
     }
@@ -3074,6 +3622,40 @@ class InpaintEditor {
             ctx.lineWidth = 1.5 / s;
             ctx.strokeStyle = "#4a90d9";
             ctx.strokeRect(x, y, w, h);
+            ctx.restore();
+        }
+
+        // reference layers: cyan frame with their batch index
+        const refs = this.referenceLayers();
+        if (refs.length) {
+            ctx.save();
+            ctx.lineWidth = 1.5 / s;
+            ctx.strokeStyle = "#7cc7ff";
+            ctx.fillStyle = "#7cc7ff";
+            ctx.font = `${Math.max(11, 13 / s)}px system-ui, sans-serif`;
+            ctx.textBaseline = "top";
+            refs.forEach((l, i) => {
+                ctx.setLineDash([5 / s, 3 / s]);
+                ctx.strokeRect(l.x, l.y, l.w, l.h);
+                ctx.setLineDash([]);
+                const label = `ref ${i + 1}`;
+                const tw = ctx.measureText(label).width + 8 / s, th = Math.max(11, 13 / s) + 4 / s;
+                ctx.globalAlpha = 0.85;
+                ctx.fillRect(l.x, l.y, tw, th);
+                ctx.globalAlpha = 1;
+                ctx.fillStyle = "#10202c";
+                ctx.fillText(label, l.x + 4 / s, l.y + 2 / s);
+                ctx.fillStyle = "#7cc7ff";
+            });
+            ctx.restore();
+        }
+        const maskLayer = this.layers.find((l) => l.mask && l.maskEdit && l.visible);
+        if (maskLayer) {
+            ctx.save();
+            ctx.lineWidth = 2 / s;
+            ctx.strokeStyle = "#ff66cc";
+            ctx.setLineDash([4 / s, 4 / s]);
+            ctx.strokeRect(maskLayer.x, maskLayer.y, maskLayer.w, maskLayer.h);
             ctx.restore();
         }
 
@@ -3174,8 +3756,8 @@ class InpaintEditor {
         const graph = this.node.graph || app.graph;
         for (let i = FIXED_OUTPUTS; i < outs.length; i++) {
             const o = outs[i];
-            if (!o || !o.links || !o.links.length) continue;
-            const link = graph.links[o.links[0]];
+            if (!isSettingOutput(o) || !o.links || !o.links.length) continue;
+            const link = linkOf(graph, o.links[0]);
             if (!link) continue;
             const target = graph.getNodeById(link.target_id);
             if (!target) continue;
@@ -3185,7 +3767,7 @@ class InpaintEditor {
             const nd = target.constructor && target.constructor.nodeData;
             const spec = nd && nd.input && ((nd.input.required && nd.input.required[inputName]) || (nd.input.optional && nd.input.optional[inputName])) || null;
             const widget = target.widgets && target.widgets.find((w) => w.name === inputName) || null;
-            res.push({ index: i - FIXED_OUTPUTS + 1, output: o, node: target, inputName, spec, widget });
+            res.push({ index: settingIndex(o), output: o, node: target, inputName, spec, widget });
         }
         return res;
     }
@@ -3280,6 +3862,7 @@ class InpaintEditor {
         const local = this.genSettings.mode === "local";
         this.modeSel.value = local ? "local" : "api";
         this.denoiseInput.value = this.genSettings.denoise;
+        if (this.denoiseVal) this.denoiseVal.textContent = (+this.genSettings.denoise || 1).toFixed(2);
         this.seedInput.value = this.genSettings.seed;
         this.seedRandom.checked = !!this.genSettings.seedRandom;
         this.refineBtn.classList.toggle("ipc-toggle-on", !!this.genSettings.refine);
@@ -3332,7 +3915,7 @@ class InpaintEditor {
             prompt: this.promptText,
             layers: this.layers.map((l) => ({
                 id: l.id, name: l.name, kind: l.kind, role: l.role || "none", blend: l.blend || "normal", ref: l.ref,
-                x: l.x, y: l.y, w: l.w, h: l.h, opacity: l.opacity, visible: l.visible,
+                x: l.x, y: l.y, w: l.w, h: l.h, opacity: l.opacity, visible: l.visible, mask: l.maskRef || null,
             })),
             history: this.history.slice(-100).map((h) => ({ key: h.key, name: h.name, ref: h.ref, x: h.x, y: h.y, w: h.w, h: h.h, prompt: h.prompt, layerId: h.layerId, time: h.time, seed: h.seed, mode: h.mode, denoise: h.denoise })),
             selection: this.selectionDataUrl,
@@ -3342,6 +3925,8 @@ class InpaintEditor {
             gen: this.genSettings,
             negative: this.negativeText,
             settings: this.settings,
+            refs: this.refSettings,
+            cutout: this.cutoutSettings,
         });
     }
 
@@ -3369,6 +3954,9 @@ class InpaintEditor {
             this.negativeText = state.negative || "";
             if (this.negativeInput) this.negativeInput.value = this.negativeText;
             this.settings = state.settings && typeof state.settings === "object" ? { ...state.settings } : {};
+            this.refSettings = { ...REF_DEFAULTS, ...(state.refs || {}) };
+            this.cutoutSettings = { backend: "auto", ...(state.cutout || {}) };
+            this.syncRefControls();
             this.syncGenControls();
             this.renderSettings();
             for (const l of state.layers || []) {
@@ -3376,10 +3964,17 @@ class InpaintEditor {
                 try {
                     const limg = await loadImageEl(viewUrl(l.ref));
                     if (stale()) return;
+                    const canvas = imageToCanvas(limg);
+                    let mask = null;
+                    if (l.mask && l.mask.filename) {
+                        try { mask = imageToCanvas(await loadImageEl(viewUrl(l.mask)), canvas.width, canvas.height); } catch (err) { console.warn("Inpaint Canvas: layer mask missing", l.mask, err); }
+                        if (stale()) return;
+                    }
                     this.layers.push({
                         id: l.id, name: l.name, kind: l.kind || "result", role: l.role || "none", blend: l.blend || "normal",
-                        ref: l.ref, canvas: imageToCanvas(limg),
+                        ref: l.ref, canvas,
                         x: l.x, y: l.y, w: l.w, h: l.h, opacity: l.opacity ?? 1, visible: l.visible !== false, dirty: false,
+                        mask, maskRef: mask ? l.mask : null, maskDirty: false, maskEdit: false,
                     });
                     if (l.kind === "paint") this.paintCounter += 1;
                 } catch (err) {
@@ -3441,8 +4036,19 @@ class InpaintEditor {
             }
             controlRef = this.uploaded.controlRef;
         }
+        // Reference layers at their native size: the uploaded file itself when it is
+        // untouched, otherwise the pixels with the mask applied (cached per layer).
+        const references = [];
+        for (const l of this.referenceLayers()) {
+            if (!l.mask && l.ref && !l.dirty) { references.push(l.ref); continue; }
+            if (!l.exportRef) {
+                const up = await uploadCanvas(this.layerPixels(l), `n${id}_ref`);
+                l.exportRef = up.ref;
+            }
+            references.push(l.exportRef);
+        }
         const [x, y, w, h] = this.cropRect();
-        this.setStatus(`Queued crop ${w} × ${h} at ${x}, ${y}. Waiting for the result ...`);
+        this.setStatus(`Queued crop ${w} × ${h} at ${x}, ${y}${references.length ? `, ${references.length} reference${references.length > 1 ? "s" : ""}` : ""}. Waiting for the result ...`);
         return JSON.stringify({
             width: this.width,
             height: this.height,
@@ -3455,6 +4061,8 @@ class InpaintEditor {
             gen: this.genSettings,
             negative: this.negativeText,
             settings: this.settings,
+            references,
+            refs: this.refSettings,
         });
     }
 
@@ -3474,20 +4082,39 @@ app.registerExtension({
 
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name === NODE_CLASS) {
-            /** Keep exactly one unconnected setting output after the connected ones (trailing outputs only, so slot indices stay stable). */
+            /**
+             * Outputs after the fixed ones: the connected setting slots plus one free
+             * one, then the tail outputs (reference_images). Setting slots keep their
+             * index while connected; the tail moves and the queuePrompt wrapper maps
+             * its visible slot to the backend slot (FIXED_OUTPUTS + SETTING_SLOTS + i).
+             */
             const syncSettingOutputs = (node) => {
-                const outs = node.outputs || [];
+                const graph = node.graph || app.graph;
                 let highest = 0;
-                for (let i = FIXED_OUTPUTS; i < outs.length; i++) if (outs[i] && outs[i].links && outs[i].links.length) highest = i - FIXED_OUTPUTS + 1;
+                for (const o of node.outputs || []) if (isSettingOutput(o) && o.links && o.links.length) highest = Math.max(highest, settingIndex(o));
                 const want = Math.min(SETTING_SLOTS, highest + 1);
-                while (node.outputs.length > FIXED_OUTPUTS + want) node.removeOutput(node.outputs.length - 1);
-                while (node.outputs.length < FIXED_OUTPUTS + want) node.addOutput(`setting_${node.outputs.length - FIXED_OUTPUTS + 1}`, "*");
-                for (let i = FIXED_OUTPUTS; i < node.outputs.length; i++) {
+                // drop free setting slots above the wanted count (from the end: removeOutput reindexes later links)
+                for (let i = node.outputs.length - 1; i >= FIXED_OUTPUTS; i--) {
                     const o = node.outputs[i];
-                    const n = i - FIXED_OUTPUTS + 1;
-                    o.name = `setting_${n}`;
-                    o.label = (o.links && o.links.length) ? `setting ${n}` : `setting ${n} (free)`;
+                    if (isSettingOutput(o) && settingIndex(o) > want) node.removeOutput(i);
                 }
+                for (const t of TAIL_OUTPUTS) if (!node.outputs.some((o) => o && o.name === t.name)) node.addOutput(t.name, t.type, { label: t.label });
+                for (let n = 1; n <= want; n++) if (!node.outputs.some((o) => isSettingOutput(o) && settingIndex(o) === n)) node.addOutput(`setting_${n}`, "*");
+                // order: fixed, settings by number, tail; then point every link at its slot
+                const fixed = node.outputs.slice(0, FIXED_OUTPUTS);
+                const settings = node.outputs.filter(isSettingOutput).sort((a, b) => settingIndex(a) - settingIndex(b));
+                const tail = TAIL_OUTPUTS.map((t) => node.outputs.find((o) => o && o.name === t.name)).filter(Boolean);
+                const rest = node.outputs.slice(FIXED_OUTPUTS).filter((o) => !isSettingOutput(o) && !tail.includes(o));
+                const ordered = fixed.concat(settings, tail, rest);
+                if (ordered.some((o, i) => node.outputs[i] !== o) || ordered.length !== node.outputs.length) {
+                    node.outputs.splice(0, node.outputs.length, ...ordered);
+                }
+                node.outputs.forEach((o, i) => {
+                    for (const id of (o && o.links) || []) { const link = linkOf(graph, id); if (link) link.origin_slot = i; }
+                    if (isSettingOutput(o)) { const n = settingIndex(o); o.label = (o.links && o.links.length) ? `setting ${n}` : `setting ${n} (free)`; }
+                    const t = TAIL_OUTPUTS.find((x) => o && x.name === o.name);
+                    if (t) o.label = t.label;
+                });
                 node.setSize([node.size[0], Math.max(node.size[1], node.computeSize()[1])]);
             };
             const onNodeCreated = nodeType.prototype.onNodeCreated;
@@ -3520,9 +4147,11 @@ app.registerExtension({
             const onConnectionsChange = nodeType.prototype.onConnectionsChange;
             nodeType.prototype.onConnectionsChange = function (type, slot, connected, linkInfo, ioSlot) {
                 const r = onConnectionsChange ? onConnectionsChange.apply(this, arguments) : undefined;
-                if (type === LiteGraph.OUTPUT && slot >= FIXED_OUTPUTS) {
+                if (type === LiteGraph.OUTPUT && slot >= FIXED_OUTPUTS && isSettingOutput(this.outputs && this.outputs[slot])) {
                     syncSettingOutputs(this);
                     setTimeout(() => { if (this.inpaintEditor) this.inpaintEditor.settingsChanged(); }, 0);
+                } else if (type === LiteGraph.OUTPUT && this.inpaintEditor) {
+                    setTimeout(() => this.inpaintEditor.renderInfo(), 0);
                 } else if (type === LiteGraph.INPUT && this.inpaintEditor) {
                     setTimeout(() => this.inpaintEditor.renderInfo(), 0);
                 }
@@ -3587,8 +4216,10 @@ app.registerExtension({
         api.queuePrompt = async function (number, prompt, ...rest) {
             const output = prompt && prompt.output;
             if (output) {
-                for (const node of Object.values(output)) {
+                const canvasIds = new Set();
+                for (const [id, node] of Object.entries(output)) {
                     if (node.class_type !== NODE_CLASS) continue;
+                    canvasIds.add(String(id));
                     for (const [input, key] of [["result", "result_source"], ["result_local", "result_source_local"]]) {
                         const link = node.inputs && node.inputs[input];
                         if (Array.isArray(link)) {
@@ -3596,6 +4227,19 @@ app.registerExtension({
                             delete node.inputs[input];
                         } else if (node.inputs) {
                             delete node.inputs[key];
+                        }
+                    }
+                }
+                // Tail outputs sit right after the visible setting slots in the node but
+                // after all SETTING_SLOTS in the backend: map the slot by output name.
+                if (canvasIds.size) {
+                    for (const node of Object.values(output)) {
+                        for (const [name, v] of Object.entries(node.inputs || {})) {
+                            if (!Array.isArray(v) || v.length !== 2 || !canvasIds.has(String(v[0]))) continue;
+                            const gnode = app.graph.getNodeById(+v[0]);
+                            const o = gnode && gnode.outputs && gnode.outputs[v[1]];
+                            const ti = o ? TAIL_OUTPUTS.findIndex((t) => t.name === o.name) : -1;
+                            if (ti >= 0) node.inputs[name] = [v[0], FIXED_OUTPUTS + SETTING_SLOTS + ti];
                         }
                     }
                 }
@@ -3624,6 +4268,11 @@ app.registerExtension({
                     ed.upBtn.disabled = false;
                     ed.setStatus("Upsampling failed: " + (detail.exception_message || "execution failed"));
                 }
+                if (ed && ed.cutoutPromptId && detail && detail.prompt_id === ed.cutoutPromptId) {
+                    ed.cutoutPending = null;
+                    ed.renderLayers();
+                    ed.setStatus("Background removal failed: " + (detail.exception_message || "execution failed"));
+                }
             }
         });
 
@@ -3641,6 +4290,7 @@ app.registerExtension({
                 const node = app.graph.getNodeById(+info.canvas_node);
                 if (!node || !node.inpaintEditor) continue;
                 if (info.purpose === "segments") node.inpaintEditor.applySegmentsFile(info);
+                else if (info.purpose === "cutout") node.inpaintEditor.applyCutoutFile(info);
                 else node.inpaintEditor.applyMaskFile(info);
             }
         });

@@ -129,6 +129,32 @@ size, hardness, opacity and the paint colour.
   canny, other). Such layers are left out of the image your chain sees and
   instead composited on black into the `control_image` output, cropped and
   scaled exactly like `crop_image`. Feed it to ControlNet.
+- **Reference layers** (Flux.2 / Kontext multi-reference editing): the image
+  button in the Layers header uploads one or more files as layers with the
+  role *reference* (dropping files onto the layer list, or onto the canvas
+  with Shift, does the same). Reference layers are shown on the canvas with a
+  cyan frame and their batch number, but they are not part of the image your
+  chain sees. Instead they go out as one IMAGE batch on `reference_images`,
+  top of the list first, at their native resolution (cutout masks applied,
+  transparency on white). Wire that batch into the Flux.2 API node's
+  `images` / `image_1` input; the node flattens batches, so one link carries
+  all references. Any layer can be turned into a reference through its role
+  select, and a hidden reference layer is left out of the batch. *References*
+  in the Canvas section sets the long side (0 = native) and how images of
+  different sizes become one batch: *pad* with the image's border colour,
+  *crop* to cover, or *stretch*.
+- **Layer masks and cutouts** (Krita's transparency masks, LayerForge's
+  background removal): every layer row has a mask row. *Cutout* runs one of
+  the installed background removal nodes on the layer (comfyui-rmbg's
+  RMBG-2.0, BiRefNet or BEN2, or BRIA RMBG 1.4; the model select shows up on
+  the active layer) and turns the result into a transparency mask, so a
+  product shot or a pasted photo becomes a cutout without touching its pixels.
+  *Mask from selection* keeps only the selected part visible. With a mask
+  present, the pencil toggle switches the paint (reveal) and erase (hide)
+  tools onto the mask, Shift+F reveals the selection; the check applies the
+  mask to the pixels, the trash removes it. Masks are undoable, survive a
+  reload, and are respected by *From layer*, the segmentation source *active
+  layer*, the reference batch and the run image.
 
 ### Prompt and upsampling
 
@@ -143,9 +169,9 @@ writes for the chosen **use case**:
 | fill       | what the area should show, matching materials, lighting and perspective    |
 | add        | a new object with scale, contact shadows and the scene's lighting          |
 | remove     | only the background that should appear, never naming the object            |
-| edit       | a verb-first instruction for editing models such as Flux.2                 |
+| edit       | one verb-first instruction for editing models (Flux.2, Kontext, Klein): the requested change with its exact colours and materials, then what stays unchanged |
 | outpaint   | the scene continued beyond the border                                      |
-| auto       | outpaint when the selection touches the border, fill otherwise             |
+| auto       | outpaint when the selection touches the border, edit otherwise             |
 
 When the selection came from select by text, the model is also told what the
 outline contains. **Revert** brings the previous prompt back. Backends:
@@ -162,9 +188,10 @@ or Gemini through ComfyUI's API node.
   comes back from: *api* uses the `result` input, *local* the `result_local`
   input. Only the chain wired to the selected input runs. The Crop panel shows
   which input the current mode expects and warns when nothing is wired there.
-- **Denoise** (1.0 repaints the selection, lower values refine what is there)
-  and **Seed** with a *random* toggle and a dice button leave the node on the
-  `denoise` and `seed` outputs. Wire them into your sampler.
+- **Denoise** (a slider, local mode: 1.0 repaints the selection, lower
+  values refine what is there) and **Seed** with a *random* toggle and a dice
+  button leave the node on the `denoise` and `seed` outputs. Wire them into
+  your sampler.
 - Local mode adds **Refine**: the selection goes to the sampler as a plain,
   unfeathered mask without fill, the seam still blends softly when stitching.
   Switching it on drops denoise to 0.5 if it was at 1. The auto feather also
@@ -221,7 +248,20 @@ into the new base and the border becomes the selection. **Border** chooses
 what fills it before the model sees it: the image's average colour (default),
 neutral grey, green for edit models, black, random noise for latent models, or
 stretched edge pixels. Press Generate to fill it; the *outpaint* use case of
-the upsampler writes the matching prompt.
+the upsampler writes the matching prompt. Control and reference layers survive
+the extension.
+
+### Cleaning up files
+
+Uploads, results and helper masks accumulate in `input/inpaint_canvas`,
+`output/inpaint_canvas` and `temp/inpaint_canvas`. **Clean up files** in the
+Canvas section deletes what nothing uses any more: files referenced by an open
+editor, an open workflow tab, the browser's stored workflows or any saved
+workflow (every `.json` under ComfyUI's `user` directory) are kept, and so is
+anything younger than two minutes. You see the counts and sizes and confirm
+before anything is deleted. Discarded history results whose files are gone
+can no longer be restored. Helper results in `temp/inpaint_canvas` older than
+an hour are pruned automatically on the next helper run.
 
 ### History
 
@@ -286,8 +326,11 @@ Outputs
 | `control_image`              | control layers on black, aligned with `crop_image` (black if none)      |
 | `denoise` / `seed` / `mode`  | the Generate settings (`mode` is "api" or "local")                      |
 | `setting_1` ... `setting_8`  | wildcard outputs driven from the editor's Settings section              |
+| `reference_images`           | the visible reference layers as one IMAGE batch, top of the list first; an empty batch without any |
 
-Only ever appended, so saved workflows keep working.
+Only ever appended, so saved workflows keep working. The node shows only the
+connected setting slots plus one free one, with `reference_images` right after
+them; the visible slot is mapped to the backend slot when the prompt is queued.
 
 ### Inpaint Canvas Stitch (`InpaintCanvasStitch`)
 
@@ -302,7 +345,7 @@ Used by the editor's helper prompts; you can also wire them yourself.
 - `Inpaint Canvas Load Ref`: loads an image by a `{filename, subfolder, type}`
   JSON reference.
 - `Inpaint Canvas Mask Out`: hands a MASK back to the editor (optional `label`
-  text is echoed along).
+  text is echoed along; purpose `cutout` delivers a layer mask).
 - `Inpaint Canvas Object Map`: runs SAM2's automatic mask generator (model
   from Kijai's `DownloadAndLoadSAM2Model` with segmentor `automaskgenerator`)
   and hands the editor an object label map.
