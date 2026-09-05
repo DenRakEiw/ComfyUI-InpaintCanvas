@@ -493,7 +493,7 @@ class InpaintCanvas:
     RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "MASK", "STRING", "INT", "INT", "STRING", "IMAGE", "FLOAT", "INT", "STRING", "STRING") + ("*",) * SETTING_SLOTS + ("IMAGE",)
     RETURN_NAMES = ("crop_image", "crop_mask", "image", "mask", "stitch_info", "crop_width", "crop_height", "prompt", "control_image", "denoise", "seed", "mode", "negative") + tuple(f"setting_{i}" for i in range(1, SETTING_SLOTS + 1)) + ("reference_images",)
     OUTPUT_TOOLTIPS = (
-        "Selected region plus padding, scaled to target_size. Inpaint this.",
+        "Selected region plus padding, scaled to target_size. Inpaint this. With the editor's Crop option \"Original\" and a fill mode it is a batch of two: the filled crop first, the untouched crop second (edit models see what was under the fill).",
         "Selection mask matching crop_image (grown and feathered when the editor's Feather is auto).",
         "The flattened canvas at full size.",
         "Selection mask at full size.",
@@ -551,6 +551,7 @@ class InpaintCanvas:
         auto_feather = crop_settings.get("feather") == "auto"
         fill_mode = crop_settings.get("fill", "none") or "none"
         color_match = bool(crop_settings.get("colorMatch", False))
+        with_original = bool(crop_settings.get("withOriginal", False))
         has_selection = bool((mask > 0.5).any())
 
         sx0, sy0, sx1, sy1 = _selection_bbox(mask, 0)
@@ -579,12 +580,17 @@ class InpaintCanvas:
             x0, x1 = _fit_span_to_multiple(x0, x1, width, m)
             y0, y1 = _fit_span_to_multiple(y0, y1, height, m)
         crop = image[:, y0:y1, x0:x1]
+        crop_orig = crop
         sel_crop = mask[y0:y1, x0:x1]
         # crop_mask is the denoise mask: grown and feathered in auto mode, the raw selection otherwise.
         crop_mask = _denoise_mask(sel_crop, grow_used, feather_used) if auto_feather and has_selection else sel_crop
         if has_selection and fill_mode != "none":
             fill_px = max(grow_used - feather_used // 2, 0)
             crop = _fill_masked(crop, _dilate_mask(sel_crop, fill_px), fill_mode)
+            if with_original:
+                # Edit models that get a filled (green) area cannot know what was
+                # under it: send the untouched crop along as a second batch image.
+                crop = torch.cat([crop, crop_orig], dim=0)
 
         control_ref = state.get("control")
         if control_ref:

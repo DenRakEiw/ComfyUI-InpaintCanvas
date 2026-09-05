@@ -470,6 +470,13 @@ blur = normalized-convolution smear of the surroundings (sigma
 border = OpenCV `cv2.inpaint(..., INPAINT_NS)` averaged with the smear; green
 = (0, 1, 0) hard. `cv2` 4.13 is in python_embeded; blurs fall back to PIL.
 
+`crop.withOriginal` (2026-09-05 late, user request): with a fill mode the
+`crop_image` output is `torch.cat([filled, untouched])`, filled first, so an
+edit model that gets the green area also sees what was there (the user
+masked a whole head to change the hair and got the back of a head). The
+stitch takes `result[0:1]` as before. Off by default; the Crop info shows
+"×2 (filled + original)" when it applies.
+
 Color match (`_color_match`): per-channel mean/std transfer in RGB, measured
 where the composite keeps the base (`1 - composite mask`, the ring), std ratio
 clamped to [0.5, 2], skipped when the ring has < 64 px of weight. Verified on

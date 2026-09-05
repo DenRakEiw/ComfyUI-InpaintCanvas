@@ -235,6 +235,12 @@ size that actually leaves the node, and four settings stored with the canvas:
   OpenCV border fill plus smear, *green* pure green with a hard edge for edit
   models that are told to "fill the green area". Use one of these when the
   model keeps the old content instead of replacing it.
+- **Original** (with a fill mode) sends the untouched crop along: `crop_image`
+  becomes a batch of two, the filled crop first, the original second. An edit
+  model that only gets a green head sees hair from behind and paints the back
+  of a head; with the original next to it, it knows what is under the green.
+  The Flux.2 API node flattens the batch into two input images. Not meant for
+  VAE Encode chains, which would encode both.
 - **Color match** matches the result's colours and brightness to the ring
   around the selection when it is stitched back, so results that come back
   with a colour shift leave no visible seam.
@@ -319,7 +325,7 @@ Outputs
 
 | Output                       | Content                                                                 |
 | ---------------------------- | ----------------------------------------------------------------------- |
-| `crop_image` / `crop_mask`   | the region to inpaint, scaled, with fill and grown / feathered mask applied when on |
+| `crop_image` / `crop_mask`   | the region to inpaint, scaled, with fill and grown / feathered mask applied when on; with **Original** on and a fill mode, `crop_image` is a batch of two (filled, untouched) |
 | `image` / `mask`             | the flattened canvas and the raw selection at full size                 |
 | `stitch_info`                | parameters for the standalone stitch node                               |
 | `crop_width` / `crop_height` | size of `crop_image`, for generators that take an explicit size         |

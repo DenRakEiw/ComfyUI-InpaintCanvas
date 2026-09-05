@@ -307,7 +307,7 @@ const SEGMENT_BACKENDS = [
 ];
 
 const MIN_AUTO_CROP = 512;          // keep in sync with nodes.py
-const CROP_DEFAULTS = { context: "auto", feather: "auto", fill: "none", colorMatch: true, extendFill: "average color" };
+const CROP_DEFAULTS = { context: "auto", feather: "auto", fill: "none", colorMatch: true, extendFill: "average color", withOriginal: false };
 const CROP_LEGACY = { context: "manual", feather: "manual", fill: "none", colorMatch: false };   // workflows saved before these existed
 // Generate settings: mode picks which result input the round trip uses ("api" =
 // result, "local" = result_local); denoise and seed are emitted as node outputs.
@@ -1227,10 +1227,12 @@ class InpaintEditor {
             const sec = el("div", "ipc-sec ipc-cropset");
             const onChange = () => {
                 this.cropSettings = {
+                    ...this.cropSettings,
                     context: this.cropContextSel.value === "auto" ? "auto" : "manual",
                     feather: this.cropFeatherSel.value === "auto" ? "auto" : "manual",
                     fill: this.cropFillSel.value,
                     colorMatch: this.cropColorMatch.checked,
+                    withOriginal: this.cropOriginal.checked,
                 };
                 this.renderInfo();
                 this.draw();
@@ -1248,11 +1250,16 @@ class InpaintEditor {
             this.cropColorMatch = document.createElement("input");
             this.cropColorMatch.type = "checkbox";
             this.cropColorMatch.checked = true;
+            this.cropOriginal = document.createElement("input");
+            this.cropOriginal.type = "checkbox";
+            this.cropOriginal.checked = false;
             for (const c of [this.cropContextSel, this.cropFeatherSel, this.cropFillSel]) c.addEventListener("change", onChange);
             this.cropColorMatch.addEventListener("change", onChange);
+            this.cropOriginal.addEventListener("change", onChange);
             row("Context", this.cropContextSel);
             row("Feather", this.cropFeatherSel);
             row("Fill", this.cropFillSel);
+            row("Original", this.cropOriginal, "With a fill mode: crop_image becomes a batch of two, the filled crop first and the untouched crop second, so an edit model (Flux.2, Kontext) sees what is under the green area. The stitch uses the first result image. Not for VAE Encode chains.");
             row("Color match", this.cropColorMatch, "Match the result's colors and brightness to the surroundings when it is stitched back");
             d.appendChild(sec);
             this.infoEl = el("div", "ipc-info");
@@ -3118,6 +3125,7 @@ class InpaintEditor {
         this.cropFeatherSel.value = this.cropSettings.feather === "auto" ? "auto" : "manual";
         this.cropFillSel.value = this.cropSettings.fill || "none";
         this.cropColorMatch.checked = !!this.cropSettings.colorMatch;
+        if (this.cropOriginal) this.cropOriginal.checked = !!this.cropSettings.withOriginal;
         if (this.extendFillSel) this.extendFillSel.value = this.cropSettings.extendFill || "average color";
     }
 
@@ -3139,11 +3147,12 @@ class InpaintEditor {
             if (ap) rows.push(["Edge", this.cropSettings.feather === "auto" ? `grow ${ap.grow}, feather ${ap.feather}, blend ${ap.blend} px` : `feather ${this.widgetValue("feather", 0)} px`]);
             const target = this.widgetValue("target_size", 0);
             const m = Math.max(1, this.widgetValue("multiple_of", 64) || 64);
+            const pair = b && this.cropSettings.withOriginal && this.cropSettings.fill && this.cropSettings.fill !== "none" ? " ×2 (filled + original)" : "";
             if (target > 0) {
                 const s = target / Math.max(cw, ch);
-                rows.push(["Emitted", `${Math.max(m, Math.round(cw * s / m) * m)} × ${Math.max(m, Math.round(ch * s / m) * m)}`]);
+                rows.push(["Emitted", `${Math.max(m, Math.round(cw * s / m) * m)} × ${Math.max(m, Math.round(ch * s / m) * m)}${pair}`]);
             } else {
-                rows.push(["Emitted", `${Math.min(this.width, Math.ceil(cw / m) * m)} × ${Math.min(this.height, Math.ceil(ch / m) * m)}`]);
+                rows.push(["Emitted", `${Math.min(this.width, Math.ceil(cw / m) * m)} × ${Math.min(this.height, Math.ceil(ch / m) * m)}${pair}`]);
             }
             const ctrl = this.layers.filter((l) => this.isControl(l) && l.visible).length;
             rows.push(["Control", ctrl ? `${ctrl} layer${ctrl > 1 ? "s" : ""}` : "none (black)"]);
