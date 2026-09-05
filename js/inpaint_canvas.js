@@ -578,6 +578,7 @@ const ICONS = {
     redo: '<path d="M15 14l5-5-5-5"/><path d="M20 9H10a6 6 0 000 12h3"/>',
     clear: '<circle cx="12" cy="12" r="8"/><path d="M6.5 6.5l11 11"/>',
     invert: '<circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 010 16z" fill="currentColor" stroke="none"/>',
+    ants: '<rect x="4" y="4" width="16" height="16" rx="1" stroke-dasharray="3 2"/><rect x="8" y="8" width="8" height="8" fill="currentColor" stroke="none" opacity=".35"/>',
     fit: '<path d="M4 9V4h5"/><path d="M20 9V4h-5"/><path d="M4 15v5h5"/><path d="M20 15v5h-5"/>',
     flatten: '<path d="M12 4l8 4-8 4-8-4z"/><path d="M4 12l8 4 8-4"/><path d="M4 16l8 4 8-4"/>',
     load: '<path d="M4 17v3h16v-3"/><path d="M12 4v11"/><path d="M7 9l5-5 5 5"/>',
@@ -835,6 +836,9 @@ class InpaintEditor {
         this.objectShapeCache = new Map();
         this.hoverObjectId = 0;
         this.hoverObjectCanvas = null;
+        let selDisplay = "ants";
+        try { selDisplay = localStorage.getItem("ipc.selectionDisplay") || "ants"; } catch (_) { /* no storage */ }
+        this.selectionDisplay = selDisplay === "tint" ? "tint" : "ants";   // marching ants (default) or red tint
         this.status = "No image loaded.";
         this.isOpen = false;
 
@@ -1005,6 +1009,15 @@ class InpaintEditor {
         tools.appendChild(el("div", "ipc-sep"));
         tools.appendChild(iconButton("clear", "Clear selection (Ctrl+D)", () => this.clearSelection()));
         tools.appendChild(iconButton("invert", "Invert selection (Ctrl+I)", () => this.invertSelection()));
+        this.antsBtn = iconButton("ants", "Selection display: marching ants outline (on) or red tint (off)", () => {
+            this.selectionDisplay = this.selectionDisplay === "ants" ? "tint" : "ants";
+            try { localStorage.setItem("ipc.selectionDisplay", this.selectionDisplay); } catch (_) { /* ignore */ }
+            this.antsBtn.classList.toggle("ipc-toggle-on", this.selectionDisplay === "ants");
+            this.draw();
+            this.setStatus(this.selectionDisplay === "ants" ? "Selection shown as an outline." : "Selection shown as a red tint.");
+        });
+        this.antsBtn.classList.toggle("ipc-toggle-on", this.selectionDisplay === "ants");
+        tools.appendChild(this.antsBtn);
         tools.appendChild(el("div", "ipc-sep"));
         tools.appendChild(iconButton("fit", "Fit to view (F)", () => this.fitView()));
         tools.appendChild(iconButton("flatten", "Flatten all visible layers into the base", () => this.flatten()));
@@ -1611,6 +1624,7 @@ class InpaintEditor {
         if (!this.isOpen) return;
         if (this.pending) this.cancelPending();
         this.isOpen = false;
+        if (this.antsTimer) { clearInterval(this.antsTimer); this.antsTimer = null; }
         this.pointer = null;
         this.lassoPoints = null;
         if (this._docKey) window.removeEventListener("keydown", this._docKey, true);
@@ -3967,6 +3981,55 @@ class InpaintEditor {
         this.notifyChanged();
     }
 
+    /** Selection as a marching-ants outline: the mask shifted by a screen pixel in eight directions minus the mask, filled with a moving stripe pattern. */
+    drawMarchingAnts(ctx) {
+        const W = this.canvas.width, H = this.canvas.height;
+        if (!this.antsCanvas || this.antsCanvas.width !== W || this.antsCanvas.height !== H) this.antsCanvas = makeCanvas(W, H);
+        const a = this.antsCanvas.getContext("2d");
+        const s = this.view.scale, vx = this.view.x, vy = this.view.y;
+        a.setTransform(1, 0, 0, 1, 0, 0);
+        a.globalCompositeOperation = "source-over";
+        a.globalAlpha = 1;
+        a.clearRect(0, 0, W, H);
+        a.imageSmoothingEnabled = s < 1;
+        const r = 1.25;
+        for (const [dx, dy] of [[r, 0], [-r, 0], [0, r], [0, -r], [r, r], [-r, -r], [r, -r], [-r, r]]) {
+            a.setTransform(s, 0, 0, s, vx + dx, vy + dy);
+            a.drawImage(this.selection, 0, 0);
+        }
+        a.setTransform(s, 0, 0, s, vx, vy);
+        a.globalCompositeOperation = "destination-out";
+        a.drawImage(this.selection, 0, 0);
+        a.setTransform(1, 0, 0, 1, 0, 0);
+        a.globalCompositeOperation = "source-in";
+        if (!this.antsPattern) {
+            const tile = makeCanvas(8, 8);
+            const t = tile.getContext("2d");
+            t.fillStyle = "#fff"; t.fillRect(0, 0, 8, 8);
+            t.fillStyle = "#000";
+            t.beginPath();
+            t.moveTo(0, 0); t.lineTo(4, 0); t.lineTo(8, 4); t.lineTo(8, 8); t.lineTo(4, 8); t.lineTo(0, 4); t.closePath();
+            t.fill();
+            this.antsPattern = a.createPattern(tile, "repeat");
+        }
+        const offset = Math.floor(Date.now() / 120) % 8;
+        try { this.antsPattern.setTransform(new DOMMatrix().translate(offset, 0)); } catch (_) { /* old browsers: static stripes */ }
+        a.fillStyle = this.antsPattern;
+        a.fillRect(0, 0, W, H);
+        a.globalCompositeOperation = "source-over";
+        const t = ctx.getTransform();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.drawImage(this.antsCanvas, 0, 0);
+        ctx.setTransform(t);
+        if (!this.antsTimer) {
+            // keep the ants walking while a selection is shown; stops itself when there is none or the editor closes
+            this.antsTimer = setInterval(() => {
+                if (!this.isOpen || this.selectionDisplay !== "ants" || !this.getBounds()) { clearInterval(this.antsTimer); this.antsTimer = null; return; }
+                if (!this.pointer) this.draw();
+            }, 120);
+        }
+    }
+
     draw() {
         if (!this.isOpen) return;
         const ctx = this.ctx;
@@ -3979,9 +4042,13 @@ class InpaintEditor {
         ctx.imageSmoothingEnabled = s < 1;
         this.drawComposite(ctx);
 
-        ctx.globalAlpha = 0.4;
-        ctx.drawImage(this.selection, 0, 0);
-        ctx.globalAlpha = 1;
+        if (this.selectionDisplay === "tint" || !this.getBounds()) {
+            ctx.globalAlpha = 0.4;
+            ctx.drawImage(this.selection, 0, 0);
+            ctx.globalAlpha = 1;
+        } else {
+            this.drawMarchingAnts(ctx);
+        }
 
         if (this.tool === "object" && this.hoverObjectCanvas && !this.spaceDown) {
             // the object under the cursor, red shape shown in cyan

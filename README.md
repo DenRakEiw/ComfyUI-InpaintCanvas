@@ -86,6 +86,11 @@ center-cropped, never distorted.
 
 ### Selecting
 
+The selection is shown as a marching-ants outline like in Krita and
+Photoshop; the dashed-square button in the toolbar switches to a red tint
+(useful to see a soft or grown selection as an area). The blue dashed
+rectangle is the crop that leaves the node, not the selection.
+
 Tools on the left: brush (B), rectangle (R), lasso (L), object selection
 (O), deselect brush (D). `[` and `]` change the brush size, the top bar holds
 size, hardness, opacity and the paint colour.
