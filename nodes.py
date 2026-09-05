@@ -32,6 +32,7 @@ from comfy_execution.graph_utils import GraphBuilder
 
 SUBFOLDER = "inpaint_canvas"
 MIN_AUTO_CROP = 512   # auto context never emits a region smaller than this (image permitting)
+SETTING_SLOTS = 8     # wildcard "setting_n" outputs the editor can drive (LoRA names, steps, ...)
 
 
 # ---------------------------------------------------------------------------
@@ -89,16 +90,19 @@ def _blur_mask(mask, radius):
     return torch.from_numpy(np.asarray(img).astype(np.float32) / 255.0)
 
 
-def _auto_selection_params(sel_w, sel_h):
+def _auto_selection_params(sel_w, sel_h, strength=1.0):
     """Context padding, grow, feather and blend derived from the selection size.
 
     Same idea as the Krita AI plugin's defaults (reimplemented, not copied):
     feather 10 % of the selection diagonal but at least 32 px, a 4 px hard grow
     plus half the feather, a blend of at most 25 px for the composite, and a
-    context padding of feather + 4 + 6 % of the diagonal.
+    context padding of feather + 4 + 6 % of the diagonal. ``strength`` (the
+    denoise of a local run) scales the feather like Krita does: a gentle refine
+    needs a narrower transition than a full repaint.
     """
     diag = math.hypot(sel_w, sel_h)
-    feather = max(int(0.10 * diag), 32)
+    strength = min(1.0, max(0.05, float(strength)))
+    feather = max(int(0.10 * diag * strength), int(round(32 * strength)))
     grow = 4 + feather // 2
     blend = min(25, grow + feather // 2)
     pad = feather + 4 + int(0.06 * diag)
@@ -215,6 +219,24 @@ def _fill_masked(crop, fill_mask, mode):
         smeared = img * 0.5 + smeared * 0.5
     out = img * (1 - soft[..., None]) + smeared * soft[..., None]
     return torch.from_numpy(np.clip(out, 0, 1).astype(np.float32))[None]
+
+
+def _cast_setting(entry):
+    """Value for a setting_n output, typed for the widget it is wired to."""
+    if not isinstance(entry, dict) or "value" not in entry:
+        return None
+    v = entry.get("value")
+    t = str(entry.get("type") or "").upper()
+    try:
+        if t == "INT":
+            return int(round(float(v)))
+        if t == "FLOAT":
+            return float(v)
+        if t == "BOOLEAN":
+            return bool(v) if not isinstance(v, str) else v.strip().lower() in ("1", "true", "yes", "on")
+    except (TypeError, ValueError):
+        return None
+    return v
 
 
 def _color_match(patch, reference, weight):
@@ -336,8 +358,8 @@ class InpaintCanvas:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "MASK", "STRING", "INT", "INT", "STRING", "IMAGE", "FLOAT", "INT", "STRING")
-    RETURN_NAMES = ("crop_image", "crop_mask", "image", "mask", "stitch_info", "crop_width", "crop_height", "prompt", "control_image", "denoise", "seed", "mode")
+    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "MASK", "STRING", "INT", "INT", "STRING", "IMAGE", "FLOAT", "INT", "STRING", "STRING") + ("*",) * SETTING_SLOTS
+    RETURN_NAMES = ("crop_image", "crop_mask", "image", "mask", "stitch_info", "crop_width", "crop_height", "prompt", "control_image", "denoise", "seed", "mode", "negative") + tuple(f"setting_{i}" for i in range(1, SETTING_SLOTS + 1))
     OUTPUT_TOOLTIPS = (
         "Selected region plus padding, scaled to target_size. Inpaint this.",
         "Selection mask matching crop_image (grown and feathered when the editor's Feather is auto).",
@@ -351,7 +373,8 @@ class InpaintCanvas:
         "Denoise strength from the editor's Generate section (1.0 = full repaint). Wire it into your local sampler.",
         "Seed from the editor (random per run or fixed). Wire it into your local sampler.",
         "\"api\" or \"local\": which result input the editor expects the result on.",
-    )
+        "Negative prompt from the editor (shown in local mode; for SDXL-class models).",
+    ) + tuple("Editor-driven setting: wire it into any widget input (lora_name, ckpt_name, steps, ...) and a matching control appears in the editor. The next free slot shows up once this one is connected." for _ in range(SETTING_SLOTS))
     FUNCTION = "run"
     CATEGORY = "image/inpaint"
     OUTPUT_NODE = True
@@ -372,6 +395,8 @@ class InpaintCanvas:
         mode = "local" if gen.get("mode") == "local" else "api"
         denoise = min(1.0, max(0.0, float(gen.get("denoise", 1.0) or 0.0)))
         seed = int(gen.get("seed", 0) or 0)
+        refine = bool(gen.get("refine")) and mode == "local"
+        strength = denoise if mode == "local" else 1.0
         # Only the chain wired to the selected mode's input is pulled in by the stitch expansion.
         result_source = result_source_local if mode == "local" else result_source
         base_ref = state.get("base")
@@ -391,7 +416,7 @@ class InpaintCanvas:
         has_selection = bool((mask > 0.5).any())
 
         sx0, sy0, sx1, sy1 = _selection_bbox(mask, 0)
-        auto_pad, auto_grow, auto_feather_px, auto_blend = _auto_selection_params(sx1 - sx0, sy1 - sy0)
+        auto_pad, auto_grow, auto_feather_px, auto_blend = _auto_selection_params(sx1 - sx0, sy1 - sy0, strength)
         if not has_selection:
             auto_pad, auto_grow, auto_feather_px, auto_blend = 0, 0, 0, 0
         pad_used = auto_pad if auto_context else int(padding)
@@ -399,6 +424,13 @@ class InpaintCanvas:
             grow_used, feather_used, blend_used = auto_grow, auto_feather_px, auto_blend
         else:
             grow_used, feather_used, blend_used = 0, int(feather), 0
+        if refine:
+            # Refine pass: the sampler sees the plain selection (no grow, no feather)
+            # and the untouched content; only the composite keeps a soft seam.
+            grow_used, feather_used = 0, 0
+            fill_mode = "none"
+            if not auto_feather:
+                blend_used = int(feather)
 
         x0, y0, x1, y1 = _selection_bbox(mask, pad_used)
         if auto_context and has_selection:
@@ -442,15 +474,17 @@ class InpaintCanvas:
             "feather": int(feather_used),
             "grow": int(grow_used),
             "blend": int(blend_used),
-            "auto_feather": bool(auto_feather and has_selection),
+            "auto_feather": bool((auto_feather or refine) and has_selection),
             "color_match": color_match,
             "width": width,
             "height": height,
         })
 
+        settings = state.get("settings") or {}
+        setting_values = tuple(_cast_setting(settings.get(str(i))) for i in range(1, SETTING_SLOTS + 1))
         outputs = (crop, crop_mask[None], image, mask[None], stitch_info,
                    int(crop.shape[2]), int(crop.shape[1]), str(state.get("prompt", "") or ""),
-                   control_crop, denoise, seed, mode)
+                   control_crop, denoise, seed, mode, str(state.get("negative", "") or "")) + setting_values
 
         if result_source:
             src_id, _, src_slot = result_source.partition(":")

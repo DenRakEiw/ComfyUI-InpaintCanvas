@@ -54,8 +54,34 @@ Crop (`InpaintCanvas.run`): bbox = selection bounds + `padding`, clamped. With
 sides rounded to `multiple_of`. With `target_size == 0` the bbox itself is grown
 symmetrically to a multiple (`_fit_span_to_multiple`). `control_image` is the
 control PNG cropped/scaled identically (zeros if none). Outputs in order:
-`crop_image, crop_mask, image, mask, stitch_info, crop_width, crop_height, prompt, control_image, denoise, seed, mode`.
+`crop_image, crop_mask, image, mask, stitch_info, crop_width, crop_height, prompt, control_image, denoise, seed, mode, negative, setting_1..setting_8`.
 Only ever append outputs; reordering breaks saved workflows.
+
+Setting outputs (2026-09-05): eight wildcard (`"*"`) outputs after `negative`
+(`FIXED_OUTPUTS` = 13 in the JS must equal the number of outputs before
+them). The backend always returns all eight (`_cast_setting` types the stored
+value by the target widget: INT, FLOAT, BOOLEAN, else as is; unconnected ones
+are None). The frontend keeps only the connected ones plus one free slot
+(`syncSettingOutputs`: trailing outputs are removed/added, so slot indices of
+connected ones never move; the label says "(free)"). `onConnectionsChange` for
+an output slot >= 13 resyncs and calls `editor.settingsChanged()`, which reads
+the link targets (`settingTargets`: target node, input name, its spec from
+`nodeData.input`, its widget), stores `{value, type, label, target}` in
+`canvas_state.settings[n]` seeded from the widget's current value, and
+renders a control per entry (`renderSettings`: combo -> select with the
+option list, INT/FLOAT -> number with min/max/step, BOOLEAN -> checkbox, else
+text). Editing pushes the value into the target widget too. Wildcard outputs
+pass backend validation (`validate_node_input` returns True for "*") and the
+frontend connects "*" to any input, including combo widgets. Verified in the
+browser with `LoraLoader.lora_name` (1178 options) and `KSampler.steps`, via
+the API with INT/FLOAT/COMBO targets on ImageBlur and ImageScaleBy.
+
+Refine (`gen.refine`, local only): crop_mask is the plain selection (grow 0,
+feather 0), fill forced to none, the composite keeps the blend so the seam
+stays soft. Strength scaling: `_auto_selection_params(..., strength)` with
+strength = denoise in local mode multiplies the feather (and its 32 px
+minimum) like Krita's `feather_rel * strength`. `negative` output =
+`canvas_state.negative`.
 
 Two result inputs (2026-09-05): `result` (API chain) and `result_local`
 (local chain), both lazy and both removed from the prompt by the queuePrompt
@@ -153,9 +179,12 @@ Painting maps image coords into layer pixels (`sx = canvas.width / w`).
   updates the rect. The sub-toolbar (`buildSubbar`/`updateSubbar`) lives inside
   `.ipc-view`; `.ipc-modal [hidden]` needs `display:none !important` because
   the flex rules would otherwise override the attribute.
-- `extendCanvas()` bakes visible non-control layers into a new base (edge
-  pixels stretched into the border), keeps control layers (shifted / resized),
-  sets the border as selection.
+- `extendCanvas()` bakes visible non-control layers into a new base, keeps
+  control layers (shifted / resized), sets the border as selection. The
+  border fill is `cropSettings.extendFill`: average colour of a 64 px
+  thumbnail (default), grey, green, black, per-pixel random noise, or the
+  original stretched edge pixels (the user found the stretching distorting
+  and wanted plain colour / noise for context and latent models).
 - `history` entries are results; `soloResult`, `removeLayer`, `restoreResult`.
 - `setValue` is guarded by a load token and `lastValueString`; concurrent
   restores were producing duplicated layers before.

@@ -301,17 +301,22 @@ const SEGMENT_BACKENDS = [
 ];
 
 const MIN_AUTO_CROP = 512;          // keep in sync with nodes.py
-const CROP_DEFAULTS = { context: "auto", feather: "auto", fill: "none", colorMatch: true };
+const CROP_DEFAULTS = { context: "auto", feather: "auto", fill: "none", colorMatch: true, extendFill: "average color" };
 const CROP_LEGACY = { context: "manual", feather: "manual", fill: "none", colorMatch: false };   // workflows saved before these existed
 // Generate settings: mode picks which result input the round trip uses ("api" =
 // result, "local" = result_local); denoise and seed are emitted as node outputs.
-const GEN_DEFAULTS = { mode: "api", denoise: 1.0, seed: 0, seedRandom: true };
+const GEN_DEFAULTS = { mode: "api", denoise: 1.0, seed: 0, seedRandom: true, refine: false };
+// Editor-driven setting outputs: wildcard outputs after the fixed ones, wired to
+// any widget input in the graph. FIXED_OUTPUTS must match RETURN_NAMES up to "negative".
+const FIXED_OUTPUTS = 13;
+const SETTING_SLOTS = 8;
 const randomSeed = () => Math.floor(Math.random() * 0xffffffff);
 
 /** Context padding, grow, feather and blend from the selection size (same formula as nodes.py). */
-function autoSelectionParams(selW, selH) {
+function autoSelectionParams(selW, selH, strength = 1) {
     const diag = Math.hypot(selW, selH);
-    const feather = Math.max(Math.floor(0.10 * diag), 32);
+    strength = Math.min(1, Math.max(0.05, strength));
+    const feather = Math.max(Math.floor(0.10 * diag * strength), Math.round(32 * strength));
     const grow = 4 + Math.floor(feather / 2);
     const blend = Math.min(25, grow + Math.floor(feather / 2));
     const pad = feather + 4 + Math.floor(0.06 * diag);
@@ -475,6 +480,7 @@ const ICONS = {
     distort: '<path d="M5 6l14-2v14l-14 2z"/><circle cx="5" cy="6" r="1.6" fill="currentColor" stroke="none"/><circle cx="19" cy="4" r="1.6" fill="currentColor" stroke="none"/><circle cx="19" cy="18" r="1.6" fill="currentColor" stroke="none"/><circle cx="5" cy="20" r="1.6" fill="currentColor" stroke="none"/>',
     warp: '<path d="M4 6c4-3 12 3 16 0"/><path d="M4 12c4-3 12 3 16 0"/><path d="M4 18c4-3 12 3 16 0"/><path d="M8 4v16"/><path d="M16 4v16"/>',
     check: '<path d="M5 12l5 5 9-10"/>',
+    refine: '<path d="M20 12a8 8 0 11-2.3-5.7"/><path d="M20 3v5h-5"/><circle cx="12" cy="12" r="2.5" fill="currentColor" stroke="none"/>',
     dice: '<rect x="4" y="4" width="16" height="16" rx="3"/><circle cx="9" cy="9" r="1.5" fill="currentColor" stroke="none"/><circle cx="15" cy="15" r="1.5" fill="currentColor" stroke="none"/><circle cx="15" cy="9" r="1.5" fill="currentColor" stroke="none"/><circle cx="9" cy="15" r="1.5" fill="currentColor" stroke="none"/>',
     magic: '<path d="M4 20l10-10"/><path d="M15 3l1 2 2 1-2 1-1 2-1-2-2-1 2-1z" fill="currentColor" stroke="none"/><path d="M19 9l.7 1.3L21 11l-1.3.7L19 13l-.7-1.3L17 11l1.3-.7z" fill="currentColor" stroke="none"/><path d="M14 8l2 2"/>',
     extend: '<rect x="8" y="8" width="8" height="8"/><path d="M12 2v4"/><path d="M12 18v4"/><path d="M2 12h4"/><path d="M18 12h4"/><path d="M10 4l2-2 2 2"/><path d="M10 20l2 2 2-2"/><path d="M4 10l-2 2 2 2"/><path d="M20 10l2 2-2 2"/>',
@@ -605,6 +611,9 @@ const STYLE = `
 .ipc-info { padding:8px 10px; color:#aaa; display:grid; grid-template-columns:auto 1fr; gap:3px 10px; }
 .ipc-upsample { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
 .ipc-gen { display:flex; flex-wrap:wrap; gap:6px 10px; align-items:center; }
+.ipc-settings { display:grid; grid-template-columns:auto 1fr; gap:4px 10px; align-items:center; }
+.ipc-settings label { display:contents; }
+.ipc-settings .ipc-sel, .ipc-settings input[type=text] { min-width:0; width:100%; }
 .ipc-mode { margin-right:6px; }
 .ipc-cropset { display:grid; grid-template-columns:auto 1fr; gap:4px 10px; align-items:center; }
 .ipc-cropset label { display:contents; }
@@ -655,6 +664,8 @@ class InpaintEditor {
         this.cropSettings = { ...CROP_DEFAULTS };
         this.upsampleSettings = { useCase: "auto", backend: "auto" };
         this.genSettings = { ...GEN_DEFAULTS, seed: randomSeed() };
+        this.negativeText = "";
+        this.settings = {};             // {"1": {value, type, label}, ...} for the setting_n outputs
         this.promptBackup = null;
         this.selectionLabel = "";       // what the selection is, when it came from "Select by text"
         this.undo = [];
@@ -797,7 +808,7 @@ class InpaintEditor {
         top.appendChild(el("span", "ipc-grow"));
         this.modeSel = selectInput(["api", "local"], "api", "Which chain the result comes back from: API = the result input, Local = the result_local input. Only that chain runs.");
         this.modeSel.classList.add("ipc-mode");
-        this.modeSel.addEventListener("change", () => { this.genSettings.mode = this.modeSel.value; this.renderInfo(); this.notifyChanged(); });
+        this.modeSel.addEventListener("change", () => { this.genSettings.mode = this.modeSel.value; this.syncGenControls(); this.renderInfo(); this.notifyChanged(); });
         top.appendChild(this.modeSel);
         this.generateBtn = iconButton("play", "Queue the workflow (Ctrl+Enter). The result comes back as a new layer.", () => this.generate(), "Generate");
         this.generateBtn.classList.add("ipc-primary");
@@ -951,6 +962,12 @@ class InpaintEditor {
                 grid.appendChild(this.extendInputs[key]);
             }
             sec.appendChild(grid);
+            const fillLab = el("label", null, "Border");
+            this.extendFillSel = selectInput(["stretch edges", "average color", "grey", "green", "black", "noise"], "average color",
+                "What fills the new border before the model sees it: stretched edge pixels, the image's average colour, neutral grey, green (edit models), black, or random noise (latent models).");
+            this.extendFillSel.addEventListener("change", () => { this.cropSettings.extendFill = this.extendFillSel.value; this.notifyChanged(); });
+            fillLab.appendChild(this.extendFillSel);
+            sec.appendChild(fillLab);
             const ext = iconButton("extend", "Extend the canvas (outpainting). The new border becomes the selection.", () => this.extendCanvas(), "Extend canvas");
             ext.classList.add("ipc-small");
             sec.appendChild(ext);
@@ -973,6 +990,14 @@ class InpaintEditor {
                 if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "u") { e.preventDefault(); this.upsamplePrompt(); }
             });
             wrap.appendChild(this.promptInput);
+            this.negativeInput = document.createElement("textarea");
+            this.negativeInput.placeholder = "Negative prompt (local mode, SDXL-class models). Available as the node's negative output.";
+            this.negativeInput.spellcheck = false;
+            this.negativeInput.rows = 2;
+            this.negativeInput.addEventListener("input", () => { this.negativeText = this.negativeInput.value; });
+            this.negativeInput.addEventListener("change", () => this.notifyChanged());
+            this.negativeInput.addEventListener("keydown", (e) => { e.stopPropagation(); if (e.key === "Escape") { this.negativeInput.blur(); this.root.focus({ preventScroll: true }); } });
+            wrap.appendChild(this.negativeInput);
             d.appendChild(wrap);
 
             // prompt upsampling
@@ -1001,7 +1026,7 @@ class InpaintEditor {
             denLab.title = "Denoise strength for a local sampler (denoise output). 1.0 repaints the selection completely, lower values keep more of what is there (refine).";
             this.denoiseInput = numberInput(1.0, 0.05, 1.0, "Denoise strength, emitted on the node's denoise output", 60);
             this.denoiseInput.step = 0.05;
-            this.denoiseInput.addEventListener("change", () => { this.genSettings.denoise = Math.min(1, Math.max(0.05, +this.denoiseInput.value || 1)); this.denoiseInput.value = this.genSettings.denoise; this.notifyChanged(); });
+            this.denoiseInput.addEventListener("change", () => { this.genSettings.denoise = Math.min(1, Math.max(0.05, +this.denoiseInput.value || 1)); this.denoiseInput.value = this.genSettings.denoise; this.renderInfo(); this.draw(); this.notifyChanged(); });
             denLab.appendChild(this.denoiseInput);
             sec.appendChild(denLab);
             const seedLab = el("label", null, "Seed");
@@ -1022,7 +1047,21 @@ class InpaintEditor {
             const dice = iconButton("dice", "Roll a new seed now", () => { this.genSettings.seed = randomSeed(); this.seedInput.value = this.genSettings.seed; this.notifyChanged(); });
             dice.classList.add("ipc-small");
             sec.appendChild(dice);
+            this.refineBtn = iconButton("refine", "Refine (local mode): re-run the selection at the denoise below without fill and without a feathered mask; the seam stays soft when stitching.", () => {
+                this.genSettings.refine = !this.genSettings.refine;
+                if (this.genSettings.refine && this.genSettings.denoise >= 1) { this.genSettings.denoise = 0.5; this.denoiseInput.value = 0.5; }
+                this.syncGenControls(); this.renderInfo(); this.notifyChanged();
+                this.setStatus(this.genSettings.refine ? `Refine on: denoise ${this.genSettings.denoise}, plain selection mask, no fill.` : "Refine off.");
+            }, "Refine");
+            this.refineBtn.classList.add("ipc-small");
+            sec.appendChild(this.refineBtn);
             d.appendChild(sec);
+        });
+
+        section("Settings", true, (d) => {
+            this.settingsList = el("div", "ipc-sec ipc-settings");
+            d.appendChild(this.settingsList);
+            this.renderSettings();
         });
 
         section("History", true, (d, sum) => {
@@ -2324,19 +2363,40 @@ class InpaintEditor {
         const nw = W + left + right, nh = H + top + bottom;
         try {
             this.setStatus(`Extending canvas to ${nw} × ${nh} ...`);
-            // Flatten what is visible now, then stretch its edge pixels into the new border.
+            // Flatten what is visible now and fill the new border the chosen way.
             const flat = this.flattenToCanvas({ forRun: true });
             const nb = makeCanvas(nw, nh);
             const ctx = nb.getContext("2d");
-            ctx.imageSmoothingEnabled = true;
-            if (top) ctx.drawImage(flat, 0, 0, W, 1, left, 0, W, top);
-            if (bottom) ctx.drawImage(flat, 0, H - 1, W, 1, left, top + H, W, bottom);
-            if (left) ctx.drawImage(flat, 0, 0, 1, H, 0, top, left, H);
-            if (right) ctx.drawImage(flat, W - 1, 0, 1, H, left + W, top, right, H);
-            if (top && left) ctx.drawImage(flat, 0, 0, 1, 1, 0, 0, left, top);
-            if (top && right) ctx.drawImage(flat, W - 1, 0, 1, 1, left + W, 0, right, top);
-            if (bottom && left) ctx.drawImage(flat, 0, H - 1, 1, 1, 0, top + H, left, bottom);
-            if (bottom && right) ctx.drawImage(flat, W - 1, H - 1, 1, 1, left + W, top + H, right, bottom);
+            const fill = (this.extendFillSel && this.extendFillSel.value) || "average color";
+            if (fill === "stretch edges") {
+                ctx.imageSmoothingEnabled = true;
+                if (top) ctx.drawImage(flat, 0, 0, W, 1, left, 0, W, top);
+                if (bottom) ctx.drawImage(flat, 0, H - 1, W, 1, left, top + H, W, bottom);
+                if (left) ctx.drawImage(flat, 0, 0, 1, H, 0, top, left, H);
+                if (right) ctx.drawImage(flat, W - 1, 0, 1, H, left + W, top, right, H);
+                if (top && left) ctx.drawImage(flat, 0, 0, 1, 1, 0, 0, left, top);
+                if (top && right) ctx.drawImage(flat, W - 1, 0, 1, 1, left + W, 0, right, top);
+                if (bottom && left) ctx.drawImage(flat, 0, H - 1, 1, 1, 0, top + H, left, bottom);
+                if (bottom && right) ctx.drawImage(flat, W - 1, H - 1, 1, 1, left + W, top + H, right, bottom);
+            } else if (fill === "noise") {
+                const img = ctx.createImageData(nw, nh);
+                const d = img.data;
+                for (let i = 0; i < d.length; i += 4) { d[i] = Math.random() * 255; d[i + 1] = Math.random() * 255; d[i + 2] = Math.random() * 255; d[i + 3] = 255; }
+                ctx.putImageData(img, 0, 0);
+            } else {
+                let color = "#808080";
+                if (fill === "green") color = "#00ff00";
+                else if (fill === "black") color = "#000000";
+                else if (fill === "average color") {
+                    // mean of a 64 px thumbnail: cheap and close enough
+                    const t = makeCanvas(64, 64); const tc = t.getContext("2d"); tc.drawImage(flat, 0, 0, 64, 64);
+                    const d = tc.getImageData(0, 0, 64, 64).data; let r = 0, g = 0, b = 0;
+                    for (let i = 0; i < d.length; i += 4) { r += d[i]; g += d[i + 1]; b += d[i + 2]; }
+                    const n = d.length / 4; color = `rgb(${Math.round(r / n)},${Math.round(g / n)},${Math.round(b / n)})`;
+                }
+                ctx.fillStyle = color;
+                ctx.fillRect(0, 0, nw, nh);
+            }
             ctx.drawImage(flat, left, top);
             const { ref } = await uploadCanvas(nb, `n${this.node.id}_base`);
             const img = await loadImageEl(viewUrl(ref));
@@ -2527,7 +2587,8 @@ class InpaintEditor {
     /** Auto sizing values for the current selection, or null without a selection. */
     autoParams() {
         const b = this.getBounds();
-        return b ? autoSelectionParams(b[2] - b[0], b[3] - b[1]) : null;
+        const strength = this.genSettings.mode === "local" ? this.genSettings.denoise : 1;
+        return b ? autoSelectionParams(b[2] - b[0], b[3] - b[1], strength) : null;
     }
 
     cropRect() {
@@ -2550,6 +2611,7 @@ class InpaintEditor {
         this.cropFeatherSel.value = this.cropSettings.feather === "auto" ? "auto" : "manual";
         this.cropFillSel.value = this.cropSettings.fill || "none";
         this.cropColorMatch.checked = !!this.cropSettings.colorMatch;
+        if (this.extendFillSel) this.extendFillSel.value = this.cropSettings.extendFill || "average color";
     }
 
     widgetValue(name, fallback) {
@@ -2579,7 +2641,7 @@ class InpaintEditor {
             const ctrl = this.layers.filter((l) => this.isControl(l) && l.visible).length;
             rows.push(["Control", ctrl ? `${ctrl} layer${ctrl > 1 ? "s" : ""}` : "none (black)"]);
             const rs = this.resultInputState();
-            rows.push(["Result", `${this.genSettings.mode} → ${rs.name}${rs.wired ? "" : " (not wired!)"}`]);
+            rows.push(["Result", `${this.genSettings.mode} → ${rs.name}${rs.wired ? "" : " (not wired!)"}` + (this.genSettings.mode === "local" && this.genSettings.refine ? " · refine" : "")]);
         }
         this.infoEl.innerHTML = rows.map(([k, v]) => `<span>${k}</span><b>${v}</b>`).join("");
         if (this.canvasInfo) this.canvasInfo.textContent = this.base ? `now ${this.width} × ${this.height}` : "";
@@ -3103,6 +3165,109 @@ class InpaintEditor {
 
     // ---- queue -------------------------------------------------------------
 
+    // ---- editor-driven settings (setting_n outputs) -------------------------------
+
+    /** Connected setting outputs with their targets: [{index, output, node, inputName, spec, widget}]. */
+    settingTargets() {
+        const res = [];
+        const outs = this.node.outputs || [];
+        const graph = this.node.graph || app.graph;
+        for (let i = FIXED_OUTPUTS; i < outs.length; i++) {
+            const o = outs[i];
+            if (!o || !o.links || !o.links.length) continue;
+            const link = graph.links[o.links[0]];
+            if (!link) continue;
+            const target = graph.getNodeById(link.target_id);
+            if (!target) continue;
+            const input = target.inputs && target.inputs[link.target_slot];
+            if (!input) continue;
+            const inputName = input.name;
+            const nd = target.constructor && target.constructor.nodeData;
+            const spec = nd && nd.input && ((nd.input.required && nd.input.required[inputName]) || (nd.input.optional && nd.input.optional[inputName])) || null;
+            const widget = target.widgets && target.widgets.find((w) => w.name === inputName) || null;
+            res.push({ index: i - FIXED_OUTPUTS + 1, output: o, node: target, inputName, spec, widget });
+        }
+        return res;
+    }
+
+    /** Kind and options of a target input from its node definition (or its widget as fallback). */
+    settingKind(t) {
+        const spec = t.spec;
+        let type = spec ? spec[0] : (t.widget ? t.widget.type : "STRING");
+        let opts = spec && spec[1] ? spec[1] : {};
+        if (Array.isArray(type)) return { kind: "combo", options: type, opts };
+        if (type === "COMBO") return { kind: "combo", options: (opts.options || (t.widget && t.widget.options && t.widget.options.values) || []), opts };
+        if (type === "INT" || type === "FLOAT") return { kind: "number", type, opts };
+        if (type === "BOOLEAN") return { kind: "boolean", opts };
+        if (t.widget && t.widget.type === "combo") return { kind: "combo", options: (t.widget.options && t.widget.options.values) || [], opts };
+        if (t.widget && t.widget.type === "number") return { kind: "number", type: Number.isInteger(t.widget.options && t.widget.options.precision) && t.widget.options.precision === 0 ? "INT" : "FLOAT", opts: t.widget.options || {} };
+        return { kind: "string", opts };
+    }
+
+    /** Called when a setting output is (dis)connected: keep the stored values in step with the targets. */
+    settingsChanged() {
+        const targets = this.settingTargets();
+        const live = new Set();
+        for (const t of targets) {
+            const key = String(t.index);
+            live.add(key);
+            const k = this.settingKind(t);
+            const label = `${t.node.title || t.node.type} · ${t.inputName}`;
+            const type = k.kind === "number" ? k.type : (k.kind === "boolean" ? "BOOLEAN" : (k.kind === "combo" ? "COMBO" : "STRING"));
+            const cur = this.settings[key];
+            if (!cur || cur.target !== `${t.node.id}:${t.inputName}`) {
+                // new target: start from what the widget shows now, so connecting changes nothing
+                const value = t.widget ? t.widget.value : (k.kind === "combo" ? k.options[0] : (k.kind === "number" ? (k.opts.default ?? 0) : (k.kind === "boolean" ? !!k.opts.default : "")));
+                this.settings[key] = { value, type, label, target: `${t.node.id}:${t.inputName}` };
+            } else {
+                cur.type = type; cur.label = label;
+            }
+        }
+        for (const key of Object.keys(this.settings)) if (!live.has(key)) delete this.settings[key];
+        this.renderSettings();
+        this.notifyChanged();
+    }
+
+    renderSettings() {
+        if (!this.settingsList) return;
+        const list = this.settingsList;
+        list.innerHTML = "";
+        const targets = this.settingTargets();
+        if (!targets.length) {
+            list.appendChild(el("span", null, "Wire a setting output of the node into any widget (lora_name, ckpt_name, steps ...) and it shows up here."));
+            return;
+        }
+        for (const t of targets) {
+            const key = String(t.index);
+            const entry = this.settings[key];
+            if (!entry) continue;
+            const k = this.settingKind(t);
+            const lab = el("label", null, entry.label);
+            lab.title = `setting_${t.index} → ${entry.label}`;
+            let control;
+            const commit = (v) => { entry.value = v; if (t.widget) { try { t.widget.value = v; } catch (_) { /* read-only */ } } this.notifyChanged(); };
+            if (k.kind === "combo") {
+                control = selectInput(k.options.map(String), String(entry.value), entry.label);
+                if (!k.options.map(String).includes(String(entry.value)) && k.options.length) { entry.value = k.options[0]; control.value = String(entry.value); }
+                control.addEventListener("change", () => commit(control.value));
+            } else if (k.kind === "number") {
+                const o = k.opts || {};
+                control = numberInput(entry.value, o.min ?? -1e9, o.max ?? 1e9, entry.label, 96);
+                control.step = o.step ?? (k.type === "INT" ? 1 : 0.01);
+                control.addEventListener("change", () => commit(k.type === "INT" ? Math.round(+control.value || 0) : (+control.value || 0)));
+            } else if (k.kind === "boolean") {
+                control = document.createElement("input"); control.type = "checkbox"; control.checked = !!entry.value;
+                control.addEventListener("change", () => commit(control.checked));
+            } else {
+                control = document.createElement("input"); control.type = "text"; control.value = entry.value == null ? "" : String(entry.value); control.spellcheck = false;
+                control.addEventListener("keydown", (e) => e.stopPropagation());
+                control.addEventListener("change", () => commit(control.value));
+            }
+            lab.appendChild(control);
+            list.appendChild(lab);
+        }
+    }
+
     /** Name of the result input the current mode expects, and whether something is wired to it. */
     resultInputState() {
         const name = this.genSettings.mode === "local" ? "result_local" : "result";
@@ -3112,10 +3277,15 @@ class InpaintEditor {
 
     syncGenControls() {
         if (!this.modeSel) return;
-        this.modeSel.value = this.genSettings.mode === "local" ? "local" : "api";
+        const local = this.genSettings.mode === "local";
+        this.modeSel.value = local ? "local" : "api";
         this.denoiseInput.value = this.genSettings.denoise;
         this.seedInput.value = this.genSettings.seed;
         this.seedRandom.checked = !!this.genSettings.seedRandom;
+        this.refineBtn.classList.toggle("ipc-toggle-on", !!this.genSettings.refine);
+        this.refineBtn.hidden = !local;
+        this.denoiseInput.parentElement.hidden = !local;
+        if (this.negativeInput) this.negativeInput.hidden = !local;
     }
 
     async generate() {
@@ -3170,6 +3340,8 @@ class InpaintEditor {
             crop: this.cropSettings,
             upsample: this.upsampleSettings,
             gen: this.genSettings,
+            negative: this.negativeText,
+            settings: this.settings,
         });
     }
 
@@ -3194,7 +3366,11 @@ class InpaintEditor {
             this.upsampleSettings = { useCase: "auto", backend: "auto", ...(state.upsample || {}) };
             this.refreshSegmentBackends();
             this.genSettings = { ...GEN_DEFAULTS, seed: randomSeed(), ...(state.gen || {}) };
+            this.negativeText = state.negative || "";
+            if (this.negativeInput) this.negativeInput.value = this.negativeText;
+            this.settings = state.settings && typeof state.settings === "object" ? { ...state.settings } : {};
             this.syncGenControls();
+            this.renderSettings();
             for (const l of state.layers || []) {
                 if (!l.ref) continue;
                 try {
@@ -3277,6 +3453,8 @@ class InpaintEditor {
             layers: this.layers.length,
             crop: this.cropSettings,
             gen: this.genSettings,
+            negative: this.negativeText,
+            settings: this.settings,
         });
     }
 
@@ -3296,6 +3474,22 @@ app.registerExtension({
 
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name === NODE_CLASS) {
+            /** Keep exactly one unconnected setting output after the connected ones (trailing outputs only, so slot indices stay stable). */
+            const syncSettingOutputs = (node) => {
+                const outs = node.outputs || [];
+                let highest = 0;
+                for (let i = FIXED_OUTPUTS; i < outs.length; i++) if (outs[i] && outs[i].links && outs[i].links.length) highest = i - FIXED_OUTPUTS + 1;
+                const want = Math.min(SETTING_SLOTS, highest + 1);
+                while (node.outputs.length > FIXED_OUTPUTS + want) node.removeOutput(node.outputs.length - 1);
+                while (node.outputs.length < FIXED_OUTPUTS + want) node.addOutput(`setting_${node.outputs.length - FIXED_OUTPUTS + 1}`, "*");
+                for (let i = FIXED_OUTPUTS; i < node.outputs.length; i++) {
+                    const o = node.outputs[i];
+                    const n = i - FIXED_OUTPUTS + 1;
+                    o.name = `setting_${n}`;
+                    o.label = (o.links && o.links.length) ? `setting ${n}` : `setting ${n} (free)`;
+                }
+                node.setSize([node.size[0], Math.max(node.size[1], node.computeSize()[1])]);
+            };
             const onNodeCreated = nodeType.prototype.onNodeCreated;
             nodeType.prototype.onNodeCreated = function () {
                 const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
@@ -3316,6 +3510,22 @@ app.registerExtension({
                 }
                 const [w, h] = this.size;
                 this.setSize([Math.max(w, 340), Math.max(h, 500)]);
+                syncSettingOutputs(this);
+                return r;
+            };
+
+            // Setting outputs behave like a Primitive node's: the next free slot
+            // appears once the previous one is connected, and the editor lists a
+            // control per connected target.
+            const onConnectionsChange = nodeType.prototype.onConnectionsChange;
+            nodeType.prototype.onConnectionsChange = function (type, slot, connected, linkInfo, ioSlot) {
+                const r = onConnectionsChange ? onConnectionsChange.apply(this, arguments) : undefined;
+                if (type === LiteGraph.OUTPUT && slot >= FIXED_OUTPUTS) {
+                    syncSettingOutputs(this);
+                    setTimeout(() => { if (this.inpaintEditor) this.inpaintEditor.settingsChanged(); }, 0);
+                } else if (type === LiteGraph.INPUT && this.inpaintEditor) {
+                    setTimeout(() => this.inpaintEditor.renderInfo(), 0);
+                }
                 return r;
             };
 
@@ -3337,6 +3547,8 @@ app.registerExtension({
                         }
                     }
                 }
+                // links are restored after configure; refresh the setting controls once the graph is complete
+                setTimeout(() => { syncSettingOutputs(this); if (this.inpaintEditor) { this.inpaintEditor.renderSettings(); this.inpaintEditor.renderInfo(); } }, 0);
                 return r;
             };
 

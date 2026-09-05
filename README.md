@@ -78,8 +78,11 @@ Editor
   inpaint chain and instead composited on black into the `control_image`
   output, cropped and scaled exactly like `crop_image`. Feed it to ControlNet.
 - **Canvas** section: extend the canvas on any side (outpainting). The
-  visible image is baked into the new base, edge pixels are stretched into the
-  border, and the border becomes the selection. Press Generate to fill it.
+  visible image is baked into the new base and the border becomes the
+  selection; *Border* chooses what fills it before the model sees it: the
+  image's average colour (default), neutral grey, green for edit models,
+  black, random noise for latent models, or stretched edge pixels. Press
+  Generate to fill it.
 - **Prompt**: the text field is stored with the workflow and comes out of the
   node as the `prompt` output.
 - **Prompt upsampling**: type a short request (any language) into the prompt
@@ -111,6 +114,20 @@ Editor
   with a *random* toggle and a dice button; both leave the node on the
   `denoise` and `seed` outputs for your local sampler. The Crop panel shows
   which input the current mode expects and warns when nothing is wired there.
+  In local mode two more things appear: a *Refine* toggle (re-run the
+  selection at the denoise value with a plain, unfeathered mask and no fill,
+  the seam stays soft when stitching; switching it on drops denoise to 0.5)
+  and a *negative prompt* field under the prompt, available as the `negative`
+  output. In local mode the auto feather also scales with denoise, so a
+  gentle refine gets a narrower transition than a full repaint.
+- **Settings outputs**: the node ends with `setting 1 (free)`. Wire it into
+  any widget input of another node, a LoRA loader's `lora_name`, a checkpoint
+  name, `steps`, `cfg`, a sampler name, and the next free setting output
+  appears, up to eight. The editor's Settings section shows a matching
+  control for every connected one (a drop-down with the model list, a number
+  field, a checkbox or a text field) and starts from the value the widget had
+  when you connected it, so nothing changes until you touch it. Values are
+  stored with the canvas and pushed to the widget as you edit.
 - **History**: every result with a preview, the prompt it was made with, the
   mode and the seed. Click the seed line to reuse that seed (random goes off).
   Click a preview (or the solo button) to show only that result, discard one
@@ -182,6 +199,9 @@ Outputs
   (black if there are none).
 - `denoise` / `seed` / `mode`: the editor's Generate settings, for a local
   sampler (`mode` is "api" or "local").
+- `negative`: the negative prompt field (local mode).
+- `setting_1` ... `setting_8`: wildcard outputs driven from the editor's
+  Settings section; wire them into widget inputs anywhere in the graph.
 
 ### Helper nodes
 

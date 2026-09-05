@@ -75,7 +75,8 @@ comfyui-rmbg as default), the object selection tool (hover/click, SAM2 object
 map), the Source switch (image / active layer), the Crop settings (auto
 context, auto feather, fill modes, color match; DEVELOPMENT.md 10), prompt
 upsampling (Qwen3-VL local / Gemini API, DEVELOPMENT.md 11), the API/Local
-switch with two result inputs plus denoise/seed outputs (section 2), and the
+switch with two result inputs plus denoise/seed/negative outputs, refine,
+the eight editor-driven `setting_n` wildcard outputs (section 2), and the
 window-capture key handling (Ctrl+Z never reaches ComfyUI's workflow undo).
 SAM3 weights are at `models/checkpoints/sam3.pt` with a hardlink at
 `models/sam3/sam3.pt`. The core SAM3 text path returns noise here (6b).
