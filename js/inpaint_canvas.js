@@ -1921,7 +1921,7 @@ class InpaintEditor {
         ctx.drawImage(layer.mask, 0, 0);
         ctx.globalAlpha = this.brushOpacity;
         ctx.globalCompositeOperation = p.erase ? "destination-out" : "source-over";
-        ctx.drawImage(p.stroke, 0, 0);
+        ctx.drawImage(this.clippedStroke(p), 0, 0);
         ctx.globalAlpha = 1;
         ctx.globalCompositeOperation = "source-over";
         return this.maskPreview;
@@ -1995,7 +1995,7 @@ class InpaintEditor {
                 // Painting on the transparency mask: paint reveals, erase hides.
                 this.pushUndo({ kind: "mask", id: layer.id });
                 const stroke = makeCanvas(layer.mask.width, layer.mask.height);
-                this.pointer = { kind: "maskpaint", layer, stroke, erase: this.tool === "erase", white: true, last: [ix, iy] };
+                this.pointer = { kind: "maskpaint", layer, stroke, clip: this.strokeClip(layer, layer.mask), erase: this.tool === "erase", white: true, last: [ix, iy] };
                 this.layerDab(this.pointer, ix, iy, ix, iy);
                 this.draw();
                 return;
@@ -2007,7 +2007,7 @@ class InpaintEditor {
             }
             this.pushUndo({ kind: "layer", id: layer.id });
             const stroke = makeCanvas(layer.canvas.width, layer.canvas.height);
-            this.pointer = { kind: "layerpaint", layer, stroke, erase: this.tool === "erase", last: [ix, iy] };
+            this.pointer = { kind: "layerpaint", layer, stroke, clip: this.strokeClip(layer, layer.canvas), erase: this.tool === "erase", last: [ix, iy] };
             this.layerDab(this.pointer, ix, iy, ix, iy);
         } else if (this.tool === "transform") {
             const layer = this.activeLayer();
@@ -2247,13 +2247,42 @@ class InpaintEditor {
         }
     }
 
+    /**
+     * The selection mapped into a layer's pixel space (alpha = selected), or null
+     * without a selection. Brush and eraser strokes are clipped to it, like in
+     * Krita and Photoshop; Ctrl+D clears the selection to paint freely.
+     */
+    strokeClip(layer, target) {
+        if (!this.selection || !this.getBounds()) return null;
+        const c = makeCanvas(target.width, target.height);
+        const ctx = c.getContext("2d");
+        ctx.setTransform(target.width / layer.w, 0, 0, target.height / layer.h, 0, 0);
+        ctx.drawImage(this.selection, -layer.x, -layer.y);
+        return c;
+    }
+
+    /** The stroke buffer, limited to the selection when the gesture has a clip. */
+    clippedStroke(p) {
+        if (!p.clip) return p.stroke;
+        if (!this.clipScratch || this.clipScratch.width !== p.stroke.width || this.clipScratch.height !== p.stroke.height) this.clipScratch = makeCanvas(p.stroke.width, p.stroke.height);
+        const ctx = this.clipScratch.getContext("2d");
+        ctx.globalCompositeOperation = "source-over";
+        ctx.globalAlpha = 1;
+        ctx.clearRect(0, 0, this.clipScratch.width, this.clipScratch.height);
+        ctx.drawImage(p.stroke, 0, 0);
+        ctx.globalCompositeOperation = "destination-in";
+        ctx.drawImage(p.clip, 0, 0);
+        ctx.globalCompositeOperation = "source-over";
+        return this.clipScratch;
+    }
+
     /** Apply the stroke buffer to the layer (or its mask) with the brush opacity. */
     commitStroke(p) {
         const ctx = (p.kind === "maskpaint" ? p.layer.mask : p.layer.canvas).getContext("2d");
         ctx.save();
         ctx.globalAlpha = this.brushOpacity;
         ctx.globalCompositeOperation = p.erase ? "destination-out" : "source-over";
-        ctx.drawImage(p.stroke, 0, 0);
+        ctx.drawImage(this.clippedStroke(p), 0, 0);
         ctx.restore();
     }
 
@@ -2271,7 +2300,7 @@ class InpaintEditor {
         ctx.drawImage(layer.canvas, 0, 0);
         ctx.globalAlpha = this.brushOpacity;
         ctx.globalCompositeOperation = p.erase ? "destination-out" : "source-over";
-        ctx.drawImage(p.stroke, 0, 0);
+        ctx.drawImage(this.clippedStroke(p), 0, 0);
         ctx.globalAlpha = 1;
         ctx.globalCompositeOperation = "source-over";
         return this.strokePreview;

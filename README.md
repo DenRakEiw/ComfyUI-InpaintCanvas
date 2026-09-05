@@ -135,7 +135,9 @@ size, hardness, opacity and the paint colour.
 - Paint (P) and erase (E) on the active layer; painting on the base creates a
   paint layer automatically, the base itself is never erased. Fill the
   selection with the colour (Shift+F). Soft brushes stamp radial dabs, opacity
-  applies per stroke. The eraser has its own hardness, soft by default like
+  applies per stroke. With a selection present, brush and eraser only touch
+  the selected area, like in Krita and Photoshop; clear the selection
+  (Ctrl+D) to paint freely. The eraser has its own hardness, soft by default like
   Krita's Eraser Soft; the Hardness slider always shows and edits the active
   tool's value, both are remembered.
 - **Transform (T)** has four modes in the bar above the canvas. *Scale*: drag
