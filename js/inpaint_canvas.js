@@ -802,6 +802,12 @@ class InpaintEditor {
         this.tool = "select";
         this.brushSize = 40;
         this.hardness = 1;
+        this.eraseHardness = 0.5;       // the eraser is soft by default, like Krita's Eraser Soft
+        try {
+            const h = parseFloat(localStorage.getItem("ipc.hardness")), e = parseFloat(localStorage.getItem("ipc.eraseHardness"));
+            if (h >= 0 && h <= 1) this.hardness = h;
+            if (e >= 0 && e <= 1) this.eraseHardness = e;
+        } catch (_) { /* no storage */ }
         this.brushOpacity = 1;
         this.color = "#ff3b30";
         this.fillEnclosed = true;
@@ -948,7 +954,12 @@ class InpaintEditor {
             return { input: inp, value: val };
         };
         this.sizeCtl = slider("Size", 2, 400, this.brushSize, (v) => v + "px", (v) => { this.brushSize = v; this.draw(); });
-        this.hardCtl = slider("Hardness", 0, 100, 100, (v) => v + "%", (v) => { this.hardness = v / 100; });
+        this.hardCtl = slider("Hardness", 0, 100, Math.round(this.hardness * 100), (v) => v + "%", (v) => {
+            // the slider edits the hardness of the active tool: the eraser has its own
+            if (this.tool === "erase") this.eraseHardness = v / 100; else this.hardness = v / 100;
+            try { localStorage.setItem(this.tool === "erase" ? "ipc.eraseHardness" : "ipc.hardness", String(v / 100)); } catch (_) { /* ignore */ }
+        });
+        this.hardCtl.input.title = "Brush hardness. The eraser keeps its own value (soft by default); the slider shows the active tool's.";
         this.opacCtl = slider("Opacity", 1, 100, 100, (v) => v + "%", (v) => { this.brushOpacity = v / 100; });
 
         const colorLabel = el("label", null, "Color");
@@ -1699,9 +1710,19 @@ class InpaintEditor {
         if (this.nodeStatus) this.nodeStatus.textContent = text;
     }
 
+    /** Hardness of the tool in use: the eraser has its own, softer default. */
+    activeHardness() {
+        return this.tool === "erase" ? this.eraseHardness : this.hardness;
+    }
+
     setTool(tool) {
         if (this.pending && tool !== "transform") this.cancelPending();
         this.tool = tool;
+        if (this.hardCtl) {
+            const v = Math.round(this.activeHardness() * 100);
+            this.hardCtl.input.value = v;
+            this.hardCtl.value.textContent = v + "%";
+        }
         for (const [id, b] of Object.entries(this.toolButtons)) b.classList.toggle("ipc-active", id === tool);
         this.viewEl.classList.toggle("ipc-pan", tool === "hand");
         this.viewEl.classList.toggle("ipc-move", tool === "transform");
@@ -2182,7 +2203,8 @@ class InpaintEditor {
         const radius = this.brushSize * (sx + sy) / 4;
         const color = p.white ? "#ffffff" : (p.erase ? "#000000" : this.color);
         ctx.globalCompositeOperation = "source-over";
-        if (this.hardness >= 0.98) {
+        const hardness = p.erase ? this.eraseHardness : this.hardness;
+        if (hardness >= 0.98) {
             ctx.strokeStyle = color;
             ctx.lineCap = "round";
             ctx.lineJoin = "round";
@@ -2197,7 +2219,7 @@ class InpaintEditor {
             const g = ctx.createRadialGradient(0, 0, 0, 0, 0, radius);
             const rgb = color.length === 7 ? `${parseInt(color.slice(1, 3), 16)},${parseInt(color.slice(3, 5), 16)},${parseInt(color.slice(5, 7), 16)}` : "0,0,0";
             g.addColorStop(0, `rgba(${rgb},1)`);
-            g.addColorStop(Math.max(0, Math.min(0.97, this.hardness)), `rgba(${rgb},1)`);
+            g.addColorStop(Math.max(0, Math.min(0.97, hardness)), `rgba(${rgb},1)`);
             g.addColorStop(1, `rgba(${rgb},0)`);
             p.gradient = g;
             p.gradientRadius = radius;
@@ -4283,10 +4305,10 @@ class InpaintEditor {
             ctx.beginPath();
             ctx.arc(this.hover[0], this.hover[1], this.brushSize / 2, 0, Math.PI * 2);
             ctx.stroke();
-            if ((this.tool === "paint" || this.tool === "erase") && this.hardness < 0.98) {
+            if ((this.tool === "paint" || this.tool === "erase") && this.activeHardness() < 0.98) {
                 ctx.setLineDash([3 / s, 3 / s]);
                 ctx.beginPath();
-                ctx.arc(this.hover[0], this.hover[1], (this.brushSize / 2) * this.hardness, 0, Math.PI * 2);
+                ctx.arc(this.hover[0], this.hover[1], (this.brushSize / 2) * this.activeHardness(), 0, Math.PI * 2);
                 ctx.stroke();
             }
             ctx.restore();
