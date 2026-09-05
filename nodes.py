@@ -531,8 +531,12 @@ class InpaintCanvas:
         seed = int(gen.get("seed", 0) or 0)
         refine = bool(gen.get("refine")) and mode == "local"
         strength = denoise if mode == "local" else 1.0
-        # Only the chain wired to the selected mode's input is pulled in by the stitch expansion.
-        result_source = result_source_local if mode == "local" else result_source
+        # Only the chain wired to the selected mode's input is pulled in by the stitch
+        # expansion. When that input is not wired, the other one is used, so a single
+        # chain keeps working whatever the mode says (the editor shows the fallback).
+        preferred = result_source_local if mode == "local" else result_source
+        other = result_source if mode == "local" else result_source_local
+        result_source = preferred or other
         base_ref = state.get("base")
         if not base_ref:
             raise ValueError("Inpaint Canvas: load an image into the canvas first.")

@@ -186,8 +186,9 @@ or Gemini through ComfyUI's API node.
 
 - The **api / local** switch next to Generate says which chain the result
   comes back from: *api* uses the `result` input, *local* the `result_local`
-  input. Only the chain wired to the selected input runs. The Crop panel shows
-  which input the current mode expects and warns when nothing is wired there.
+  input. Only the chain wired to the selected input runs. When only one of the
+  two inputs is wired, that one is used whatever the mode says, and the Crop
+  panel says so ("only input wired"); it warns when nothing is wired at all.
 - **Denoise** (a slider, local mode: 1.0 repaints the selection, lower
   values refine what is there) and **Seed** with a *random* toggle and a dice
   button leave the node on the `denoise` and `seed` outputs. Wire them into

@@ -3150,7 +3150,7 @@ class InpaintEditor {
             const refs = this.referenceLayers().length;
             rows.push(["References", refs ? `${refs} image${refs > 1 ? "s" : ""} (${this.refSettings.size || "native"}, ${this.refSettings.fit})` : "none (empty batch)"]);
             const rs = this.resultInputState();
-            rows.push(["Result", `${this.genSettings.mode} → ${rs.name}${rs.wired ? "" : " (not wired!)"}` + (this.genSettings.mode === "local" && this.genSettings.refine ? " · refine" : "")]);
+            rows.push(["Result", `${this.genSettings.mode} → ${rs.name}${rs.wired ? (rs.fallback ? " (only input wired)" : "") : " (not wired!)"}` + (this.genSettings.mode === "local" && this.genSettings.refine ? " · refine" : "")]);
         }
         this.infoEl.innerHTML = rows.map(([k, v]) => `<span>${k}</span><b>${v}</b>`).join("");
         if (this.canvasInfo) this.canvasInfo.textContent = this.base ? `now ${this.width} × ${this.height}` : "";
@@ -3851,10 +3851,14 @@ class InpaintEditor {
     }
 
     /** Name of the result input the current mode expects, and whether something is wired to it. */
+    /** Which result input the run will use: the mode's own, or the other one when only that is wired. */
     resultInputState() {
-        const name = this.genSettings.mode === "local" ? "result_local" : "result";
-        const input = (this.node.inputs || []).find((i) => i.name === name);
-        return { name, wired: !!(input && input.link != null) };
+        const want = this.genSettings.mode === "local" ? "result_local" : "result";
+        const other = want === "result" ? "result_local" : "result";
+        const wired = (name) => { const input = (this.node.inputs || []).find((i) => i.name === name); return !!(input && input.link != null); };
+        if (wired(want)) return { name: want, wired: true, fallback: false };
+        if (wired(other)) return { name: other, wired: true, fallback: true };
+        return { name: want, wired: false, fallback: false };
     }
 
     syncGenControls() {
@@ -3877,7 +3881,7 @@ class InpaintEditor {
         const { name, wired } = this.resultInputState();
         try {
             this.generateBtn.disabled = true;
-            this.setStatus(wired ? `Queueing (${this.genSettings.mode}, seed ${this.genSettings.seed}) ...` : `Queueing, but nothing is wired into "${name}": the result will not come back into the canvas.`);
+            this.setStatus(wired ? `Queueing (${this.genSettings.mode}, seed ${this.genSettings.seed}, result from ${name}) ...` : `Queueing, but nothing is wired into "result" or "result_local": the result will not come back into the canvas.`);
             try {
                 await app.queuePrompt(0);
             } catch (first) {

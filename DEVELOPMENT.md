@@ -89,7 +89,10 @@ Two result inputs (2026-09-05): `result` (API chain) and `result_local`
 wrapper (`result_source`, `result_source_local`). `run()` picks the source
 by `canvas_state.gen.mode` and expands the stitch only for that one, so the
 other chain is never executed (its nodes are not ancestors of anything once
-the back-link is gone). `gen = {mode, denoise, seed, seedRandom}` lives in
+the back-link is gone). When the mode's input is not wired, the other one is
+used (2026-09-05 late: the user switched to local for the denoise slider
+while the Flux.2 chain sat on `result`, and three runs came back without a
+layer; the editor now shows "(only input wired)" in the Crop info). `gen = {mode, denoise, seed, seedRandom}` lives in
 the state; the frontend rolls a new seed before every Generate when
 `seedRandom` is on and stores mode/seed/denoise in each history entry.
 
