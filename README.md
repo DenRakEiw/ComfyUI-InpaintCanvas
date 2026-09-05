@@ -5,7 +5,7 @@ layers, the selection and the prompt. The selected region goes out as a crop,
 any inpaint chain works on it, and the result is wired straight back into the
 same node, where it lands as a new layer. Select the next spot, generate again.
 
-![The editor: a photo with a text selection, the crop rectangle and the side panel](docs/img/editor.jpg)
+![The editor: a photo with a marching-ants selection, the crop rectangle and the side panel](docs/img/editor.jpg)
 
 Highlights
 
@@ -53,8 +53,10 @@ Optional node packs, each enabling one editor feature:
 | Select by text (fallback) | [comfyui_segment_anything](https://github.com/storyicon/comfyui_segment_anything) | GroundingDINO SwinT + SAM in `models/grounding-dino`, `models/sams` |
 | Object selection (hover)  | [ComfyUI-segment-anything-2](https://github.com/kijai/ComfyUI-segment-anything-2) | `sam2_hiera_base_plus.safetensors` in `models/sam2`        |
 | Prompt upsampling         | [ComfyUI-QwenVL](https://github.com/1038lab/ComfyUI-QwenVL) or ComfyUI's Gemini API node | Qwen3-VL 2B in `models/LLM/Qwen-VL` (downloaded on first use) |
+| Layer cutouts             | [comfyui-rmbg](https://github.com/1038lab/ComfyUI-RMBG) (RMBG-2.0, BiRefNet, BEN2) or [ComfyUI-BRIA_AI-RMBG](https://github.com/ZHO-ZHO-ZHO/ComfyUI-BRIA_AI-RMBG) | `models/RMBG/<model>` (downloaded on first use); BRIA ships its weights |
 
-The editor lists only the backends whose nodes are installed.
+The editor lists only the backends whose nodes are installed. Filter layers,
+reference layers, masks, save and cleanup need nothing beyond the node.
 
 ## Quick start
 
@@ -161,31 +163,7 @@ size, hardness, opacity and the paint colour.
   Canvas section chooses how a reference is fitted to the crop size: *pad*
   with the image's border colour, *crop* to cover, or *stretch*. Not for
   chains that VAE-encode `crop_image`, they would encode the references too.
-- **Filter layers** (the fx button in the Layers header): a layer without
-  pixels that filters everything below it. Types: *Film / Grain* (film-like
-  grain, strongest in the midtones, with a colour share, and about fifty
-  film presets in groups: colour negative from Ektar and Portra to Gold,
-  UltraMax and Superia, slide films such as Ektachrome, Kodachrome, Velvia
-  and Provia, black-and-white from Pan F to Tri-X, Delta 3200, Ortho and
-  infrared, cine stocks such as Vision3 and CineStill, and special films
-  such as LomoChrome Purple, Turquoise and Metropolis, Aerochrome, redscale,
-  cross-processing, expired film and instant film; a preset sets the grain
-  and a parametric colour character whose strength the *Look* slider
-  controls. These are approximations of how the stocks are described, not
-  measurements; a real film LUT below the grain layer stays the faithful
-  route. The grain itself follows what real grain scans measure: skewed,
-  bright specks on a darker ground, set by the *Speckle* slider. With
-  *Plate* you load a real grain plate, a scan of uniformly exposed film such
-  as the fotokorn.de packs, which then replaces the synthetic grain at the
-  chosen scale), *Sharpen* (unsharp mask with radius and
-  threshold), *Levels* (input black / white, gamma, output black / white),
-  *LUT* (load any 3D `.cube`, with a strength slider; the LUT is stored with
-  the workflow) and *Vignette*. Sliders preview at reduced resolution while
-  you drag and render in full when you let go. Opacity, blend mode and a
-  transparency mask work like on any layer, so *mask from selection* limits a
-  sharpen or grain to the inpainted patch. Filters are baked into the image
-  your chain sees and into flatten / extend. Filter layers have no pixels of
-  their own: painting, transforming and cutout are not available on them.
+- **Filter layers**: see the section below.
 - **Layer masks and cutouts** (Krita's transparency masks, LayerForge's
   background removal): every layer row has a mask row. *Cutout* runs one of
   the installed background removal nodes on the layer (comfyui-rmbg's
@@ -198,6 +176,38 @@ size, hardness, opacity and the paint colour.
   mask to the pixels, the trash removes it. Masks are undoable, survive a
   reload, and are respected by *From layer*, the segmentation source *active
   layer*, the reference batch and the run image.
+
+### Filter layers
+
+The fx button in the Layers header adds a layer without pixels that filters
+everything below it. Opacity, blend mode and a transparency mask work like
+on any layer, so *mask from selection* limits a sharpen or a grain to the
+inpainted patch. Sliders preview at reduced resolution while you drag and
+render in full when you let go; every drag is one undo step. Filters are
+baked into the image your chain sees and into flatten, extend and save.
+Filter layers have no pixels of their own, so painting, transforming and
+cutout are not available on them (mask editing is).
+
+- **Film / Grain**. Film-like grain, strongest in the midtones, with a
+  colour share. Its distribution follows what real grain scans measure:
+  skewed, bright specks on a darker ground, set by the *Speckle* slider.
+  The *Film* select holds about fifty stocks in groups: colour negative from
+  Ektar and Portra to Gold, UltraMax and Superia; slide films such as
+  Ektachrome, Kodachrome, Velvia and Provia; black-and-white from Pan F to
+  Tri-X, Delta 3200, Ortho and infrared; cine stocks such as Vision3 and
+  CineStill; and special films such as LomoChrome Purple, Turquoise and
+  Metropolis, Aerochrome, redscale, cross-processing, expired and instant
+  film. A preset sets the grain and a parametric colour character whose
+  strength the *Look* slider controls. These are approximations of how the
+  stocks are described, not measurements; a real film LUT below the grain
+  layer stays the faithful route for colour. With *Plate* you load a real
+  grain plate, a scan of uniformly exposed film such as the fotokorn.de
+  packs, which then replaces the synthetic grain at the chosen scale.
+- **Sharpen**: unsharp mask with amount, radius and threshold.
+- **Levels**: input black and white point, gamma, output black and white.
+- **LUT**: load any 3D `.cube` with a strength slider; the LUT is stored
+  with the workflow.
+- **Vignette**: amount, size and softness.
 
 ### Prompt and upsampling
 
