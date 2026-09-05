@@ -82,16 +82,44 @@ Editor
   files stay, only discarded results can then no longer be restored.
 
 The dashed rectangle is the crop that will be emitted: the selection's bounding
-box plus `padding`. The Crop panel shows its size and the size that actually
-leaves the node.
+box plus context. The Crop panel shows its size, the size that actually leaves
+the node, and holds four settings that travel with the canvas:
+
+- **Context** *auto* (default) sizes the context from the selection: 6 % of
+  the selection diagonal plus the feather plus 4 px, and the crop is never
+  smaller than 512 px on a side when the image allows it. Small fixes get a
+  tight crop, large selections get room. *manual* uses the node's `padding`
+  widget.
+- **Feather** *auto* (default) derives the mask edge from the selection size
+  the way the Krita AI plugin does: feather 10 % of the diagonal (at least
+  32 px), a 4 px hard grow plus half the feather, and a blend of at most 25 px
+  for the composite. `crop_mask` is then the grown and feathered mask, and the
+  stitch keeps the result fully opaque inside your selection with a soft
+  transition outside it. *manual* emits the raw selection and blurs the edge
+  by the node's `feather` widget at stitch time (the old behaviour).
+- **Fill** changes what the model sees inside the selection in `crop_image`
+  (the canvas itself is untouched): *neutral* the average colour of the
+  surroundings, *blur* the surroundings smeared into the area, *border* an
+  OpenCV border fill plus smear, *green* pure green with a hard edge for edit
+  models that are told to "fill the green area". Use one of these when the
+  model keeps the old content instead of replacing it.
+- **Color match** (default on) matches the result's colours and brightness to
+  the ring around the selection when it is stitched back, so API results that
+  come back with a colour shift do not leave a visible seam.
+
+Workflows saved before these settings existed load with manual context, manual
+feather, no fill and no color match, so nothing changes for them.
+
+While the editor is open, all keyboard shortcuts belong to it: Ctrl+Z undoes
+the last editor step, not the workflow.
 
 Widgets
 
 | Widget        | Meaning                                                                          |
 | ------------- | -------------------------------------------------------------------------------- |
-| `padding`     | Context pixels around the selection that go into the crop.                       |
+| `padding`     | Context pixels around the selection that go into the crop (Context = manual).    |
 | `target_size` | Longest side of the emitted crop. 0 keeps the native size.                       |
-| `feather`     | Blur radius of the selection edge when the result is stitched back.              |
+| `feather`     | Blur radius of the selection edge when the result is stitched back (Feather = manual). |
 | `multiple_of` | Crop width and height are made a multiple of this. Flux wants 64.                |
 
 With `target_size` set, the scaled crop is rounded to the multiple. With
@@ -103,8 +131,9 @@ Inputs
 
 Outputs
 
-- `crop_image` / `crop_mask`: the region to inpaint, already scaled.
-- `image` / `mask`: the flattened canvas and the selection at full size.
+- `crop_image` / `crop_mask`: the region to inpaint, already scaled (with the
+  fill applied, and the mask grown and feathered, when those are on).
+- `image` / `mask`: the flattened canvas and the raw selection at full size.
 - `stitch_info`: parameters for the standalone stitch node below.
 - `crop_width` / `crop_height`: size of `crop_image`. Wire them into generators
   that take an explicit size (the Flux.2 API node, for example) so the result

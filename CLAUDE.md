@@ -67,11 +67,13 @@ Flux.2 [max] API node (returns RGBA, square unless width/height are wired).
 
 ## Where things stand (2026-09-05)
 
-Done and browser-verified: everything in README, including "Select by text"
-(SAM3 via comfyui-rmbg as default), the object selection tool (hover/click,
-SAM2 object map) and the Source switch (image / active layer). SAM3 weights
-are at `models/checkpoints/sam3.pt` with a hardlink at `models/sam3/sam3.pt`.
-The core SAM3 text path returns noise on this machine (DEVELOPMENT.md 6b).
+Done and verified: everything in README, including "Select by text" (SAM3 via
+comfyui-rmbg as default), the object selection tool (hover/click, SAM2 object
+map), the Source switch (image / active layer), the Crop settings (auto
+context, auto feather, fill modes, color match; DEVELOPMENT.md 10) and the
+window-capture key handling (Ctrl+Z never reaches ComfyUI's workflow undo).
+SAM3 weights are at `models/checkpoints/sam3.pt` with a hardlink at
+`models/sam3/sam3.pt`. The core SAM3 text path returns noise here (6b).
 
 ## Working on it
 

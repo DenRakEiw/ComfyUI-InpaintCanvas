@@ -18,6 +18,7 @@ Two nodes:
 """
 
 import json
+import math
 import os
 import time
 
@@ -30,6 +31,7 @@ import folder_paths
 from comfy_execution.graph_utils import GraphBuilder
 
 SUBFOLDER = "inpaint_canvas"
+MIN_AUTO_CROP = 512   # auto context never emits a region smaller than this (image permitting)
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +87,156 @@ def _blur_mask(mask, radius):
     img = Image.fromarray((mask.clamp(0, 1).numpy() * 255).astype(np.uint8), "L")
     img = img.filter(ImageFilter.GaussianBlur(radius))
     return torch.from_numpy(np.asarray(img).astype(np.float32) / 255.0)
+
+
+def _auto_selection_params(sel_w, sel_h):
+    """Context padding, grow, feather and blend derived from the selection size.
+
+    Same idea as the Krita AI plugin's defaults (reimplemented, not copied):
+    feather 10 % of the selection diagonal but at least 32 px, a 4 px hard grow
+    plus half the feather, a blend of at most 25 px for the composite, and a
+    context padding of feather + 4 + 6 % of the diagonal.
+    """
+    diag = math.hypot(sel_w, sel_h)
+    feather = max(int(0.10 * diag), 32)
+    grow = 4 + feather // 2
+    blend = min(25, grow + feather // 2)
+    pad = feather + 4 + int(0.06 * diag)
+    return pad, grow, feather, blend
+
+
+def _ensure_min_span(a0, a1, limit, min_size):
+    """Grow [a0, a1) symmetrically to at least ``min_size`` inside [0, limit)."""
+    size = a1 - a0
+    if size >= min_size or min_size <= 0:
+        return a0, a1
+    target = min(min_size, limit)
+    extra = target - size
+    a0 -= extra // 2
+    a1 = a0 + target
+    if a0 < 0:
+        a1 -= a0
+        a0 = 0
+    if a1 > limit:
+        a0 -= a1 - limit
+        a1 = limit
+    return max(0, a0), a1
+
+
+def _dilate_mask(mask, px):
+    """Binary-ish dilation of a [H, W] mask by ``px`` pixels (square kernel)."""
+    if px <= 0:
+        return mask
+    k = 2 * int(px) + 1
+    out = torch.nn.functional.max_pool2d(mask[None, None], kernel_size=k, stride=1, padding=int(px))
+    return out[0, 0]
+
+
+def _erode_mask(mask, px):
+    if px <= 0:
+        return mask
+    return 1.0 - _dilate_mask(1.0 - mask, px)
+
+
+def _denoise_mask(sel, grow, feather):
+    """Selection -> dilate(grow) -> blur(feather); always opaque inside the selection."""
+    m = _dilate_mask(sel, grow)
+    m = _blur_mask(m, feather / 2.5)
+    return torch.maximum(m, sel).clamp(0, 1)
+
+
+def _composite_mask(sel, grow, feather, blend):
+    """Denoise mask -> erode(blend/2) -> blur(blend); opaque inside the selection."""
+    m = _denoise_mask(sel, grow, feather)
+    m = _erode_mask(m, blend // 2)
+    m = _blur_mask(m, blend / 2.5)
+    return torch.maximum(m, sel).clamp(0, 1)
+
+
+def _gauss_np(arr, sigma):
+    """Gaussian blur of an HxW or HxWxC float32 numpy array (OpenCV, falls back to PIL)."""
+    if sigma <= 0:
+        return arr
+    try:
+        import cv2
+        return cv2.GaussianBlur(arr, (0, 0), sigmaX=float(sigma), sigmaY=float(sigma), borderType=cv2.BORDER_REPLICATE)
+    except ImportError:
+        t = torch.from_numpy(arr)
+        if t.dim() == 2:
+            return _blur_mask(t, sigma).numpy()
+        return torch.stack([_blur_mask(t[..., c], sigma) for c in range(t.shape[-1])], dim=-1).numpy()
+
+
+def _fill_masked(crop, fill_mask, mode):
+    """Fill the selected area of a [1, H, W, 3] crop before it goes to the model.
+
+    none:    untouched.
+    neutral: average color of the surroundings, soft edge.
+    blur:    surroundings smeared inward (normalized convolution), soft edge.
+    border:  OpenCV Navier-Stokes inpainting from the border, then smeared.
+    green:   pure green (0, 255, 0) with a hard edge, for edit models that are
+             told to "fill the green area".
+    """
+    if mode in (None, "", "none"):
+        return crop
+    img = crop[0].cpu().float().numpy().copy()
+    H, W = img.shape[:2]
+    fm = fill_mask.cpu().float().numpy().astype(np.float32)
+    hard = (fm > 0.5).astype(np.float32)
+    if hard.sum() <= 0:
+        return crop
+    if mode == "green":
+        out = img.copy()
+        out[hard > 0.5] = (0.0, 1.0, 0.0)
+        return torch.from_numpy(out)[None]
+    soft = np.clip(_gauss_np(hard, 4.0) * 1.0, 0, 1)
+    soft = np.maximum(soft, hard)
+    if mode == "neutral":
+        keep = hard < 0.5
+        color = img[keep].mean(axis=0) if keep.any() else np.array([0.5, 0.5, 0.5], dtype=np.float32)
+        out = img * (1 - soft[..., None]) + color[None, None, :] * soft[..., None]
+        return torch.from_numpy(out.astype(np.float32))[None]
+    if mode == "border":
+        try:
+            import cv2
+            img8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+            m8 = (hard * 255).astype(np.uint8)
+            img = cv2.inpaint(img8, m8, 3, cv2.INPAINT_NS).astype(np.float32) / 255.0
+        except ImportError:
+            pass
+    # blur (and the smoothing after border): smear the surroundings into the hole
+    # with a normalized convolution so the hole content itself does not bleed.
+    sigma = max(8.0, 0.05 * max(H, W))
+    inv = (1.0 - hard)[..., None]
+    num = _gauss_np(img * inv, sigma)
+    den = _gauss_np(inv[..., 0], sigma)[..., None]
+    smeared = np.where(den > 1e-4, num / np.maximum(den, 1e-4), img)
+    if mode == "border":
+        smeared = img * 0.5 + smeared * 0.5
+    out = img * (1 - soft[..., None]) + smeared * soft[..., None]
+    return torch.from_numpy(np.clip(out, 0, 1).astype(np.float32))[None]
+
+
+def _color_match(patch, reference, weight):
+    """Shift the patch's per-channel mean and spread towards the reference,
+    measured where ``weight`` (0..1, [H, W]) is high (the ring around the
+    selection that the composite keeps). Returns the patch unchanged when the
+    ring is too small to measure."""
+    w = weight.clamp(0, 1)
+    total = float(w.sum())
+    if total < 64:
+        return patch
+    w3 = w[..., None]
+
+    def stats(img):
+        mean = (img * w3).sum(dim=(0, 1)) / total
+        var = (((img - mean) ** 2) * w3).sum(dim=(0, 1)) / total
+        return mean, var.clamp_min(1e-6).sqrt()
+
+    mean_r, std_r = stats(reference)
+    mean_t, std_t = stats(patch)
+    scale = (std_r / std_t).clamp(0.5, 2.0)
+    return ((patch - mean_t) * scale + mean_r).clamp(0, 1)
 
 
 def _resize_image(image, width, height, crop="disabled"):
@@ -163,11 +315,11 @@ class InpaintCanvas:
         return {
             "required": {
                 "padding": ("INT", {"default": 64, "min": 0, "max": 4096, "step": 8,
-                                    "tooltip": "Context pixels added around the selection before cropping."}),
+                                    "tooltip": "Context pixels added around the selection before cropping. Ignored while the editor's Context is set to auto."}),
                 "target_size": ("INT", {"default": 1024, "min": 0, "max": 8192, "step": 8,
                                         "tooltip": "Longest side of the emitted crop. 0 keeps the native size."}),
                 "feather": ("INT", {"default": 16, "min": 0, "max": 512, "step": 1,
-                                    "tooltip": "Blur radius applied to the selection edge when the result is stitched back."}),
+                                    "tooltip": "Blur radius applied to the selection edge when the result is stitched back. Ignored while the editor's Feather is set to auto."}),
                 "multiple_of": ("INT", {"default": 64, "min": 1, "max": 256, "step": 1,
                                         "tooltip": "crop_image width and height are made a multiple of this (Flux wants 64)."}),
             },
@@ -185,7 +337,7 @@ class InpaintCanvas:
     RETURN_NAMES = ("crop_image", "crop_mask", "image", "mask", "stitch_info", "crop_width", "crop_height", "prompt", "control_image")
     OUTPUT_TOOLTIPS = (
         "Selected region plus padding, scaled to target_size. Inpaint this.",
-        "Selection mask matching crop_image.",
+        "Selection mask matching crop_image (grown and feathered when the editor's Feather is auto).",
         "The flattened canvas at full size.",
         "Selection mask at full size.",
         "Stitch parameters for a standalone Inpaint Canvas Stitch node.",
@@ -219,13 +371,38 @@ class InpaintCanvas:
         mask = _load_mask(state.get("mask"), height, width)
 
         m = max(1, int(multiple_of))
-        x0, y0, x1, y1 = _selection_bbox(mask, padding)
+        crop_settings = state.get("crop") or {}
+        auto_context = crop_settings.get("context") == "auto"
+        auto_feather = crop_settings.get("feather") == "auto"
+        fill_mode = crop_settings.get("fill", "none") or "none"
+        color_match = bool(crop_settings.get("colorMatch", False))
+        has_selection = bool((mask > 0.5).any())
+
+        sx0, sy0, sx1, sy1 = _selection_bbox(mask, 0)
+        auto_pad, auto_grow, auto_feather_px, auto_blend = _auto_selection_params(sx1 - sx0, sy1 - sy0)
+        if not has_selection:
+            auto_pad, auto_grow, auto_feather_px, auto_blend = 0, 0, 0, 0
+        pad_used = auto_pad if auto_context else int(padding)
+        if auto_feather:
+            grow_used, feather_used, blend_used = auto_grow, auto_feather_px, auto_blend
+        else:
+            grow_used, feather_used, blend_used = 0, int(feather), 0
+
+        x0, y0, x1, y1 = _selection_bbox(mask, pad_used)
+        if auto_context and has_selection:
+            x0, x1 = _ensure_min_span(x0, x1, width, MIN_AUTO_CROP)
+            y0, y1 = _ensure_min_span(y0, y1, height, MIN_AUTO_CROP)
         if target_size <= 0:
             # Native size: grow the region itself so the emitted crop is a clean multiple.
             x0, x1 = _fit_span_to_multiple(x0, x1, width, m)
             y0, y1 = _fit_span_to_multiple(y0, y1, height, m)
         crop = image[:, y0:y1, x0:x1]
-        crop_mask = mask[y0:y1, x0:x1]
+        sel_crop = mask[y0:y1, x0:x1]
+        # crop_mask is the denoise mask: grown and feathered in auto mode, the raw selection otherwise.
+        crop_mask = _denoise_mask(sel_crop, grow_used, feather_used) if auto_feather and has_selection else sel_crop
+        if has_selection and fill_mode != "none":
+            fill_px = max(grow_used - feather_used // 2, 0)
+            crop = _fill_masked(crop, _dilate_mask(sel_crop, fill_px), fill_mode)
 
         control_ref = state.get("control")
         if control_ref:
@@ -250,7 +427,11 @@ class InpaintCanvas:
             "base": base_ref,
             "mask": state.get("mask"),
             "bbox": [x0, y0, x1 - x0, y1 - y0],
-            "feather": int(feather),
+            "feather": int(feather_used),
+            "grow": int(grow_used),
+            "blend": int(blend_used),
+            "auto_feather": bool(auto_feather and has_selection),
+            "color_match": color_match,
             "width": width,
             "height": height,
         })
@@ -304,11 +485,20 @@ class InpaintCanvasStitch:
         # center-crop instead of distorting the content.
         patch = _resize_image(src, w, h, crop="center")[0]
 
-        blend = _blur_mask(mask, feather)[y:y + h, x:x + w]
+        if info.get("auto_feather"):
+            # Krita-style: opaque inside the selection, soft transition outside it.
+            full = _composite_mask(mask, int(info.get("grow", 0)), feather, int(info.get("blend", 0)))
+        else:
+            full = _blur_mask(mask, feather)
+        blend = full[y:y + h, x:x + w]
         blend3 = blend[..., None]
 
         out = base.clone()
         region = out[0, y:y + h, x:x + w]
+        if info.get("color_match"):
+            # Match the patch to the surroundings the composite keeps (the ring
+            # between the region border and the selection).
+            patch = _color_match(patch, region, 1.0 - blend)
         out[0, y:y + h, x:x + w] = region * (1.0 - blend3) + patch * blend3
 
         # Save the patch as RGBA (alpha = feathered mask) for the canvas layer.

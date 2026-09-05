@@ -300,6 +300,32 @@ const SEGMENT_BACKENDS = [
     },
 ];
 
+const MIN_AUTO_CROP = 512;          // keep in sync with nodes.py
+const CROP_DEFAULTS = { context: "auto", feather: "auto", fill: "none", colorMatch: true };
+const CROP_LEGACY = { context: "manual", feather: "manual", fill: "none", colorMatch: false };   // workflows saved before these existed
+
+/** Context padding, grow, feather and blend from the selection size (same formula as nodes.py). */
+function autoSelectionParams(selW, selH) {
+    const diag = Math.hypot(selW, selH);
+    const feather = Math.max(Math.floor(0.10 * diag), 32);
+    const grow = 4 + Math.floor(feather / 2);
+    const blend = Math.min(25, grow + Math.floor(feather / 2));
+    const pad = feather + 4 + Math.floor(0.06 * diag);
+    return { pad, grow, feather, blend };
+}
+
+function ensureMinSpan(a0, a1, limit, minSize) {
+    const size = a1 - a0;
+    if (size >= minSize || minSize <= 0) return [a0, a1];
+    const target = Math.min(minSize, limit);
+    const extra = target - size;
+    a0 -= Math.floor(extra / 2);
+    a1 = a0 + target;
+    if (a0 < 0) { a1 -= a0; a0 = 0; }
+    if (a1 > limit) { a0 -= a1 - limit; a1 = limit; }
+    return [Math.max(0, a0), a1];
+}
+
 function availableSegmentBackends() {
     const types = (window.LiteGraph && LiteGraph.registered_node_types) || {};
     return SEGMENT_BACKENDS.filter((b) => b.needs.every((n) => !!types[n]) && (!b.available || b.available(b)));
@@ -495,6 +521,8 @@ const STYLE = `
 .ipc-hitem .ipc-htext b { display:block; color:#ddd; font-weight:500; }
 .ipc-hitem .ipc-htext span { display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .ipc-info { padding:8px 10px; color:#aaa; display:grid; grid-template-columns:auto 1fr; gap:3px 10px; }
+.ipc-cropset { display:grid; grid-template-columns:auto 1fr; gap:4px 10px; align-items:center; }
+.ipc-cropset label { display:contents; }
 .ipc-info b { color:#ddd; font-weight:500; }
 .ipc-bottom { padding:5px 10px; background:#242424; border-top:1px solid #0d0d0d; color:#999; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; display:flex; }
 .ipc-kbd { color:#777; margin-left:auto; }
@@ -539,6 +567,7 @@ class InpaintEditor {
         this.color = "#ff3b30";
         this.fillEnclosed = true;
         this.promptText = "";
+        this.cropSettings = { ...CROP_DEFAULTS };
         this.undo = [];
         this.redo = [];
         this.selectionDirty = true;
@@ -861,6 +890,37 @@ class InpaintEditor {
         });
 
         section("Crop", true, (d) => {
+            const sec = el("div", "ipc-sec ipc-cropset");
+            const onChange = () => {
+                this.cropSettings = {
+                    context: this.cropContextSel.value === "auto" ? "auto" : "manual",
+                    feather: this.cropFeatherSel.value === "auto" ? "auto" : "manual",
+                    fill: this.cropFillSel.value,
+                    colorMatch: this.cropColorMatch.checked,
+                };
+                this.renderInfo();
+                this.draw();
+                this.notifyChanged();
+            };
+            const row = (label, control, title) => {
+                const l = el("label", null, label);
+                if (title) l.title = title;
+                l.appendChild(control);
+                sec.appendChild(l);
+            };
+            this.cropContextSel = selectInput(["auto", "manual"], "auto", "Context around the selection: auto sizes it from the selection (at least 512 px), manual uses the node's padding widget");
+            this.cropFeatherSel = selectInput(["auto", "manual"], "auto", "Mask edge: auto grows and feathers the mask from the selection size, manual blurs by the node's feather widget");
+            this.cropFillSel = selectInput(["none", "neutral", "blur", "border", "green"], "none", "How the selected area is filled in crop_image before the model sees it. Green is for edit models (\"fill the green area\").");
+            this.cropColorMatch = document.createElement("input");
+            this.cropColorMatch.type = "checkbox";
+            this.cropColorMatch.checked = true;
+            for (const c of [this.cropContextSel, this.cropFeatherSel, this.cropFillSel]) c.addEventListener("change", onChange);
+            this.cropColorMatch.addEventListener("change", onChange);
+            row("Context", this.cropContextSel);
+            row("Feather", this.cropFeatherSel);
+            row("Fill", this.cropFillSel);
+            row("Color match", this.cropColorMatch, "Match the result's colors and brightness to the surroundings when it is stitched back");
+            d.appendChild(sec);
             this.infoEl = el("div", "ipc-info");
             d.appendChild(this.infoEl);
         });
@@ -1103,12 +1163,23 @@ class InpaintEditor {
         if (this.isOpen) return;
         this.isOpen = true;
         document.body.appendChild(this.root);
+        // While the editor is open every shortcut belongs to it. The listener sits
+        // on window in the capture phase so ComfyUI's own handlers (workflow undo on
+        // Ctrl+Z, keybindings) never see the keys; otherwise Ctrl+Z would undo the
+        // whole workflow state and reset the canvas.
         this._docKey = (e) => {
-            if (e.key === "Escape" && this.isOpen) {
-                if (e.target === this.promptInput) return;
-                e.stopPropagation(); e.preventDefault();
+            if (!this.isOpen) return;
+            const t = e.target;
+            const inField = t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT");
+            if (e.key === "Escape") {
+                if (t === this.promptInput) return;
+                e.stopImmediatePropagation(); e.preventDefault();
                 if (this.pending) this.cancelPending(); else this.close();
+                return;
             }
+            if (inField) return;   // typing in the editor's own fields: their handlers stop propagation themselves
+            e.stopImmediatePropagation();
+            this.onKey(e);
         };
         window.addEventListener("keydown", this._docKey, true);
         this.promptInput.value = this.promptText;
@@ -1152,12 +1223,9 @@ class InpaintEditor {
             e.stopPropagation();
             this.onWheel(e);
         }, { passive: false });
-        root.addEventListener("keydown", (e) => {
-            const tag = e.target && e.target.tagName;
-            if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") { e.stopPropagation(); return; }
-            e.stopPropagation();
-            this.onKey(e);
-        });
+        // Keys are handled by the window capture listener (see open()); here we
+        // only keep them from bubbling to the graph canvas.
+        root.addEventListener("keydown", (e) => e.stopPropagation());
         root.addEventListener("paste", (e) => {
             if (e.target === this.promptInput) return;
             const items = e.clipboardData && e.clipboardData.items;
@@ -2173,13 +2241,32 @@ class InpaintEditor {
         return this.cachedBounds;
     }
 
+    /** Auto sizing values for the current selection, or null without a selection. */
+    autoParams() {
+        const b = this.getBounds();
+        return b ? autoSelectionParams(b[2] - b[0], b[3] - b[1]) : null;
+    }
+
     cropRect() {
         const b = this.getBounds();
-        const padding = this.widgetValue("padding", 0);
         if (!b) return [0, 0, this.width, this.height];
-        const x0 = Math.max(0, b[0] - padding), y0 = Math.max(0, b[1] - padding);
-        const x1 = Math.min(this.width, b[2] + padding), y1 = Math.min(this.height, b[3] + padding);
+        const auto = this.cropSettings.context === "auto";
+        const padding = auto ? this.autoParams().pad : this.widgetValue("padding", 0);
+        let x0 = Math.max(0, b[0] - padding), y0 = Math.max(0, b[1] - padding);
+        let x1 = Math.min(this.width, b[2] + padding), y1 = Math.min(this.height, b[3] + padding);
+        if (auto) {
+            [x0, x1] = ensureMinSpan(x0, x1, this.width, MIN_AUTO_CROP);
+            [y0, y1] = ensureMinSpan(y0, y1, this.height, MIN_AUTO_CROP);
+        }
         return [x0, y0, x1 - x0, y1 - y0];
+    }
+
+    syncCropControls() {
+        if (!this.cropContextSel) return;
+        this.cropContextSel.value = this.cropSettings.context === "auto" ? "auto" : "manual";
+        this.cropFeatherSel.value = this.cropSettings.feather === "auto" ? "auto" : "manual";
+        this.cropFillSel.value = this.cropSettings.fill || "none";
+        this.cropColorMatch.checked = !!this.cropSettings.colorMatch;
     }
 
     widgetValue(name, fallback) {
@@ -2195,7 +2282,9 @@ class InpaintEditor {
             const b = this.getBounds();
             rows.push(["Selection", b ? `${b[2] - b[0]} × ${b[3] - b[1]}` : "none (whole image)"]);
             const [, , cw, ch] = this.cropRect();
-            rows.push(["Crop", `${cw} × ${ch}`]);
+            const ap = this.autoParams();
+            rows.push(["Crop", `${cw} × ${ch}` + (ap && this.cropSettings.context === "auto" ? ` (context ${ap.pad} px)` : "")]);
+            if (ap) rows.push(["Edge", this.cropSettings.feather === "auto" ? `grow ${ap.grow}, feather ${ap.feather}, blend ${ap.blend} px` : `feather ${this.widgetValue("feather", 0)} px`]);
             const target = this.widgetValue("target_size", 0);
             const m = Math.max(1, this.widgetValue("multiple_of", 64) || 64);
             if (target > 0) {
@@ -2768,6 +2857,7 @@ class InpaintEditor {
             history: this.history.slice(-100).map((h) => ({ key: h.key, name: h.name, ref: h.ref, x: h.x, y: h.y, w: h.w, h: h.h, prompt: h.prompt, layerId: h.layerId, time: h.time })),
             selection: this.selectionDataUrl,
             seen: Array.from(this.seenResults).slice(-200),
+            crop: this.cropSettings,
         });
     }
 
@@ -2787,6 +2877,8 @@ class InpaintEditor {
             await this.setBase(state.base, img, { keepLayers: false });
             this.promptText = state.prompt || "";
             if (this.promptInput) this.promptInput.value = this.promptText;
+            this.cropSettings = state.crop ? { ...CROP_DEFAULTS, ...state.crop } : { ...CROP_LEGACY };
+            this.syncCropControls();
             for (const l of state.layers || []) {
                 if (!l.ref) continue;
                 try {
@@ -2867,6 +2959,7 @@ class InpaintEditor {
             control: controlRef,
             prompt: this.promptText,
             layers: this.layers.length,
+            crop: this.cropSettings,
         });
     }
 

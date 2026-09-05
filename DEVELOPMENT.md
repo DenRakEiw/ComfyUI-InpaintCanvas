@@ -338,13 +338,59 @@ Open, in the order suggested:
    patch and a `denoise` hint output).
 3. Soft-edged selection (feather preview), brush presets, keyboard color
    picker. (Rotation, distort and warp exist since 2026-09-05.)
-4. From the Krita plugin analysis (2026-09-05, see chat notes below):
-   fill modes before diffusion (blur / neutral / border / green for Flux.2
-   edit models), auto grow/feather/blend relative to selection diagonal
-   (feather 10 % of diagonal, min 32 px; grow 4 + feather/2; blend ≤ 25),
-   auto context padding `max(longest_side/16, avg_selection_side/2)` with a
-   512 px minimum and square balancing, color match in the stitch, regions via
-   the installed comfyui-tooling-nodes (`ETN_BackgroundRegion`,
-   `ETN_DefineRegion`, `ETN_AttentionMask`). Krita is GPL-3: reimplement the
-   formulas, do not copy code.
+4. Regions via the installed comfyui-tooling-nodes (`ETN_BackgroundRegion`,
+   `ETN_DefineRegion`, `ETN_AttentionMask`) - only worth it for local models
+   (the Flux.2 API takes no conditioning); check first whether the tooling
+   nodes support Flux.2 Klein at all. Krita is GPL-3: reimplement, do not copy.
+   (Fill modes, auto sizing and color match from the same analysis are done,
+   see section 10.)
 5. Registry publish once the user adds `REGISTRY_ACCESS_TOKEN`.
+
+## 10. Crop settings: auto sizing, fill modes, color match (2026-09-05)
+
+Stored in `canvas_state.crop = {context, feather, fill, colorMatch}` (not as
+node widgets: invariant 5). Defaults for new canvases `CROP_DEFAULTS`
+(auto / auto / none / true); states without a `crop` key load `CROP_LEGACY`
+(manual / manual / none / false) so old workflows behave as before. The
+editor's Crop section edits them; `cropRect()` and `renderInfo()` mirror the
+backend formula so the dashed rectangle matches what is emitted.
+
+Formulas (`_auto_selection_params` in nodes.py, `autoSelectionParams` in JS;
+Krita AI defaults reimplemented): `diag` = selection bbox diagonal,
+`feather = max(int(0.10 * diag), 32)`, `grow = 4 + feather // 2`,
+`blend = min(25, grow + feather // 2)`, `pad = feather + 4 + int(0.06 * diag)`.
+Auto context pads the bbox by `pad` and then widens it symmetrically to
+`MIN_AUTO_CROP` = 512 per side (`_ensure_min_span`, clamped to the image).
+
+Masks in auto feather mode:
+- denoise mask (`crop_mask` output) = selection -> dilate(grow) -> gaussian
+  blur(sigma feather / 2.5) -> max with selection (opaque inside).
+- composite mask (stitch) = denoise -> erode(blend // 2) -> blur(sigma
+  blend / 2.5) -> max with selection. Manual mode keeps the old
+  `_blur_mask(mask, feather)`.
+`stitch_info` carries `feather, grow, blend, auto_feather, color_match`.
+
+Fill (`_fill_masked`, applied to the crop before scaling, fill mask =
+selection dilated by `max(grow - feather // 2, 0)`, i.e. 4 px in auto mode):
+neutral = mean colour of the unmasked crop pixels with a soft edge (sigma 4);
+blur = normalized-convolution smear of the surroundings (sigma
+`max(8, 5 % of the crop's long side)`) so the old content does not bleed;
+border = OpenCV `cv2.inpaint(..., INPAINT_NS)` averaged with the smear; green
+= (0, 1, 0) hard. `cv2` 4.13 is in python_embeded; blurs fall back to PIL.
+
+Color match (`_color_match`): per-channel mean/std transfer in RGB, measured
+where the composite keeps the base (`1 - composite mask`, the ring), std ratio
+clamped to [0.5, 2], skipped when the ring has < 64 px of weight. Verified on
+an inverted patch: ring means moved from (124, 153, 144) to (121, 94, 101)
+against a base ring of (130, 102, 111).
+
+Verified via the API (`InpaintCanvas` -> `ImageInvert` -> back, synthetic
+1024x768 base with a 120x90 ellipse selection): manual crop 249x219,
+auto crop 512x512, all five fill modes visually correct, composite opaque
+inside the selection.
+
+Key handling: the window keydown listener (capture phase, registered in
+`open()`, removed in `close()`) now handles every key while the editor is
+open and calls `stopImmediatePropagation()`, except for keys typed into the
+editor's own inputs. Before, Ctrl+Z reached ComfyUI's workflow undo as well
+and reverted the canvas state.
