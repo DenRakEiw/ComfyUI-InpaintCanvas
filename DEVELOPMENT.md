@@ -656,7 +656,9 @@ alpha; `execution_error` with `cutoutPromptId` clears `cutoutPending`.
 
 `POST /inpaint_canvas/cleanup` with `{keep: [filenames], dry_run, min_age}`
 (`_register_routes` at import; `PromptServer.instance` exists when custom
-nodes load). `_cleanup_files` lists the three `inpaint_canvas` folders,
+nodes load). `_cleanup_files` lists the three `inpaint_canvas` folders
+(input/ and output/ restricted to `INTERNAL_FILE_RE`, the node's own
+`n<id>_<kind>_...` names, so user uploads and exports are never candidates),
 scans every `*.json` under `folder_paths.get_user_directory()` (saved
 workflows of every user; files over 50 MB skipped) for the file names, keeps
 those, the `keep` list and anything younger than `min_age` (default 120 s),
@@ -709,3 +711,19 @@ Measured on the 1776×2368 photo in headless Edge: grain 144 ms, sharpen
 50 -> 128); mask from selection limits the effect to the selection (outside
 diff 0); getValue/setValue round trip identical (diff 0, LUT restored); the
 run uploads a flattened base with the grain baked in.
+
+## 14. Export (2026-09-05, late)
+
+`exportImage({download})`: `flattenToCanvas({forRun: true})` (filters baked,
+control / reference layers out) -> PNG or JPEG blob -> `uploadBlob(..., {type:
+"output", subfolder: ""})`, i.e. the output root like SaveImage (not
+`output/inpaint_canvas`, which the cleanup treats as working files). The
+upload route de-duplicates identical content (same name returned, no new
+file) and appends " (n)" for changed content. PNG gets tEXt chunks
+`workflow` (graph serialize) and `inpaint_canvas` (prompt, negative, size,
+seed, mode) inserted after IHDR by `pngWithText` (CRC32 in JS); non-ASCII is
+`\uXXXX`-escaped by `asciiJson` so the chunk stays Latin-1 and the JSON
+stays valid. Verified: chunks parse, `Bäume` survives, levels are baked
+(mean 138 -> 85). Download = object URL + `<a download>`. Ctrl+S in the
+editor, the Save button in the top bar, name / format / Download in the
+Canvas section.

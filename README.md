@@ -269,11 +269,25 @@ stretched edge pixels. Press Generate to fill it; the *outpaint* use case of
 the upsampler writes the matching prompt. Control and reference layers survive
 the extension.
 
+### Saving the finished image
+
+**Save** in the top bar (Ctrl+S) writes the visible image, filters applied,
+control and reference layers left out, into ComfyUI's `output` folder. Name
+and format are set in the Canvas section: PNG carries the workflow and the
+canvas prompt as metadata like SaveImage does, so the file can be dropped
+onto ComfyUI to bring the workflow back; JPEG is smaller. **Download** saves
+and hands the file to the browser as well. Saving the same image twice does
+not create a second file, a changed image gets a counter appended. The
+node's `image` output is the same picture for chains that want to save or
+post-process it with nodes.
+
 ### Cleaning up files
 
 Uploads, results and helper masks accumulate in `input/inpaint_canvas`,
 `output/inpaint_canvas` and `temp/inpaint_canvas`. **Clean up files** in the
-Canvas section deletes what nothing uses any more: files referenced by an open
+Canvas section deletes the node's own working files (`n<id>_..._<hash>.png`)
+that nothing uses any more; images you loaded under their own name and
+images you saved are never touched. Kept are files referenced by an open
 editor, an open workflow tab, the browser's stored workflows or any saved
 workflow (every `.json` under ComfyUI's `user` directory) are kept, and so is
 anything younger than two minutes. You see the counts and sizes and confirm

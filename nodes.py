@@ -20,6 +20,7 @@ Two nodes:
 import json
 import math
 import os
+import re
 import time
 
 import numpy as np
@@ -36,6 +37,9 @@ SETTING_SLOTS = 8     # wildcard "setting_n" outputs the editor can drive (LoRA 
 REFERENCE_FITS = ("pad", "crop", "stretch")   # how reference layers of different sizes become one batch
 TEMP_MAX_AGE = 3600   # helper results in temp/inpaint_canvas older than this are pruned on the next helper run
 CLEANUP_MIN_AGE = 120  # the cleanup route never deletes files younger than this (a run may still need them)
+# Working files the node writes itself (n<canvas id>_<kind>_<hash or stamp>.png). Only these are ever cleaned up
+# in input/ and output/; files the user loaded or saved keep their own names and are never touched.
+INTERNAL_FILE_RE = re.compile(r"^n[A-Za-z0-9.]+_(base|mask|control|layer|lmask|ref|segsrc|promptctx|cutsrc|lut|result|segment|segments|cutout|upsample)_")
 
 
 # ---------------------------------------------------------------------------
@@ -146,8 +150,10 @@ def _cleanup_files(keep, dry_run=True, min_age=CLEANUP_MIN_AGE):
     """Remove files in the input/output/temp ``inpaint_canvas`` folders that no
     workflow references.
 
-    ``keep`` is the list of filenames the open editors still use (base, layers,
-    masks, history). On top of that every ``*.json`` under the user directory
+    Only the node's own working files (``INTERNAL_FILE_RE``) are candidates in
+    input/ and output/; temp/ is cleaned completely. ``keep`` is the list of
+    filenames the open editors still use (base, layers, masks, history). On
+    top of that every ``*.json`` under the user directory
     (saved workflows, incl. other users) is scanned for the file names, so a
     canvas saved in another workflow keeps its files. Files younger than
     ``min_age`` seconds are kept as well: a queued run may still need them.
@@ -159,8 +165,11 @@ def _cleanup_files(keep, dry_run=True, min_age=CLEANUP_MIN_AGE):
             continue
         for name in os.listdir(folder):
             path = os.path.join(folder, name)
-            if os.path.isfile(path):
-                files.append((kind, name, path))
+            if not os.path.isfile(path):
+                continue
+            if kind != "temp" and not INTERNAL_FILE_RE.match(name):
+                continue
+            files.append((kind, name, path))
     names = {name for _, name, _ in files}
     referenced = set(str(k) for k in (keep or []))
     user_dir = folder_paths.get_user_directory()

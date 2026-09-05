@@ -62,10 +62,10 @@ async function hashBlob(blob) {
     return Array.from(new Uint8Array(digest)).slice(0, 6).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-async function uploadBlob(blob, filename, { overwrite = true, type = "input" } = {}) {
+async function uploadBlob(blob, filename, { overwrite = true, type = "input", subfolder = SUBFOLDER } = {}) {
     const form = new FormData();
     form.append("image", new File([blob], filename, { type: "image/png" }));
-    form.append("subfolder", SUBFOLDER);
+    form.append("subfolder", subfolder);
     form.append("type", type);
     if (overwrite) form.append("overwrite", "true");
     const resp = await api.fetchApi("/upload/image", { method: "POST", body: form });
@@ -73,13 +73,54 @@ async function uploadBlob(blob, filename, { overwrite = true, type = "input" } =
         throw new Error("Inpaint Canvas: upload failed (" + resp.status + ")");
     }
     const data = await resp.json();
-    return { filename: data.name, subfolder: data.subfolder || SUBFOLDER, type: data.type || type };
+    return { filename: data.name, subfolder: data.subfolder || subfolder, type: data.type || type };
 }
 
 async function uploadCanvas(canvas, prefix) {
     const blob = await canvasToBlob(canvas);
     const hash = await hashBlob(blob);
     return { ref: await uploadBlob(blob, `${prefix}_${hash}.png`), hash };
+}
+
+const CRC_TABLE = (() => {
+    const t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
+    return t;
+})();
+
+function crc32(bytes) {
+    let c = 0xFFFFFFFF;
+    for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+    return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+/** JSON with every non-ASCII character escaped, so it fits a Latin-1 tEXt chunk unchanged. */
+function asciiJson(obj) {
+    return JSON.stringify(obj).replace(/[\u0080-\uffff]/g, (ch) => "\\u" + ch.charCodeAt(0).toString(16).padStart(4, "0"));
+}
+
+/** Insert tEXt chunks (keyword -> text) right after IHDR, the way ComfyUI's SaveImage stores prompt and workflow. */
+function pngWithText(buffer, texts) {
+    const src = new Uint8Array(buffer);
+    const ihdrEnd = 8 + 4 + 4 + 13 + 4;
+    const chunks = [];
+    for (const [key, value] of Object.entries(texts)) {
+        const payload = new TextEncoder().encode(key + "\0" + value);   // ASCII in, ASCII out (asciiJson)
+        const chunk = new Uint8Array(12 + payload.length);
+        const dv = new DataView(chunk.buffer);
+        dv.setUint32(0, payload.length);
+        chunk.set([0x74, 0x45, 0x58, 0x74], 4);   // tEXt
+        chunk.set(payload, 8);
+        dv.setUint32(8 + payload.length, crc32(chunk.subarray(4, 8 + payload.length)));
+        chunks.push(chunk);
+    }
+    const total = src.length + chunks.reduce((n, c) => n + c.length, 0);
+    const out = new Uint8Array(total);
+    out.set(src.subarray(0, ihdrEnd), 0);
+    let pos = ihdrEnd;
+    for (const c of chunks) { out.set(c, pos); pos += c.length; }
+    out.set(src.subarray(ihdrEnd), pos);
+    return new Blob([out], { type: "image/png" });
 }
 
 function makeCanvas(w, h) {
@@ -564,6 +605,8 @@ const ICONS = {
     mask: '<rect x="4" y="4" width="16" height="16" rx="2"/><circle cx="12" cy="12" r="4.5" fill="currentColor" stroke="none"/>',
     maskEdit: '<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 16l6-6 2 2-6 6H8z" fill="currentColor" stroke="none"/><path d="M15 9l1-1 2 2-1 1"/>',
     fx: '<path d="M4 6h9"/><path d="M19 6h1"/><circle cx="16" cy="6" r="2"/><path d="M4 12h2"/><path d="M12 12h8"/><circle cx="9" cy="12" r="2"/><path d="M4 18h11"/><circle cx="18" cy="18" r="2"/>',
+    save: '<path d="M5 4h11l3 3v13H5z"/><path d="M8 4v5h7V4"/><rect x="8" y="14" width="8" height="6"/>',
+    download: '<path d="M12 4v11"/><path d="M7 10l5 5 5-5"/><path d="M4 20h16"/>',
     broom: '<path d="M14 3l7 7"/><path d="M17.5 6.5L9 15"/><path d="M9 15l-5 5"/><path d="M6 12l6 6"/><path d="M11 13l-4 8"/>',
     extend: '<rect x="8" y="8" width="8" height="8"/><path d="M12 2v4"/><path d="M12 18v4"/><path d="M2 12h4"/><path d="M18 12h4"/><path d="M10 4l2-2 2 2"/><path d="M10 20l2 2 2-2"/><path d="M4 10l-2 2 2 2"/><path d="M20 10l2 2-2 2"/>',
 };
@@ -886,6 +929,7 @@ class InpaintEditor {
         });
         top.appendChild(this.fileInput);
         top.appendChild(iconButton("load", "Load an image as the base layer (Ctrl+V or drop also works)", () => this.fileInput.click(), "Load"));
+        top.appendChild(iconButton("save", "Save the finished image (Ctrl+S): all visible layers with their filters, without control and reference layers, into ComfyUI's output folder. Name and format in the Canvas section.", () => this.exportImage(), "Save"));
 
         const slider = (label, min, max, value, fmt, onInput) => {
             const lab = el("label", null, label);
@@ -1118,9 +1162,28 @@ class InpaintEditor {
             refs.appendChild(fitLab);
             d.appendChild(refs);
 
+            // export
+            const exp = el("div", "ipc-sec");
+            exp.appendChild(el("span", null, "Save as"));
+            this.saveNameInput = document.createElement("input");
+            this.saveNameInput.type = "text";
+            this.saveNameInput.className = "ipc-num";
+            this.saveNameInput.style.width = "120px";
+            this.saveNameInput.value = "inpaint_canvas";
+            this.saveNameInput.title = "File name (a counter is added when it exists)";
+            this.saveNameInput.spellcheck = false;
+            this.saveNameInput.addEventListener("keydown", (e) => { e.stopPropagation(); if (e.key === "Enter") this.exportImage(); });
+            exp.appendChild(this.saveNameInput);
+            this.saveFormatSel = selectInput(["png", "jpg"], "png", "PNG keeps the workflow inside the file (drop it onto ComfyUI to load it again), JPEG is smaller");
+            exp.appendChild(this.saveFormatSel);
+            const dl = iconButton("download", "Save and also download the file in the browser", () => this.exportImage({ download: true }), "Download");
+            dl.classList.add("ipc-small");
+            exp.appendChild(dl);
+            d.appendChild(exp);
+
             // files
             const files = el("div", "ipc-sec");
-            const clean = iconButton("broom", "Delete files in input/output/temp inpaint_canvas that no workflow uses: not this or any open editor, not any saved workflow, not younger than two minutes. Asks before deleting.", () => this.cleanupFiles(), "Clean up files");
+            const clean = iconButton("broom", "Delete the node's own working files in input/output/temp inpaint_canvas that no workflow uses: not this or any open editor, not any saved workflow, not younger than two minutes. Images you loaded or saved keep their names and are never touched. Asks before deleting.", () => this.cleanupFiles(), "Clean up files");
             clean.classList.add("ipc-small");
             files.appendChild(clean);
             this.cleanupInfo = el("span", null, "");
@@ -1654,6 +1717,7 @@ class InpaintEditor {
         if ((e.ctrlKey || e.metaKey) && k === "d") { e.preventDefault(); this.clearSelection(); return; }
         if ((e.ctrlKey || e.metaKey) && k === "u") { e.preventDefault(); this.upsamplePrompt(); return; }
         if ((e.ctrlKey || e.metaKey) && k === "i") { e.preventDefault(); this.invertSelection(); return; }
+        if ((e.ctrlKey || e.metaKey) && k === "s") { e.preventDefault(); this.exportImage(); return; }
         if (e.ctrlKey || e.metaKey || e.altKey) return;
         if (e.shiftKey && k === "f") { this.fillSelection(); return; }
         switch (k) {
@@ -3192,6 +3256,43 @@ class InpaintEditor {
         } catch (_) { /* ignore */ }
         try { for (let i = 0; i < localStorage.length; i++) scan(localStorage.getItem(localStorage.key(i))); } catch (_) { /* ignore */ }
         return Array.from(keep);
+    }
+
+    // ---- export -----------------------------------------------------------------
+
+    /** Save the visible composite (filters applied, no control / reference layers) to output/inpaint_canvas. */
+    async exportImage({ download = false } = {}) {
+        if (!this.base) { this.setStatus("Nothing to save yet."); return null; }
+        const fmt = this.saveFormatSel && this.saveFormatSel.value === "jpg" ? "jpg" : "png";
+        const stem = ((this.saveNameInput && this.saveNameInput.value) || "inpaint_canvas").trim().replace(/\.[a-z0-9]+$/i, "").replace(/[^a-z0-9._ -]/gi, "_") || "inpaint_canvas";
+        try {
+            this.setStatus("Saving ...");
+            const canvas = this.flattenToCanvas({ forRun: true });
+            let blob = await new Promise((r) => canvas.toBlob(r, fmt === "jpg" ? "image/jpeg" : "image/png", 0.92));
+            if (fmt === "png") {
+                // Same metadata as SaveImage: the workflow (and the canvas prompt), so the file loads back into ComfyUI.
+                try {
+                    const workflow = this.node.graph && this.node.graph.serialize ? this.node.graph.serialize() : app.graph.serialize();
+                    blob = pngWithText(await blob.arrayBuffer(), { workflow: asciiJson(workflow), inpaint_canvas: asciiJson({ prompt: this.promptText, negative: this.negativeText, width: this.width, height: this.height, seed: this.genSettings.seed, mode: this.genSettings.mode }) });
+                } catch (err) { console.warn("Inpaint Canvas: could not embed the workflow", err); }
+            }
+            // Into the output root like SaveImage, not into inpaint_canvas (that folder is working files the cleanup may delete).
+            const ref = await uploadBlob(blob, `${stem}.${fmt}`, { overwrite: false, type: "output", subfolder: "" });
+            const kb = Math.round(blob.size / 1024);
+            this.setStatus(`Saved output/${ref.subfolder ? ref.subfolder + "/" : ""}${ref.filename} (${this.width} × ${this.height}, ${kb} kB${fmt === "png" ? ", workflow embedded" : ""}).`);
+            if (download) {
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url; a.download = ref.filename;
+                document.body.appendChild(a); a.click(); a.remove();
+                setTimeout(() => URL.revokeObjectURL(url), 5000);
+            }
+            return ref;
+        } catch (err) {
+            console.error(err);
+            this.setStatus("Save failed: " + (err.message || err));
+            return null;
+        }
     }
 
     async cleanupFiles() {
