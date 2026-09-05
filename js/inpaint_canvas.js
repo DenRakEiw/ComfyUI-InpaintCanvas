@@ -567,6 +567,7 @@ const ICONS = {
     deselect: '<circle cx="11" cy="12" r="7" stroke-dasharray="3 2"/><path d="M8 12h6"/>',
     loop: '<circle cx="12" cy="12" r="7" stroke-dasharray="3 2"/><circle cx="12" cy="12" r="3.5" fill="currentColor" stroke="none"/>',
     rect: '<rect x="4" y="5" width="16" height="14" rx="1" stroke-dasharray="3 2"/>',
+    polygon: '<path d="M5 8l7-4 8 6-3 9H7z" stroke-dasharray="3 2"/><circle cx="5" cy="8" r="1.8" fill="currentColor" stroke="none"/><circle cx="12" cy="4" r="1.8" fill="currentColor" stroke="none"/><circle cx="20" cy="10" r="1.8" fill="currentColor" stroke="none"/><circle cx="17" cy="19" r="1.8" fill="currentColor" stroke="none"/><circle cx="7" cy="19" r="1.8" fill="currentColor" stroke="none"/>',
     lasso: '<path d="M12 4c4.4 0 8 2.2 8 5s-3.6 5-8 5-8-2.2-8-5 3.6-5 8-5z"/><path d="M6 12.5c-1 2 0 3.5 2 3.5s3 1.5 2 4"/>',
     object: '<path d="M4 9c0-3 3-5 6-5s6 1 6 4-2 3-2 5 1 3-1 4-4 1-6-1-3-4-3-7z" stroke-dasharray="3 2"/><path d="M13 12l7 3-3 1-1 3z" fill="currentColor" stroke="none"/>',
     paint: '<path d="M14 4l6 6-9 9H5v-6z"/><path d="M12 6l6 6"/><path d="M5 19c-1 0-2-1-2-2"/>',
@@ -604,6 +605,7 @@ const ICONS = {
     dice: '<rect x="4" y="4" width="16" height="16" rx="3"/><circle cx="9" cy="9" r="1.5" fill="currentColor" stroke="none"/><circle cx="15" cy="15" r="1.5" fill="currentColor" stroke="none"/><circle cx="15" cy="9" r="1.5" fill="currentColor" stroke="none"/><circle cx="9" cy="15" r="1.5" fill="currentColor" stroke="none"/>',
     magic: '<path d="M4 20l10-10"/><path d="M15 3l1 2 2 1-2 1-1 2-1-2-2-1 2-1z" fill="currentColor" stroke="none"/><path d="M19 9l.7 1.3L21 11l-1.3.7L19 13l-.7-1.3L17 11l1.3-.7z" fill="currentColor" stroke="none"/><path d="M14 8l2 2"/>',
     scissors: '<circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M20 4L8.3 15.7"/><path d="M8.3 8.3L20 20"/>',
+    refImage: '<rect x="3" y="5" width="18" height="14" rx="2" stroke-dasharray="3 2"/><circle cx="8.5" cy="10" r="1.6" fill="currentColor" stroke="none"/><path d="M21 16l-5-5-8 8"/>',
     image: '<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10" r="1.6" fill="currentColor" stroke="none"/><path d="M21 16l-5-5-8 8"/>',
     mask: '<rect x="4" y="4" width="16" height="16" rx="2"/><circle cx="12" cy="12" r="4.5" fill="currentColor" stroke="none"/>',
     maskEdit: '<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 16l6-6 2 2-6 6H8z" fill="currentColor" stroke="none"/><path d="M15 9l1-1 2 2-1 1"/>',
@@ -836,6 +838,8 @@ class InpaintEditor {
         this.paintCounter = 0;
         this.pointer = null;
         this.lassoPoints = null;
+        this.polyPoints = null;         // polygon selection in progress: [[x, y], ...]
+        this.polyMode = "replace";
         this.hover = null;
         this.objects = null;            // {hash, w, h, ids: Uint16Array, count, layerId}
         this.objectsPending = null;
@@ -998,6 +1002,7 @@ class InpaintEditor {
         addTool("select", "Paint selection (B): adds to the selection, Alt subtracts");
         addTool("rect", "Rectangle selection (R): replaces the selection, Shift adds, Alt subtracts");
         addTool("lasso", "Lasso selection (L): replaces the selection, Shift adds, Alt subtracts");
+        addTool("polygon", "Polygon selection (Shift+L): click point by point, click the first point, double-click or Enter to close, Backspace removes the last point, Esc cancels. Replaces the selection, Shift adds, Alt subtracts.");
         addTool("object", "Object selection (O): hover to see objects, click to select, click again to deselect. Shift adds, Alt subtracts.");
         addTool("deselect", "Erase from selection (D)");
         this.loopBtn = iconButton("loop", "Close loops (Photoshop-style): end a brush stroke where it started and the inside is filled too. Also for the subtract brush.", () => {
@@ -1038,7 +1043,7 @@ class InpaintEditor {
         this.canvas = document.createElement("canvas");
         this.ctx = this.canvas.getContext("2d");
         this.viewEl.appendChild(this.canvas);
-        this.dropHint = el("div", "ipc-drop", "Load an image, paste it (Ctrl+V) or drop it here.\nThen paint a selection and press Generate.\nDrop with Shift, or onto the layer list, to add reference images.");
+        this.dropHint = el("div", "ipc-drop", "Load an image, paste it (Ctrl+V) or drop it here.\nThen paint a selection and press Generate.\nDrop onto the layer list to import as a layer, with Shift on the canvas as a reference.");
         this.viewEl.appendChild(this.dropHint);
         this.buildSubbar();
         body.appendChild(this.viewEl);
@@ -1057,18 +1062,17 @@ class InpaintEditor {
 
         const layersHead = el("h4", null, "Layers");
         layersHead.appendChild(el("span", "ipc-grow"));
-        this.refInput = document.createElement("input");
-        this.refInput.type = "file";
-        this.refInput.accept = "image/*";
-        this.refInput.multiple = true;
-        this.refInput.style.display = "none";
-        this.refInput.addEventListener("change", () => {
-            const files = Array.from(this.refInput.files || []);
-            this.refInput.value = "";
-            if (files.length) this.addImageLayers(files, "reference");
-        });
-        layersHead.appendChild(this.refInput);
-        layersHead.appendChild(miniButton("image", "Add reference images (one layer per file, role \"reference\"). They are not part of the image; they travel with crop_image as extra batch images for Flux.2 / Kontext. Dropping files on this list does the same.", () => this.refInput.click()));
+        const fileInput = (onFiles) => {
+            const inp = document.createElement("input");
+            inp.type = "file"; inp.accept = "image/*"; inp.multiple = true; inp.style.display = "none";
+            inp.addEventListener("change", () => { const files = Array.from(inp.files || []); inp.value = ""; if (files.length) onFiles(files); });
+            layersHead.appendChild(inp);
+            return inp;
+        };
+        this.imageInput = fileInput((files) => this.addImageLayers(files, "none", { place: "fit" }));
+        this.refInput = fileInput((files) => this.addImageLayers(files, "reference"));
+        layersHead.appendChild(miniButton("image", "Import images as layers (one layer per file, part of the image, fitted to the canvas). Dropping files on this list does the same.", () => this.imageInput.click()));
+        layersHead.appendChild(miniButton("refImage", "Add reference images (one layer per file, role \"reference\"). They are not part of the image; they travel with crop_image as extra batch images for Flux.2 / Kontext. Shift+drop on the canvas does the same.", () => this.refInput.click()));
         layersHead.appendChild(miniButton("fx", "Add a filter layer (grain, sharpen, levels, LUT, vignette). It filters everything below it; give it a mask to limit where it applies.", () => this.addFilterLayer()));
         layersHead.appendChild(miniButton("plus", "Add a paint layer (Ctrl+Shift+N)", () => this.addPaintLayer()));
         side.appendChild(layersHead);
@@ -1079,7 +1083,7 @@ class InpaintEditor {
             e.preventDefault(); e.stopPropagation();
             this.layerList.classList.remove("ipc-dropping");
             const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []).filter((f) => f.type.startsWith("image/"));
-            if (files.length) this.addImageLayers(files, "reference");
+            if (files.length) this.addImageLayers(files, e.shiftKey ? "reference" : "none", e.shiftKey ? {} : { place: "fit" });
         });
         side.appendChild(this.layerList);
 
@@ -1625,7 +1629,9 @@ class InpaintEditor {
             if (e.key === "Escape") {
                 if (t === this.promptInput) return;
                 e.stopImmediatePropagation(); e.preventDefault();
-                if (this.pending) this.cancelPending(); else this.close();
+                if (this.pending) this.cancelPending();
+                else if (this.polyPoints) { this.polyPoints = null; this.draw(); this.setStatus("Polygon cancelled."); }
+                else this.close();
                 return;
             }
             if (inField) return;   // typing in the editor's own fields: their handlers stop propagation themselves
@@ -1686,7 +1692,9 @@ class InpaintEditor {
             for (const item of items) {
                 if (item.type.startsWith("image/")) {
                     e.preventDefault(); e.stopPropagation();
-                    this.loadFile(item.getAsFile());
+                    // no base yet: the image becomes the base; otherwise it lands as a new layer at the origin (Krita: paste as new layer)
+                    if (this.width) this.addImageLayers([item.getAsFile()], "none", { place: "origin" });
+                    else this.loadFile(item.getAsFile());
                     return;
                 }
             }
@@ -1720,6 +1728,7 @@ class InpaintEditor {
 
     setTool(tool) {
         if (this.pending && tool !== "transform") this.cancelPending();
+        if (this.polyPoints && tool !== "polygon") this.polyPoints = null;
         this.tool = tool;
         if (this.hardCtl) {
             const v = Math.round(this.activeHardness() * 100);
@@ -1741,6 +1750,8 @@ class InpaintEditor {
         if (e.key === "Escape") { e.preventDefault(); if (this.pending) this.cancelPending(); else this.close(); return; }
         if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); this.generate(); return; }
         if (e.key === "Enter" && this.pending) { e.preventDefault(); this.applyPending(); return; }
+        if (e.key === "Enter" && this.polyPoints) { e.preventDefault(); this.closePolygon(); this.draw(); return; }
+        if ((e.key === "Backspace" || e.key === "Delete") && this.polyPoints) { e.preventDefault(); this.polyPoints.pop(); if (!this.polyPoints.length) this.polyPoints = null; this.draw(); return; }
         if (this.tool === "transform" && !this.pending && e.key.startsWith("Arrow")) {
             const l = this.activeLayer();
             if (l) {
@@ -1759,10 +1770,14 @@ class InpaintEditor {
         if ((e.ctrlKey || e.metaKey) && k === "y") { e.preventDefault(); this.redoStep(); return; }
         if ((e.ctrlKey || e.metaKey) && k === "d") { e.preventDefault(); this.clearSelection(); return; }
         if ((e.ctrlKey || e.metaKey) && k === "u") { e.preventDefault(); this.upsamplePrompt(); return; }
+        if ((e.ctrlKey || e.metaKey) && k === "c") { e.preventDefault(); this.copySelection({ merged: e.shiftKey }); return; }
+        if ((e.ctrlKey || e.metaKey) && k === "x") { e.preventDefault(); this.copySelection({ cut: true }); return; }
+        if ((e.ctrlKey || e.metaKey) && k === "v" && this.clipboard) { e.preventDefault(); this.pasteClipboard(); return; }
         if ((e.ctrlKey || e.metaKey) && k === "i") { e.preventDefault(); this.invertSelection(); return; }
         if ((e.ctrlKey || e.metaKey) && k === "s") { e.preventDefault(); this.exportImage(); return; }
         if (e.ctrlKey || e.metaKey || e.altKey) return;
         if (e.shiftKey && k === "f") { this.fillSelection(); return; }
+        if (e.shiftKey && k === "l") { this.setTool("polygon"); return; }
         switch (k) {
             case "b": this.setTool("select"); break;
             case "r": this.setTool("rect"); break;
@@ -1987,6 +2002,18 @@ class InpaintEditor {
             this.pushUndo({ kind: "selection" });
             this.pointer = { kind: "lasso", mode: selMode };
             this.lassoPoints = [[ix, iy]];
+        } else if (this.tool === "polygon") {
+            if (!this.polyPoints) {
+                this.polyPoints = [[ix, iy]];
+                this.polyMode = selMode;
+            } else {
+                const [fx, fy] = this.polyPoints[0];
+                const near = Math.hypot(ix - fx, iy - fy) <= 8 / this.view.scale;
+                if ((near && this.polyPoints.length >= 3) || e.detail >= 2) { this.closePolygon(); this.draw(); return; }
+                this.polyPoints.push([ix, iy]);
+            }
+            this.draw();
+            return;
         } else if (this.tool === "object") {
             this.pointer = { kind: "object", start: [cx, cy], moved: false, shift: e.shiftKey, alt: e.altKey };
         } else if (this.tool === "paint" || this.tool === "erase") {
@@ -2144,6 +2171,26 @@ class InpaintEditor {
             this.notifyChanged();
         }
         this.draw();
+    }
+
+    /** Fill the polygon in progress into the selection with the mode chosen at its first point. */
+    closePolygon() {
+        const pts = this.polyPoints;
+        this.polyPoints = null;
+        if (!pts || pts.length < 3) { this.setStatus("A polygon needs at least three points."); return; }
+        this.pushUndo({ kind: "selection" });
+        const sctx = this.selection.getContext("2d");
+        if (this.polyMode === "replace") { sctx.globalCompositeOperation = "source-over"; sctx.clearRect(0, 0, this.width, this.height); this.selectionLabel = ""; }
+        sctx.globalCompositeOperation = this.polyMode === "subtract" ? "destination-out" : "source-over";
+        sctx.fillStyle = "#ff0000";
+        sctx.beginPath();
+        sctx.moveTo(pts[0][0], pts[0][1]);
+        for (let i = 1; i < pts.length; i++) sctx.lineTo(pts[i][0], pts[i][1]);
+        sctx.closePath();
+        sctx.fill();
+        sctx.globalCompositeOperation = "source-over";
+        this.markSelectionChanged();
+        this.setStatus(`Polygon with ${pts.length} points ${this.polyMode === "replace" ? "selected" : this.polyMode === "add" ? "added" : "subtracted"}.`);
     }
 
     selectionDab(x0, y0, x1, y1) {
@@ -2341,6 +2388,42 @@ class InpaintEditor {
         ctx.restore();
         this.markLayerChanged(layer);
         this.draw();
+    }
+
+    /** Copy the selected pixels (of the active layer, or of everything visible with merged) into the editor's clipboard; cut clears them afterwards. */
+    copySelection({ merged = false, cut = false } = {}) {
+        if (!this.selection || !this.getBounds()) { this.setStatus("Nothing selected to copy."); return null; }
+        const [x0, y0, x1, y1] = this.getBounds();
+        const w = x1 - x0, h = y1 - y0;
+        const layer = this.activeLayer();
+        const useMerged = merged || !layer || layer.kind === "filter";
+        const c = makeCanvas(w, h);
+        const ctx = c.getContext("2d");
+        if (useMerged) {
+            ctx.drawImage(this.flattenToCanvas({ forRun: true }), x0, y0, w, h, 0, 0, w, h);
+        } else {
+            ctx.drawImage(this.layerPixels(layer), layer.x - x0, layer.y - y0, layer.w, layer.h);
+        }
+        ctx.globalCompositeOperation = "destination-in";
+        ctx.drawImage(this.selection, -x0, -y0);
+        ctx.globalCompositeOperation = "source-over";
+        this.clipboard = { canvas: c, x: x0, y: y0, source: useMerged ? "merged" : layer.name };
+        if (cut && layer && !useMerged) this.clearSelectedPixels();
+        this.setStatus(`${cut ? "Cut" : "Copied"} ${w} × ${h} px from ${this.clipboard.source}. Ctrl+V pastes it as a new layer.`);
+        return this.clipboard;
+    }
+
+    /** Paste the editor's clipboard as a new layer at the place it was copied from. */
+    pasteClipboard() {
+        if (!this.clipboard) { this.setStatus("Nothing copied yet (Ctrl+C with a selection)."); return null; }
+        if (!this.width) { this.setStatus("Load an image first."); return null; }
+        this.pasteCounter = (this.pasteCounter || 0) + 1;
+        const { canvas, x, y } = this.clipboard;
+        const copy = makeCanvas(canvas.width, canvas.height);
+        copy.getContext("2d").drawImage(canvas, 0, 0);
+        const layer = this.addLayer({ name: `Paste ${this.pasteCounter}`, kind: "image", ref: null, canvas: copy, x, y, w: canvas.width, h: canvas.height, dirty: true });
+        this.setStatus(`${layer.name} added (${canvas.width} × ${canvas.height} at ${x}, ${y}). Move it with T.`);
+        return layer;
     }
 
     /** Delete the selected pixels of the active layer (Krita "Clear"); on a mask in edit mode it hides them. */
@@ -3338,7 +3421,7 @@ class InpaintEditor {
     }
 
     /** Upload image files and add each as a layer (role "reference" by default). */
-    async addImageLayers(files, role = "reference") {
+    async addImageLayers(files, role = "reference", { place = "cascade" } = {}) {
         files = Array.from(files || []).filter((f) => f && f.type && f.type.startsWith("image/"));
         if (!files.length) return;
         if (!this.width) {
@@ -3357,8 +3440,11 @@ class InpaintEditor {
                 // Shown at a third of the canvas, cascaded from the top left; the file itself stays the reference.
                 const s = Math.min(1, (Math.max(this.width, this.height) / 3) / Math.max(img.naturalWidth, img.naturalHeight));
                 const w = Math.max(1, Math.round(img.naturalWidth * s)), h = Math.max(1, Math.round(img.naturalHeight * s));
-                const off = 16 + (n % 8) * 24;
-                last = this.addLayer({ name: (file.name || "image").replace(/\.[a-z0-9]+$/i, ""), kind: "image", role, ref, canvas: imageToCanvas(img), x: off, y: off, w, h, dirty: false });
+                const off = place === "cascade" ? 16 + (n % 8) * 24 : 0;
+                // origin: native size; fit: native size unless larger than the canvas; cascade: a third of the canvas (references)
+                const fs = place === "fit" ? Math.min(1, this.width / img.naturalWidth, this.height / img.naturalHeight) : 1;
+                const lw = place === "cascade" ? w : Math.max(1, Math.round(img.naturalWidth * fs)), lh = place === "cascade" ? h : Math.max(1, Math.round(img.naturalHeight * fs));
+                last = this.addLayer({ name: (file.name || "image").replace(/\.[a-z0-9]+$/i, ""), kind: "image", role, ref, canvas: imageToCanvas(img), x: off, y: off, w: lw, h: lh, dirty: false });
                 n++;
             } catch (err) {
                 console.error(err);
@@ -3367,7 +3453,7 @@ class InpaintEditor {
         }
         if (last) {
             const refs = this.referenceLayers().length;
-            this.setStatus(role === "reference" ? `${files.length} reference image${files.length > 1 ? "s" : ""} added (${refs} will travel with crop_image). They are not part of the image.` : `${files.length} image layer${files.length > 1 ? "s" : ""} added.`);
+            this.setStatus(role === "reference" ? `${files.length} reference image${files.length > 1 ? "s" : ""} added (${refs} will travel with crop_image). They are not part of the image.` : `${files.length} image layer${files.length > 1 ? "s" : ""} added. Move or scale with T; the role select can turn it into a reference.`);
         }
     }
 
@@ -4351,6 +4437,27 @@ class InpaintEditor {
             ctx.moveTo(this.lassoPoints[0][0], this.lassoPoints[0][1]);
             for (const [x, y] of this.lassoPoints) ctx.lineTo(x, y);
             ctx.stroke();
+            ctx.restore();
+        }
+        if (this.polyPoints && this.polyPoints.length) {
+            const pts = this.polyPoints;
+            ctx.save();
+            ctx.lineWidth = 1 / s;
+            ctx.strokeStyle = "#fff";
+            ctx.setLineDash([4 / s, 3 / s]);
+            ctx.beginPath();
+            ctx.moveTo(pts[0][0], pts[0][1]);
+            for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+            if (this.hover) ctx.lineTo(this.hover[0], this.hover[1]);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            const r = 4 / s;
+            ctx.fillStyle = "#fff";
+            for (const [x, y] of pts) ctx.fillRect(x - r / 2, y - r / 2, r, r);
+            // the first point is the closing target: a ring, larger when the cursor is within reach
+            const closeNear = this.hover && pts.length >= 3 && Math.hypot(this.hover[0] - pts[0][0], this.hover[1] - pts[0][1]) <= 8 / s;
+            ctx.strokeStyle = closeNear ? "#7cc7ff" : "#fff";
+            ctx.beginPath(); ctx.arc(pts[0][0], pts[0][1], (closeNear ? 8 : 5) / s, 0, Math.PI * 2); ctx.stroke();
             ctx.restore();
         }
         const brushTools = ["select", "deselect", "paint", "erase"];

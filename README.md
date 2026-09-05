@@ -96,8 +96,10 @@ rectangle is the crop that leaves the node, not the selection.
 Rectangle and lasso replace the selection like in Krita and Photoshop; hold
 Shift to add, Alt to subtract. The brush adds, with Alt it subtracts.
 
-Tools on the left: brush (B), rectangle (R), lasso (L), object selection
-(O), deselect brush (D). `[` and `]` change the brush size, the top bar holds
+Tools on the left: brush (B), rectangle (R), lasso (L), polygon (Shift+L:
+click point by point, click the first point, double-click or Enter to close,
+Backspace removes the last point, Esc cancels), object selection (O),
+deselect brush (D). `[` and `]` change the brush size, the top bar holds
 size, hardness, opacity and the paint colour.
 
 - **Close loops** (toggle under the selection tools) works like Photoshop's
@@ -128,7 +130,11 @@ size, hardness, opacity and the paint colour.
   takes the opaque area of the active layer. Clear the selection (Ctrl+D),
   invert it (Ctrl+I). **Clear** (Del) deletes the selected pixels of the
   active layer, like Krita: select what you want to keep, invert, Del.
-  Without a selection, Del deletes the active layer.
+  Without a selection, Del deletes the active layer. **Ctrl+C** copies the
+  selected pixels of the active layer (Ctrl+Shift+C from everything
+  visible), **Ctrl+X** cuts them, **Ctrl+V** pastes them as a new layer at
+  the same place. An image from the system clipboard becomes a new layer
+  when a base is loaded, the base otherwise.
 
 ### Layers
 
@@ -155,10 +161,14 @@ size, hardness, opacity and the paint colour.
   canny, other). Such layers are left out of the image your chain sees and
   instead composited on black into the `control_image` output, cropped and
   scaled exactly like `crop_image`. Feed it to ControlNet.
-- **Reference layers** (Flux.2 / Kontext multi-reference editing): the image
-  button in the Layers header uploads one or more files as layers with the
-  role *reference* (dropping files onto the layer list, or onto the canvas
-  with Shift, does the same). Reference layers are shown on the canvas with a
+- **Image layers**: the image button in the Layers header imports one or
+  more files as ordinary layers, part of the image, at native size (fitted
+  to the canvas when larger); dropping files onto the layer list does the
+  same, and an image pasted from the system clipboard lands as a layer too.
+- **Reference layers** (Flux.2 / Kontext multi-reference editing): the
+  dashed image button in the Layers header uploads one or more files as
+  layers with the role *reference* (dropping files onto the canvas with
+  Shift does the same). Reference layers are shown on the canvas with a
   cyan frame and their batch number, but they are not part of the image your
   chain sees. Instead they are appended to the `crop_image` batch, top of the
   list first, fitted to the crop's size (cutout masks applied, transparency
@@ -373,13 +383,14 @@ and files stay.
 
 | Keys                         | Action                                   |
 | ---------------------------- | ---------------------------------------- |
-| B, R, L, O, D                | selection brush, rectangle, lasso, object, deselect |
+| B, R, L, Shift+L, O, D       | selection brush, rectangle, lasso, polygon, object, deselect |
 | P, E, T, H                   | paint, erase, transform, hand            |
 | `[` `]`                      | brush size                               |
 | Ctrl+Z, Ctrl+Shift+Z, Ctrl+Y | undo, redo                               |
 | Ctrl+D, Ctrl+I               | clear, invert selection                  |
 | Shift+F                      | fill selection with colour               |
 | Ctrl+Shift+N                 | new paint layer                          |
+| Ctrl+C, Ctrl+Shift+C, Ctrl+X, Ctrl+V | copy selection (from layer / merged), cut, paste as new layer |
 | Delete                       | clear the selected pixels of the active layer; without a selection delete the layer |
 | Ctrl+U                       | upsample prompt                          |
 | Ctrl+S                       | save the finished image                  |
