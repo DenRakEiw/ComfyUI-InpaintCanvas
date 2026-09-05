@@ -126,13 +126,19 @@ the state; the frontend rolls a new seed before every Generate when
   prompt: "...",
   layers: [{ id, name, kind: "result"|"paint", role: "none"|"scribble"|...,
              blend: "normal"|"multiply"|..., ref, x, y, w, h, opacity, visible }],
-  history: [{ key, name, ref, x, y, w, h, prompt, layerId, time }],
+  history: [{ key, name, ref, x, y, w, h, prompt, layerId, time, seed, mode, denoise }],
   selection: "data:image/png;base64,...",     // red where selected
-  seen: ["subfolder/filename", ...] }          // results already added
+  seen: ["subfolder/filename", ...],           // results already added
+  negative: "...",
+  crop: { context: "auto"|"manual", feather: "auto"|"manual",
+          fill: "none"|"neutral"|"blur"|"border"|"green", colorMatch, extendFill },
+  upsample: { useCase, backend },
+  gen: { mode: "api"|"local", denoise, seed, seedRandom, refine },
+  settings: { "1": { value, type, label, target }, ... } }   // setting_n outputs
 ```
 
 Prompt-time JSON (what the backend sees, from `serializeForPrompt`):
-`{ width, height, base, mask, control, prompt, layers }` where `base` is the
+`{ width, height, base, mask, control, prompt, negative, layers, crop, gen, settings }` where `base` is the
 flattened visible non-control layers (or the original ref when no layer is
 visible), `mask` the selection as grayscale PNG, `control` the control layers
 on black (or null). Files are named `n{nodeId}_{base|mask|control|layer}_{sha1[:12]}.png`
@@ -340,56 +346,91 @@ Florence.
 ## 7. Known limitations
 
 - Base layer is not editable (no erase); painting on it creates a paint layer.
-- Layer transform is move/scale only (no rotation, no free distortion).
 - History thumbnails come from the layer canvas or the output file; discarded
-  results keep their file in `output/inpaint_canvas/` forever (no cleanup).
-- Uploads accumulate in `input/inpaint_canvas/` (hash-named, deduplicated per
-  content, never deleted).
-- Very large canvases: `selectionBounds`, flood fill and the distance
-  transform are O(W·H) in JS; a 4K canvas takes a few hundred ms per op.
+  results keep their file in `output/inpaint_canvas/` forever, uploads
+  accumulate in `input/inpaint_canvas/` (hash-named, deduplicated per content),
+  helper results in `temp/inpaint_canvas/`. No cleanup anywhere yet.
+- Very large canvases: `selectionBounds`, `layerAlpha`, the object map and the
+  distance transform are O(W*H) in JS; a 4K canvas takes a few hundred ms per
+  op.
 - Painting on a scaled layer paints into its native resolution (fine), but
   brush size is scaled by the average of the two axes.
+- The object tool's map is computed at `points_per_side` 32; very small parts
+  are missed (a detail slider would raise it to 48/64).
+- Prompt upsampling with the 2B model: German requests sometimes lose a word,
+  *remove* keeps describing the object (see section 11).
+- Setting outputs push values into the target widget, but a value typed into
+  the target widget itself is not read back until the link is re-made.
 - No LICENSE file yet (user has not chosen one).
 
-## 9. State at the end of 2026-09-05
+## 8. State at the end of the 2026-09-05 session
 
-Browser-verified on the user's photo (`input/inpaint_canvas/ComfyUI_01940_.png`):
-select by text with SAM3 (RMBG), object tool hover / click / toggle / Shift /
-Alt with undo, source switch for both, helper prompts only (`/history` shows
-`seg_*` and `obj_*` keys, never the main chain). Test recipe for the editor
-from the console: build the graph as in section 6, `ed = c.inpaintEditor`,
-`ed.setTool("object")`, then dispatch `PointerEvent`s on `ed.canvas` (map
-image coords with `ed.view` and the canvas bounding rect; `buttons: 0` for
-hover, pointerdown + pointerup at the same spot for a click).
+Everything in README is built and verified (browser and/or API), pushed to
+GitHub as DenRakEiw, latest commit "README rewritten ..." (`64ce260`). Nothing
+is half-done. Screenshots for the README live in `docs/img/*.jpg` and were
+taken with `docs/shots.py`: a headless Edge with `--remote-debugging-port`
+driven over the DevTools protocol (aiohttp websocket), which loads ComfyUI,
+builds a demo graph, opens the editor, runs SAM3 / SAM2 / a model-free
+round trip and captures `Page.captureScreenshot`. Re-run it after UI changes
+(see the docstring; ComfyUI must be running).
 
-Note: `.p-blockui-mask` can stay in the DOM with size 0x0 after the restore;
-check `offsetWidth` rather than existence.
+Test recipes: section 6 (round trip), 6b (helper prompts), and from the
+console `ed = c.inpaintEditor`, `ed.setTool("object")`, dispatch
+`PointerEvent`s on `ed.canvas` (map image coords with `ed.view` and the
+canvas bounding rect; `buttons: 0` for hover, pointerdown + pointerup at the
+same spot for a click). In the in-app browser the pane must be visible for
+the editor to have a layout; hidden panes give a 0x0 canvas. The
+`.p-blockui-mask` element can stay in the DOM with size 0x0 after the
+workflow restore; check `offsetWidth` rather than existence.
 
-Ideas not done: a "detail" slider for the object tool (points_per_side 48/64
-finds smaller parts), showing all object outlines while hovering, SAM3 point
-prompts for click-to-segment without the precomputed map (core's point path
-works), and cleanup of `temp/inpaint_canvas/`.
+## 9. Roadmap
 
-## 8. Roadmap (from the user's own Krita list)
+Done from the user's Krita list and the plugin analysis: control layers,
+soft brush + opacity, blend modes, outpainting with border fill, grow /
+shrink / from layer, history, select by text, object selection, prompt
+upsampling, auto context / feather, fill modes, color match, API / local
+switch, denoise + seed, refine, negative prompt, strength-scaled feather,
+editor-driven setting outputs.
 
-Done: control layers, soft brush + opacity, blend modes, outpainting,
-grow/shrink/from-layer, history.
+Open, roughly by value for the user's workflow (Flux.2 API plus local Klein):
 
-Open, in the order suggested:
-1. **Regions**: per-layer prompt that applies only inside that layer's alpha.
-   Backend: mask outputs per region + string outputs, or a list output.
-2. **Refine pass**: re-run a result at low denoise without reselecting
-   (probably a "refine" flag in canvas_state that makes `crop_mask` the whole
-   patch and a `denoise` hint output).
-3. Soft-edged selection (feather preview), brush presets, keyboard color
-   picker. (Rotation, distort and warp exist since 2026-09-05.)
-4. Regions via the installed comfyui-tooling-nodes (`ETN_BackgroundRegion`,
-   `ETN_DefineRegion`, `ETN_AttentionMask`) - only worth it for local models
-   (the Flux.2 API takes no conditioning); check first whether the tooling
-   nodes support Flux.2 Klein at all. Krita is GPL-3: reimplement, do not copy.
-   (Fill modes, auto sizing and color match from the same analysis are done,
-   see section 10.)
-5. Registry publish once the user adds `REGISTRY_ACCESS_TOKEN`.
+1. **Reference layers** (Flux.2 / Kontext multi-reference editing): a layer
+   role "reference" that is excluded from the image and emitted as a batch on
+   a new `reference_images` output (append!), so a product shot or a face can
+   be dropped onto the canvas as a layer and used as a reference by the API
+   node. Same mechanism as control layers.
+2. **Batch / variants**: N results per Generate landing in the history, plus
+   an A/B compare (InvokeAI's staging area idea: accept or discard before the
+   layer stays). Local only by default; on the API it is N paid calls, so ask
+   for confirmation.
+3. **Layer masks and cutouts**: a "remove background" action on a layer via
+   the installed RMBG nodes (helper prompt, mask -> layer alpha), and an
+   optional alpha mask per layer. LayerForge and Krita both have it.
+4. **Styles**: presets bundling prompt prefix / suffix, `<lora:name:1.0>`
+   syntax parsed out of the prompt, sampler settings (Krita's new "Style &
+   Prompt" node does this for custom workflows); here they would become
+   string outputs and setting values.
+5. **Regions**: per-layer prompts through the installed comfyui-tooling-nodes
+   (`ETN_BackgroundRegion`, `ETN_DefineRegion`, `ETN_AttentionMask`), local
+   models only; verify Flux.2 Klein support first. Krita 1.53 also added
+   semantic segmentation control layers (Anima regional controlnet), which
+   is the same idea from the control side.
+6. **Object tool details**: a detail slider (points_per_side 48 / 64), all
+   object outlines shown while the tool is active, SAM3 point prompts for a
+   click-to-segment without the precomputed map (core's point path works).
+7. **Live preview**: Krita's live mode (continuous low-step generation while
+   painting) is a separate project; a cheap first step is "auto-generate on
+   selection change" with a local model.
+8. **Housekeeping**: cleanup of `temp/`, `output/` and `input/` files older
+   than N days or not referenced by any history entry; LICENSE; Comfy Registry
+   publish once `REGISTRY_ACCESS_TOKEN` exists; soft-edged selection preview;
+   brush presets; keyboard colour picker.
+
+Sources looked at on 2026-09-05: the installed Krita AI plugin (`%APPDATA%/
+krita/pykrita/ai_diffusion`, GPL-3: reimplement, never copy), its 1.49 / 1.53
+release notes, Comfyui-LayerForge (polygonal inpaint selection, IndexedDB
+persistence, background removal), InvokeAI's unified canvas (infinite canvas,
+staging area, region prompting).
 
 ## 10. Crop settings: auto sizing, fill modes, color match (2026-09-05)
 
@@ -433,28 +474,6 @@ Verified via the API (`InpaintCanvas` -> `ImageInvert` -> back, synthetic
 1024x768 base with a 120x90 ellipse selection): manual crop 249x219,
 auto crop 512x512, all five fill modes visually correct, composite opaque
 inside the selection.
-
-## 12. Ideas from the Krita AI plugin not taken yet (2026-09-05)
-
-Looked at `model.py` properties and `settings.py` of the installed plugin
-(`%APPDATA%/krita/pykrita/ai_diffusion`). Done here: strength (= denoise),
-seed / fixed seed, fill modes, auto grow/feather/padding, color match,
-history, control layers, prompt translation (via the upsampler). Not done,
-roughly by value for this node:
-- Refine workflow (WorkflowKind.refine / refine_region): re-run the selected
-  region at denoise < 1 without a mask edge; with the denoise setting this is
-  now "lower denoise + Generate", a dedicated button could also set the fill
-  to none and skip the mask feather.
-- Batch count: N results per Generate, all landing in the history (local
-  only; on the API that is N paid calls).
-- Styles: presets bundling prompt prefix/suffix, LoRAs (`<lora:name:1.0>`
-  syntax parsed out of the prompt), sampler settings; would become string
-  outputs here.
-- Negative prompt output (SDXL-class local models only).
-- Upscale workflow (tiled with refinement, `upscale_tiled`), live mode, and
-  regions (attention masks, local models only) are separate projects.
-- Strength-scaled selection modifiers (feather * strength) are a five-line
-  tweak once refine exists.
 
 ## 11. Prompt upsampling (2026-09-05)
 

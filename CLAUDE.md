@@ -68,18 +68,22 @@ Flux.2 [max] API node (returns RGBA, square unless width/height are wired).
 - Icons, not text, for tools. Krita/Photoshop vocabulary. Answer in German.
 - The user asks for features by Krita name; the roadmap is in DEVELOPMENT.md.
 
-## Where things stand (2026-09-05)
+## Where things stand (end of 2026-09-05)
 
-Done and verified: everything in README, including "Select by text" (SAM3 via
-comfyui-rmbg as default), the object selection tool (hover/click, SAM2 object
-map), the Source switch (image / active layer), the Crop settings (auto
-context, auto feather, fill modes, color match; DEVELOPMENT.md 10), prompt
-upsampling (Qwen3-VL local / Gemini API, DEVELOPMENT.md 11), the API/Local
-switch with two result inputs plus denoise/seed/negative outputs, refine,
-the eight editor-driven `setting_n` wildcard outputs (section 2), and the
-window-capture key handling (Ctrl+Z never reaches ComfyUI's workflow undo).
-SAM3 weights are at `models/checkpoints/sam3.pt` with a hardlink at
-`models/sam3/sam3.pt`. The core SAM3 text path returns noise here (6b).
+Everything described in README.md is built, verified and pushed (latest
+commit "README rewritten ..."). No half-finished work. DEVELOPMENT.md 8 has
+the session state and test recipes, DEVELOPMENT.md 9 the roadmap with the
+researched ideas (reference layers, batch / variants with an A/B staging
+area, layer masks / background removal, styles, regions, object tool details,
+live preview, housekeeping). Start a new feature from that list or from what
+the user asks for by Krita / Photoshop name.
+
+Environment facts that matter: SAM3 weights are `models/checkpoints/sam3.pt`
+with a hardlink at `models/sam3/sam3.pt` (comfyui-rmbg's SAM3 node is the
+segmentation default; ComfyUI core's SAM3 text path returns noise here, 6b).
+Qwen3-VL 2B is in `models/LLM/Qwen-VL` (prompt upsampling). SAM2 base_plus in
+`models/sam2` (object tool). The user's chains: Flux.2 [max] API node on
+`result`, local Flux.2 Klein on `result_local`.
 
 ## Working on it
 
@@ -92,3 +96,10 @@ SAM3 weights are at `models/checkpoints/sam3.pt` with a hardlink at
 - Check syntax with `python -m py_compile nodes.py` and `node --check js/inpaint_canvas.js`.
 - Browser testing: see DEVELOPMENT.md "Testing". Beware the workflow restore
   that happens 2–4 minutes after page load and replaces any scripted graph.
+  The in-app browser pane must be visible for the editor to have a layout.
+- README screenshots: `docs/shots.py` (headless Edge over DevTools, see
+  DEVELOPMENT.md 8). Re-run after UI changes and commit `docs/img/*.jpg`.
+- Every state addition goes into the `canvas_state` JSON (keys so far: width,
+  height, base, prompt, negative, layers, history, selection, seen, crop,
+  upsample, gen, settings), never into node widgets (invariant 5). New node
+  outputs are appended only.
