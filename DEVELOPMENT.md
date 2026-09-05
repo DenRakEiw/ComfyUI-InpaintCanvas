@@ -128,9 +128,10 @@ the state; the frontend rolls a new seed before every Generate when
 { width, height,
   base: {filename, subfolder, type},          // input/inpaint_canvas/...
   prompt: "...",
-  layers: [{ id, name, kind: "result"|"paint"|"image", role: "none"|"reference"|"scribble"|...,
+  layers: [{ id, name, kind: "result"|"paint"|"image"|"filter", role: "none"|"reference"|"scribble"|...,
              blend: "normal"|"multiply"|..., ref, x, y, w, h, opacity, visible,
-             mask: {filename, subfolder, type} | null }],   // transparency mask PNG (alpha = visible)
+             mask: {filename, subfolder, type} | null,      // transparency mask PNG (alpha = visible)
+             filter, params, lut: {name, size, ref} }],     // kind "filter" only (ref = null there)
   history: [{ key, name, ref, x, y, w, h, prompt, layerId, time, seed, mode, denoise }],
   selection: "data:image/png;base64,...",     // red where selected
   seen: ["subfolder/filename", ...],           // results already added
@@ -667,3 +668,44 @@ every open workflow tab (`app.extensionManager.workflow.openWorkflows`:
 (the frontend keeps unsaved workflows there). Flow: dry run -> confirm with
 counts and sizes -> real run -> status. `_prune_temp()` in `MaskOut.send` and
 `ObjectMap.run` deletes helper results older than an hour.
+
+## 13. Filter layers (2026-09-05, late)
+
+Scope decided with the user: only what helps an inpainted patch blend and the
+image finish (grain, sharpen, levels, LUT, vignette), no Nik-style suite.
+`js/inpaint_filters.js` holds the registry `FILTERS` (`{label, params:
+[{key, label, min, max, step, default, unit, type}], apply(src, params,
+info), needsLut}`) and the `.cube` helpers; the editor knows nothing about
+individual filters.
+
+Layer model: kind `filter`, `filter` id, `params`, `lut: {name, size, ref}`
+plus `_lutData` (Float32Array size³·3) in memory, `_fcache`. The layer keeps an
+empty W×H canvas so masks, undo and the panel code work unchanged; paint,
+erase, fill, transform and cutout refuse filter layers (mask editing works).
+
+Compositing: `drawComposite` takes a fast path without filter layers and
+otherwise renders everything into `this.flatCanvas` (image-sized) through
+`drawLayersInto`, so a filter layer sees the composite below it at full
+resolution (`applyFilterLayer`), then draws the flat canvas onto the target
+(view, thumbnail, flatten). `filteredCanvas` caches the result per layer,
+keyed on `compositeVersion`, params, LUT file, `forRun` (control / reference
+layers are excluded there) and preview mode. `compositeVersion` is bumped by
+the `uploaded.baseHash` setter (`makeUploaded`) whenever it is cleared, which
+every composite change already did. During a slider drag (`filterPreview`
+= layer id, set on `input`, cleared on `change`) the filter runs on a copy
+downscaled to 1024 px (`info.scale` shrinks radii) and the result is drawn
+scaled up; `change` pushes one undo step captured at the first `input`
+(`_undoPending`, `pushUndoSnapshot`). While a gesture edits a layer below the
+filter, the filter is skipped for that frame so the live stroke stays visible.
+
+LUTs: `lutFromCube` parses 3D `.cube` (DOMAIN_MIN/MAX honoured, 1D rejected),
+`lutToCanvas` bakes it into a size²×size RGB PNG (x = r + b·size, y = g) that
+is uploaded like any layer file (`n{id}_lut_{hash}.png`, so the cleanup keeps
+it), `lutFromImage` reads it back on restore. Applying is trilinear in a
+pixel loop, `strength` mixes with the input.
+
+Measured on the 1776×2368 photo in headless Edge: grain 144 ms, sharpen
+75 ms, cached redraw 0 ms; invert LUT exact (mean 16.25 -> 238.75, strength
+50 -> 128); mask from selection limits the effect to the selection (outside
+diff 0); getValue/setValue round trip identical (diff 0, LUT restored); the
+run uploads a flattened base with the grain baked in.

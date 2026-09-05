@@ -14,6 +14,7 @@
 
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
+import { FILTERS, FILTER_IDS, filterDefaults, applyFilter, lutFromCube, lutToCanvas, lutFromImage } from "./inpaint_filters.js";
 
 const NODE_CLASS = "InpaintCanvas";
 const STITCH_CLASS = "InpaintCanvasStitch";
@@ -562,6 +563,7 @@ const ICONS = {
     image: '<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10" r="1.6" fill="currentColor" stroke="none"/><path d="M21 16l-5-5-8 8"/>',
     mask: '<rect x="4" y="4" width="16" height="16" rx="2"/><circle cx="12" cy="12" r="4.5" fill="currentColor" stroke="none"/>',
     maskEdit: '<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 16l6-6 2 2-6 6H8z" fill="currentColor" stroke="none"/><path d="M15 9l1-1 2 2-1 1"/>',
+    fx: '<path d="M4 6h9"/><path d="M19 6h1"/><circle cx="16" cy="6" r="2"/><path d="M4 12h2"/><path d="M12 12h8"/><circle cx="9" cy="12" r="2"/><path d="M4 18h11"/><circle cx="18" cy="18" r="2"/>',
     broom: '<path d="M14 3l7 7"/><path d="M17.5 6.5L9 15"/><path d="M9 15l-5 5"/><path d="M6 12l6 6"/><path d="M11 13l-4 8"/>',
     extend: '<rect x="8" y="8" width="8" height="8"/><path d="M12 2v4"/><path d="M12 18v4"/><path d="M2 12h4"/><path d="M18 12h4"/><path d="M10 4l2-2 2 2"/><path d="M10 20l2 2 2-2"/><path d="M4 10l-2 2 2 2"/><path d="M20 10l2 2-2 2"/>',
 };
@@ -668,6 +670,13 @@ const STYLE = `
 .ipc-layer .ipc-kind { font-size:10px; color:#777; text-transform:uppercase; }
 .ipc-layer .ipc-kind.ipc-ctrl { color:#ffb347; }
 .ipc-layer .ipc-kind.ipc-ref { color:#7cc7ff; }
+.ipc-layer .ipc-kind.ipc-fxk { color:#c7a2ff; }
+.ipc-fx { display:grid; grid-template-columns:auto 1fr auto; gap:3px 6px; align-items:center; font-size:11px; color:#888; }
+.ipc-fx .ipc-sel { grid-column:1 / -1; max-width:none; }
+.ipc-fx input[type=range] { width:100%; min-width:0; margin:0; }
+.ipc-fx b { width:42px; text-align:right; font-weight:500; color:#bbb; }
+.ipc-fx .ipc-lutrow { grid-column:1 / -1; display:flex; gap:6px; align-items:center; min-width:0; }
+.ipc-fx .ipc-lutrow span { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#aaa; }
 .ipc-layer .ipc-maskrow { display:flex; align-items:center; gap:2px; color:#888; font-size:11px; }
 .ipc-layer .ipc-maskrow .ipc-sel { max-width:96px; }
 .ipc-layer .ipc-maskrow .ipc-grow { flex:1; }
@@ -766,7 +775,10 @@ class InpaintEditor {
         this.selectionDirty = true;
         this.selectionDataUrl = null;
         this.cachedBounds = null;
-        this.uploaded = { baseHash: null, baseRef: null, maskHash: null, maskRef: null, controlHash: null, controlRef: null };
+        this.compositeVersion = 0;      // bumped whenever the composite changes (filter caches key on it)
+        this.uploaded = this.makeUploaded();
+        this.filterCounter = 0;
+        this.filterPreview = null;      // id of the filter layer whose slider is being dragged (low-res preview)
         this.seenResults = new Set();
         this.layerCounter = 0;
         this.paintCounter = 0;
@@ -987,6 +999,7 @@ class InpaintEditor {
         });
         layersHead.appendChild(this.refInput);
         layersHead.appendChild(miniButton("image", "Add reference images (one layer per file, role \"reference\"). They are not part of the image; they go out as the reference_images batch. Dropping files on this list does the same.", () => this.refInput.click()));
+        layersHead.appendChild(miniButton("fx", "Add a filter layer (grain, sharpen, levels, LUT, vignette). It filters everything below it; give it a mask to limit where it applies.", () => this.addFilterLayer()));
         layersHead.appendChild(miniButton("plus", "Add a paint layer (Ctrl+Shift+N)", () => this.addPaintLayer()));
         side.appendChild(layersHead);
         this.layerList = el("div", "ipc-list");
@@ -1356,6 +1369,7 @@ class InpaintEditor {
     startPending(mode) {
         const layer = this.activeLayer();
         if (!layer) { this.setStatus("Select a layer to transform. The base stays put."); return; }
+        if (layer.kind === "filter") { this.setStatus("Filter layers cannot be transformed."); return; }
         const p = { mode, layer, angle: 0 };
         const { x, y, w, h } = layer;
         if (mode === "distort") {
@@ -1873,6 +1887,7 @@ class InpaintEditor {
                 this.draw();
                 return;
             }
+            if (layer && layer.kind === "filter") { this.setStatus("Filter layers have no pixels. Add a mask (from selection) and enable mask editing to limit where the filter applies."); return; }
             if (!layer) {
                 if (this.tool === "erase") { this.setStatus("The base layer cannot be erased. Select a layer or add a paint layer."); return; }
                 layer = this.addPaintLayer();
@@ -1884,6 +1899,7 @@ class InpaintEditor {
         } else if (this.tool === "transform") {
             const layer = this.activeLayer();
             if (!layer) { this.setStatus("Select a layer to move or scale it. The base stays put."); return; }
+            if (layer.kind === "filter") { this.setStatus("Filter layers cover the whole canvas and cannot be transformed."); return; }
             if (this.pending) { this.pendingPointerDown(ix, iy, e); this.draw(); return; }
             const handle = this.handleAt(ix, iy);
             this.pushUndo({ kind: "transform", id: layer.id });
@@ -2145,6 +2161,7 @@ class InpaintEditor {
         let layer = this.activeLayer();
         if (!layer) layer = this.addPaintLayer();
         const onMask = !!(layer.mask && layer.maskEdit);
+        if (layer.kind === "filter" && !onMask) { this.setStatus("Filter layers have no pixels to fill. Use \"mask from selection\" to limit the filter instead."); return; }
         this.pushUndo(onMask ? { kind: "mask", id: layer.id } : { kind: "layer", id: layer.id });
         const shape = makeCanvas(this.width, this.height);
         const sctx = shape.getContext("2d");
@@ -2672,7 +2689,7 @@ class InpaintEditor {
             sctx.fillRect(0, 0, nw, nh);
             sctx.clearRect(left, top, W, H);
             this.undo = []; this.redo = [];
-            this.uploaded = { baseHash: null, baseRef: null, maskHash: null, maskRef: null, controlHash: null, controlRef: null };
+            this.uploaded = this.makeUploaded();
             this.selectionDirty = true;
             this.selectionDataUrl = null;
             for (const k of Object.keys(this.extendInputs)) this.extendInputs[k].value = 0;
@@ -2697,6 +2714,7 @@ class InpaintEditor {
         if (step.kind === "layer") return { kind: "layer", id: layer.id, url: layer.canvas.toDataURL("image/png") };
         if (step.kind === "transform") return { kind: "transform", id: layer.id, x: layer.x, y: layer.y, w: layer.w, h: layer.h };
         if (step.kind === "mask") return { kind: "mask", id: layer.id, url: layer.mask ? layer.mask.toDataURL("image/png") : null, mw: layer.mask ? layer.mask.width : 0, mh: layer.mask ? layer.mask.height : 0 };
+        if (step.kind === "filter") return { kind: "filter", id: layer.id, filter: layer.filter, params: { ...(layer.params || {}) }, lut: layer.lut ? { ...layer.lut } : null, lutData: layer._lutData || null, name: layer.name };
         if (step.kind === "layerfull") return { kind: "layerfull", id: layer.id, url: layer.canvas.toDataURL("image/png"), cw: layer.canvas.width, ch: layer.canvas.height, x: layer.x, y: layer.y, w: layer.w, h: layer.h,
             mask: layer.mask ? layer.mask.toDataURL("image/png") : null, mw: layer.mask ? layer.mask.width : 0, mh: layer.mask ? layer.mask.height : 0 };
         return null;
@@ -2704,7 +2722,10 @@ class InpaintEditor {
 
     pushUndo(step) {
         if (!this.selection) return;
-        const snap = this.snapshot(step);
+        this.pushUndoSnapshot(this.snapshot(step));
+    }
+
+    pushUndoSnapshot(snap) {
         if (!snap) return;
         this.undo.push(snap);
         if (this.undo.length > MAX_UNDO) this.undo.shift();
@@ -2736,6 +2757,14 @@ class InpaintEditor {
                 this.renderLayers();
                 this.drawThumb();
                 this.notifyChanged();
+            } else if (snap.kind === "filter") {
+                layer.filter = snap.filter;
+                layer.params = { ...snap.params };
+                layer.lut = snap.lut ? { ...snap.lut } : null;
+                layer._lutData = snap.lutData || null;
+                layer.name = snap.name || layer.name;
+                this.markFilterChanged(layer);
+                this.renderLayers();
             } else if (snap.kind === "mask") {
                 layer.mask = snap.url ? imageToCanvas(await loadImageEl(snap.url), snap.mw, snap.mh) : null;
                 if (!layer.mask) layer.maskEdit = false;
@@ -2818,6 +2847,130 @@ class InpaintEditor {
         this.uploaded.controlHash = null;
         this.drawThumb();
         this.notifyChanged();
+    }
+
+    /** The upload cache; clearing baseHash means "the composite changed" and bumps compositeVersion. */
+    makeUploaded() {
+        const ed = this;
+        let baseHash = null;
+        const u = { baseRef: null, maskHash: null, maskRef: null, controlHash: null, controlRef: null };
+        Object.defineProperty(u, "baseHash", {
+            enumerable: true,
+            get: () => baseHash,
+            set: (v) => { if (v == null) ed.compositeVersion++; baseHash = v; },
+        });
+        return u;
+    }
+
+    // ---- filter layers ------------------------------------------------------------
+
+    addFilterLayer(id = "grain") {
+        if (!this.width) { this.setStatus("Load an image first."); return null; }
+        if (!FILTERS[id]) id = "grain";
+        this.filterCounter += 1;
+        const layer = this.addLayer({
+            name: `${FILTERS[id].label} ${this.filterCounter}`, kind: "filter", filter: id, params: filterDefaults(id), lut: null,
+            ref: null, canvas: makeCanvas(this.width, this.height), x: 0, y: 0, w: this.width, h: this.height, dirty: false,
+        });
+        this.setStatus(`${layer.name} added. It filters everything below it; pick the type and drag the sliders in the layer list.`);
+        return layer;
+    }
+
+    setFilterType(layer, id) {
+        if (!FILTERS[id] || layer.filter === id) return;
+        this.pushUndo({ kind: "filter", id: layer.id });
+        const auto = FILTER_IDS.some((k) => (layer.name || "").startsWith(FILTERS[k].label + " "));
+        layer.filter = id;
+        layer.params = filterDefaults(id);
+        if (auto) layer.name = `${FILTERS[id].label} ${this.filterCounter}`;
+        this.markFilterChanged(layer);
+        this.renderLayers();
+    }
+
+    markFilterChanged(layer) {
+        layer._fcache = null;
+        this.uploaded.baseHash = null;
+        this.draw();
+        this.drawThumb();
+        this.notifyChanged();
+    }
+
+    async loadLutFile(layer, file) {
+        if (!file) return;
+        try {
+            this.setStatus(`Reading ${file.name} ...`);
+            const lut = lutFromCube(await file.text());
+            const up = await uploadCanvas(lutToCanvas(lut), `n${this.node.id}_lut`);
+            this.pushUndo({ kind: "filter", id: layer.id });
+            layer.lut = { name: file.name, size: lut.size, ref: up.ref };
+            layer._lutData = lut;
+            if (/^LUT/.test(layer.name || "") || !layer.name) layer.name = file.name.replace(/\.cube$/i, "");
+            this.markFilterChanged(layer);
+            this.renderLayers();
+            this.setStatus(`${file.name} loaded (${lut.size}³ LUT).`);
+        } catch (err) {
+            console.error(err);
+            this.setStatus("Could not load the LUT: " + (err.message || err));
+        }
+    }
+
+    /** Filtered copy of `below` for a filter layer, cached until the composite or the parameters change. */
+    filteredCanvas(layer, below, forRun, preview) {
+        const key = JSON.stringify([layer.filter, layer.params, layer.lut && layer.lut.ref && layer.lut.ref.filename, !!forRun, !!preview, below.width, below.height]);
+        const c = layer._fcache;
+        if (c && c.version === this.compositeVersion && c.key === key) return c.canvas;
+        let input = below, scale = 1;
+        if (preview) {
+            const s = Math.min(1, 1024 / Math.max(below.width, below.height));
+            if (s < 1) {
+                input = makeCanvas(Math.round(below.width * s), Math.round(below.height * s));
+                const ictx = input.getContext("2d");
+                ictx.imageSmoothingEnabled = true;
+                ictx.drawImage(below, 0, 0, input.width, input.height);
+                scale = s;
+            }
+        }
+        let canvas = null;
+        try { canvas = applyFilter(layer.filter, input, layer.params, { scale, seed: layer.id, lut: layer._lutData }); }
+        catch (err) { console.error(err); }
+        layer._fcache = { version: this.compositeVersion, key, canvas };
+        return canvas;
+    }
+
+    /** Draw a filter layer onto `ctx` (an image-sized canvas holding everything below it). */
+    applyFilterLayer(ctx, layer, index, forRun) {
+        if (!forRun) {
+            // While something below the filter is being painted or moved, the cached
+            // result would hide the live change: show the layers unfiltered instead.
+            const p = this.pointer;
+            const gestureLayer = (p && p.layer) || (this.pending && this.pending.layer) || null;
+            if (gestureLayer && gestureLayer !== layer) {
+                const gi = this.layers.indexOf(gestureLayer);
+                if (gi >= 0 && gi < index) return;
+            }
+        }
+        const preview = !forRun && this.filterPreview === layer.id;
+        const out = this.filteredCanvas(layer, ctx.canvas, forRun, preview);
+        if (!out) return;
+        let src = out;
+        if (layer.mask) {
+            if (!this.filterMaskCanvas || this.filterMaskCanvas.width !== out.width || this.filterMaskCanvas.height !== out.height) this.filterMaskCanvas = makeCanvas(out.width, out.height);
+            const m = this.filterMaskCanvas;
+            const mctx = m.getContext("2d");
+            mctx.globalCompositeOperation = "source-over";
+            mctx.globalAlpha = 1;
+            mctx.clearRect(0, 0, m.width, m.height);
+            mctx.drawImage(out, 0, 0);
+            mctx.globalCompositeOperation = "destination-in";
+            mctx.drawImage(this.maskWithStroke(layer), 0, 0, m.width, m.height);
+            mctx.globalCompositeOperation = "source-over";
+            src = m;
+        }
+        ctx.globalAlpha = layer.opacity;
+        ctx.globalCompositeOperation = (layer.blend && layer.blend !== "normal") ? layer.blend : "source-over";
+        ctx.drawImage(src, 0, 0, this.width, this.height);
+        ctx.globalAlpha = 1;
+        ctx.globalCompositeOperation = "source-over";
     }
 
     markMaskChanged(layer) {
@@ -3311,8 +3464,9 @@ class InpaintEditor {
             name.title = `${layer.w} × ${layer.h} at ${layer.x}, ${layer.y}`;
             top.appendChild(name);
             const refIndex = this.isReference(layer) ? this.referenceLayers().indexOf(layer) : -1;
-            const kindText = this.isControl(layer) ? layer.role : (this.isReference(layer) ? (refIndex >= 0 ? `ref ${refIndex + 1}` : "ref (hidden)") : layer.kind);
-            top.appendChild(el("span", "ipc-kind" + (this.isControl(layer) ? " ipc-ctrl" : (this.isReference(layer) ? " ipc-ref" : "")), kindText));
+            const isFx = layer.kind === "filter";
+            const kindText = isFx ? "filter" : (this.isControl(layer) ? layer.role : (this.isReference(layer) ? (refIndex >= 0 ? `ref ${refIndex + 1}` : "ref (hidden)") : layer.kind));
+            top.appendChild(el("span", "ipc-kind" + (isFx ? " ipc-fxk" : (this.isControl(layer) ? " ipc-ctrl" : (this.isReference(layer) ? " ipc-ref" : ""))), kindText));
             const up = miniButton("up", "Move layer up", () => this.moveLayer(layer.id, +1));
             up.disabled = i === this.layers.length - 1;
             top.appendChild(up);
@@ -3336,6 +3490,8 @@ class InpaintEditor {
             opRow.appendChild(pct);
             row.appendChild(opRow);
 
+            if (isFx) row.appendChild(this.buildFilterControls(layer));
+
             const modeRow = el("div", "ipc-op");
             const blendLab = el("label", null, "Blend");
             const blend = selectInput(BLEND_MODES, layer.blend || "normal", "Blend mode");
@@ -3352,6 +3508,7 @@ class InpaintEditor {
                 this.renderLayers(); this.renderInfo(); this.draw(); this.drawThumb(); this.notifyChanged();
             });
             roleLab.appendChild(role);
+            roleLab.hidden = isFx;
             modeRow.appendChild(roleLab);
             row.appendChild(modeRow);
 
@@ -3359,9 +3516,9 @@ class InpaintEditor {
             const maskRow = el("div", "ipc-maskrow");
             const busy = !!(this.cutoutPending && this.cutoutPending.layer === layer);
             const cut = miniButton("scissors", busy ? "Removing the background ..." : "Cutout: remove the background with the model on the right (RMBG). The result is a transparency mask you can edit.", () => this.cutoutLayer(layer));
-            cut.disabled = busy || !availableCutoutBackends().length;
+            cut.disabled = busy || isFx || !availableCutoutBackends().length;
             maskRow.appendChild(cut);
-            if (layer.id === this.activeLayerId) {
+            if (layer.id === this.activeLayerId && !isFx) {
                 const sel = selectInput(["auto"], "auto", "Background removal model");
                 this.cutoutSel = sel;
                 this.refreshCutoutBackends();
@@ -3395,6 +3552,78 @@ class InpaintEditor {
         top.appendChild(el("span", "ipc-kind", "base"));
         row.appendChild(top);
         list.appendChild(row);
+    }
+
+    /** Type select, one slider per parameter, LUT loader: the controls of a filter layer row. */
+    buildFilterControls(layer) {
+        const box = el("div", "ipc-fx");
+        const stop = (e) => e.stopPropagation();
+        const typeSel = document.createElement("select");
+        typeSel.className = "ipc-sel";
+        typeSel.title = "Filter type";
+        for (const id of FILTER_IDS) { const o = document.createElement("option"); o.value = id; o.textContent = FILTERS[id].label; typeSel.appendChild(o); }
+        typeSel.value = FILTERS[layer.filter] ? layer.filter : "grain";
+        typeSel.addEventListener("click", stop);
+        typeSel.addEventListener("keydown", stop);
+        typeSel.addEventListener("change", () => this.setFilterType(layer, typeSel.value));
+        box.appendChild(typeSel);
+        const def = FILTERS[layer.filter] || FILTERS.grain;
+        if (def.needsLut) {
+            const lr = el("div", "ipc-lutrow");
+            const input = document.createElement("input");
+            input.type = "file"; input.accept = ".cube,.CUBE"; input.style.display = "none";
+            input.addEventListener("change", () => { const f = input.files && input.files[0]; input.value = ""; if (f) this.loadLutFile(layer, f); });
+            input.addEventListener("click", stop);
+            lr.appendChild(input);
+            const load = iconButton("load", "Load a 3D LUT (.cube). It is stored with the workflow.", () => input.click(), ".cube");
+            load.classList.add("ipc-small");
+            lr.appendChild(load);
+            lr.appendChild(el("span", null, layer.lut ? `${layer.lut.name} (${layer.lut.size}³)` : "no LUT loaded"));
+            box.appendChild(lr);
+        }
+        const fmt = (p, v) => (p.type === "bool" ? (v ? "on" : "off") : (Number.isInteger(p.step) ? Math.round(v) : (+v).toFixed(p.step < 0.1 ? 2 : 1)) + (p.unit || ""));
+        for (const p of def.params) {
+            const lab = el("span", null, p.label);
+            box.appendChild(lab);
+            const cur = layer.params[p.key] ?? p.default;
+            const val = el("b", null, fmt(p, cur));
+            if (p.type === "bool") {
+                const cb = document.createElement("input");
+                cb.type = "checkbox"; cb.checked = !!cur;
+                cb.addEventListener("click", stop);
+                cb.addEventListener("change", () => {
+                    this.pushUndo({ kind: "filter", id: layer.id });
+                    layer.params[p.key] = cb.checked;
+                    val.textContent = fmt(p, cb.checked);
+                    this.markFilterChanged(layer);
+                });
+                box.appendChild(cb);
+                box.appendChild(val);
+                continue;
+            }
+            const range = document.createElement("input");
+            range.type = "range"; range.min = p.min; range.max = p.max; range.step = p.step; range.value = cur;
+            range.title = p.label;
+            range.addEventListener("click", stop);
+            range.addEventListener("pointerdown", stop);
+            range.addEventListener("keydown", stop);
+            range.addEventListener("input", () => {
+                if (!layer._undoPending) layer._undoPending = this.snapshot({ kind: "filter", id: layer.id });
+                layer.params[p.key] = +range.value;
+                val.textContent = fmt(p, +range.value);
+                this.filterPreview = layer.id;
+                this.markFilterChanged(layer);
+            });
+            range.addEventListener("change", () => {
+                this.filterPreview = null;
+                if (layer._undoPending) { this.pushUndoSnapshot(layer._undoPending); layer._undoPending = null; }
+                layer.params[p.key] = +range.value;
+                this.markFilterChanged(layer);
+            });
+            box.appendChild(range);
+            box.appendChild(val);
+        }
+        return box;
     }
 
     // ---- history -------------------------------------------------------------
@@ -3497,16 +3726,34 @@ class InpaintEditor {
 
     // ---- compositing -------------------------------------------------------
 
-    drawComposite(ctx, { forRun = false, controlOnly = false } = {}) {
+    drawComposite(ctx, opts = {}) {
         if (!this.base) return;
+        const hasFilters = !opts.controlOnly && this.layers.some((l) => l.kind === "filter" && l.visible);
+        if (!hasFilters) { this.drawLayersInto(ctx, opts); return; }
+        // Filters need the composite below them at image resolution: build it offscreen first.
+        if (!this.flatCanvas || this.flatCanvas.width !== this.width || this.flatCanvas.height !== this.height) this.flatCanvas = makeCanvas(this.width, this.height);
+        const fctx = this.flatCanvas.getContext("2d");
+        fctx.setTransform(1, 0, 0, 1, 0, 0);
+        fctx.globalAlpha = 1;
+        fctx.globalCompositeOperation = "source-over";
+        fctx.clearRect(0, 0, this.width, this.height);
+        this.drawLayersInto(fctx, opts);
+        ctx.globalAlpha = 1;
+        ctx.globalCompositeOperation = "source-over";
+        ctx.drawImage(this.flatCanvas, 0, 0);
+    }
+
+    drawLayersInto(ctx, { forRun = false, controlOnly = false } = {}) {
         if (controlOnly) {
             ctx.fillStyle = "#000";
             ctx.fillRect(0, 0, this.width, this.height);
         } else {
             ctx.drawImage(this.base.img, 0, 0);
         }
-        for (const layer of this.layers) {
+        for (let i = 0; i < this.layers.length; i++) {
+            const layer = this.layers[i];
             if (!layer.visible || !layer.canvas) continue;
+            if (layer.kind === "filter") { if (!controlOnly) this.applyFilterLayer(ctx, layer, i, forRun); continue; }
             const ctrl = this.isControl(layer);
             if (controlOnly && !ctrl) continue;
             if (forRun && (ctrl || this.isReference(layer))) continue;
@@ -3929,6 +4176,7 @@ class InpaintEditor {
             layers: this.layers.map((l) => ({
                 id: l.id, name: l.name, kind: l.kind, role: l.role || "none", blend: l.blend || "normal", ref: l.ref,
                 x: l.x, y: l.y, w: l.w, h: l.h, opacity: l.opacity, visible: l.visible, mask: l.maskRef || null,
+                ...(l.kind === "filter" ? { filter: l.filter, params: l.params, lut: l.lut || null } : {}),
             })),
             history: this.history.slice(-100).map((h) => ({ key: h.key, name: h.name, ref: h.ref, x: h.x, y: h.y, w: h.w, h: h.h, prompt: h.prompt, layerId: h.layerId, time: h.time, seed: h.seed, mode: h.mode, denoise: h.denoise })),
             selection: this.selectionDataUrl,
@@ -3973,6 +4221,32 @@ class InpaintEditor {
             this.syncGenControls();
             this.renderSettings();
             for (const l of state.layers || []) {
+                if (l.kind === "filter") {
+                    try {
+                        const canvas = makeCanvas(this.width, this.height);
+                        let mask = null;
+                        if (l.mask && l.mask.filename) {
+                            try { mask = imageToCanvas(await loadImageEl(viewUrl(l.mask)), canvas.width, canvas.height); } catch (err) { console.warn("Inpaint Canvas: layer mask missing", l.mask, err); }
+                            if (stale()) return;
+                        }
+                        let lutData = null;
+                        if (l.lut && l.lut.ref) {
+                            try { lutData = lutFromImage(await loadImageEl(viewUrl(l.lut.ref)), l.lut.size); } catch (err) { console.warn("Inpaint Canvas: LUT missing", l.lut, err); }
+                            if (stale()) return;
+                        }
+                        const fid = FILTERS[l.filter] ? l.filter : "grain";
+                        this.layers.push({
+                            id: l.id, name: l.name, kind: "filter", role: "none", blend: l.blend || "normal", ref: null, canvas,
+                            x: 0, y: 0, w: this.width, h: this.height, opacity: l.opacity ?? 1, visible: l.visible !== false, dirty: false,
+                            mask, maskRef: mask ? l.mask : null, maskDirty: false, maskEdit: false,
+                            filter: fid, params: { ...filterDefaults(fid), ...(l.params || {}) }, lut: l.lut || null, _lutData: lutData,
+                        });
+                        this.filterCounter += 1;
+                    } catch (err) {
+                        console.warn("Inpaint Canvas: filter layer skipped", l, err);
+                    }
+                    continue;
+                }
                 if (!l.ref) continue;
                 try {
                     const limg = await loadImageEl(viewUrl(l.ref));

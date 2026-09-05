@@ -143,6 +143,17 @@ size, hardness, opacity and the paint colour.
   in the Canvas section sets the long side (0 = native) and how images of
   different sizes become one batch: *pad* with the image's border colour,
   *crop* to cover, or *stretch*.
+- **Filter layers** (the fx button in the Layers header): a layer without
+  pixels that filters everything below it. Types: *Grain* (film-like, mono or
+  colour, strongest in the midtones), *Sharpen* (unsharp mask with radius and
+  threshold), *Levels* (input black / white, gamma, output black / white),
+  *LUT* (load any 3D `.cube`, with a strength slider; the LUT is stored with
+  the workflow) and *Vignette*. Sliders preview at reduced resolution while
+  you drag and render in full when you let go. Opacity, blend mode and a
+  transparency mask work like on any layer, so *mask from selection* limits a
+  sharpen or grain to the inpainted patch. Filters are baked into the image
+  your chain sees and into flatten / extend. Filter layers have no pixels of
+  their own: painting, transforming and cutout are not available on them.
 - **Layer masks and cutouts** (Krita's transparency masks, LayerForge's
   background removal): every layer row has a mask row. *Cutout* runs one of
   the installed background removal nodes on the layer (comfyui-rmbg's

@@ -24,6 +24,9 @@ Flux.2 [max] API node (returns RGBA, square unless width/height are wired).
   One HTTP route, `POST /inpaint_canvas/cleanup` (file housekeeping).
 - `js/inpaint_canvas.js` — the whole frontend: node thumbnail widget, the
   full-window editor (`InpaintEditor`), state persistence, prompt rewriting.
+- `js/inpaint_filters.js` — the filter layers (grain, sharpen, levels, LUT,
+  vignette): pure Canvas 2D / pixel loops, registry `FILTERS`. New filters go
+  here, not into the editor file.
 - `pyproject.toml` + `.github/workflows/publish_action.yml` — Comfy Registry
   (`PublisherId = "denrakeiw"`, secret `REGISTRY_ACCESS_TOKEN` is the user's).
 - Local install path: `ComfyUI/custom_nodes/ComfyUI-InpaintCanvas`.
