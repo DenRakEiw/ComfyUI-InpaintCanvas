@@ -83,7 +83,9 @@ reference layers, masks, save and cleanup need nothing beyond the node.
 ![The node in a graph with a LoRA loader, a KSampler and the inpaint chain wired back into result](docs/img/graph.jpg)
 
 1. Add **Inpaint Canvas**, click **Open editor**, load an image (button,
-   Ctrl+V or drag and drop).
+   Ctrl+V or drag and drop) or start with **New**, an empty white canvas
+   of the size you type (everything in the editor is discarded, it asks
+   first).
 2. Wire `crop_image` (and `crop_mask`, `prompt`, `crop_width` / `crop_height`
    as your chain needs them) into your inpaint chain, and the decoded result
    back into `result` (API chain) or `result_local` (local chain).

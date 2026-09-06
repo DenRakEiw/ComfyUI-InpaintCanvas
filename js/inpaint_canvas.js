@@ -623,6 +623,7 @@ const ICONS = {
     trash: '<path d="M4 7h16"/><path d="M9 7V4h6v3"/><path d="M6 7l1 13h10l1-13"/>',
     edit: '<path d="M4 20h4l10-10-4-4L4 16z"/><path d="M12 8l4 4"/>',
     plus: '<path d="M12 5v14"/><path d="M5 12h14"/>',
+    newfile: '<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/><path d="M12 10v6"/><path d="M9 13h6"/>',
     up: '<path d="M6 14l6-6 6 6"/>',
     down: '<path d="M6 10l6 6 6-6"/>',
     solo: '<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3" fill="currentColor" stroke="none"/>',
@@ -1037,6 +1038,7 @@ class InpaintEditor {
             this.fileInput.value = "";
         });
         top.appendChild(this.fileInput);
+        top.appendChild(iconButton("newfile", "New: an empty white canvas. Everything in this editor (layers, results, selection, history) is discarded; you are asked first.", () => this.newCanvas(), "New"));
         top.appendChild(iconButton("load", "Load an image as the base layer (Ctrl+drop replaces the image; a plain drop adds a layer)", () => this.fileInput.click(), "Load"));
         top.appendChild(iconButton("save", "Save the finished image (Ctrl+S): all visible layers with their filters, without control and reference layers, into ComfyUI's output folder. Name and format in the Canvas section.", () => this.exportImage(), "Save"));
 
@@ -1157,10 +1159,8 @@ class InpaintEditor {
         tools.appendChild(this.quickMaskBtn);
         tools.appendChild(el("div", "ipc-sep"));
         tools.appendChild(el("div", "ipc-grp", "Layer"));
-        addGroup([
-            { tool: "paint", label: "Paint", key: "P", title: "Paint on the active layer (P). On the base it creates a paint layer. Alt+click picks a colour, Shift+click draws a straight line." },
-            { tool: "erase", label: "Erase", key: "E", title: "Erase from the active layer (E)" },
-        ]);
+        addTool("paint", "Paint on the active layer (P). On the base it creates a paint layer. Alt+click picks a colour, Shift+click draws a straight line.");
+        addTool("erase", "Erase from the active layer (E)");
         addGroup([
             { tool: "smudge", label: "Smudge", key: "Shift+S", title: "Smudge (Shift+S): drag pixels along the stroke, like a finger in wet paint. Strength in the bar above the canvas; on the base it first makes a copy layer." },
             { tool: "clone", label: "Clone stamp", key: "S", title: "Clone stamp (S): Alt+click sets the source, then paint to copy from there onto the active layer. Aligned keeps the offset between strokes; Sample chooses the visible image or the layer." },
@@ -6228,6 +6228,45 @@ class InpaintEditor {
         this.drawThumb();
         this.notifyChanged();
         this.setStatus(layer ? `Showing only ${h.name}.` : `${h.name} is discarded; restore it first.`);
+    }
+
+    /** A fresh white canvas after a confirmation; the size is asked for in the same dialog. */
+    async newCanvas() {
+        const cur = this.width ? `${this.width}x${this.height}` : "1024x1024";
+        const what = this.base ? `This discards the current image, ${this.layers.length} layer${this.layers.length === 1 ? "" : "s"}, the selection and ${this.history.length} history entr${this.history.length === 1 ? "y" : "ies"} in this editor.` : "";
+        const answer = window.prompt(`New empty canvas.${what ? " " + what : ""}
+
+Size as width x height:`, cur);
+        if (answer == null) { this.setStatus("New canvas cancelled."); return; }
+        const m = /^\s*(\d{2,5})\s*[x×*,\s]\s*(\d{2,5})\s*$/i.exec(answer);
+        if (!m) { this.setStatus("Size not understood. Use width x height, e.g. 1024x1024."); return; }
+        const w = Math.min(16384, +m[1]), h = Math.min(16384, +m[2]);
+        try {
+            this.setStatus(`Creating a ${w} × ${h} canvas ...`);
+            if (this.pending) this.cancelPending();
+            if (this.textEdit) this.endTextEdit(false);
+            const c = makeCanvas(w, h);
+            const ctx = c.getContext("2d");
+            ctx.fillStyle = "#ffffff";
+            ctx.fillRect(0, 0, w, h);
+            const { ref } = await uploadCanvas(c, `n${this.node.id}_base`);
+            const img = await loadImageEl(viewUrl(ref));
+            this.layers = [];
+            this.activeLayerId = null;
+            this.history = [];
+            this.savedSelections = [];
+            this.guides = { x: [], y: [] };
+            this.compare = null;
+            this.selection = null;
+            await this.setBase(ref, img, { keepLayers: false });
+            this.undo = []; this.redo = [];
+            this.renderHistory();
+            this.renderSelectionList();
+            this.setStatus(`New ${w} × ${h} canvas. Load an image as a layer, paint, or select and generate.`);
+        } catch (err) {
+            console.error(err);
+            this.setStatus("Could not create the canvas: " + (err.message || err));
+        }
     }
 
     clearHistory() {
