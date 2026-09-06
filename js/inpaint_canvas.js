@@ -17,6 +17,7 @@ import { api } from "../../scripts/api.js";
 import { FILTERS, FILTER_IDS, filterDefaults, applyFilter, lutFromCube, lutToCanvas, lutFromImage, plateStats } from "./inpaint_filters.js";
 import { TEXT_DEFAULTS, FONT_CATEGORIES, loadFontList, fontList, addUserFont, renderText } from "./inpaint_text.js";
 import { floodMask, maskToColorCanvas, clipMaskToSelection, rgbToHex } from "./inpaint_raster.js";
+import { buildPsd, buildOra } from "./inpaint_export.js";
 
 const NODE_CLASS = "InpaintCanvas";
 const STITCH_CLASS = "InpaintCanvasStitch";
@@ -1387,11 +1388,17 @@ class InpaintEditor {
             this.saveNameInput.spellcheck = false;
             this.saveNameInput.addEventListener("keydown", (e) => { e.stopPropagation(); if (e.key === "Enter") this.exportImage(); });
             exp.appendChild(this.saveNameInput);
-            this.saveFormatSel = selectInput(["png", "jpg"], "png", "PNG keeps the workflow inside the file (drop it onto ComfyUI to load it again), JPEG is smaller");
+            this.saveFormatSel = selectInput(["png", "jpg", "webp", "psd", "ora"], "png", "PNG keeps the workflow inside the file (drop it onto ComfyUI to load it again), JPEG and WebP are smaller. PSD (Photoshop) and ORA (OpenRaster, for Krita / GIMP) keep the layers: name, position, opacity, visibility, blend mode; filter layers are baked into the merged image only.");
             exp.appendChild(this.saveFormatSel);
             const dl = iconButton("download", "Save and also download the file in the browser", () => this.exportImage({ download: true }), "Download");
             dl.classList.add("ipc-small");
             exp.appendChild(dl);
+            const lay = iconButton("image", "Save the active layer alone as a PNG with transparency (output folder)", () => this.exportLayerPng(), "Layer");
+            lay.classList.add("ipc-small");
+            exp.appendChild(lay);
+            const msk = iconButton("mask", "Save the selection as a black and white mask PNG (output folder)", () => this.exportMaskPng(), "Mask");
+            msk.classList.add("ipc-small");
+            exp.appendChild(msk);
             d.appendChild(exp);
 
             // files
@@ -5327,14 +5334,70 @@ class InpaintEditor {
     // ---- export -----------------------------------------------------------------
 
     /** Save the visible composite (filters applied, no control / reference layers) to output/inpaint_canvas. */
+    /** The layers as PSD / ORA see them: pixels at image resolution, bottom first, the base as "Background". */
+    exportLayerStack() {
+        const layers = [];
+        const bg = makeCanvas(this.width, this.height);
+        bg.getContext("2d").drawImage(this.base.img, 0, 0);
+        layers.push({ name: "Background", x: 0, y: 0, canvas: bg, opacity: 1, visible: true, blend: "normal" });
+        let skipped = 0;
+        for (const l of this.layers) {
+            if (l.kind === "filter" || !l.canvas) { skipped++; continue; }
+            const w = Math.max(1, Math.round(l.w)), h = Math.max(1, Math.round(l.h));
+            const c = makeCanvas(w, h);
+            const ctx = c.getContext("2d");
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = "high";
+            ctx.drawImage(this.layerPixels(l), 0, 0, w, h);
+            const aside = this.isControl(l) || this.isReference(l);
+            layers.push({ name: l.name + (aside ? ` (${l.role})` : ""), x: Math.round(l.x), y: Math.round(l.y), canvas: c, opacity: l.opacity ?? 1, visible: l.visible !== false && !aside, blend: l.blend || "normal" });
+        }
+        return { layers, skipped };
+    }
+
+    /** The active layer alone as a PNG with transparency, into the output folder. */
+    async exportLayerPng() {
+        const l = this.activeLayer();
+        if (!l || l.kind === "filter" || !l.canvas) { this.setStatus("Select a pixel layer to save it on its own."); return null; }
+        try {
+            const c = makeCanvas(this.width, this.height);
+            c.getContext("2d").drawImage(this.layerPixels(l), l.x, l.y, l.w, l.h);
+            const blob = await new Promise((r) => c.toBlob(r, "image/png"));
+            const stem = (l.name || "layer").replace(/[^a-z0-9._ -]/gi, "_");
+            const ref = await uploadBlob(blob, `${stem}.png`, { overwrite: false, type: "output", subfolder: "" });
+            this.setStatus(`Saved output/${ref.filename} (${l.name}, ${this.width} × ${this.height} with transparency).`);
+            return ref;
+        } catch (err) { console.error(err); this.setStatus("Save failed: " + (err.message || err)); return null; }
+    }
+
+    /** The selection as a black and white mask PNG, into the output folder. */
+    async exportMaskPng() {
+        if (!this.getBounds()) { this.setStatus("Nothing selected to save as a mask."); return null; }
+        try {
+            const blob = await new Promise((r) => this.maskToCanvas().toBlob(r, "image/png"));
+            const stem = ((this.saveNameInput && this.saveNameInput.value) || "inpaint_canvas").trim().replace(/\.[a-z0-9]+$/i, "").replace(/[^a-z0-9._ -]/gi, "_") || "inpaint_canvas";
+            const ref = await uploadBlob(blob, `${stem}_mask.png`, { overwrite: false, type: "output", subfolder: "" });
+            this.setStatus(`Saved output/${ref.filename} (mask, white = selected).`);
+            return ref;
+        } catch (err) { console.error(err); this.setStatus("Save failed: " + (err.message || err)); return null; }
+    }
+
     async exportImage({ download = false } = {}) {
         if (!this.base) { this.setStatus("Nothing to save yet."); return null; }
-        const fmt = this.saveFormatSel && this.saveFormatSel.value === "jpg" ? "jpg" : "png";
+        const fmt = ["png", "jpg", "webp", "psd", "ora"].includes(this.saveFormatSel && this.saveFormatSel.value) ? this.saveFormatSel.value : "png";
         const stem = ((this.saveNameInput && this.saveNameInput.value) || "inpaint_canvas").trim().replace(/\.[a-z0-9]+$/i, "").replace(/[^a-z0-9._ -]/gi, "_") || "inpaint_canvas";
         try {
             this.setStatus("Saving ...");
             const canvas = this.flattenToCanvas({ forRun: true });
-            let blob = await new Promise((r) => canvas.toBlob(r, fmt === "jpg" ? "image/jpeg" : "image/png", 0.92));
+            let blob, note = "";
+            if (fmt === "psd" || fmt === "ora") {
+                const t0 = performance.now();
+                const { layers, skipped } = this.exportLayerStack();
+                blob = fmt === "psd" ? buildPsd({ width: this.width, height: this.height, layers, composite: canvas }) : await buildOra({ width: this.width, height: this.height, layers, composite: canvas });
+                note = `, ${layers.length} layers${skipped ? `, ${skipped} filter layer${skipped > 1 ? "s" : ""} only in the merged image` : ""}, ${Math.round(performance.now() - t0)} ms`;
+            } else {
+                blob = await new Promise((r) => canvas.toBlob(r, fmt === "jpg" ? "image/jpeg" : fmt === "webp" ? "image/webp" : "image/png", 0.92));
+            }
             if (fmt === "png") {
                 // Same metadata as SaveImage: the workflow (and the canvas prompt), so the file loads back into ComfyUI.
                 try {
@@ -5345,7 +5408,7 @@ class InpaintEditor {
             // Into the output root like SaveImage, not into inpaint_canvas (that folder is working files the cleanup may delete).
             const ref = await uploadBlob(blob, `${stem}.${fmt}`, { overwrite: false, type: "output", subfolder: "" });
             const kb = Math.round(blob.size / 1024);
-            this.setStatus(`Saved output/${ref.subfolder ? ref.subfolder + "/" : ""}${ref.filename} (${this.width} × ${this.height}, ${kb} kB${fmt === "png" ? ", workflow embedded" : ""}).`);
+            this.setStatus(`Saved output/${ref.subfolder ? ref.subfolder + "/" : ""}${ref.filename} (${this.width} × ${this.height}, ${kb >= 1024 ? (kb / 1024).toFixed(1) + " MB" : kb + " kB"}${fmt === "png" ? ", workflow embedded" : ""}${note}).`);
             if (download) {
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement("a");

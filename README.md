@@ -449,8 +449,15 @@ the extension.
 control and reference layers left out, into ComfyUI's `output` folder. Name
 and format are set in the Canvas section: PNG carries the workflow and the
 canvas prompt as metadata like SaveImage does, so the file can be dropped
-onto ComfyUI to bring the workflow back; JPEG is smaller. **Download** saves
-and hands the file to the browser as well. Saving the same image twice does
+onto ComfyUI to bring the workflow back; JPEG and WebP are smaller. **PSD**
+(Photoshop) and **ORA** (OpenRaster, the native layered format of Krita and
+GIMP) keep the layers: the base as *Background*, every pixel layer with its
+name, position, opacity, visibility and blend mode (control and reference
+layers hidden), plus the merged image. Filter layers cannot be represented
+in either format and are only part of the merged image. **Download** saves
+and hands the file to the browser as well. **Layer** saves the active layer
+alone as a PNG with transparency, **Mask** the selection as a black and
+white PNG. Saving the same image twice does
 not create a second file, a changed image gets a counter appended. The
 node's `image` output is the same picture for chains that want to save or
 post-process it with nodes.

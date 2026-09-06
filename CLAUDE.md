@@ -28,6 +28,8 @@ Flux.2 [max] API node (returns RGBA, square unless width/height are wired).
   manifest `fonts.json`, OFL / Apache licences in `js/fonts/licenses`), user
   fonts from `input/inpaint_canvas/fonts` (route `GET /inpaint_canvas/fonts`),
   `renderText()` draws a layer's `text` description at 2x.
+- `js/inpaint_export.js` — PSD (PackBits) and ORA (stored zip) writers,
+  `js/inpaint_raster.js` — flood fill and mask helpers for bucket / wand.
 - `js/inpaint_filters.js` (+ `inpaint_curves.js`, the curves editor) — the
   filter layers (grain, sharpen, blur, levels, curves, brightness/contrast,
   hue/saturation, colour balance, black & white, invert, LUT,
