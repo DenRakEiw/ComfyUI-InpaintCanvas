@@ -156,8 +156,17 @@ def _cleanup_files(keep, dry_run=True, min_age=CLEANUP_MIN_AGE):
             files.append((kind, name, path))
     names = {name for _, name, _ in files}
     referenced = set(str(k) for k in (keep or []))
+    # Saved workflows live in user/<name>/workflows; only those are read, nothing else in the user directory.
     user_dir = folder_paths.get_user_directory()
-    for root, _dirs, fnames in os.walk(user_dir):
+    workflow_dirs = []
+    try:
+        for entry in os.scandir(user_dir):
+            wf = os.path.join(entry.path, "workflows")
+            if entry.is_dir() and os.path.isdir(wf):
+                workflow_dirs.append(wf)
+    except OSError:
+        workflow_dirs = []
+    for root, _dirs, fnames in (pair for wf in workflow_dirs for pair in os.walk(wf)):
         for fn in fnames:
             if not fn.lower().endswith(".json"):
                 continue
