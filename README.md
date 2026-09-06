@@ -80,7 +80,7 @@ reference layers, masks, save and cleanup need nothing beyond the node.
 
 ## Quick start
 
-![The node in a graph with a LoRA loader, a KSampler and the inpaint chain wired back into result](docs/img/graph.jpg)
+![The Flux.2 API example: Inpaint Canvas wired into the Flux.2 Image node and back into result](docs/img/example-api.jpg)
 
 1. Add **Inpaint Canvas**, click **Open editor**, load an image (button,
    Ctrl+V or drag and drop) or start with **New**, an empty white canvas
@@ -117,6 +117,8 @@ ComfyUI, open the editor, load an image and press Generate.
   `result`. Reference layers ride along in `crop_image` and the API node
   reads them as extra reference images. Needs ComfyUI API credits, no local
   model.
+![The Flux.2 Klein example: two Image From Batch nodes feed the Klein subgraph, the result returns into result_local](docs/img/example-klein.jpg)
+
 - [`inpaint_canvas_flux2_klein_local.json`](examples/inpaint_canvas_flux2_klein_local.json):
   a local chain with **Flux.2 Klein 9B** in a subgraph (UNET, Qwen3 8B text
   encoder, Flux.2 VAE, ReferenceLatent, SamplerCustomAdvanced). Two

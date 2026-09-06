@@ -100,6 +100,38 @@ return { ok, hist: ed.history.length, status: ed.status };
 ]
 
 
+EXAMPLES = {"example-api": "inpaint_canvas_flux2_api.json", "example-klein": "inpaint_canvas_flux2_klein_local.json"}
+
+# the example workflows loaded as graphs, fitted to the window (after the editor scenes: they replace the graph)
+EXAMPLE_SCENE = r"""
+const app = window.comfyAPI.app.app;
+if (window.__ed && window.__ed.isOpen) window.__ed.close();
+await app.loadGraphData(JSON.parse(__EXAMPLE__));
+await window.__wait(2500);
+// a clean canvas: focus mode hides the side panels, toasts go, the guide notes shrink for the picture
+try { const em = app.extensionManager; if (em && !em.focusMode && em.toggleFocusMode) em.toggleFocusMode(); } catch (e) {}
+document.querySelectorAll('.p-toast').forEach((e) => { e.style.display = 'none'; });
+const nodes = app.graph._nodes;
+const isNote = (n) => n.type === 'Note' || n.type === 'MarkdownNote';
+let gx0 = Infinity, gy0 = Infinity;
+for (const n of nodes) { if (isNote(n)) continue; gx0 = Math.min(gx0, n.pos[0]); gy0 = Math.min(gy0, n.pos[1]); }
+// the notes stack in a column left of the graph so the picture stays compact
+let k = 0;
+for (const n of nodes) { if (!isNote(n)) continue; n.size = [340, 150]; if (n.flags) n.flags.collapsed = false; n.pos = [gx0 - 400, gy0 + k * 200]; k++; }
+await window.__wait(600);
+let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+for (const n of nodes) { const [x, y] = n.pos, [w, h] = n.size; x0 = Math.min(x0, x); y0 = Math.min(y0, y - 40); x1 = Math.max(x1, x + w); y1 = Math.max(y1, y + h); }
+const cw = app.canvas.canvas.width, ch = app.canvas.canvas.height;
+app.canvas.low_quality_zoom_threshold = 0.25;
+const s = Math.min((cw - 120) / (x1 - x0), (ch - 120) / (y1 - y0), 1.1);
+app.canvas.ds.scale = s; app.canvas.ds.offset = [(cw / s - (x1 - x0)) / 2 - x0, (ch / s - (y1 - y0)) / 2 - y0];
+app.canvas.setDirty(true, true); await window.__wait(1500);
+return { nodes: nodes.length, scale: +s.toFixed(2), focus: !!(app.extensionManager && app.extensionManager.focusMode) };
+"""
+SCENES.append(("example-api", EXAMPLE_SCENE))
+SCENES.append(("example-klein", EXAMPLE_SCENE))
+
+
 async def main():
     pages = json.load(urllib.request.urlopen(f"http://127.0.0.1:{PORT}/json"))
     page = next((p for p in pages if p.get("type") == "page" and "8188" in p.get("url", "")), None)
@@ -148,6 +180,10 @@ async def main():
             for name, code in SCENES:
                 if name not in only:
                     continue
+                if "__EXAMPLE__" in code:
+                    # the example workflows: their JSON is handed to the page as a string literal
+                    ex = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "examples", EXAMPLES[name])
+                    code = code.replace("__EXAMPLE__", json.dumps(open(ex, encoding="utf-8").read()))
                 res = await js(code)
                 print(name, "->", res)
                 await shot(name)
