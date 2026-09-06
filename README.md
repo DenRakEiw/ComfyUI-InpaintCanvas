@@ -678,8 +678,8 @@ pixels of the layers.
 
 ## Development
 
-See `DEVELOPMENT.md` for the mechanisms, measurements and test recipes, and
-`CLAUDE.md` for the invariants that must not be broken.
+See `DEVELOPMENT.md` for the mechanisms, measurements, test recipes and the
+invariants that must not be broken.
 
 ## License
 
