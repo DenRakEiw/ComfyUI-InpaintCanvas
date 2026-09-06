@@ -35,6 +35,9 @@ Flux.2 [max] API node (returns RGBA, square unless width/height are wired).
   hue/saturation, colour balance, black & white, invert, LUT,
   vignette): pure Canvas 2D / pixel loops, registry `FILTERS`. New filters go
   here, not into the editor file.
+- `examples/` — two workflows (Flux.2 API, Flux.2 Klein local) with an empty
+  editor state; `docs/img` the README screenshots made by `docs/shots.py`;
+  `GUIDE.md` the manual for a Note node.
 - `pyproject.toml` + `.github/workflows/publish_action.yml` — Comfy Registry
   (`PublisherId = "denrakeiw"`, secret `REGISTRY_ACCESS_TOKEN` is the user's).
 - Local install path: `ComfyUI/custom_nodes/ComfyUI-InpaintCanvas`.

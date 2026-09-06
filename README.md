@@ -106,6 +106,31 @@ With an API node (Flux.2 for example) wire `crop_image`, `prompt`,
 The stitch accepts any size and RGBA; a different aspect ratio is
 center-cropped, never distorted.
 
+## Example workflows
+
+Two ready-made graphs are in [`examples/`](examples): drop the file onto
+ComfyUI, open the editor, load an image and press Generate.
+
+- [`inpaint_canvas_flux2_api.json`](examples/inpaint_canvas_flux2_api.json):
+  the API chain. `crop_image`, `prompt`, `crop_width` and `crop_height` go
+  into ComfyUI's **Flux.2 Image** API node, its image comes back into
+  `result`. Reference layers ride along in `crop_image` and the API node
+  reads them as extra reference images. Needs ComfyUI API credits, no local
+  model.
+- [`inpaint_canvas_flux2_klein_local.json`](examples/inpaint_canvas_flux2_klein_local.json):
+  a local chain with **Flux.2 Klein 9B** in a subgraph (UNET, Qwen3 8B text
+  encoder, Flux.2 VAE, ReferenceLatent, SamplerCustomAdvanced). Two
+  **Image From Batch** nodes split the `crop_image` batch: index 0 is the
+  crop that is edited, index 1 the first reference layer, which goes into
+  ReferenceLatent. The result returns into `result_local`; switch the
+  editor to *Local*. A note in the graph lists the model downloads
+  (`flux-2-klein-base-9b-fp8`, `qwen_3_8b_fp8mixed`, the Flux.2 VAE). On a
+  32 GB card see the VRAM notes under *Generate* below: the helper models
+  are freed before a local run.
+
+Both graphs carry the guide as a note. The editor state in the examples is
+empty, so the node shows "No image" until you load one.
+
 ## The editor
 
 ### Selecting
