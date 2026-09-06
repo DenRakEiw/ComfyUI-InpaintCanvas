@@ -730,6 +730,7 @@ const STYLE = `
 .ipc-layer .ipc-maskrow .ipc-grow { flex:1; }
 .ipc-mini.ipc-on { background:#2b3a4f; color:#7cc7ff; }
 .ipc-list.ipc-dropping { outline:2px dashed #7cc7ff; outline-offset:-2px; }
+.ipc-view.ipc-dropping { outline:2px dashed #7cc7ff; outline-offset:-3px; }
 .ipc-mini { display:inline-flex; align-items:center; justify-content:center; width:26px; height:24px; border-radius:4px;
   cursor:pointer; color:#bbb; background:transparent; border:none; padding:0; flex:none; }
 .ipc-mini:hover { background:#3a3a3a; color:#fff; }
@@ -886,8 +887,11 @@ class InpaintEditor {
         root.addEventListener("dragover", (e) => { e.preventDefault(); e.stopPropagation(); });
         root.addEventListener("drop", (e) => {
             e.preventDefault(); e.stopPropagation();
-            const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
-            if (f && f.type.startsWith("image/")) this.loadFile(f);
+            const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []).filter((f) => f.type.startsWith("image/"));
+            if (!files.length) return;
+            // no base yet or Ctrl held: (re)load the base; otherwise every file becomes a new image layer
+            if (!this.width || e.ctrlKey) this.loadFile(files[0]);
+            else this.addImageLayers(files, e.shiftKey ? "reference" : "none", e.shiftKey ? {} : { place: "fit" });
         });
         root.addEventListener("wheel", (e) => e.stopPropagation(), { passive: true });
 
@@ -945,7 +949,7 @@ class InpaintEditor {
             this.fileInput.value = "";
         });
         top.appendChild(this.fileInput);
-        top.appendChild(iconButton("load", "Load an image as the base layer (Ctrl+V or drop also works)", () => this.fileInput.click(), "Load"));
+        top.appendChild(iconButton("load", "Load an image as the base layer (Ctrl+drop replaces the image; a plain drop adds a layer)", () => this.fileInput.click(), "Load"));
         top.appendChild(iconButton("save", "Save the finished image (Ctrl+S): all visible layers with their filters, without control and reference layers, into ComfyUI's output folder. Name and format in the Canvas section.", () => this.exportImage(), "Save"));
 
         const slider = (label, min, max, value, fmt, onInput) => {
@@ -1044,7 +1048,7 @@ class InpaintEditor {
         this.canvas = document.createElement("canvas");
         this.ctx = this.canvas.getContext("2d");
         this.viewEl.appendChild(this.canvas);
-        this.dropHint = el("div", "ipc-drop", "Load an image, paste it (Ctrl+V) or drop it here.\nThen paint a selection and press Generate.\nDrop onto the layer list to import as a layer, with Shift on the canvas as a reference.");
+        this.dropHint = el("div", "ipc-drop", "Load an image, paste it (Ctrl+V) or drop it here.\nThen paint a selection and press Generate.\nOnce an image is loaded, dropped files become new layers (Shift: reference, Ctrl: replace the image).");
         this.viewEl.appendChild(this.dropHint);
         this.buildSubbar();
         body.appendChild(this.viewEl);
@@ -1073,7 +1077,7 @@ class InpaintEditor {
         this.imageInput = fileInput((files) => this.addImageLayers(files, "none", { place: "fit" }));
         this.refInput = fileInput((files) => this.addImageLayers(files, "reference"));
         layersHead.appendChild(miniButton("image", "Import images as layers (one layer per file, part of the image, fitted to the canvas). Dropping files on this list does the same.", () => this.imageInput.click()));
-        layersHead.appendChild(miniButton("refImage", "Add reference images (one layer per file, role \"reference\"). They are not part of the image; they travel with crop_image as extra batch images for Flux.2 / Kontext. Shift+drop on the canvas does the same.", () => this.refInput.click()));
+        layersHead.appendChild(miniButton("refImage", "Add reference images (one layer per file, role \"reference\"). They are not part of the image; they travel with crop_image as extra batch images for Flux.2 / Kontext. Shift+drop on the canvas does the same (a plain drop adds an image layer).", () => this.refInput.click()));
         layersHead.appendChild(miniButton("fx", "Add a filter layer (grain, sharpen, levels, LUT, vignette). It filters everything below it; give it a mask to limit where it applies.", () => this.addFilterLayer()));
         layersHead.appendChild(miniButton("plus", "Add a paint layer (Ctrl+Shift+N)", () => this.addPaintLayer()));
         side.appendChild(layersHead);
@@ -1700,14 +1704,18 @@ class InpaintEditor {
                 }
             }
         });
-        this.viewEl.addEventListener("dragover", (e) => { e.preventDefault(); e.stopPropagation(); });
+        this.viewEl.addEventListener("dragover", (e) => { e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = e.ctrlKey && this.width ? "move" : "copy"; this.viewEl.classList.add("ipc-dropping"); });
+        this.viewEl.addEventListener("dragleave", (e) => { if (!this.viewEl.contains(e.relatedTarget)) this.viewEl.classList.remove("ipc-dropping"); });
         this.viewEl.addEventListener("drop", (e) => {
             e.preventDefault(); e.stopPropagation();
+            this.viewEl.classList.remove("ipc-dropping");
             const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []).filter((f) => f.type.startsWith("image/"));
             if (!files.length) return;
-            // Shift, several files, or a base that already exists plus Shift: reference layers.
-            if (this.width && (e.shiftKey || files.length > 1)) { this.addImageLayers(files, "reference"); return; }
-            this.loadFile(files[0]);
+            // No image yet, or Ctrl held: the file becomes (replaces) the base. Otherwise each file is a new
+            // image layer centred on the drop point (Shift: reference layers), like dropping into Krita.
+            if (!this.width || e.ctrlKey) { this.loadFile(files[0]); return; }
+            if (e.shiftKey) { this.addImageLayers(files, "reference"); return; }
+            this.addImageLayers(files, "none", { place: "at", at: this.toImage(e) });
         });
         this.canvas.addEventListener("pointerdown", (e) => this.onPointerDown(e));
         this.canvas.addEventListener("pointermove", (e) => this.onPointerMove(e));
@@ -3429,7 +3437,7 @@ class InpaintEditor {
     }
 
     /** Upload image files and add each as a layer (role "reference" by default). */
-    async addImageLayers(files, role = "reference", { place = "cascade" } = {}) {
+    async addImageLayers(files, role = "reference", { place = "cascade", at = null } = {}) {
         files = Array.from(files || []).filter((f) => f && f.type && f.type.startsWith("image/"));
         if (!files.length) return;
         if (!this.width) {
@@ -3450,9 +3458,16 @@ class InpaintEditor {
                 const w = Math.max(1, Math.round(img.naturalWidth * s)), h = Math.max(1, Math.round(img.naturalHeight * s));
                 const off = place === "cascade" ? 16 + (n % 8) * 24 : 0;
                 // origin: native size; fit: native size unless larger than the canvas; cascade: a third of the canvas (references)
-                const fs = place === "fit" ? Math.min(1, this.width / img.naturalWidth, this.height / img.naturalHeight) : 1;
+                const fs = place === "fit" || place === "at" ? Math.min(1, this.width / img.naturalWidth, this.height / img.naturalHeight) : 1;
                 const lw = place === "cascade" ? w : Math.max(1, Math.round(img.naturalWidth * fs)), lh = place === "cascade" ? h : Math.max(1, Math.round(img.naturalHeight * fs));
-                last = this.addLayer({ name: (file.name || "image").replace(/\.[a-z0-9]+$/i, ""), kind: "image", role, ref, canvas: imageToCanvas(img), x: off, y: off, w: lw, h: lh, dirty: false });
+                let lx = off, ly = off;
+                if (place === "at" && at) {
+                    // centred on the drop point, nudged back so the layer stays inside the canvas; several files cascade from there
+                    lx = Math.round(Math.min(Math.max(0, at[0] - lw / 2), Math.max(0, this.width - lw)));
+                    ly = Math.round(Math.min(Math.max(0, at[1] - lh / 2), Math.max(0, this.height - lh)));
+                    at = [at[0] + 24, at[1] + 24];
+                }
+                last = this.addLayer({ name: (file.name || "image").replace(/\.[a-z0-9]+$/i, ""), kind: "image", role, ref, canvas: imageToCanvas(img), x: lx, y: ly, w: lw, h: lh, dirty: false });
                 n++;
             } catch (err) {
                 console.error(err);

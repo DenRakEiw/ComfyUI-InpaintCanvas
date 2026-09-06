@@ -174,10 +174,13 @@ size, hardness, opacity and the paint colour.
   canny, other). Such layers are left out of the image your chain sees and
   instead composited on black into the `control_image` output, cropped and
   scaled exactly like `crop_image`. Feed it to ControlNet.
-- **Image layers**: the image button in the Layers header imports one or
-  more files as ordinary layers, part of the image, at native size (fitted
-  to the canvas when larger); dropping files onto the layer list does the
-  same, and an image pasted from the system clipboard lands as a layer too.
+- **Image layers**: drag an image onto the canvas and it opens as a new
+  layer centred on the drop point, at native size (fitted to the canvas when
+  larger); several files cascade from there. The image button in the Layers
+  header and dropping onto the layer list do the same at the origin, and an
+  image pasted from the system clipboard lands as a layer too. Ctrl+drop
+  replaces the base image instead; with no image loaded a drop loads the
+  base.
 - **Reference layers** (Flux.2 / Kontext multi-reference editing): the
   dashed image button in the Layers header uploads one or more files as
   layers with the role *reference* (dropping files onto the canvas with

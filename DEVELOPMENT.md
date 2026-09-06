@@ -588,8 +588,10 @@ select it. `drawComposite({forRun})` skips control *and* reference layers;
 `controlOnly` skips them as well. In the editor they are drawn normally plus a
 cyan dashed frame with "ref n" (`draw()`), the layer badge says "ref n" or
 "ref (hidden)". Upload: image button in the Layers header (`refInput`,
-multiple), drop on the layer list, or drop on the canvas with Shift / with
-several files (`addImageLayers(files, role)`): the original file is uploaded
+multiple), drop on the layer list, or drop on the canvas with Shift
+(`addImageLayers(files, role, {place, at})`; a plain drop on the canvas adds
+image layers with `place: "at"`, centred on the drop point, Ctrl+drop or a
+drop without a base calls `loadFile`): the original file is uploaded
 with `overwrite: false` and *is* the layer's `ref` (kind `image`, `dirty`
 false), the layer is shown at a third of the canvas, cascaded from the top
 left. `extendCanvas()` and `flatten()` keep reference layers.
