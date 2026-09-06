@@ -365,9 +365,10 @@ feather, no fill and no colour match, so nothing changes for them.
 ### Outpainting
 
 The **canvas tool (C)** shows the canvas as a frame: drag its edges or corners
-outward, the new size and the pixels per side are shown, Enter or **Extend
-canvas** applies (8 px steps, Alt for single pixels, Esc resets). The Canvas
-section does the same with numbers. The visible image is baked into the new
+outward, the new size and the pixels per side are shown while you drag, and
+releasing applies it (8 px steps, Alt for single pixels); Ctrl+Z takes an
+extension back. The Canvas section does the same with numbers and the
+**Extend canvas** button. The visible image is baked into the new
 base and the border becomes the selection. **Border** chooses
 what fills it before the model sees it: the image's average colour (default),
 neutral grey, green for edit models, black, random noise for latent models, or

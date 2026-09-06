@@ -880,3 +880,27 @@ Test: scratchpad `scenes_text.py` (rotate zone cursor, pending rotate, scale
 in the rotated frame with anchor check, move, Enter; canvas tool drag with
 and without Alt, Enter; text layer creation, font list, re-render on input,
 bold + undo, kind select round trip, persistence).
+
+## 17. Quality-of-life plan (2026-09-06)
+
+The user's list of what Photoshop / Krita have and the node lacked, built in
+this order (each package committed and browser-tested on its own):
+
+1. **Canvas extension by dragging applies on release** and is undoable
+   (undo kind `canvas`: base, size, selection, shallow layer copies). Done.
+2. **Layers**: rename (double-click), duplicate (Ctrl+J), merge down
+   (Ctrl+E), thumbnails, drag reorder, lock / alpha lock, Alt+eye solo,
+   Ctrl+click on the canvas selects the layer under the cursor.
+3. **Adjustment filter layers** (`inpaint_filters.js`): hue / saturation,
+   brightness / contrast, colour balance, curves (custom control via
+   `FILTERS[id].control`, param `type: "custom"`), gaussian blur, black &
+   white. Built by a subagent in parallel with 2.
+4. **Painting**: eyedropper (Alt in brush / I), Shift-click straight lines,
+   tablet pressure for size and opacity, bucket fill, gradient tool, then
+   smudge, clone stamp and healing brush.
+5. **Selection**: magic wand / colour range with tolerance, ellipse, feather,
+   move the selection outline, save / restore selections, quick mask mode.
+6. **Transform / canvas**: flip, rotate 90°, numeric position / size,
+   snapping to canvas edges and centre, centre layer, crop, resize image.
+7. **View**: zoom 100%, rotate view, rulers / grid / guides, before-after
+   toggle, side-by-side compare, on-canvas text editing, autosave / recovery.

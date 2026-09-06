@@ -1043,7 +1043,7 @@ class InpaintEditor {
         addTool("transform", "Move / scale / rotate the active layer (T). Drag inside to move, corners scale (Shift: free aspect), edges scale one axis, drag just outside a corner to rotate (Shift snaps to 15°). Rotation is applied with Enter.");
         addTool("text", "Text (Shift+T): click on the canvas to add a text layer, click a text layer to select it, drag to move it. Text, font, size and colour are edited in the layer panel.");
         addTool("hand", "Pan (H, Space or middle mouse)");
-        addTool("canvas", "Canvas size (C): drag the frame's edges or corners outward to extend the canvas (outpainting). Snaps to 8 px, Alt for single pixels. Enter or \"Extend canvas\" applies, Esc resets.");
+        addTool("canvas", "Canvas size (C): drag the frame's edges or corners outward to extend the canvas (outpainting); it is applied when you release, Ctrl+Z takes it back. Snaps to 8 px, Alt for single pixels.");
         tools.appendChild(el("div", "ipc-sep"));
         tools.appendChild(iconButton("undo", "Undo (Ctrl+Z)", () => this.undoStep()));
         tools.appendChild(iconButton("redo", "Redo (Ctrl+Shift+Z)", () => this.redoStep()));
@@ -1787,7 +1787,7 @@ class InpaintEditor {
         this.viewEl.classList.toggle("ipc-pan", tool === "hand");
         this.viewEl.classList.toggle("ipc-move", tool === "transform");
         if (tool !== "transform" && tool !== "canvas") this.viewEl.classList.remove(...CURSOR_CLASSES);
-        if (tool === "canvas") this.setStatus("Drag the frame's edges or corners outward to extend the canvas (8 px steps, Alt for single pixels). Enter or \"Extend canvas\" applies, Esc resets.");
+        if (tool === "canvas") this.setStatus("Drag the frame's edges or corners outward to extend the canvas (8 px steps, Alt for single pixels). Applied on release, Ctrl+Z takes it back.");
         if (tool === "text") this.setStatus("Click on the canvas to add a text layer; click a text layer to select it, drag to move it.");
         if (tool !== "object") { this.hoverObjectId = 0; this.hoverObjectCanvas = null; }
         else this.ensureObjects();
@@ -2260,7 +2260,7 @@ class InpaintEditor {
             if (h.includes("n")) this.extendInputs.top.value = q(o.top - dy);
             if (h.includes("s")) this.extendInputs.bottom.value = q(o.bottom + dy);
             const R = this.extendRect();
-            this.setStatus(`Canvas ${this.width} × ${this.height} → ${R.w} × ${R.h}. Enter or "Extend canvas" applies, Esc resets.`);
+            this.setStatus(`Canvas ${this.width} × ${this.height} → ${R.w} × ${R.h}, applied on release.`);
         } else if (p.kind === "pending") {
             this.pendingPointerMove(ix, iy, e);
         }
@@ -2338,6 +2338,9 @@ class InpaintEditor {
             this.renderLayers();
             this.drawThumb();
             this.notifyChanged();
+        } else if (p.kind === "canvasext") {
+            // like a crop handle in Photoshop: releasing applies; Ctrl+Z takes it back
+            if (this.extendPending()) this.extendCanvas();
         }
         this.draw();
     }
@@ -3049,6 +3052,7 @@ class InpaintEditor {
         if (!(top || right || bottom || left)) { this.setStatus("Enter how many pixels to add on each side."); return; }
         const W = this.width, H = this.height;
         const nw = W + left + right, nh = H + top + bottom;
+        const before = this.snapshot({ kind: "canvas" });
         try {
             this.setStatus(`Extending canvas to ${nw} × ${nh} ...`);
             // Flatten what is visible now and fill the new border the chosen way.
@@ -3096,6 +3100,7 @@ class InpaintEditor {
                     const c = makeCanvas(nw, nh);
                     c.getContext("2d").drawImage(l.canvas, left, top);
                     l.canvas = c; l.x = 0; l.y = 0; l.w = nw; l.h = nh;
+                    if (l.mask) { const m = makeCanvas(nw, nh); m.getContext("2d").drawImage(l.mask, left, top); l.mask = m; l.maskDirty = true; l._maskedValid = false; }
                 } else {
                     l.x += left; l.y += top;
                 }
@@ -3110,7 +3115,7 @@ class InpaintEditor {
             sctx.fillStyle = "#ff0000";
             sctx.fillRect(0, 0, nw, nh);
             sctx.clearRect(left, top, W, H);
-            this.undo = []; this.redo = [];
+            this.pushUndoSnapshot(before);
             this.uploaded = this.makeUploaded();
             this.selectionDirty = true;
             this.selectionDataUrl = null;
@@ -3120,7 +3125,7 @@ class InpaintEditor {
             this.fitView();
             this.drawThumb();
             this.notifyChanged();
-            this.setStatus(`Canvas is ${nw} × ${nh}. The new border is selected; press Generate to outpaint it.`);
+            this.setStatus(`Canvas is ${nw} × ${nh}. The new border is selected; press Generate to outpaint it (Ctrl+Z takes the extension back).`);
         } catch (err) {
             console.error(err);
             this.setStatus(String(err.message || err));
@@ -3131,6 +3136,10 @@ class InpaintEditor {
 
     snapshot(step) {
         if (step.kind === "selection") return { kind: "selection", url: this.selection.toDataURL("image/png") };
+        if (step.kind === "canvas") {
+            // base, size, selection and the layer list (shallow copies: the canvases themselves are never mutated by extend / crop, only replaced)
+            return { kind: "canvas", base: this.base, width: this.width, height: this.height, selection: this.selection.toDataURL("image/png"), layers: this.layers.map((l) => ({ ...l })), activeLayerId: this.activeLayerId };
+        }
         const layer = this.layers.find((l) => l.id === step.id);
         if (!layer) return null;
         if (step.kind === "layer") return { kind: "layer", id: layer.id, url: layer.canvas.toDataURL("image/png") };
@@ -3157,6 +3166,27 @@ class InpaintEditor {
     }
 
     async applySnapshot(snap) {
+        if (snap.kind === "canvas") {
+            if (this.pending) this.cancelPending();
+            this.base = snap.base;
+            this.width = snap.width;
+            this.height = snap.height;
+            this.layers = snap.layers.map((l) => ({ ...l, dirty: true, exportRef: null, _maskedValid: false, _mcache: null, _fxCache: null, maskDirty: !!l.mask }));
+            this.activeLayerId = snap.activeLayerId;
+            this.selection = makeCanvas(this.width, this.height);
+            try { this.selection.getContext("2d").drawImage(await loadImageEl(snap.selection), 0, 0); } catch (_) { /* empty selection */ }
+            this.uploaded = this.makeUploaded();
+            this.selectionDirty = true;
+            this.selectionDataUrl = null;
+            if (this.extendInputs) for (const k of Object.keys(this.extendInputs)) this.extendInputs[k].value = 0;
+            this.renderLayers();
+            this.renderInfo();
+            this.fitView();
+            this.drawThumb();
+            this.notifyChanged();
+            this.setStatus(`Canvas is ${this.width} × ${this.height} again.`);
+            return;
+        }
         if (snap.kind === "selection") {
             const img = await loadImageEl(snap.url);
             const sctx = this.selection.getContext("2d");
@@ -4349,6 +4379,18 @@ class InpaintEditor {
         for (const p of def.params) {
             if (p.onlyWithPlate && !layer.plate) continue;
             if (p.notWithPlate && layer.plate) continue;
+            if (p.type === "custom") {
+                // a control the filter module builds itself (e.g. the curves editor), full row; it reports edits through the callbacks
+                if (typeof def.control !== "function") continue;
+                const node = def.control(layer, p, {
+                    begin: () => { if (!layer._undoPending) layer._undoPending = this.snapshot({ kind: "filter", id: layer.id }); },
+                    preview: () => { this.filterPreview = layer.id; this.markFilterChanged(layer, { soon: true }); },
+                    commit: () => { this.filterPreview = null; if (layer._undoPending) { this.pushUndoSnapshot(layer._undoPending); layer._undoPending = null; } this.markFilterChanged(layer); },
+                    stop,
+                });
+                if (node) { node.style.gridColumn = "1 / -1"; box.appendChild(node); }
+                continue;
+            }
             const lab = el("span", null, p.label);
             box.appendChild(lab);
             const cur = layer.params[p.key] ?? p.default;
