@@ -711,6 +711,12 @@ const STYLE = `
 .ipc-tools .ipc-ib { width:38px; height:36px; padding:0; }
 .ipc-tools .ipc-sep { height:1px; background:#3a3a3a; margin:4px 2px; }
 .ipc-tools .ipc-grp { font-size:9px; text-transform:uppercase; letter-spacing:.06em; color:#666; text-align:center; margin:2px 0 -1px; }
+.ipc-groupbtn { position:relative; }
+.ipc-groupbtn .ipc-tri { position:absolute; right:3px; bottom:3px; width:0; height:0; border-left:5px solid transparent; border-bottom:5px solid #9a9a9a; }
+.ipc-flyout { position:absolute; z-index:6; display:flex; flex-direction:column; gap:3px; padding:5px; background:#262626; border:1px solid #444; border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.55); min-width:170px; }
+.ipc-flyout .ipc-ib { justify-content:flex-start; padding:5px 10px; width:auto; height:auto; text-align:left; white-space:nowrap; }
+.ipc-flyout .ipc-key { margin-left:auto; padding-left:14px; color:#8a8a8a; font-size:11px; }
+.ipc-flyout .ipc-sep { height:1px; background:#3a3a3a; margin:3px 2px; }
 .ipc-view { flex:1; position:relative; overflow:hidden; min-width:0; cursor:crosshair;
   background-color:#2b2b2b;
   background-image: linear-gradient(45deg,#333 25%,transparent 25%),linear-gradient(-45deg,#333 25%,transparent 25%),
@@ -1069,66 +1075,101 @@ class InpaintEditor {
             this.toolButtons[id] = b;
             tools.appendChild(b);
         };
+        // Tool groups: one button per family, the button shows the family's current tool; hover,
+        // right-click or hold opens the flyout with all of them (Photoshop / Krita style).
+        this.toolGroups = [];
+        this.toolGroupOf = {};
+        const addGroup = (items, actions = []) => {
+            const g = { items, tools: items.map((i) => i.tool), current: items[0].tool, actions, btn: null };
+            const btn = el("button", "ipc-ib ipc-groupbtn");
+            btn.type = "button";
+            btn.addEventListener("click", (e) => { e.stopPropagation(); e.preventDefault(); clearTimeout(g._hold); this.closeFlyout(); this.setTool(g.current); });
+            btn.addEventListener("contextmenu", (e) => { e.preventDefault(); e.stopPropagation(); this.openFlyout(g, btn); });
+            btn.addEventListener("pointerenter", () => { clearTimeout(g._hover); g._hover = setTimeout(() => this.openFlyout(g, btn), 400); });
+            btn.addEventListener("pointerleave", () => { clearTimeout(g._hover); this.scheduleFlyoutClose(); });
+            btn.addEventListener("pointerdown", (e) => { if (e.button === 0) g._hold = setTimeout(() => this.openFlyout(g, btn), 450); });
+            btn.addEventListener("pointerup", () => clearTimeout(g._hold));
+            g.btn = btn;
+            this.toolGroups.push(g);
+            for (const it of items) this.toolGroupOf[it.tool] = g;
+            tools.appendChild(btn);
+            this.refreshGroupButton(g);
+            return g;
+        };
+        // a menu button: click opens a flyout of actions and toggles
+        const addMenu = (iconName, title, actions) => {
+            const g = { items: [], tools: [], actions, menu: true, btn: null };
+            const btn = iconButton(iconName, title, () => { if (this.flyout && this.flyout.group === g) this.closeFlyout(); else this.openFlyout(g, btn); });
+            btn.classList.add("ipc-groupbtn");
+            btn.innerHTML += '<span class="ipc-tri"></span>';
+            btn.addEventListener("pointerleave", () => this.scheduleFlyoutClose());
+            g.btn = btn;
+            tools.appendChild(btn);
+            return g;
+        };
+
         tools.appendChild(el("div", "ipc-grp", "Select"));
-        addTool("select", "Paint selection (B): adds to the selection, Alt subtracts");
-        addTool("rect", "Rectangle selection (R): replaces the selection, Shift adds, Alt subtracts, Ctrl keeps it square. Drag inside an existing selection to move its outline.");
-        addTool("ellipse", "Ellipse selection (Shift+R): replaces the selection, Shift adds, Alt subtracts, Ctrl keeps it a circle. Drag inside an existing selection to move its outline.");
-        addTool("lasso", "Lasso selection (L): replaces the selection, Shift adds, Alt subtracts");
-        addTool("polygon", "Polygon selection (Shift+L): click point by point, click the first point, double-click or Enter to close, Backspace removes the last point, Esc cancels. Replaces the selection, Shift adds, Alt subtracts.");
-        addTool("object", "Object selection (O): hover to see objects, click to select, click again to deselect. Shift adds, Alt subtracts.");
-        addTool("wand", "Magic wand (W): selects the area of similar colour under the cursor. Tolerance, contiguous and the sample source are in the bar above the canvas. Shift adds, Alt subtracts.");
-        addTool("deselect", "Erase from selection (D)");
-        this.loopBtn = iconButton("loop", "Close loops (Photoshop-style): end a brush stroke where it started and the inside is filled too. Also for the subtract brush.", () => {
-            this.fillEnclosed = !this.fillEnclosed;
-            this.loopBtn.classList.toggle("ipc-toggle-on", this.fillEnclosed);
-            this.setStatus(this.fillEnclosed ? "Close loops on: end a stroke where it started to fill the inside." : "Close loops off.");
-        });
-        this.loopBtn.classList.toggle("ipc-toggle-on", this.fillEnclosed);
-        tools.appendChild(this.loopBtn);
+        addGroup([
+            { tool: "select", label: "Selection brush", key: "B", title: "Paint selection (B): adds to the selection, Alt subtracts" },
+            { tool: "deselect", label: "Deselect brush", key: "D", title: "Erase from selection (D)" },
+        ], [
+            { icon: "loop", label: "Close loops", title: "Close loops (Photoshop-style): end a brush stroke where it started and the inside is filled too. Also for the subtract brush.", toggle: () => this.fillEnclosed, onClick: () => { this.fillEnclosed = !this.fillEnclosed; this.setStatus(this.fillEnclosed ? "Close loops on: end a stroke where it started to fill the inside." : "Close loops off."); } },
+        ]);
+        addGroup([
+            { tool: "rect", label: "Rectangle", key: "R", title: "Rectangle selection (R): replaces the selection, Shift adds, Alt subtracts, Ctrl keeps it square. Drag inside an existing selection to move its outline." },
+            { tool: "ellipse", label: "Ellipse", key: "Shift+R", title: "Ellipse selection (Shift+R): replaces the selection, Shift adds, Alt subtracts, Ctrl keeps it a circle. Drag inside an existing selection to move its outline." },
+            { tool: "lasso", label: "Lasso", key: "L", title: "Lasso selection (L): replaces the selection, Shift adds, Alt subtracts" },
+            { tool: "polygon", label: "Polygon", key: "Shift+L", title: "Polygon selection (Shift+L): click point by point, click the first point, double-click or Enter to close, Backspace removes the last point, Esc cancels. Replaces the selection, Shift adds, Alt subtracts." },
+        ]);
+        addGroup([
+            { tool: "object", label: "Object", key: "O", title: "Object selection (O): hover to see objects, click to select, click again to deselect. Shift adds, Alt subtracts." },
+            { tool: "wand", label: "Magic wand", key: "W", title: "Magic wand (W): selects the area of similar colour under the cursor. Tolerance, contiguous and the sample source are in the bar above the canvas. Shift adds, Alt subtracts." },
+        ]);
         this.quickMaskBtn = iconButton("quickmask", "Quick mask (Q): while on, the paint and erase tools edit the selection (paint selects, erase deselects, the bucket works like the wand) and the selection is shown as a red tint.", () => this.toggleQuickMask());
         tools.appendChild(this.quickMaskBtn);
+        addMenu("clear", "Selection: clear (Ctrl+D), invert (Ctrl+I), outline or tint display", [
+            { icon: "clear", label: "Clear", key: "Ctrl+D", title: "Clear selection (Ctrl+D)", onClick: () => this.clearSelection() },
+            { icon: "invert", label: "Invert", key: "Ctrl+I", title: "Invert selection (Ctrl+I)", onClick: () => this.invertSelection() },
+            { icon: "ants", label: "Marching ants", title: "Selection display: marching ants outline (on) or red tint (off)", toggle: () => this.selectionDisplay === "ants", onClick: () => {
+                this.selectionDisplay = this.selectionDisplay === "ants" ? "tint" : "ants";
+                try { localStorage.setItem("ipc.selectionDisplay", this.selectionDisplay); } catch (_) { /* ignore */ }
+                this.draw();
+                this.setStatus(this.selectionDisplay === "ants" ? "Selection shown as an outline." : "Selection shown as a red tint.");
+            } },
+        ]);
         tools.appendChild(el("div", "ipc-sep"));
         tools.appendChild(el("div", "ipc-grp", "Layer"));
-        addTool("paint", "Paint on the active layer (P). On the base it creates a paint layer.");
-        addTool("erase", "Erase from the active layer (E)");
-        addTool("smudge", "Smudge (Shift+S): drag pixels along the stroke, like a finger in wet paint. Strength in the bar above the canvas; on the base it first makes a copy layer.");
-        addTool("clone", "Clone stamp (S): Alt+click sets the source, then paint to copy from there onto the active layer. Aligned keeps the offset between strokes; Sample chooses the visible image or the layer.");
-        addTool("heal", "Healing brush (J): like the clone stamp, but the copied texture takes on the colour and brightness of where it lands.");
-        tools.appendChild(iconButton("fill", "Fill the selection with the color on the active layer (Shift+F)", () => this.fillSelection()));
-        addTool("bucket", "Bucket fill (G): fills the connected area of similar colour under the cursor on the active layer, limited to the selection. Tolerance, contiguous and the sample source are in the bar above the canvas.");
-        addTool("gradient", "Gradient (Shift+G): drag on the active layer to draw a gradient from the colour to transparent, white or black (linear or radial, bar above the canvas), limited to the selection.");
+        addGroup([
+            { tool: "paint", label: "Paint", key: "P", title: "Paint on the active layer (P). On the base it creates a paint layer. Alt+click picks a colour, Shift+click draws a straight line." },
+            { tool: "erase", label: "Erase", key: "E", title: "Erase from the active layer (E)" },
+        ]);
+        addGroup([
+            { tool: "smudge", label: "Smudge", key: "Shift+S", title: "Smudge (Shift+S): drag pixels along the stroke, like a finger in wet paint. Strength in the bar above the canvas; on the base it first makes a copy layer." },
+            { tool: "clone", label: "Clone stamp", key: "S", title: "Clone stamp (S): Alt+click sets the source, then paint to copy from there onto the active layer. Aligned keeps the offset between strokes; Sample chooses the visible image or the layer." },
+            { tool: "heal", label: "Healing brush", key: "J", title: "Healing brush (J): like the clone stamp, but the copied texture takes on the colour and brightness of where it lands." },
+        ]);
+        addGroup([
+            { tool: "bucket", label: "Bucket fill", key: "G", title: "Bucket fill (G): fills the connected area of similar colour under the cursor on the active layer, limited to the selection. Tolerance, contiguous and the sample source are in the bar above the canvas." },
+            { tool: "gradient", label: "Gradient", key: "Shift+G", title: "Gradient (Shift+G): drag on the active layer to draw a gradient from the colour to transparent, white or black (linear or radial, bar above the canvas), limited to the selection." },
+        ], [
+            { icon: "fill", label: "Fill selection", key: "Shift+F", title: "Fill the selection with the colour on the active layer (Shift+F)", onClick: () => this.fillSelection() },
+        ]);
         addTool("eyedropper", "Eyedropper (I): click to pick the colour under the cursor from the visible image. Alt+click with the brush does the same.");
         addTool("transform", "Move / scale / rotate the active layer (T). Drag inside to move, corners scale (Shift: free aspect), edges scale one axis, drag just outside a corner to rotate (Shift snaps to 15°). Rotation is applied with Enter.");
-        addTool("text", "Text (Shift+T): click on the canvas to add a text layer, click a text layer to select it, drag to move it. Text, font, size and colour are edited in the layer panel.");
+        addTool("text", "Text (Shift+T): click on the canvas to add a text layer, click a text layer to select it, drag to move it, double-click to edit it on the canvas.");
         addTool("hand", "Pan (H, Space or middle mouse)");
-        addTool("canvas", "Canvas size (C): drag the frame's edges or corners outward to extend the canvas (outpainting); it is applied when you release, Ctrl+Z takes it back. Snaps to 8 px, Alt for single pixels.");
+        addTool("canvas", "Canvas size (C): drag the frame's edges or corners outward to extend the canvas (outpainting), inward to crop; applied when you release, Ctrl+Z takes it back. Snaps to 8 px, Alt for single pixels.");
         tools.appendChild(el("div", "ipc-sep"));
         tools.appendChild(iconButton("undo", "Undo (Ctrl+Z)", () => this.undoStep()));
         tools.appendChild(iconButton("redo", "Redo (Ctrl+Shift+Z)", () => this.redoStep()));
         tools.appendChild(el("div", "ipc-sep"));
         tools.appendChild(el("div", "ipc-grp", "View"));
-        this.rulersBtn = iconButton("ruler", "Rulers (Ctrl+Shift+R). Drag a guide out of a ruler; drag it back to remove it; double-click a ruler clears all guides. Layers snap to guides.", () => this.toggleRulers());
-        this.rulersBtn.classList.toggle("ipc-toggle-on", this.showRulers);
-        tools.appendChild(this.rulersBtn);
-        this.gridBtn = iconButton("grid", "Grid (Ctrl+Shift+G): lines every 64 px (the spacing follows the node's multiple_of)", () => this.toggleGrid());
-        this.gridBtn.classList.toggle("ipc-toggle-on", this.showGrid);
-        tools.appendChild(this.gridBtn);
-        this.peekBtn = iconButton("peek", "Before / after: show the base image without any layer. Hold \\ for a quick look, click to toggle.", () => { this.peekBase = !this.peekBase; this.peekHold = false; this.peekBtn.classList.toggle("ipc-toggle-on", this.peekBase); this.draw(); });
-        tools.appendChild(this.peekBtn);
-        tools.appendChild(el("div", "ipc-sep"));
-        tools.appendChild(iconButton("clear", "Clear selection (Ctrl+D)", () => this.clearSelection()));
-        tools.appendChild(iconButton("invert", "Invert selection (Ctrl+I)", () => this.invertSelection()));
-        this.antsBtn = iconButton("ants", "Selection display: marching ants outline (on) or red tint (off)", () => {
-            this.selectionDisplay = this.selectionDisplay === "ants" ? "tint" : "ants";
-            try { localStorage.setItem("ipc.selectionDisplay", this.selectionDisplay); } catch (_) { /* ignore */ }
-            this.antsBtn.classList.toggle("ipc-toggle-on", this.selectionDisplay === "ants");
-            this.draw();
-            this.setStatus(this.selectionDisplay === "ants" ? "Selection shown as an outline." : "Selection shown as a red tint.");
-        });
-        this.antsBtn.classList.toggle("ipc-toggle-on", this.selectionDisplay === "ants");
-        tools.appendChild(this.antsBtn);
-        tools.appendChild(el("div", "ipc-sep"));
-        tools.appendChild(iconButton("fit", "Fit to view (F)", () => this.fitView()));
+        addMenu("peek", "View: fit, 100 %, rulers, grid, before / after", [
+            { icon: "fit", label: "Fit to view", key: "F", title: "Fit the image to the window (F)", onClick: () => this.fitView() },
+            { icon: "ruler", label: "Rulers", key: "Ctrl+Shift+R", title: "Rulers (Ctrl+Shift+R). Drag a guide out of a ruler; drag it back to remove it; double-click a ruler clears all guides. Layers snap to guides.", toggle: () => this.showRulers, onClick: () => this.toggleRulers() },
+            { icon: "grid", label: "Grid", key: "Ctrl+Shift+G", title: "Grid (Ctrl+Shift+G): lines every 64 px", toggle: () => this.showGrid, onClick: () => this.toggleGrid() },
+            { icon: "peek", label: "Before / after", key: "\\", title: "Show the base image without any layer. Hold \\ for a quick look, click to toggle.", toggle: () => !!this.peekBase, onClick: () => { this.peekBase = !this.peekBase; this.peekHold = false; this.draw(); } },
+        ]);
         tools.appendChild(iconButton("flatten", "Flatten all visible layers into the base", () => this.flatten()));
         body.appendChild(tools);
 
@@ -1865,6 +1906,7 @@ class InpaintEditor {
                 if (this.pending) this.cancelPending();
                 else if (this.polyPoints) { this.polyPoints = null; this.draw(); this.setStatus("Polygon cancelled."); }
                 else if (this.tool === "canvas" && this.extendPending()) { this.resetExtend(); this.setStatus("Canvas extension reset."); }
+                else if (this.flyout) this.closeFlyout();
                 else if (this.textEdit) this.endTextEdit(false);
                 else if (this.compare) { this.compare = null; if (this.compareBtn) this.compareBtn.classList.remove("ipc-on"); this.draw(); this.setStatus("Compare ended."); }
                 else this.close();
@@ -1903,6 +1945,7 @@ class InpaintEditor {
         if (this._docKeyUp) window.removeEventListener("keyup", this._docKeyUp, true);
         this._docKeyUp = null;
         if (this.textEdit) this.endTextEdit(true);
+        this.closeFlyout();
         clearTimeout(this._autosave);
         this.compare = null;
         this.peekBase = false;
@@ -1987,6 +2030,7 @@ class InpaintEditor {
             this.hardCtl.value.textContent = v + "%";
         }
         for (const [id, b] of Object.entries(this.toolButtons)) b.classList.toggle("ipc-active", id === tool);
+        for (const g of this.toolGroups || []) { if (g.tools.includes(tool)) g.current = tool; this.refreshGroupButton(g); }
         this.viewEl.classList.toggle("ipc-pan", tool === "hand");
         this.viewEl.classList.toggle("ipc-move", tool === "transform");
         if (tool !== "transform" && tool !== "canvas") this.viewEl.classList.remove(...CURSOR_CLASSES);
@@ -2317,6 +2361,63 @@ class InpaintEditor {
 
     updateCanvasCursor(ix, iy) {
         this.setHandleCursor(this.canvasHandleAt(ix, iy));
+    }
+
+    // ---- tool groups (flyouts) ----------------------------------------------------------------
+
+    refreshGroupButton(g) {
+        if (!g.btn || g.menu) return;
+        const it = g.items.find((i) => i.tool === g.current) || g.items[0];
+        g.btn.innerHTML = icon(it.tool) + '<span class="ipc-tri"></span>';
+        g.btn.title = it.title + "\nHover, right-click or hold for the other tools of this group.";
+        g.btn.classList.toggle("ipc-active", this.tool === it.tool);
+    }
+
+    openFlyout(g, anchor) {
+        if (this.flyout && this.flyout.group === g) { clearTimeout(this._flyClose); return; }
+        this.closeFlyout();
+        const fly = el("div", "ipc-flyout");
+        const add = (iconName, label, key, title, onClick, active, toggled) => {
+            const b = iconButton(iconName, title, onClick, label);
+            if (key) b.appendChild(el("span", "ipc-key", key));
+            if (active) b.classList.add("ipc-active");
+            if (toggled) b.classList.add("ipc-toggle-on");
+            fly.appendChild(b);
+            return b;
+        };
+        for (const it of g.items) add(it.tool, it.label, it.key, it.title, () => { this.setTool(it.tool); this.closeFlyout(); }, this.tool === it.tool, false);
+        if (g.items.length && g.actions.length) fly.appendChild(el("div", "ipc-sep"));
+        for (const a of g.actions) {
+            const b = add(a.icon, a.label, a.key, a.title, () => {
+                a.onClick();
+                if (a.toggle) b.classList.toggle("ipc-toggle-on", !!a.toggle()); else this.closeFlyout();
+            }, false, a.toggle ? !!a.toggle() : false);
+        }
+        fly.addEventListener("pointerenter", () => clearTimeout(this._flyClose));
+        fly.addEventListener("pointerleave", () => this.scheduleFlyoutClose());
+        for (const type of ["pointerdown", "pointerup", "click", "wheel", "contextmenu"]) fly.addEventListener(type, (e) => e.stopPropagation());
+        this.root.appendChild(fly);
+        const r = anchor.getBoundingClientRect(), rr = this.root.getBoundingClientRect();
+        fly.style.left = `${r.right - rr.left + 6}px`;
+        const top = Math.min(r.top - rr.top, rr.height - fly.offsetHeight - 8);
+        fly.style.top = `${Math.max(4, top)}px`;
+        this.flyout = { el: fly, group: g };
+        if (!this._flyDocDown) {
+            this._flyDocDown = (e) => { if (this.flyout && !this.flyout.el.contains(e.target) && !(this.flyout.group.btn && this.flyout.group.btn.contains(e.target))) this.closeFlyout(); };
+            window.addEventListener("pointerdown", this._flyDocDown, true);
+        }
+    }
+
+    scheduleFlyoutClose() {
+        clearTimeout(this._flyClose);
+        this._flyClose = setTimeout(() => this.closeFlyout(), 450);
+    }
+
+    closeFlyout() {
+        clearTimeout(this._flyClose);
+        if (!this.flyout) return;
+        this.flyout.el.remove();
+        this.flyout = null;
     }
 
     // ---- view: rulers, grid, guides, before/after, compare, on-canvas text ----------------------

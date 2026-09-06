@@ -102,7 +102,13 @@ rectangle is the crop that leaves the node, not the selection.
 Rectangle and lasso replace the selection like in Krita and Photoshop; hold
 Shift to add, Alt to subtract. The brush adds, with Alt it subtracts.
 
-Tools on the left: brush (B), rectangle (R) and ellipse (Shift+R; Ctrl keeps
+The tool column on the left groups related tools Photoshop-style: a button
+shows the group's current tool and a small triangle; hover, right-click or
+hold it to open the group (selection brushes, marquees, smart selection,
+brushes, retouch, fill), and the shortcuts pick any tool directly. Two menu
+buttons hold the selection actions and the view toggles.
+
+Tools: brush (B), rectangle (R) and ellipse (Shift+R; Ctrl keeps
 them square or round, dragging inside an existing selection moves its
 outline), lasso (L), polygon (Shift+L: click point by point, click the first
 point, double-click or Enter to close, Backspace removes the last point, Esc

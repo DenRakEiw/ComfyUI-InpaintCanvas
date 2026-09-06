@@ -978,3 +978,43 @@ this order (each package committed and browser-tested on its own):
    snapping to canvas edges and centre, centre layer, crop, resize image.
 7. **View**: zoom 100%, rotate view, rulers / grid / guides, before-after
    toggle, side-by-side compare, on-canvas text editing, autosave / recovery.
+
+Status 2026-09-06, late: all seven packages are built, browser-tested and
+pushed, plus an eighth: **tool groups**. The left column went from 31 to 17
+buttons: `addGroup(items, actions)` makes one button per family (selection
+brushes, marquees, smart selection, brushes, retouch, fill) that shows the
+family's current tool plus a triangle; hover (400 ms), right-click or hold
+(450 ms) opens `openFlyout()` (icon, name, shortcut; actions and toggles
+below a separator, toggles keep the flyout open), `refreshGroupButton()` is
+called from `setTool` so shortcuts keep the buttons in sync. Two `addMenu`
+buttons hold the selection actions (clear, invert, marching ants) and the
+view toggles (fit, rulers, grid, before / after). Standalone: quick mask,
+eyedropper, transform, text, hand, canvas, undo / redo, flatten.
+
+## 18. Notes on the QoL packages (2026-09-06)
+
+- **Layers**: undo kind `layers` = shallow copies of the list (canvases are
+  replaced, never mutated, by merge / duplicate / reorder / delete), so an
+  undo restores new layer objects with the same ids: never keep layer object
+  references across an undo (tests learned this the hard way). Locked layers
+  block paint, erase, transform, fill, clear, merge and delete; alpha lock
+  composites strokes with `source-atop`. Merge down draws the upper layer
+  with its opacity and blend onto the lower one's canvas at the lower one's
+  resolution; the bottom layer merges into the base (canvas undo).
+- **Painting**: `inpaint_raster.js` holds `floodMask` (scanline fill, 4 ms
+  for 512×384, tolerance per channel) shared by the bucket and the wand.
+  Smudge works directly on the layer canvas (dab = previous patch masked by
+  `dabMask`), clone / heal go through the normal stroke buffer so opacity,
+  selection clip and undo apply; heal shifts each dab by the difference of
+  the 8×8 means of source and destination.
+- **Selection**: feather is a `ctx.filter` blur of the mask; soft alpha is
+  honoured by strokes (`destination-in`), fills and the mask sent along,
+  while `getBounds` still uses alpha > 127. Saved selections are data URLs in
+  the workflow state. Quick mask maps paint / erase to the selection brushes
+  and the bucket to the wand.
+- **View**: the view transform is `translate(v) rotate(angle) scale(s)`;
+  `canvasToImage` / `imageToScreen` / `applyViewTransform` are the only
+  places that know it. Compare mode draws two clipped passes with
+  `compareShow` and invalidates the composite caches between them. The text
+  overlay is a transparent textarea over the layer (caret only), the layer
+  renders live. Autosave = `syncLayers` 15 s after the last change.
