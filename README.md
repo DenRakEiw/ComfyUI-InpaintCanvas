@@ -52,6 +52,9 @@ Highlights
   prompt and up to eight editor-driven setting outputs, helper prompts that
   never trigger your generation chain.
 
+A compact English manual for a Note node or a text display lives in
+[GUIDE.md](GUIDE.md).
+
 ## Installation
 
 ```bash
