@@ -16,6 +16,7 @@ import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { FILTERS, FILTER_IDS, filterDefaults, applyFilter, lutFromCube, lutToCanvas, lutFromImage, plateStats } from "./inpaint_filters.js";
 import { TEXT_DEFAULTS, FONT_CATEGORIES, loadFontList, fontList, addUserFont, renderText } from "./inpaint_text.js";
+import { floodMask, maskToColorCanvas, clipMaskToSelection, rgbToHex } from "./inpaint_raster.js";
 
 const NODE_CLASS = "InpaintCanvas";
 const STITCH_CLASS = "InpaintCanvasStitch";
@@ -566,6 +567,9 @@ function objectBackendAvailable() {
 
 const ICONS = {
     text: '<path d="M5 5h14"/><path d="M12 5v14"/><path d="M9 19h6"/>',
+    eyedropper: '<path d="M4 20l1-4 9-9 3 3-9 9z"/><path d="M14 7l3-3 3 3-3 3"/>',
+    bucket: '<path d="M4 11l7-7 8 8-7 7z"/><path d="M4 11h11"/><path d="M19 14c0 2 1.5 3 1.5 4.5a1.5 1.5 0 01-3 0C17.5 17 19 16 19 14z" fill="currentColor" stroke="none"/>',
+    gradient: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M8 4v16" stroke-dasharray="1 2"/><path d="M12 4v16" stroke-dasharray="2 2"/><path d="M16 4v16" stroke-dasharray="3 1"/>',
     lock: '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/>',
     alphaLock: '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/><path d="M8 14h3v3H8zM13 17h3v3h-3z" fill="currentColor" stroke="none"/>',
     duplicate: '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 00-2-2H6a2 2 0 00-2 2v8a2 2 0 002 2h2"/>',
@@ -808,6 +812,8 @@ const STYLE = `
 .ipc-subbar .ipc-ib { padding:3px 8px; min-width:0; font-size:12px; }
 .ipc-subbar .ipc-sep { width:1px; height:18px; background:#444; margin:0 2px; }
 .ipc-subbar label { display:flex; align-items:center; gap:4px; color:#aaa; }
+.ipc-subbar input[type=range] { width:90px; }
+.ipc-subbar input[type=checkbox] { margin:0; }
 .ipc-subbar .ipc-hint { color:#888; }
 `;
 
@@ -1054,6 +1060,9 @@ class InpaintEditor {
         addTool("paint", "Paint on the active layer (P). On the base it creates a paint layer.");
         addTool("erase", "Erase from the active layer (E)");
         tools.appendChild(iconButton("fill", "Fill the selection with the color on the active layer (Shift+F)", () => this.fillSelection()));
+        addTool("bucket", "Bucket fill (G): fills the connected area of similar colour under the cursor on the active layer, limited to the selection. Tolerance, contiguous and the sample source are in the bar above the canvas.");
+        addTool("gradient", "Gradient (Shift+G): drag on the active layer to draw a gradient from the colour to transparent, white or black (linear or radial, bar above the canvas), limited to the selection.");
+        addTool("eyedropper", "Eyedropper (I): click to pick the colour under the cursor from the visible image. Alt+click with the brush does the same.");
         addTool("transform", "Move / scale / rotate the active layer (T). Drag inside to move, corners scale (Shift: free aspect), edges scale one axis, drag just outside a corner to rotate (Shift snaps to 15°). Rotation is applied with Enter.");
         addTool("text", "Text (Shift+T): click on the canvas to add a text layer, click a text layer to select it, drag to move it. Text, font, size and colour are edited in the layer panel.");
         addTool("hand", "Pan (H, Space or middle mouse)");
@@ -1085,6 +1094,7 @@ class InpaintEditor {
         this.dropHint = el("div", "ipc-drop", "Load an image, paste it (Ctrl+V) or drop it here.\nThen paint a selection and press Generate.\nOnce an image is loaded, dropped files become new layers (Shift: reference, Ctrl: replace the image).");
         this.viewEl.appendChild(this.dropHint);
         this.buildSubbar();
+        this.buildOptsBar();
         body.appendChild(this.viewEl);
 
         // side panel
@@ -1480,6 +1490,48 @@ class InpaintEditor {
         this.updateSubbar();
     }
 
+    /** Options of the bucket, gradient and eyedropper tools (a second bar in the subbar's place). */
+    buildOptsBar() {
+        const bar = el("div", "ipc-subbar");
+        bar.hidden = true;
+        this.optsBar = bar;
+        this.fillOpts = { tolerance: 32, contiguous: true, sample: "image" };
+        this.gradientOpts = { type: "linear", to: "transparent" };
+        const row = (cls, ...nodes) => { const lab = el("label", null); lab.dataset.for = cls; for (const n of nodes) lab.appendChild(typeof n === "string" ? el("span", null, n) : n); bar.appendChild(lab); return lab; };
+        const tol = document.createElement("input");
+        tol.type = "range"; tol.min = 0; tol.max = 255; tol.value = this.fillOpts.tolerance; tol.title = "Tolerance: how different a colour may be to count as the same area (0..255 per channel)";
+        const tolVal = el("span", null, String(this.fillOpts.tolerance));
+        tol.addEventListener("input", () => { this.fillOpts.tolerance = +tol.value; tolVal.textContent = tol.value; });
+        row("bucket", "Tolerance", tol, tolVal);
+        const cont = document.createElement("input");
+        cont.type = "checkbox"; cont.checked = true; cont.title = "Contiguous: only the connected area under the cursor; off fills every similar colour of the image";
+        cont.addEventListener("change", () => { this.fillOpts.contiguous = cont.checked; });
+        row("bucket", cont, "Contiguous");
+        const sample = selectInput(["image", "layer"], "image", "What the fill looks at: the visible image (all layers) or the active layer alone");
+        sample.addEventListener("change", () => { this.fillOpts.sample = sample.value; });
+        row("bucket eyedropper", "Sample", sample);
+        const gtype = selectInput(["linear", "radial"], "linear", "Gradient shape");
+        gtype.addEventListener("change", () => { this.gradientOpts.type = gtype.value; });
+        row("gradient", "Type", gtype);
+        const gto = selectInput(["transparent", "white", "black"], "transparent", "What the colour fades to");
+        gto.addEventListener("change", () => { this.gradientOpts.to = gto.value; });
+        row("gradient", "To", gto);
+        this.optsHint = el("span", "ipc-hint", "");
+        bar.appendChild(this.optsHint);
+        for (const type of ["pointerdown", "pointermove", "pointerup", "wheel"]) bar.addEventListener(type, (e) => e.stopPropagation());
+        this.viewEl.appendChild(bar);
+    }
+
+    updateOptsBar() {
+        if (!this.optsBar) return;
+        const tool = this.tool;
+        const on = tool === "bucket" || tool === "gradient" || tool === "eyedropper";
+        this.optsBar.hidden = !on;
+        if (!on) return;
+        for (const lab of this.optsBar.querySelectorAll("label")) lab.hidden = !(lab.dataset.for || "").split(" ").includes(tool);
+        this.optsHint.textContent = tool === "bucket" ? "Click to fill; Shift+F fills the whole selection" : tool === "gradient" ? "Drag from the colour to where it should have faded" : "Click to pick a colour";
+    }
+
     updateSubbar() {
         if (!this.subbar) return;
         const on = this.tool === "transform";
@@ -1806,6 +1858,7 @@ class InpaintEditor {
         if (tool !== "object") { this.hoverObjectId = 0; this.hoverObjectCanvas = null; }
         else this.ensureObjects();
         this.updateSubbar();
+        this.updateOptsBar();
         this.draw();
     }
 
@@ -1858,6 +1911,8 @@ class InpaintEditor {
             case "t": this.setTool("transform"); break;
             case "h": this.setTool("hand"); break;
             case "c": this.setTool("canvas"); break;
+            case "i": this.setTool("eyedropper"); break;
+            case "g": this.setTool(e.shiftKey ? "gradient" : "bucket"); break;
             case "f": this.fitView(); break;
             case "delete": case "backspace": {
                 // with a selection: clear the selected pixels of the active layer (Krita / Photoshop); without: delete the layer
@@ -2169,16 +2224,34 @@ class InpaintEditor {
             return;
         } else if (this.tool === "object") {
             this.pointer = { kind: "object", start: [cx, cy], moved: false, shift: e.shiftKey, alt: e.altKey };
+        } else if (this.tool === "eyedropper" || (this.tool === "paint" && e.altKey)) {
+            this.pickColor(ix, iy);
+            return;
+        } else if (this.tool === "bucket") {
+            this.bucketFill(ix, iy);
+            return;
+        } else if (this.tool === "gradient") {
+            let layer = this.activeLayer();
+            if (layer && layer.locked) { this.setStatus(`${layer.name} is locked.`); return; }
+            if (layer && layer.kind === "filter") { this.setStatus("Filter layers have no pixels. Select a paint or image layer."); return; }
+            if (!layer) layer = this.addPaintLayer();
+            this.pushUndo({ kind: "layer", id: layer.id });
+            const stroke = makeCanvas(layer.canvas.width, layer.canvas.height);
+            this.pointer = { kind: "layerpaint", grad: true, layer, stroke, clip: this.strokeClip(layer, layer.canvas), erase: false, start: [ix, iy], last: [ix, iy] };
         } else if (this.tool === "paint" || this.tool === "erase") {
             let layer = this.activeLayer();
             if (layer && layer.locked) { this.setStatus(`${layer.name} is locked.`); return; }
+            const pressure = e.pointerType === "pen" && e.pressure > 0 ? e.pressure : 1;
+            // Shift+click: a straight line from where the last stroke on this layer ended
+            const prev = this.lastStrokeEnd;
+            const lineFrom = e.shiftKey && prev && layer && prev.layerId === layer.id ? [prev.x, prev.y] : null;
             if (layer && layer.alphaLock && this.tool === "erase" && !(layer.mask && layer.maskEdit)) { this.setStatus(`${layer.name} has its alpha locked: nothing to erase. Unlock alpha first.`); return; }
             if (layer && layer.mask && layer.maskEdit) {
                 // Painting on the transparency mask: paint reveals, erase hides.
                 this.pushUndo({ kind: "mask", id: layer.id });
                 const stroke = makeCanvas(layer.mask.width, layer.mask.height);
-                this.pointer = { kind: "maskpaint", layer, stroke, clip: this.strokeClip(layer, layer.mask), erase: this.tool === "erase", white: true, last: [ix, iy] };
-                this.layerDab(this.pointer, ix, iy, ix, iy);
+                this.pointer = { kind: "maskpaint", layer, stroke, clip: this.strokeClip(layer, layer.mask), erase: this.tool === "erase", white: true, last: [ix, iy], pressure };
+                if (lineFrom && prev.mask) this.layerDab(this.pointer, lineFrom[0], lineFrom[1], ix, iy); else this.layerDab(this.pointer, ix, iy, ix, iy);
                 this.draw();
                 return;
             }
@@ -2189,8 +2262,8 @@ class InpaintEditor {
             }
             this.pushUndo({ kind: "layer", id: layer.id });
             const stroke = makeCanvas(layer.canvas.width, layer.canvas.height);
-            this.pointer = { kind: "layerpaint", layer, stroke, clip: this.strokeClip(layer, layer.canvas), erase: this.tool === "erase", last: [ix, iy] };
-            this.layerDab(this.pointer, ix, iy, ix, iy);
+            this.pointer = { kind: "layerpaint", layer, stroke, clip: this.strokeClip(layer, layer.canvas), erase: this.tool === "erase", last: [ix, iy], pressure };
+            if (lineFrom && !prev.mask) this.layerDab(this.pointer, lineFrom[0], lineFrom[1], ix, iy); else this.layerDab(this.pointer, ix, iy, ix, iy);
         } else if (this.tool === "transform") {
             const layer = this.activeLayer();
             if (!layer) { this.setStatus("Select a layer to move or scale it. The base stays put."); return; }
@@ -2258,7 +2331,9 @@ class InpaintEditor {
             p.last = [ix, iy];
             p.path.push([ix, iy]);
         } else if (p.kind === "layerpaint" || p.kind === "maskpaint") {
-            this.layerDab(p, p.last[0], p.last[1], ix, iy);
+            if (e.pointerType === "pen" && e.pressure > 0) p.pressure = e.pressure;
+            if (p.grad) this.gradientDab(p, ix, iy);
+            else this.layerDab(p, p.last[0], p.last[1], ix, iy);
             p.last = [ix, iy];
         } else if (p.kind === "rect") {
             p.cur = [ix, iy];
@@ -2359,9 +2434,11 @@ class InpaintEditor {
         } else if (p.kind === "layerpaint") {
             this.commitStroke(p);
             this.markLayerChanged(p.layer);
+            if (!p.grad) this.lastStrokeEnd = { layerId: p.layer.id, x: p.last[0], y: p.last[1], mask: false };
         } else if (p.kind === "maskpaint") {
             this.commitStroke(p);
             this.markMaskChanged(p.layer);
+            this.lastStrokeEnd = { layerId: p.layer.id, x: p.last[0], y: p.last[1], mask: true };
         } else if (p.kind === "move" || p.kind === "scale") {
             this.uploaded.baseHash = null;
             this.uploaded.controlHash = null;
@@ -2456,7 +2533,8 @@ class InpaintEditor {
         const ctx = c.getContext("2d");
         const lx0 = (x0 - layer.x) * sx, ly0 = (y0 - layer.y) * sy;
         const lx1 = (x1 - layer.x) * sx, ly1 = (y1 - layer.y) * sy;
-        const radius = this.brushSize * (sx + sy) / 4;
+        // a pen's pressure scales the size (Krita's default "size by pressure"); the mouse paints at full size
+        const radius = this.brushSize * (sx + sy) / 4 * (p.pressure == null ? 1 : Math.max(0.05, Math.min(1, p.pressure)));
         const color = p.white ? "#ffffff" : (p.erase ? "#000000" : this.color);
         ctx.globalCompositeOperation = "source-over";
         const hardness = p.erase ? this.eraseHardness : this.hardness;
@@ -2494,6 +2572,81 @@ class InpaintEditor {
             ctx.fill();
             ctx.restore();
         }
+    }
+
+    /** Gradient tool: rebuild the stroke buffer as a gradient from the drag start to (ix, iy). */
+    gradientDab(p, ix, iy) {
+        const layer = p.layer, c = p.stroke;
+        const sx = c.width / layer.w, sy = c.height / layer.h;
+        const x0 = (p.start[0] - layer.x) * sx, y0 = (p.start[1] - layer.y) * sy;
+        const x1 = (ix - layer.x) * sx, y1 = (iy - layer.y) * sy;
+        const ctx = c.getContext("2d");
+        ctx.globalCompositeOperation = "source-over";
+        ctx.clearRect(0, 0, c.width, c.height);
+        const dist = Math.hypot(x1 - x0, y1 - y0);
+        if (dist < 0.5) return;
+        const o = this.gradientOpts || { type: "linear", to: "transparent" };
+        const g = o.type === "radial" ? ctx.createRadialGradient(x0, y0, 0, x0, y0, dist) : ctx.createLinearGradient(x0, y0, x1, y1);
+        const rgb = this.color.length === 7 ? `${parseInt(this.color.slice(1, 3), 16)},${parseInt(this.color.slice(3, 5), 16)},${parseInt(this.color.slice(5, 7), 16)}` : "0,0,0";
+        g.addColorStop(0, `rgba(${rgb},1)`);
+        g.addColorStop(1, o.to === "white" ? "rgba(255,255,255,1)" : o.to === "black" ? "rgba(0,0,0,1)" : `rgba(${rgb},0)`);
+        ctx.fillStyle = g;
+        ctx.fillRect(0, 0, c.width, c.height);
+    }
+
+    /** Image-sized canvas the bucket and eyedropper look at: the visible image or the active layer alone. */
+    sampleCanvas(source = "image") {
+        if (source === "layer") {
+            const l = this.activeLayer();
+            if (!l || l.kind === "filter") return this.flattenToCanvas();
+            const c = makeCanvas(this.width, this.height);
+            c.getContext("2d").drawImage(this.layerPixels(l), l.x, l.y, l.w, l.h);
+            return c;
+        }
+        return this.flattenToCanvas();
+    }
+
+    /** Eyedropper: the colour of the visible image under (ix, iy) becomes the paint colour. */
+    pickColor(ix, iy) {
+        if (!this.width) return;
+        const x = Math.max(0, Math.min(this.width - 1, Math.floor(ix))), y = Math.max(0, Math.min(this.height - 1, Math.floor(iy)));
+        const d = this.sampleCanvas(this.fillOpts && this.fillOpts.sample).getContext("2d").getImageData(x, y, 1, 1).data;
+        if (d[3] === 0) { this.setStatus("Transparent here, nothing to pick."); return; }
+        const hex = rgbToHex(d[0], d[1], d[2]);
+        this.color = hex;
+        if (this.colorInput) this.colorInput.value = hex;
+        this.setStatus(`Colour ${hex} picked.`);
+    }
+
+    /** Bucket: fill the area of similar colour under (ix, iy) on the active layer, within the selection. */
+    bucketFill(ix, iy) {
+        if (!this.width) return;
+        let layer = this.activeLayer();
+        if (layer && layer.locked) { this.setStatus(`${layer.name} is locked.`); return; }
+        if (layer && layer.kind === "filter") { this.setStatus("Filter layers have no pixels. Select a paint or image layer."); return; }
+        const x = Math.floor(ix), y = Math.floor(iy);
+        if (x < 0 || y < 0 || x >= this.width || y >= this.height) return;
+        const o = this.fillOpts || { tolerance: 32, contiguous: true, sample: "image" };
+        const src = this.sampleCanvas(o.sample).getContext("2d").getImageData(0, 0, this.width, this.height).data;
+        const t0 = performance.now();
+        const mask = floodMask(src, this.width, this.height, x, y, o.tolerance, o.contiguous);
+        if (this.getBounds()) clipMaskToSelection(mask, this.selection);
+        let n = 0;
+        for (let i = 0; i < mask.length; i++) n += mask[i];
+        if (!n) { this.setStatus("Nothing to fill here (outside the selection?)."); return; }
+        if (!layer) layer = this.addPaintLayer();
+        this.pushUndo({ kind: "layer", id: layer.id });
+        const fill = maskToColorCanvas(mask, this.width, this.height, this.color);
+        const ctx = layer.canvas.getContext("2d");
+        ctx.save();
+        ctx.globalAlpha = this.brushOpacity;
+        ctx.globalCompositeOperation = layer.alphaLock ? "source-atop" : "source-over";
+        ctx.setTransform(layer.canvas.width / layer.w, 0, 0, layer.canvas.height / layer.h, 0, 0);
+        ctx.drawImage(fill, -layer.x, -layer.y);
+        ctx.restore();
+        this.markLayerChanged(layer);
+        this.draw();
+        this.setStatus(`Filled ${n.toLocaleString()} px on ${layer.name} (${Math.round(performance.now() - t0)} ms).`);
     }
 
     /**
