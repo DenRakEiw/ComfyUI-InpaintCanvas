@@ -462,7 +462,7 @@ the extension.
 
 **Save** in the top bar (Ctrl+S) writes the visible image, filters applied,
 control and reference layers left out, into ComfyUI's `output` folder. Name
-and format are set in the Canvas section: PNG carries the workflow and the
+and format are set in the Export section of the side panel: PNG carries the workflow and the
 canvas prompt as metadata like SaveImage does, so the file can be dropped
 onto ComfyUI to bring the workflow back; JPEG and WebP are smaller. **PSD**
 (Photoshop) and **ORA** (OpenRaster, the native layered format of Krita and

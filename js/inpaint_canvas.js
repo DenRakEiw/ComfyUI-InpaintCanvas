@@ -1381,7 +1381,17 @@ class InpaintEditor {
             refs.appendChild(fitLab);
             d.appendChild(refs);
 
-            // export
+            // files
+            const files = el("div", "ipc-sec");
+            const clean = iconButton("broom", "Delete the node's own working files in input/output/temp inpaint_canvas that no workflow uses: not this or any open editor, not any saved workflow, not younger than two minutes. Images you loaded or saved keep their names and are never touched. Asks before deleting.", () => this.cleanupFiles(), "Clean up files");
+            clean.classList.add("ipc-small");
+            files.appendChild(clean);
+            this.cleanupInfo = el("span", null, "");
+            files.appendChild(this.cleanupInfo);
+            d.appendChild(files);
+        });
+
+        section("Export", true, (d) => {
             const exp = el("div", "ipc-sec");
             exp.appendChild(el("span", null, "Save as"));
             this.saveNameInput = document.createElement("input");
@@ -1406,14 +1416,6 @@ class InpaintEditor {
             exp.appendChild(msk);
             d.appendChild(exp);
 
-            // files
-            const files = el("div", "ipc-sec");
-            const clean = iconButton("broom", "Delete the node's own working files in input/output/temp inpaint_canvas that no workflow uses: not this or any open editor, not any saved workflow, not younger than two minutes. Images you loaded or saved keep their names and are never touched. Asks before deleting.", () => this.cleanupFiles(), "Clean up files");
-            clean.classList.add("ipc-small");
-            files.appendChild(clean);
-            this.cleanupInfo = el("span", null, "");
-            files.appendChild(this.cleanupInfo);
-            d.appendChild(files);
         });
 
         section("Prompt", true, (d) => {
