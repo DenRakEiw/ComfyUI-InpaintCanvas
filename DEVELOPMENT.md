@@ -769,6 +769,80 @@ Measured on the 1776×2368 photo in headless Edge: grain 144 ms, sharpen
 diff 0); getValue/setValue round trip identical (diff 0, LUT restored); the
 run uploads a flattened base with the grain baked in.
 
+### 13b. Adjustment filters (2026-09-06)
+
+Six point / convolution filters were added to `FILTERS` (ids `blur`,
+`curves`, `brightness_contrast`, `hue_sat`, `color_balance`, `bw`, plus the
+parameter-less `invert`), all in `inpaint_filters.js`; the curves editor and
+its interpolation live in `js/inpaint_curves.js` (imported by the filter
+module, nothing in the editor file knows about it). All of them are one pass
+over the pixels with precomputed tables or a 3x3 matrix; `openPixels` /
+`applyTables` / `copyCanvas` are the shared helpers, identity parameters
+return a plain copy.
+
+- `hue_sat`: SVG `feColorMatrix` hueRotate and saturate matrices (Rec. 709
+  luma constants) multiplied into one 3x3 (`hueSatMatrix`), lightness as a
+  256 table (positive blends to white, negative to black). Hue 180 turns a
+  pure red into (0, 109, 109): the matrix keeps luma, so pure primaries do
+  not become pure complements as an HSL shift would.
+- `brightness_contrast`: one 256 table. Brightness `b` (scaled to ±0.4)
+  adds `b (1 - v²)` above zero and `b (1 - (1 - v)²)` below, so one end stays
+  fixed and the slope never goes negative; contrast is the Photoshop legacy
+  pivot around 0.5 with slope `1 / (1 - 0.98 c)` (c > 0) or `1 + c` (c < 0).
+- `color_balance`: nine sliders `{shadows,mid,high}_{cr,mg,yb}` and the bool
+  `preserve`. The shift of a pixel depends only on its luma, so the three
+  channel offsets are `Float32Array(256)` tables indexed by Rec. 601 luma
+  (`colorBalanceTables`): tone weights are the GIMP ramps (shadows fade out
+  0.21..0.46, highlights fade in 0.54..0.79, midtones the product), gain
+  0.4·255 per 100, and *preserve luminosity* subtracts the luma of the offset
+  from all three channels inside the table. +100 midtone red moves mid grey
+  to (200, 98, 98).
+- `curves`: `params.curves = {rgb, r, g, b}`, each a point list `[[x, y],
+  ...]` in 0..255 (a `type: "custom"` param, default from `curveDefaults`).
+  `curveTable` is Fritsch–Carlson monotone cubic (no overshoot, flat outside
+  the end points), `curvesToTables` composes master then channel into three
+  tables (`null` when everything is identity: plain copy). The apply pass
+  also stores a luma histogram of its input (every 4th pixel) in
+  `info.cache.histogram` = `layer._fxCache.histogram`, which the control
+  draws behind the curve (sqrt-scaled). The control (`buildCurvesControl`,
+  220x160 CSS px, DPR-aware, channel buttons, Reset / Shift+Reset): the
+  gesture calls `callbacks.begin()` and then *replaces*
+  `layer.params.curves` with a deep copy before mutating it, because the
+  editor's filter snapshot copies params shallowly — the undo snapshot keeps
+  the old object. Pointer capture on the canvas; click adds a point on a free
+  column, drag clamps y to 0..255 and x between the neighbours (end points
+  keep their x), dragging more than 36 px outside the box removes an interior
+  point (re-entering re-inserts it), double-click removes, `preview()` per
+  move, `commit()` on up / cancel. `callbacks.stop` is attached for click,
+  pointerdown, dblclick and keydown on the wrapper so the layer row ignores
+  the gesture. After an undo the layer list is re-rendered, so tests must
+  re-query the row before dispatching more events.
+- `blur`: `ctx.filter = blur(sigma)` with sigma = radius · `info.scale`, on a
+  canvas padded by `ceil(3 sigma) + 2` px of mirrored source (eight
+  `drawImage` calls with flipped transforms), cropped back and backed with
+  the source through `destination-over` so alpha is exactly 255 everywhere.
+  Radius < 0.05 px returns a copy.
+- `bw`: weights normalised by their sum (30/59/11 and 60/118/22 are the
+  same), one dot product per pixel; tint = `hueToRgb(hue) - 0.5` times
+  `0.35 · 255 · strength` times a midtone tent `1 - |2l - 1|`, so black and
+  white stay neutral (hue 35 at 100 % on mid grey: 172, 135, 84).
+- `invert`: the 255 - i table, no params (`filterDefaults` returns `{}`).
+
+Measured 2026-09-06 in headless Edge on a 2048x2048 gradient (best of 3,
+`applyFilter` plus a 1x1 `getImageData`): hue_sat 51 ms, brightness_contrast
+39, color_balance 39, curves 26, bw 33, invert 23, levels 23 (for
+comparison), blur radius 4 / 64 1–2 ms (GPU; 11 ms with a full 2048²
+readback, checker variance 16256 -> 0, min alpha 255), blur 64 on the 1024
+preview 2 ms. Scene checks (512x384 patches through `addFilterLayer` +
+`flattenToCanvas({forRun: true})`): hue 180 red -> (0, 109, 109), saturation
+-100 -> grey, lightness ±50 on mid grey -> 192 / 64; brightness +50: 40 ->
+90, 128 -> 166, 220 -> 233; contrast -100 -> everything 128; curves
+[128 -> 192] lifts mid grey to 192 and a blue curve [0,255]-[255,0] inverts
+blue only (master then channel: 192, 192, 63); bw red-only weights make red
+white and green black; invert red -> cyan; the curves params survive a
+getValue/setValue round trip; no `console.error` during the run. The scene
+file is `scratchpad/fx2/scenes_fx2.py` (runner on port 9334).
+
 ## 14. Export (2026-09-05, late)
 
 `exportImage({download})`: `flattenToCanvas({forRun: true})` (filters baked,

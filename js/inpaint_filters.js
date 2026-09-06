@@ -1,11 +1,17 @@
-// Inpaint Canvas - filter layers (grain, sharpen, levels, LUT, vignette).
+// Inpaint Canvas - filter layers (grain, sharpen, blur, levels, curves,
+// brightness / contrast, hue / saturation, colour balance, black & white,
+// invert, LUT, vignette).
 //
 // A filter layer has no pixels of its own: it takes everything composited below
 // it (an image-sized canvas) and returns a filtered canvas of the same size. The
 // editor caches that result per layer and applies mask, opacity and blend mode
 // like for any other layer. Everything here is plain Canvas 2D / pixel loops;
 // blurs go through ctx.filter (GPU). Kept separate from inpaint_canvas.js so the
-// editor file does not grow with every filter.
+// editor file does not grow with every filter. The point adjustments below are
+// 256-entry tables and 3x3 matrices, one pass over the pixels each; the curves
+// editor control lives in inpaint_curves.js.
+
+import { curveDefaults, curvesToTables, buildCurvesControl } from "./inpaint_curves.js";
 
 function makeCanvas(w, h) {
     const c = document.createElement("canvas");
@@ -422,6 +428,273 @@ function applyVignette(src, p) {
 }
 
 // ---------------------------------------------------------------------------
+// point adjustments: shared helpers
+// ---------------------------------------------------------------------------
+
+/** Copy of `src` plus its pixel data, for the one-pass adjustments below. */
+function openPixels(src) {
+    const W = src.width, H = src.height;
+    const out = makeCanvas(W, H);
+    const octx = out.getContext("2d");
+    octx.drawImage(src, 0, 0);
+    const img = octx.getImageData(0, 0, W, H);
+    return { out, octx, img, px: img.data };
+}
+
+/** Apply one 256-entry table to all three channels (or three tables, one per channel). */
+function applyTables(src, tr, tg = tr, tb = tr) {
+    const { out, octx, img, px } = openPixels(src);
+    for (let i = 0; i < px.length; i += 4) { px[i] = tr[px[i]]; px[i + 1] = tg[px[i + 1]]; px[i + 2] = tb[px[i + 2]]; }
+    octx.putImageData(img, 0, 0);
+    return out;
+}
+
+function copyCanvas(src) {
+    const out = makeCanvas(src.width, src.height);
+    out.getContext("2d").drawImage(src, 0, 0);
+    return out;
+}
+
+// Rec. 601 luma, the weights the rest of the file uses too.
+const LR = 0.299, LG = 0.587, LB = 0.114;
+
+// ---------------------------------------------------------------------------
+// hue / saturation / lightness
+// ---------------------------------------------------------------------------
+
+/** 3x3 row-major matrix: hue rotation (SVG feColorMatrix hueRotate) followed by a saturation scale. */
+function hueSatMatrix(hueDeg, satK) {
+    const a = hueDeg * Math.PI / 180, c = Math.cos(a), s = Math.sin(a);
+    // SVG feColorMatrix hueRotate / saturate (Rec. 709 luma 0.213 / 0.715 / 0.072)
+    const Hm = [
+        0.213 + c * 0.787 - s * 0.213, 0.715 - c * 0.715 - s * 0.715, 0.072 - c * 0.072 + s * 0.928,
+        0.213 - c * 0.213 + s * 0.143, 0.715 + c * 0.285 + s * 0.140, 0.072 - c * 0.072 - s * 0.283,
+        0.213 - c * 0.213 - s * 0.787, 0.715 - c * 0.715 + s * 0.715, 0.072 + c * 0.928 + s * 0.072,
+    ];
+    const Sm = [
+        0.213 + 0.787 * satK, 0.715 - 0.715 * satK, 0.072 - 0.072 * satK,
+        0.213 - 0.213 * satK, 0.715 + 0.285 * satK, 0.072 - 0.072 * satK,
+        0.213 - 0.213 * satK, 0.715 - 0.715 * satK, 0.072 + 0.928 * satK,
+    ];
+    const M = new Float32Array(9);
+    for (let r = 0; r < 3; r++) for (let col = 0; col < 3; col++) M[r * 3 + col] = Sm[r * 3] * Hm[col] + Sm[r * 3 + 1] * Hm[3 + col] + Sm[r * 3 + 2] * Hm[6 + col];
+    return M;
+}
+
+/** Photoshop-style lightness: positive blends towards white, negative towards black. */
+function lightnessTable(l) {
+    const t = new Uint8ClampedArray(256);
+    const k = Math.max(-1, Math.min(1, l / 100));
+    for (let i = 0; i < 256; i++) t[i] = k >= 0 ? i + (255 - i) * k : i * (1 + k);
+    return t;
+}
+
+function applyHueSat(src, p) {
+    const hue = p.hue ?? 0, sat = p.saturation ?? 0, light = p.lightness ?? 0;
+    if (!hue && !sat && !light) return copyCanvas(src);
+    const satK = Math.max(0, 1 + sat / 100);
+    const M = hueSatMatrix(hue, satK);
+    const m00 = M[0], m01 = M[1], m02 = M[2], m10 = M[3], m11 = M[4], m12 = M[5], m20 = M[6], m21 = M[7], m22 = M[8];
+    const { out, octx, img, px } = openPixels(src);
+    if (hue || sat) {
+        for (let i = 0; i < px.length; i += 4) {
+            const r = px[i], g = px[i + 1], b = px[i + 2];
+            px[i] = m00 * r + m01 * g + m02 * b;          // Uint8ClampedArray rounds and clamps
+            px[i + 1] = m10 * r + m11 * g + m12 * b;
+            px[i + 2] = m20 * r + m21 * g + m22 * b;
+        }
+    }
+    if (light) {
+        const t = lightnessTable(light);
+        for (let i = 0; i < px.length; i += 4) { px[i] = t[px[i]]; px[i + 1] = t[px[i + 1]]; px[i + 2] = t[px[i + 2]]; }
+    }
+    octx.putImageData(img, 0, 0);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// brightness / contrast
+// ---------------------------------------------------------------------------
+
+/**
+ * Brightness lifts (or lowers) with the ends protected: +100 takes black to
+ * ~100 and mid grey to ~200 while white stays white (negative: mirrored, black
+ * stays black). Contrast pivots around mid grey like Photoshop's legacy
+ * control: slope 1 / (1 - c) above zero (+50 doubles, +100 is nearly a
+ * threshold), 1 + c below (-100 is flat mid grey).
+ */
+function brightnessContrastTable(brightness, contrast) {
+    const t = new Uint8ClampedArray(256);
+    const b = Math.max(-1, Math.min(1, (brightness ?? 0) / 100)) * 0.4;
+    const c = Math.max(-1, Math.min(1, (contrast ?? 0) / 100));
+    const slope = c >= 0 ? 1 / (1 - c * 0.98) : 1 + c;
+    for (let i = 0; i < 256; i++) {
+        let v = i / 255;
+        if (b > 0) v += b * (1 - v * v);
+        else if (b < 0) v += b * (1 - (1 - v) * (1 - v));
+        v = 0.5 + (v - 0.5) * slope;
+        t[i] = v * 255;
+    }
+    return t;
+}
+
+function applyBrightnessContrast(src, p) {
+    if (!(p.brightness ?? 0) && !(p.contrast ?? 0)) return copyCanvas(src);
+    return applyTables(src, brightnessContrastTable(p.brightness, p.contrast));
+}
+
+// ---------------------------------------------------------------------------
+// colour balance
+// ---------------------------------------------------------------------------
+
+/**
+ * Tone weights on luma like Photoshop / GIMP: shadows fade out around 0.45,
+ * highlights fade in around 0.55, midtones peak at 0.5. Because the shift of a
+ * pixel depends only on its luma, the three per-channel offsets (and the
+ * luminosity correction) are three 256-entry tables indexed by luma. +100 on
+ * the midtones moves mid grey by about 100 levels (Photoshop's reach), before
+ * the luminosity correction pulls the other two channels down.
+ */
+function colorBalanceTables(p) {
+    const K = 0.4 * 255 / 100;
+    const cl01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+    const dR = new Float32Array(256), dG = new Float32Array(256), dB = new Float32Array(256);
+    const s = [p.shadows_cr ?? 0, p.shadows_mg ?? 0, p.shadows_yb ?? 0];
+    const m = [p.mid_cr ?? 0, p.mid_mg ?? 0, p.mid_yb ?? 0];
+    const h = [p.high_cr ?? 0, p.high_mg ?? 0, p.high_yb ?? 0];
+    const preserve = p.preserve !== false;
+    for (let i = 0; i < 256; i++) {
+        const l = i / 255;
+        const ws = cl01(0.5 - (l - 0.333) * 4);
+        const wh = cl01(0.5 + (l - 0.667) * 4);
+        const wm = cl01(0.5 + (l - 0.333) * 4) * cl01(0.5 - (l - 0.667) * 4);
+        let r = (s[0] * ws + m[0] * wm + h[0] * wh) * K;
+        let g = (s[1] * ws + m[1] * wm + h[1] * wh) * K;
+        let b = (s[2] * ws + m[2] * wm + h[2] * wh) * K;
+        if (preserve) { const dl = LR * r + LG * g + LB * b; r -= dl; g -= dl; b -= dl; }
+        dR[i] = r; dG[i] = g; dB[i] = b;
+    }
+    return { dR, dG, dB };
+}
+
+function applyColorBalance(src, p) {
+    const keys = ["shadows_cr", "shadows_mg", "shadows_yb", "mid_cr", "mid_mg", "mid_yb", "high_cr", "high_mg", "high_yb"];
+    if (keys.every((k) => !(p[k] ?? 0))) return copyCanvas(src);
+    const { dR, dG, dB } = colorBalanceTables(p);
+    const { out, octx, img, px } = openPixels(src);
+    for (let i = 0; i < px.length; i += 4) {
+        const r = px[i], g = px[i + 1], b = px[i + 2];
+        const l = (LR * r + LG * g + LB * b + 0.5) | 0;
+        px[i] = r + dR[l]; px[i + 1] = g + dG[l]; px[i + 2] = b + dB[l];
+    }
+    octx.putImageData(img, 0, 0);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// curves
+// ---------------------------------------------------------------------------
+
+function applyCurves(src, p, info) {
+    const tables = curvesToTables(p.curves);
+    const { out, octx, img, px } = openPixels(src);
+    // luma histogram of the input for the curve editor (every 4th pixel is plenty)
+    const hist = new Uint32Array(256);
+    for (let i = 0; i < px.length; i += 16) hist[(LR * px[i] + LG * px[i + 1] + LB * px[i + 2] + 0.5) | 0]++;
+    if (info && info.cache) info.cache.histogram = hist;
+    if (!tables) return out;
+    const tr = tables.r, tg = tables.g, tb = tables.b;
+    for (let i = 0; i < px.length; i += 4) { px[i] = tr[px[i]]; px[i + 1] = tg[px[i + 1]]; px[i + 2] = tb[px[i + 2]]; }
+    octx.putImageData(img, 0, 0);
+    return out;
+}
+
+function curvesControl(layer, param, callbacks) {
+    return buildCurvesControl(layer, param, callbacks, { histogram: () => (layer._fxCache && layer._fxCache.histogram) || null });
+}
+
+// ---------------------------------------------------------------------------
+// gaussian blur
+// ---------------------------------------------------------------------------
+
+/**
+ * ctx.filter blur on a canvas padded with mirrored copies of the source, so
+ * the picture edges blur into themselves instead of into transparency; the
+ * result is cropped back and the (all but exactly opaque) fringe is backed
+ * with the source so alpha stays 255.
+ */
+function applyBlur(src, p, info) {
+    const W = src.width, H = src.height;
+    const sigma = Math.max(0, (p.radius ?? 4) * (info.scale || 1));
+    if (sigma < 0.05) return copyCanvas(src);
+    const pad = Math.min(W, H, Math.ceil(sigma * 3) + 2);
+    const PW = W + 2 * pad, PH = H + 2 * pad;
+    const padded = makeCanvas(PW, PH);
+    const pctx = padded.getContext("2d");
+    pctx.drawImage(src, pad, pad);
+    // mirrored strips: left / right, top / bottom, then the four corners
+    pctx.save(); pctx.translate(pad, 0); pctx.scale(-1, 1); pctx.drawImage(src, 0, 0, pad, H, 0, pad, pad, H); pctx.restore();
+    pctx.save(); pctx.translate(PW, 0); pctx.scale(-1, 1); pctx.drawImage(src, W - pad, 0, pad, H, 0, pad, pad, H); pctx.restore();
+    pctx.save(); pctx.translate(0, pad); pctx.scale(1, -1); pctx.drawImage(src, 0, 0, W, pad, pad, 0, W, pad); pctx.restore();
+    pctx.save(); pctx.translate(0, PH); pctx.scale(1, -1); pctx.drawImage(src, 0, H - pad, W, pad, pad, 0, W, pad); pctx.restore();
+    pctx.save(); pctx.translate(pad, pad); pctx.scale(-1, -1); pctx.drawImage(src, 0, 0, pad, pad, 0, 0, pad, pad); pctx.restore();
+    pctx.save(); pctx.translate(PW, pad); pctx.scale(-1, -1); pctx.drawImage(src, W - pad, 0, pad, pad, 0, 0, pad, pad); pctx.restore();
+    pctx.save(); pctx.translate(pad, PH); pctx.scale(-1, -1); pctx.drawImage(src, 0, H - pad, pad, pad, 0, 0, pad, pad); pctx.restore();
+    pctx.save(); pctx.translate(PW, PH); pctx.scale(-1, -1); pctx.drawImage(src, W - pad, H - pad, pad, pad, 0, 0, pad, pad); pctx.restore();
+    const out = makeCanvas(W, H);
+    const octx = out.getContext("2d");
+    try { octx.filter = `blur(${sigma}px)`; } catch (_) { /* no filter support: unblurred copy */ }
+    octx.drawImage(padded, -pad, -pad);
+    octx.filter = "none";
+    octx.globalCompositeOperation = "destination-over";
+    octx.drawImage(src, 0, 0);
+    octx.globalCompositeOperation = "source-over";
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// black & white
+// ---------------------------------------------------------------------------
+
+/** Pure hue (0..360) as r, g, b in 0..1. */
+function hueToRgb(hue) {
+    const h = (((hue % 360) + 360) % 360) / 60, x = 1 - Math.abs((h % 2) - 1);
+    const k = Math.floor(h) % 6;
+    return k === 0 ? [1, x, 0] : k === 1 ? [x, 1, 0] : k === 2 ? [0, 1, x] : k === 3 ? [0, x, 1] : k === 4 ? [x, 0, 1] : [1, 0, x];
+}
+
+/** Weighted mono (weights normalised, so 30/59/11 and 60/118/22 are the same) with a midtone tint mixed in by strength. */
+function applyBlackWhite(src, p) {
+    let wr = p.red ?? 30, wg = p.green ?? 59, wb = p.blue ?? 11;
+    const sum = wr + wg + wb;
+    if (sum > 0) { wr /= sum; wg /= sum; wb /= sum; } else { wr = LR; wg = LG; wb = LB; }
+    const strength = Math.max(0, Math.min(1, (p.tint_strength ?? 0) / 100));
+    const { out, octx, img, px } = openPixels(src);
+    if (strength <= 0) {
+        for (let i = 0; i < px.length; i += 4) { const l = wr * px[i] + wg * px[i + 1] + wb * px[i + 2]; px[i] = l; px[i + 1] = l; px[i + 2] = l; }
+    } else {
+        // tint: push the channels apart around the luma, strongest in the midtones (a duotone / sepia look)
+        const t = hueToRgb(p.tint_hue ?? 35);
+        const A = 0.35 * 255 * strength;
+        const tr = (t[0] - 0.5) * A, tg = (t[1] - 0.5) * A, tb = (t[2] - 0.5) * A;
+        for (let i = 0; i < px.length; i += 4) {
+            const l = wr * px[i] + wg * px[i + 1] + wb * px[i + 2];
+            const shape = l < 127.5 ? l / 127.5 : (255 - l) / 127.5;
+            px[i] = l + tr * shape; px[i + 1] = l + tg * shape; px[i + 2] = l + tb * shape;
+        }
+    }
+    octx.putImageData(img, 0, 0);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// invert
+// ---------------------------------------------------------------------------
+
+const INVERT_TABLE = (() => { const t = new Uint8ClampedArray(256); for (let i = 0; i < 256; i++) t[i] = 255 - i; return t; })();
+function applyInvert(src) { return applyTables(src, INVERT_TABLE); }
+
+// ---------------------------------------------------------------------------
 // registry
 // ---------------------------------------------------------------------------
 
@@ -450,6 +723,13 @@ export const FILTERS = {
         ],
         apply: applySharpen,
     },
+    blur: {
+        label: "Gaussian blur",
+        params: [
+            { key: "radius", label: "Radius", min: 0, max: 64, step: 0.5, default: 4, unit: "px" },
+        ],
+        apply: applyBlur,
+    },
     levels: {
         label: "Levels",
         params: [
@@ -460,6 +740,63 @@ export const FILTERS = {
             { key: "outWhite", label: "Out white", min: 0, max: 255, step: 1, default: 255 },
         ],
         apply: applyLevels,
+    },
+    curves: {
+        label: "Curves",
+        params: [
+            { key: "curves", label: "Curves", type: "custom", default: curveDefaults() },
+        ],
+        control: curvesControl,
+        apply: applyCurves,
+    },
+    brightness_contrast: {
+        label: "Brightness / Contrast",
+        params: [
+            { key: "brightness", label: "Brightness", min: -100, max: 100, step: 1, default: 0 },
+            { key: "contrast", label: "Contrast", min: -100, max: 100, step: 1, default: 0 },
+        ],
+        apply: applyBrightnessContrast,
+    },
+    hue_sat: {
+        label: "Hue / Saturation",
+        params: [
+            { key: "hue", label: "Hue", min: -180, max: 180, step: 1, default: 0, unit: "°" },
+            { key: "saturation", label: "Saturation", min: -100, max: 100, step: 1, default: 0, unit: "%" },
+            { key: "lightness", label: "Lightness", min: -100, max: 100, step: 1, default: 0, unit: "%" },
+        ],
+        apply: applyHueSat,
+    },
+    color_balance: {
+        label: "Colour balance",
+        params: [
+            { key: "shadows_cr", label: "Shadows C–R", min: -100, max: 100, step: 1, default: 0 },
+            { key: "shadows_mg", label: "Shadows M–G", min: -100, max: 100, step: 1, default: 0 },
+            { key: "shadows_yb", label: "Shadows Y–B", min: -100, max: 100, step: 1, default: 0 },
+            { key: "mid_cr", label: "Mid C–R", min: -100, max: 100, step: 1, default: 0 },
+            { key: "mid_mg", label: "Mid M–G", min: -100, max: 100, step: 1, default: 0 },
+            { key: "mid_yb", label: "Mid Y–B", min: -100, max: 100, step: 1, default: 0 },
+            { key: "high_cr", label: "High C–R", min: -100, max: 100, step: 1, default: 0 },
+            { key: "high_mg", label: "High M–G", min: -100, max: 100, step: 1, default: 0 },
+            { key: "high_yb", label: "High Y–B", min: -100, max: 100, step: 1, default: 0 },
+            { key: "preserve", label: "Preserve luminosity", type: "bool", default: true },
+        ],
+        apply: applyColorBalance,
+    },
+    bw: {
+        label: "Black & white",
+        params: [
+            { key: "red", label: "Red", min: 0, max: 200, step: 1, default: 30, unit: "%" },
+            { key: "green", label: "Green", min: 0, max: 200, step: 1, default: 59, unit: "%" },
+            { key: "blue", label: "Blue", min: 0, max: 200, step: 1, default: 11, unit: "%" },
+            { key: "tint_hue", label: "Tint hue", min: 0, max: 360, step: 1, default: 35, unit: "°" },
+            { key: "tint_strength", label: "Tint", min: 0, max: 100, step: 1, default: 0, unit: "%" },
+        ],
+        apply: applyBlackWhite,
+    },
+    invert: {
+        label: "Invert",
+        params: [],
+        apply: applyInvert,
     },
     lut: {
         label: "LUT (.cube)",

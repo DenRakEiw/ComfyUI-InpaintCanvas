@@ -22,8 +22,9 @@ Highlights
   onto the canvas, they travel with `crop_image` as extra batch images.
 - Layer masks and cutouts: background removal with the installed RMBG nodes
   (RMBG-2.0, BiRefNet, BEN2, BRIA) becomes an editable transparency mask.
-- Filter layers to finish the picture: grain, sharpen, levels, LUT (.cube)
-  and vignette, non-destructive, with masks and undo.
+- Filter layers to finish the picture: grain, sharpen, blur, levels, curves,
+  brightness / contrast, hue / saturation, colour balance, black & white,
+  LUT (.cube) and vignette, non-destructive, with masks and undo.
 - Prompt upsampling with a local vision-language model (Qwen3-VL) or Gemini,
   tuned per use case: an edit instruction for Flux.2 / Kontext by default,
   or fill, add, remove, outpaint descriptions.
@@ -150,7 +151,24 @@ size, hardness, opacity and the paint colour.
   the selected area, like in Krita and Photoshop; clear the selection
   (Ctrl+D) to paint freely. The eraser has its own hardness, soft by default like
   Krita's Eraser Soft; the Hardness slider always shows and edits the active
-  tool's value, both are remembered.
+  tool's value, both are remembered. Shift+click draws a straight line from
+  where the last stroke on that layer ended; a pen's pressure scales the
+  brush size.
+- **Eyedropper (I)**, or Alt+click with the brush: picks the colour under the
+  cursor from the visible image (or the active layer, bar above the canvas).
+- **Bucket (G)**: fills the connected area of similar colour under the cursor
+  on the active layer (a new paint layer on the base), within the selection.
+  Tolerance, contiguous and the sample source (image or layer) are in the
+  bar above the canvas. **Gradient (Shift+G)**: drag to draw a linear or
+  radial gradient from the colour to transparent, white or black.
+- **Smudge (Shift+S)**: drags the pixels along the stroke like a finger in
+  wet paint, with a strength slider; the tool of choice for a hard seam
+  after inpainting. On the base it first adds a copy layer.
+- **Clone stamp (S)** and **healing brush (J)**: Alt+click sets the source,
+  then paint to copy from there onto the active layer (new paint layer on
+  the base). The healing brush shifts the copied texture to the colour and
+  brightness of where it lands. *Aligned* keeps the offset between strokes,
+  *Sample* takes the visible image or the layer alone.
 - **Transform (T)** has four modes in the bar above the canvas. *Scale*: drag
   inside to move, corners scale proportionally (Shift for free aspect), edge
   handles scale one axis, arrow keys nudge (Shift: 10 px). Drag just outside
@@ -171,10 +189,16 @@ size, hardness, opacity and the paint colour.
   where they stay available. Text layers are ordinary pixel layers for
   everything else: move them with the text tool, scale and rotate with T,
   mask them, blend them; editing the text renders them again.
-- The layer list (right): click to activate, toggle visibility, opacity, blend
-  mode (multiply, screen, overlay, ...), move up / down, delete (Delete key),
-  plus button for an empty paint layer (Ctrl+Shift+N). Flatten bakes all
-  visible layers into the base.
+- The layer list (right): click to activate, Ctrl+click on the canvas
+  activates the topmost layer with a pixel under the cursor. Each row has a
+  thumbnail, the eye (Alt+click: solo, again to restore), the name
+  (double-click renames), a lock (no painting, moving, merging, deleting), an
+  alpha lock (paint only lands on existing pixels), opacity, blend mode
+  (multiply, screen, overlay, ...) and delete (Delete key). Drag a row's
+  header to reorder, or Ctrl+] / Ctrl+[ ; Ctrl+J duplicates, Ctrl+E merges the
+  layer into the one below (the bottom layer into the base), the plus button
+  adds an empty paint layer (Ctrl+Shift+N). Flatten bakes all visible layers
+  into the base. Deleting, reordering, merging and duplicating are undoable.
 - **Match** (per layer, non-destructive): shifts the layer's colours and
   contrast towards the image below it, per channel by mean and spread like
   the stitch's colour match, dosed by the slider. Source *surroundings*
@@ -250,7 +274,31 @@ cutout are not available on them (mask editing is).
   grain plate, a scan of uniformly exposed film such as the fotokorn.de
   packs, which then replaces the synthetic grain at the chosen scale.
 - **Sharpen**: unsharp mask with amount, radius and threshold.
+- **Gaussian blur**: radius in image pixels (0–64). The edges blur into a
+  mirrored copy of the picture, so nothing goes dark or transparent at the
+  border.
 - **Levels**: input black and white point, gamma, output black and white.
+- **Curves**: a curve editor in the layer row with a master (RGB) curve and
+  one per channel. Click adds a point, drag moves it, dragging it out of the
+  box or double-clicking removes it, the end points move only vertically.
+  The curve is a smooth monotone spline (no overshoot), the master curve is
+  applied first, then the channel curves; a luma histogram of what the
+  layer sees is drawn behind the curve. *Reset* straightens the current
+  channel, Shift+Reset all four.
+- **Brightness / Contrast**: brightness lifts or lowers with the ends
+  protected (white stays white, black stays black); contrast pivots around
+  mid grey like Photoshop's legacy control (+100 is nearly a threshold,
+  −100 flat grey).
+- **Hue / Saturation**: hue rotation (±180°), saturation (−100 = grey,
+  +100 doubles) and lightness (blends towards white or black), like
+  Photoshop's Hue/Saturation in master mode.
+- **Colour balance**: cyan–red, magenta–green and yellow–blue for shadows,
+  midtones and highlights each, with *Preserve luminosity* (on by default)
+  keeping the brightness where it was.
+- **Black & white**: channel weights for red, green and blue (30/59/11 by
+  default; only their ratio matters) like Photoshop's Black & White, plus a
+  tint hue and strength for sepia and split-tone looks.
+- **Invert**: negative of the image below (no parameters).
 - **LUT**: load any 3D `.cube` with a strength slider; the LUT is stored
   with the workflow.
 - **Vignette**: amount, size and softness.
@@ -418,12 +466,17 @@ and files stay.
 | ---------------------------- | ---------------------------------------- |
 | B, R, L, Shift+L, O, D       | selection brush, rectangle, lasso, polygon, object, deselect |
 | P, E, T, H                   | paint, erase, transform, hand            |
+| I, G, Shift+G                | eyedropper, bucket, gradient             |
+| Shift+S, S, J                | smudge, clone stamp, healing brush       |
 | Shift+T, C                   | text tool, canvas tool                   |
 | `[` `]`                      | brush size                               |
 | Ctrl+Z, Ctrl+Shift+Z, Ctrl+Y | undo, redo                               |
 | Ctrl+D, Ctrl+I               | clear, invert selection                  |
 | Shift+F                      | fill selection with colour               |
 | Ctrl+Shift+N                 | new paint layer                          |
+| Ctrl+J, Ctrl+E               | duplicate layer, merge down              |
+| Ctrl+], Ctrl+[               | move layer up / down                     |
+| Ctrl+click on the canvas     | select the layer under the cursor        |
 | Ctrl+C, Ctrl+Shift+C, Ctrl+X, Ctrl+V | copy selection (from layer / merged), cut, paste as new layer |
 | Delete                       | clear the selected pixels of the active layer; without a selection delete the layer |
 | Ctrl+U                       | upsample prompt                          |

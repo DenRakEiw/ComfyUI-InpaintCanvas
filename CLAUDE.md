@@ -28,7 +28,9 @@ Flux.2 [max] API node (returns RGBA, square unless width/height are wired).
   manifest `fonts.json`, OFL / Apache licences in `js/fonts/licenses`), user
   fonts from `input/inpaint_canvas/fonts` (route `GET /inpaint_canvas/fonts`),
   `renderText()` draws a layer's `text` description at 2x.
-- `js/inpaint_filters.js` — the filter layers (grain, sharpen, levels, LUT,
+- `js/inpaint_filters.js` (+ `inpaint_curves.js`, the curves editor) — the
+  filter layers (grain, sharpen, blur, levels, curves, brightness/contrast,
+  hue/saturation, colour balance, black & white, invert, LUT,
   vignette): pure Canvas 2D / pixel loops, registry `FILTERS`. New filters go
   here, not into the editor file.
 - `pyproject.toml` + `.github/workflows/publish_action.yml` — Comfy Registry
