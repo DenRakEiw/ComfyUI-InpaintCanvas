@@ -717,7 +717,8 @@ const STYLE = `
 .ipc-tools .ipc-sep { height:1px; background:#3a3a3a; margin:4px 2px; }
 .ipc-tools .ipc-grp { font-size:9px; text-transform:uppercase; letter-spacing:.06em; color:#666; text-align:center; margin:2px 0 -1px; }
 .ipc-groupbtn { position:relative; }
-.ipc-groupbtn .ipc-tri { position:absolute; right:3px; bottom:3px; width:0; height:0; border-left:5px solid transparent; border-bottom:5px solid #9a9a9a; }
+.ipc-groupbtn .ipc-tri { position:absolute; right:2px; bottom:2px; width:0; height:0; border-left:6px solid transparent; border-bottom:6px solid #c0c0c0; }
+.ipc-sec .ipc-gap { width:6px; }
 .ipc-flyout { position:absolute; z-index:6; display:flex; flex-direction:column; gap:3px; padding:5px; background:#262626; border:1px solid #444; border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.55); min-width:170px; }
 .ipc-flyout .ipc-ib { justify-content:flex-start; padding:5px 10px; width:auto; height:auto; text-align:left; white-space:nowrap; }
 .ipc-flyout .ipc-key { margin-left:auto; padding-left:14px; color:#8a8a8a; font-size:11px; }
@@ -738,7 +739,12 @@ const STYLE = `
 .ipc-view.ipc-rotate { cursor:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'><path d='M19 12a7 7 0 1 1-2-4.9' fill='none' stroke='black' stroke-width='4.5' stroke-linecap='round'/><path d='M19 3v5h-5' fill='none' stroke='black' stroke-width='4.5' stroke-linecap='round' stroke-linejoin='round'/><path d='M19 12a7 7 0 1 1-2-4.9' fill='none' stroke='white' stroke-width='2' stroke-linecap='round'/><path d='M19 3v5h-5' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/></svg>") 12 12, alias; }
 .ipc-drop { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; text-align:center;
   color:#888; pointer-events:none; padding:20px; white-space:pre-line; font-size:15px; }
-.ipc-side { width:290px; display:flex; flex-direction:column; background:#202020; border-left:1px solid #0d0d0d; overflow:auto; }
+.ipc-side { width:290px; display:flex; flex-direction:column; background:#202020; border-left:1px solid #0d0d0d; overflow:hidden; }
+.ipc-tabs { display:flex; background:#1a1a1a; border-bottom:1px solid #0d0d0d; flex:none; }
+.ipc-tab { flex:1; background:transparent; border:none; border-bottom:2px solid transparent; color:#888; padding:8px 0 6px; font:inherit; font-size:11px; text-transform:uppercase; letter-spacing:.06em; cursor:pointer; }
+.ipc-tab:hover { color:#ddd; }
+.ipc-tab.ipc-active { color:#fff; border-bottom-color:#4a90d9; }
+.ipc-pane { display:flex; flex-direction:column; overflow:auto; flex:1; min-height:0; }
 .ipc-side h4, .ipc-side summary { margin:0; padding:6px 10px; font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:#999; background:#262626;
   border-bottom:1px solid #0d0d0d; border-top:1px solid #0d0d0d; display:flex; align-items:center; gap:6px; cursor:default; list-style:none; }
 .ipc-side summary { cursor:pointer; }
@@ -756,7 +762,7 @@ const STYLE = `
 .ipc-sec .ipc-row4 { display:grid; grid-template-columns:auto 1fr auto 1fr; gap:4px 6px; align-items:center; width:100%; }
 .ipc-num { background:#161616; color:#ddd; border:1px solid #3a3a3a; border-radius:4px; padding:3px 5px; font:inherit; }
 .ipc-sel { background:#161616; color:#ccc; border:1px solid #3a3a3a; border-radius:4px; padding:2px 4px; font:11px system-ui, sans-serif; max-width:110px; }
-.ipc-list { overflow:auto; flex:none; min-height:90px; max-height:42vh; }
+.ipc-list { overflow:auto; flex:none; min-height:90px; max-height:56vh; }
 .ipc-layer { display:flex; flex-direction:column; gap:4px; padding:6px 8px; border-bottom:1px solid #161616; cursor:pointer; }
 .ipc-layer:hover { background:#262b33; }
 .ipc-layer.ipc-selected { background:#2b3a4f; box-shadow: inset 3px 0 0 #4a90d9; }
@@ -842,6 +848,7 @@ const STYLE = `
 .ipc-subbar .ipc-sep { width:1px; height:18px; background:#444; margin:0 2px; }
 .ipc-subbar label { display:flex; align-items:center; gap:4px; color:#aaa; }
 .ipc-subbar input[type=range] { width:90px; }
+.ipc-subbar input[type=color] { width:30px; height:22px; padding:0; border:1px solid #4a4a4a; border-radius:5px; background:#333; cursor:pointer; }
 .ipc-subbar .ipc-geo { display:flex; align-items:center; gap:4px; }
 .ipc-textedit { position:absolute; z-index:3; background:transparent; color:transparent; caret-color:#fff; border:1px dashed #7cc7ff; outline:none; resize:none; margin:0; overflow:hidden; white-space:pre; box-sizing:border-box; }
 .ipc-subbar .ipc-geo label { gap:2px; }
@@ -1049,6 +1056,7 @@ class InpaintEditor {
         this.opacCtl = slider("Opacity", 1, 100, 100, (v) => v + "%", (v) => { this.brushOpacity = v / 100; });
 
         const colorLabel = el("label", null, "Color");
+        this.colorLabel = colorLabel;
         this.colorInput = document.createElement("input");
         this.colorInput.type = "color";
         this.colorInput.value = this.color;
@@ -1184,13 +1192,29 @@ class InpaintEditor {
 
         // side panel
         const side = el("div", "ipc-side");
+        // two tabs: Image (layers, selection, canvas, export) and Generate (prompt, settings, history, crop)
+        const tabBar = el("div", "ipc-tabs");
+        this.panes = { image: el("div", "ipc-pane"), gen: el("div", "ipc-pane") };
+        this.tabButtons = {};
+        for (const [id, label, title] of [["image", "Image", "Layers, selection, canvas, export"], ["gen", "Generate", "Prompt, generation settings, history, crop"]]) {
+            const b = el("button", "ipc-tab", label);
+            b.type = "button";
+            b.title = title;
+            b.addEventListener("click", (e) => { e.stopPropagation(); this.showPane(id); });
+            this.tabButtons[id] = b;
+            tabBar.appendChild(b);
+        }
+        side.appendChild(tabBar);
+        side.appendChild(this.panes.image);
+        side.appendChild(this.panes.gen);
+        let pane = this.panes.image;
         const section = (title, open, build) => {
             const d = document.createElement("details");
             d.open = open;
             const sum = el("summary", null, title);
             d.appendChild(sum);
             build(d, sum);
-            side.appendChild(d);
+            pane.appendChild(d);
             return d;
         };
 
@@ -1211,7 +1235,7 @@ class InpaintEditor {
         layersHead.appendChild(miniButton("refImage", "Add reference images (one layer per file, role \"reference\"). They are not part of the image; they travel with crop_image as extra batch images for Flux.2 / Kontext. Shift+drop on the canvas does the same (a plain drop adds an image layer).", () => this.refInput.click()));
         layersHead.appendChild(miniButton("fx", "Add a filter layer (film grain, sharpen, blur, levels, curves, brightness / contrast, hue / saturation, colour balance, black & white, invert, LUT, vignette). It filters everything below it; give it a mask to limit where it applies.", () => this.addFilterLayer()));
         layersHead.appendChild(miniButton("plus", "Add a paint layer (Ctrl+Shift+N)", () => this.addPaintLayer()));
-        side.appendChild(layersHead);
+        this.panes.image.appendChild(layersHead);
         this.layerList = el("div", "ipc-list");
         this.layerList.addEventListener("dragover", (e) => { e.preventDefault(); e.stopPropagation(); this.layerList.classList.add("ipc-dropping"); });
         this.layerList.addEventListener("dragleave", () => this.layerList.classList.remove("ipc-dropping"));
@@ -1221,7 +1245,7 @@ class InpaintEditor {
             const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []).filter((f) => f.type.startsWith("image/"));
             if (files.length) this.addImageLayers(files, e.shiftKey ? "reference" : "none", e.shiftKey ? {} : { place: "fit" });
         });
-        side.appendChild(this.layerList);
+        this.panes.image.appendChild(this.layerList);
 
         section("Selection", true, (d) => {
             const sec = el("div", "ipc-sec");
@@ -1253,13 +1277,14 @@ class InpaintEditor {
             const shrink = iconButton("shrink", "Shrink the selection by n pixels", () => this.growSelection(-this.growInput.value), "Shrink");
             shrink.classList.add("ipc-small");
             sec.appendChild(shrink);
-            const from = iconButton("fromLayer", "Replace the selection with the opaque area of the active layer", () => this.selectionFromLayer(), "From layer");
+            const from = iconButton("fromLayer", "Replace the selection with the opaque area of the active layer", () => this.selectionFromLayer(), "Layer");
             from.classList.add("ipc-small");
-            sec.appendChild(from);
-            const clr = iconButton("erase", "Clear: delete the selected pixels of the active layer (Del). Invert the selection first to keep only the selection.", () => this.clearSelectedPixels(), "Clear");
+            selRow.appendChild(from);
+            const clr = iconButton("erase", "Delete the selected pixels of the active layer (Del). Invert the selection first to keep only the selection.", () => this.clearSelectedPixels(), "Delete px");
             clr.classList.add("ipc-small");
-            sec.appendChild(clr);
-            this.featherInput = numberInput(8, 1, 512, "Feather radius in pixels", 56);
+            selRow.appendChild(clr);
+            this.featherInput = numberInput(8, 1, 512, "Feather radius in pixels", 52);
+            sec.appendChild(el("span", "ipc-gap", ""));
             sec.appendChild(this.featherInput);
             const fe = iconButton("blur", "Feather: soften the selection's edge by the radius (a gaussian blur of the selection mask)", () => this.featherSelection(+this.featherInput.value), "Feather");
             fe.classList.add("ipc-small");
@@ -1418,6 +1443,7 @@ class InpaintEditor {
 
         });
 
+        pane = this.panes.gen;
         section("Prompt", true, (d) => {
             const wrap = el("div", "ipc-prompt");
             this.promptInput = document.createElement("textarea");
@@ -1582,6 +1608,9 @@ class InpaintEditor {
             d.appendChild(this.infoEl);
         });
 
+        let paneId = "image";
+        try { paneId = localStorage.getItem("ipc.pane") || "image"; } catch (_) { /* no storage */ }
+        this.showPane(paneId);
         body.appendChild(side);
         root.appendChild(body);
 
@@ -1668,6 +1697,12 @@ class InpaintEditor {
         this.optsBar = bar;
         this.fillOpts = { tolerance: 32, contiguous: true, sample: "image" };
         this.gradientOpts = { type: "linear", to: "transparent" };
+        // the brush settings move from the top bar into this bar and show for the tools that use them
+        const moveCtl = (labelEl, forTools) => { if (!labelEl) return; labelEl.dataset.for = forTools; bar.appendChild(labelEl); };
+        moveCtl(this.sizeCtl && this.sizeCtl.input.parentElement, "select deselect paint erase smudge clone heal");
+        moveCtl(this.hardCtl && this.hardCtl.input.parentElement, "paint erase smudge clone heal");
+        moveCtl(this.opacCtl && this.opacCtl.input.parentElement, "paint erase clone heal bucket gradient");
+        moveCtl(this.colorLabel, "paint bucket gradient");
         const row = (cls, ...nodes) => { const lab = el("label", null); lab.dataset.for = cls; for (const n of nodes) lab.appendChild(typeof n === "string" ? el("span", null, n) : n); bar.appendChild(lab); return lab; };
         const tol = document.createElement("input");
         tol.type = "range"; tol.min = 0; tol.max = 255; tol.value = this.fillOpts.tolerance; tol.title = "Tolerance: how different a colour may be to count as the same area (0..255 per channel)";
@@ -1710,11 +1745,11 @@ class InpaintEditor {
     updateOptsBar() {
         if (!this.optsBar) return;
         const tool = this.tool;
-        const on = ["bucket", "gradient", "eyedropper", "smudge", "clone", "heal", "wand"].includes(tool);
+        const on = ["select", "deselect", "paint", "erase", "bucket", "gradient", "eyedropper", "smudge", "clone", "heal", "wand"].includes(tool);
         this.optsBar.hidden = !on;
         if (!on) return;
         for (const lab of this.optsBar.querySelectorAll("label")) lab.hidden = !(lab.dataset.for || "").split(" ").includes(tool);
-        const hints = { wand: "Click to select the similar area; Shift adds, Alt subtracts", bucket: "Click to fill; Shift+F fills the whole selection", gradient: "Drag from the colour to where it should have faded", eyedropper: "Click to pick a colour", smudge: "Drag across an edge to soften it", clone: this.cloneSource ? "Paint to copy from the source (Alt+click moves it)" : "Alt+click sets the source point", heal: this.cloneSource ? "Paint to repair with the source's texture (Alt+click moves it)" : "Alt+click sets the source point" };
+        const hints = { select: "Paint to select, Alt subtracts", deselect: "Paint to deselect", paint: "Alt+click picks a colour, Shift+click draws a line", erase: "Shift+click draws a line", wand: "Click to select the similar area; Shift adds, Alt subtracts", bucket: "Click to fill; Shift+F fills the whole selection", gradient: "Drag from the colour to where it should have faded", eyedropper: "Click to pick a colour", smudge: "Drag across an edge to soften it", clone: this.cloneSource ? "Paint to copy from the source (Alt+click moves it)" : "Alt+click sets the source point", heal: this.cloneSource ? "Paint to repair with the source's texture (Alt+click moves it)" : "Alt+click sets the source point" };
         this.optsHint.textContent = hints[tool] || "";
     }
 
@@ -2392,6 +2427,13 @@ class InpaintEditor {
 
     updateCanvasCursor(ix, iy) {
         this.setHandleCursor(this.canvasHandleAt(ix, iy));
+    }
+
+    showPane(id) {
+        if (!this.panes || !this.panes[id]) id = "image";
+        for (const [k, pane] of Object.entries(this.panes)) pane.hidden = k !== id;
+        for (const [k, b] of Object.entries(this.tabButtons)) b.classList.toggle("ipc-active", k === id);
+        try { localStorage.setItem("ipc.pane", id); } catch (_) { /* ignore */ }
     }
 
     // ---- tool groups (flyouts) ----------------------------------------------------------------
@@ -5791,6 +5833,7 @@ class InpaintEditor {
             top.appendChild(miniButton("trash", "Delete layer (Delete). Drag the row to reorder, Ctrl+] / Ctrl+[ move it up / down, Ctrl+J duplicates, Ctrl+E merges down", () => this.removeLayer(layer.id), "ipc-del"));
             row.appendChild(top);
 
+            if (layer.id !== this.activeLayerId) { list.appendChild(row); continue; }
             const opRow = el("div", "ipc-op");
             opRow.appendChild(el("span", null, "Opacity"));
             const op = document.createElement("input");

@@ -117,9 +117,13 @@ The tool column on the left groups related tools Photoshop-style: a button
 shows the group's current tool and a small triangle. Left-click picks that
 tool; right-click, holding the button or clicking the triangle opens the
 group (selection brushes, marquees, smart selection, brushes, retouch,
-fill), and the shortcuts pick any tool directly. Selection actions (none,
-invert, marching ants) sit in the Selection panel, the view toggles (rulers,
-grid, before / after, fit) in the top bar.
+fill), and the shortcuts pick any tool directly. The bar above the canvas
+shows the options of the active tool (brush size, hardness, opacity and
+colour for the brushes; tolerance, strength, gradient type and so on for the
+others). The side panel has two tabs: **Image** (layers, selection, canvas,
+export) and **Generate** (prompt, generation settings, history, crop). In
+the layer list only the active layer shows its controls; the others are one
+line each.
 
 Tools: brush (B), rectangle (R) and ellipse (Shift+R; Ctrl keeps
 them square or round, dragging inside an existing selection moves its
