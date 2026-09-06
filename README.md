@@ -368,6 +368,15 @@ or Gemini through ComfyUI's API node.
 
 ### Generate: API or local, denoise, seed, refine
 
+**VRAM and the helper models.** Select by text, object selection, cutouts
+and prompt upsampling run Qwen-VL, SAM3, SAM2 or RMBG through helper
+prompts; those nodes keep their weights loaded for the next call, outside
+ComfyUI's model management. In **API** mode that is fine, they stay resident.
+In **local** mode a big model such as Flux.2 needs the whole card, so before
+a local run the editor frees them (ComfyUI's `/free`) whenever a helper was
+used since the last run; the next upsample or segmentation reloads its model
+in a few seconds. **Free VRAM** in the Generate section does it by hand.
+
 ![Local mode: denoise, seed, refine, negative prompt and the settings driven from the editor](docs/img/local-settings.jpg)
 
 - The **api / local** switch next to Generate says which chain the result

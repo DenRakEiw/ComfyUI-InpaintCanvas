@@ -1526,6 +1526,9 @@ class InpaintEditor {
             const dice = iconButton("dice", "Roll a new seed now", () => { this.genSettings.seed = randomSeed(); this.seedInput.value = this.genSettings.seed; this.notifyChanged(); });
             dice.classList.add("ipc-small");
             sec.appendChild(dice);
+            const freeBtn = iconButton("broom", "Free the helper models (Qwen-VL, SAM3, SAM2, RMBG) from VRAM now. In local mode this happens by itself before a run whenever a helper was used; in API mode they stay loaded.", () => this.freeHelperModels(), "Free VRAM");
+            freeBtn.classList.add("ipc-small");
+            sec.appendChild(freeBtn);
             this.refineBtn = iconButton("refine", "Refine (local mode): re-run the selection at the denoise below without fill and without a feathered mask; the seam stays soft when stitching.", () => {
                 this.genSettings.refine = !this.genSettings.refine;
                 if (this.genSettings.refine && this.genSettings.denoise >= 1) { this.genSettings.denoise = 0.5; this.denoiseInput.value = 0.5; }
@@ -4016,6 +4019,7 @@ class InpaintEditor {
             }
             Object.assign(prompt, backend.build("seg_load", text, threshold, { quality: this.segQuality.checked }, backend));
             prompt.seg_out = { class_type: "InpaintCanvasMaskOut", inputs: { mask: backend.maskOut, canvas_node: String(this.node.id), purpose: "segment", ...(fromPrompt ? { label: text } : {}) } };
+            this.helperUsed = true;   // a helper model (SAM2 / SAM3 / RMBG / Qwen-VL) may now sit in VRAM outside ComfyUI's model management
             const res = await api.queuePrompt(-1, { output: prompt, workflow: { nodes: [], links: [], version: 0.4, extra: { inpaint_canvas_helper: true } } });
             this.segmentPromptId = res && res.prompt_id;
             this.segmentPending = { text: fromPrompt ? "" : text, mode: this.segMode, layer, fromPrompt };
@@ -4141,6 +4145,7 @@ class InpaintEditor {
                 ...backend.build("up_load", upsampleInstruction(useCase, text, region, this.getBounds() ? this.selectionLabel : "")),
                 up_out: { class_type: "InpaintCanvasTextOut", inputs: { text: backend.textOut, canvas_node: String(this.node.id), purpose: "upsample" } },
             };
+            this.helperUsed = true;   // a helper model (SAM2 / SAM3 / RMBG / Qwen-VL) may now sit in VRAM outside ComfyUI's model management
             const res = await api.queuePrompt(-1, { output: prompt, workflow: { nodes: [], links: [], version: 0.4, extra: { inpaint_canvas_helper: true } } });
             this.upsamplePromptId = res && res.prompt_id;
             if (res && res.node_errors && Object.keys(res.node_errors).length) {
@@ -4195,6 +4200,7 @@ class InpaintEditor {
                 obj_load: { class_type: "InpaintCanvasLoadRef", inputs: { ref: JSON.stringify(ref) } },
                 ...OBJECT_BACKEND.build("obj_load", String(this.node.id)),
             };
+            this.helperUsed = true;   // a helper model (SAM2 / SAM3 / RMBG / Qwen-VL) may now sit in VRAM outside ComfyUI's model management
             const res = await api.queuePrompt(-1, { output: prompt, workflow: { nodes: [], links: [], version: 0.4, extra: { inpaint_canvas_helper: true } } });
             if (res && res.node_errors && Object.keys(res.node_errors).length) {
                 const first = Object.values(res.node_errors)[0];
@@ -4833,6 +4839,7 @@ class InpaintEditor {
                 ...backend.build("cut_load"),
                 cut_out: { class_type: "InpaintCanvasMaskOut", inputs: { mask: backend.maskOut, canvas_node: String(this.node.id), purpose: "cutout" } },
             };
+            this.helperUsed = true;   // a helper model (SAM2 / SAM3 / RMBG / Qwen-VL) may now sit in VRAM outside ComfyUI's model management
             const res = await api.queuePrompt(-1, { output: prompt, workflow: { nodes: [], links: [], version: 0.4, extra: { inpaint_canvas_helper: true } } });
             this.cutoutPromptId = res && res.prompt_id;
             if (res && res.node_errors && Object.keys(res.node_errors).length) {
@@ -6846,12 +6853,30 @@ class InpaintEditor {
         if (this.negativeInput) this.negativeInput.hidden = !local;
     }
 
+    /** Drop the helper models from VRAM: ComfyUI's /free resets the executor, which releases the node instances holding them. */
+    async freeHelperModels() {
+        try {
+            this.setStatus("Freeing helper models (SAM, Qwen-VL) from VRAM ...");
+            const r = await api.fetchApi("/free", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ unload_models: true, free_memory: true }) });
+            if (r.status !== 200) throw new Error("/free answered " + r.status);
+            this.helperUsed = false;
+            this.setStatus("Helper models freed.");
+        } catch (err) {
+            console.warn("Inpaint Canvas: could not free models", err);
+            this.setStatus("Could not free the helper models: " + (err.message || err));
+        }
+    }
+
     async generate() {
         if (!this.base) { this.setStatus("Load an image first."); return; }
         if (this.genSettings.seedRandom) { this.genSettings.seed = randomSeed(); if (this.seedInput) this.seedInput.value = this.genSettings.seed; }
         const { name, wired } = this.resultInputState();
         try {
             this.generateBtn.disabled = true;
+            // Local mode: the helper models (Qwen-VL, SAM3, SAM2, RMBG) keep their weights inside their node
+            // instances, invisible to ComfyUI's model management. Before a local run they are freed, so a big
+            // model such as Flux.2 gets the whole card; in API mode they simply stay resident.
+            if (this.genSettings.mode === "local" && this.helperUsed) await this.freeHelperModels();
             this.setStatus(wired ? `Queueing (${this.genSettings.mode}, seed ${this.genSettings.seed}, result from ${name}) ...` : `Queueing, but nothing is wired into "result" or "result_local": the result will not come back into the canvas.`);
             try {
                 await app.queuePrompt(0);
