@@ -708,7 +708,9 @@ const STYLE = `
 .ipc-ib.ipc-small { padding:3px 7px; font-size:12px; min-width:0; }
 .ipc-body { display:flex; flex:1; min-height:0; }
 .ipc-tools { display:flex; flex-direction:column; gap:4px; padding:6px; background:#202020; border-right:1px solid #0d0d0d; overflow:auto; }
-.ipc-tools .ipc-ib { width:38px; height:36px; padding:0; }
+.ipc-tools .ipc-ib { width:38px; height:36px; padding:0; transition:none; user-select:none; -webkit-user-select:none; }
+.ipc-tools .ipc-ib:active { background:#555; transform:translateY(1px); }
+.ipc-groupbtn .ipc-tri { pointer-events:none; }
 .ipc-tools .ipc-sep { height:1px; background:#3a3a3a; margin:4px 2px; }
 .ipc-tools .ipc-grp { font-size:9px; text-transform:uppercase; letter-spacing:.06em; color:#666; text-align:center; margin:2px 0 -1px; }
 .ipc-groupbtn { position:relative; }
@@ -1083,12 +1085,22 @@ class InpaintEditor {
             const g = { items, tools: items.map((i) => i.tool), current: items[0].tool, actions, btn: null };
             const btn = el("button", "ipc-ib ipc-groupbtn");
             btn.type = "button";
-            btn.addEventListener("click", (e) => { e.stopPropagation(); e.preventDefault(); clearTimeout(g._hold); this.closeFlyout(); this.setTool(g.current); });
+            // click: the group's current tool at once. The flyout opens on right-click, on holding the
+            // button (300 ms) or on a click on the corner triangle; it never opens on hover, so moving
+            // down the column stays quiet.
+            btn.addEventListener("click", (e) => {
+                e.stopPropagation(); e.preventDefault();
+                clearTimeout(g._hold);
+                if (g._held) { g._held = false; return; }
+                const r = btn.getBoundingClientRect();
+                if (e.clientX > r.right - 12 && e.clientY > r.bottom - 12) { this.openFlyout(g, btn); return; }
+                this.closeFlyout();
+                this.setTool(g.current);
+            });
             btn.addEventListener("contextmenu", (e) => { e.preventDefault(); e.stopPropagation(); this.openFlyout(g, btn); });
-            btn.addEventListener("pointerenter", () => { clearTimeout(g._hover); g._hover = setTimeout(() => this.openFlyout(g, btn), 400); });
-            btn.addEventListener("pointerleave", () => { clearTimeout(g._hover); this.scheduleFlyoutClose(); });
-            btn.addEventListener("pointerdown", (e) => { if (e.button === 0) g._hold = setTimeout(() => this.openFlyout(g, btn), 450); });
+            btn.addEventListener("pointerdown", (e) => { if (e.button === 0) { g._held = false; g._hold = setTimeout(() => { g._held = true; this.openFlyout(g, btn); }, 300); } });
             btn.addEventListener("pointerup", () => clearTimeout(g._hold));
+            btn.addEventListener("pointerleave", () => clearTimeout(g._hold));
             g.btn = btn;
             this.toolGroups.push(g);
             for (const it of items) this.toolGroupOf[it.tool] = g;
@@ -1102,7 +1114,6 @@ class InpaintEditor {
             const btn = iconButton(iconName, title, () => { if (this.flyout && this.flyout.group === g) this.closeFlyout(); else this.openFlyout(g, btn); });
             btn.classList.add("ipc-groupbtn");
             btn.innerHTML += '<span class="ipc-tri"></span>';
-            btn.addEventListener("pointerleave", () => this.scheduleFlyoutClose());
             g.btn = btn;
             tools.appendChild(btn);
             return g;
@@ -2039,7 +2050,14 @@ class InpaintEditor {
         else this.ensureObjects();
         this.updateSubbar();
         this.updateOptsBar();
-        this.draw();
+        this.drawAfterPaint();
+    }
+
+    /** Redraw after the next paint, so button states and cursors show before a heavy composite runs. */
+    drawAfterPaint() {
+        if (this._drawAfterPaint) return;
+        this._drawAfterPaint = true;
+        requestAnimationFrame(() => requestAnimationFrame(() => { this._drawAfterPaint = false; this.draw(); }));
     }
 
     onKey(e) {
@@ -2393,7 +2411,7 @@ class InpaintEditor {
             }, false, a.toggle ? !!a.toggle() : false);
         }
         fly.addEventListener("pointerenter", () => clearTimeout(this._flyClose));
-        fly.addEventListener("pointerleave", () => this.scheduleFlyoutClose());
+        fly.addEventListener("pointerleave", (e) => { if (!(g.btn && g.btn.contains(e.relatedTarget))) this.scheduleFlyoutClose(); });
         for (const type of ["pointerdown", "pointerup", "click", "wheel", "contextmenu"]) fly.addEventListener(type, (e) => e.stopPropagation());
         this.root.appendChild(fly);
         const r = anchor.getBoundingClientRect(), rr = this.root.getBoundingClientRect();
@@ -2409,7 +2427,7 @@ class InpaintEditor {
 
     scheduleFlyoutClose() {
         clearTimeout(this._flyClose);
-        this._flyClose = setTimeout(() => this.closeFlyout(), 450);
+        this._flyClose = setTimeout(() => this.closeFlyout(), 160);
     }
 
     closeFlyout() {
@@ -2594,8 +2612,8 @@ class InpaintEditor {
         ta.addEventListener("blur", () => { if (this.textEdit && this.textEdit.ta === ta) this.endTextEdit(true); });
         this.viewEl.appendChild(ta);
         this.positionTextEdit();
-        ta.focus();
-        ta.select();
+        // focus after the click's default actions have run (a mousedown on the canvas would blur it again)
+        setTimeout(() => { if (this.textEdit && this.textEdit.ta === ta) { ta.focus(); ta.select(); } }, 0);
         this.setStatus("Editing the text on the canvas: Enter applies, Shift+Enter starts a new line, Esc cancels.");
     }
 
@@ -2876,6 +2894,13 @@ class InpaintEditor {
     onPointerDown(e) {
         this.root.focus({ preventScroll: true });
         if (!this.width) return;
+        // Chrome reports detail = 0 on pointer events, so double-clicks are detected here:
+        // a second press within 400 ms and 8 css px of the previous one.
+        const nowMs = performance.now();
+        const [dcx, dcy] = this.toCanvasPx(e);
+        const last = this._lastDown;
+        const isDouble = !!(last && nowMs - last.t < 400 && last.button === e.button && Math.hypot(dcx - last.x, dcy - last.y) < 8 * (window.devicePixelRatio || 1));
+        this._lastDown = isDouble ? null : { t: nowMs, x: dcx, y: dcy, button: e.button };
         const pan = e.button === 1 || e.button === 2 || this.spaceDown || this.tool === "hand";
         try { this.canvas.setPointerCapture(e.pointerId); } catch (_) { /* ignore */ }
         const [cx, cy] = this.toCanvasPx(e);
@@ -2896,7 +2921,7 @@ class InpaintEditor {
             if (this.showRulers) {
                 const rp = RULER_PX * dpr;
                 if (cx < rp || cy < rp) {
-                    if (e.detail >= 2) { this.guides = { x: [], y: [] }; this.draw(); this.notifyChanged(); this.setStatus("Guides cleared."); return; }
+                    if ((e.detail >= 2 || isDouble)) { this.guides = { x: [], y: [] }; this.draw(); this.notifyChanged(); this.setStatus("Guides cleared."); return; }
                     this.pointer = { kind: "guide", axis: cy < rp ? "y" : "x", index: -1, pos: null };
                     return;
                 }
@@ -2944,7 +2969,7 @@ class InpaintEditor {
             } else {
                 const [fx, fy] = this.polyPoints[0];
                 const near = Math.hypot(ix - fx, iy - fy) <= 8 / this.view.scale;
-                if ((near && this.polyPoints.length >= 3) || e.detail >= 2) { this.closePolygon(); this.draw(); return; }
+                if ((near && this.polyPoints.length >= 3) || (e.detail >= 2 || isDouble)) { this.closePolygon(); this.draw(); return; }
                 this.polyPoints.push([ix, iy]);
             }
             this.draw();
@@ -3052,7 +3077,7 @@ class InpaintEditor {
             if (hit) {
                 this.activeLayerId = hit.id;
                 this.renderLayers();
-                if (e.detail >= 2 && !hit.locked) { this.beginTextEdit(hit); this.draw(); return; }
+                if ((e.detail >= 2 || isDouble) && !hit.locked) { e.preventDefault(); this.beginTextEdit(hit); this.draw(); return; }
                 if (hit.locked) { this.setStatus(`${hit.name} is locked.`); this.draw(); return; }
                 this.pushUndo({ kind: "transform", id: hit.id });
                 this.pointer = { kind: "move", layer: hit, start: [ix, iy], orig: { x: hit.x, y: hit.y } };
