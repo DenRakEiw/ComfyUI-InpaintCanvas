@@ -698,7 +698,10 @@ class InpaintCanvas:
                    control_crop, denoise, seed, mode, str(state.get("negative", "") or "")) + setting_values
 
         if result_source:
-            src_id, _, src_slot = result_source.partition(":")
+            # "id:slot"; inside a subgraph the id itself is "parent:child", so split at the last colon
+            src_id, _, src_slot = str(result_source).rpartition(":")
+            if not src_id:
+                src_id, src_slot = src_slot, "0"
             graph = GraphBuilder()
             graph.node("InpaintCanvasStitch",
                        result=[str(src_id), int(src_slot or 0)],
