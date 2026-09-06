@@ -102,10 +102,18 @@ rectangle is the crop that leaves the node, not the selection.
 Rectangle and lasso replace the selection like in Krita and Photoshop; hold
 Shift to add, Alt to subtract. The brush adds, with Alt it subtracts.
 
-Tools on the left: brush (B), rectangle (R), lasso (L), polygon (Shift+L:
-click point by point, click the first point, double-click or Enter to close,
-Backspace removes the last point, Esc cancels), object selection (O),
-deselect brush (D). `[` and `]` change the brush size, the top bar holds
+Tools on the left: brush (B), rectangle (R) and ellipse (Shift+R; Ctrl keeps
+them square or round, dragging inside an existing selection moves its
+outline), lasso (L), polygon (Shift+L: click point by point, click the first
+point, double-click or Enter to close, Backspace removes the last point, Esc
+cancels), magic wand (W: similar colour under the cursor, tolerance and
+contiguous in the bar above the canvas), object selection (O), deselect brush
+(D). **Quick mask (Q)** turns the paint and erase tools into selection
+brushes and the bucket into a wand, with the selection shown as a red tint.
+The Selection section grows, shrinks and **feathers** the selection (soft
+edge, respected by painting, filling and the mask that is sent along), takes
+it from a layer, and **saves** selections with the workflow to load them again
+later (Shift+click adds, Alt+click subtracts). `[` and `]` change the brush size, the top bar holds
 size, hardness, opacity and the paint colour.
 
 - **Close loops** (toggle under the selection tools) works like Photoshop's
@@ -464,7 +472,8 @@ and files stay.
 
 | Keys                         | Action                                   |
 | ---------------------------- | ---------------------------------------- |
-| B, R, L, Shift+L, O, D       | selection brush, rectangle, lasso, polygon, object, deselect |
+| B, R, Shift+R, L, Shift+L    | selection brush, rectangle, ellipse, lasso, polygon |
+| W, O, D, Q                   | magic wand, object, deselect brush, quick mask |
 | P, E, T, H                   | paint, erase, transform, hand            |
 | I, G, Shift+G                | eyedropper, bucket, gradient             |
 | Shift+S, S, J                | smudge, clone stamp, healing brush       |

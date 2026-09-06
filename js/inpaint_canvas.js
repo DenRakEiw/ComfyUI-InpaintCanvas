@@ -567,6 +567,10 @@ function objectBackendAvailable() {
 
 const ICONS = {
     text: '<path d="M5 5h14"/><path d="M12 5v14"/><path d="M9 19h6"/>',
+    wand: '<path d="M4 20L15 9"/><path d="M15 9l-2-2 4-4 2 2z"/><path d="M19 2v2M22 5h-2M21 9l-1.5-.5M17 1l-.5 1.5"/>',
+    ellipse: '<ellipse cx="12" cy="12" rx="9" ry="6" stroke-dasharray="3 2"/>',
+    quickmask: '<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="4" fill="currentColor" stroke="none"/>',
+    blur: '<circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="9" stroke-dasharray="2 3"/>',
     smudge: '<path d="M8 21c-3 0-5-2-5-5v-6a2 2 0 014 0v3"/><path d="M7 13V5a2 2 0 014 0v7"/><path d="M11 12V7a2 2 0 014 0v5"/><path d="M15 12v-1a2 2 0 014 0v5c0 3-2 5-5 5H8"/>',
     clone: '<path d="M5 21h14"/><path d="M4 17h16v-4H4z"/><path d="M9 13V7a3 3 0 016 0v6"/>',
     heal: '<rect x="2" y="9" width="20" height="6" rx="3" transform="rotate(-45 12 12)"/><path d="M10 10l4 4"/><path d="M14 10l-4 4"/>',
@@ -1046,10 +1050,12 @@ class InpaintEditor {
         };
         tools.appendChild(el("div", "ipc-grp", "Select"));
         addTool("select", "Paint selection (B): adds to the selection, Alt subtracts");
-        addTool("rect", "Rectangle selection (R): replaces the selection, Shift adds, Alt subtracts");
+        addTool("rect", "Rectangle selection (R): replaces the selection, Shift adds, Alt subtracts, Ctrl keeps it square. Drag inside an existing selection to move its outline.");
+        addTool("ellipse", "Ellipse selection (Shift+R): replaces the selection, Shift adds, Alt subtracts, Ctrl keeps it a circle. Drag inside an existing selection to move its outline.");
         addTool("lasso", "Lasso selection (L): replaces the selection, Shift adds, Alt subtracts");
         addTool("polygon", "Polygon selection (Shift+L): click point by point, click the first point, double-click or Enter to close, Backspace removes the last point, Esc cancels. Replaces the selection, Shift adds, Alt subtracts.");
         addTool("object", "Object selection (O): hover to see objects, click to select, click again to deselect. Shift adds, Alt subtracts.");
+        addTool("wand", "Magic wand (W): selects the area of similar colour under the cursor. Tolerance, contiguous and the sample source are in the bar above the canvas. Shift adds, Alt subtracts.");
         addTool("deselect", "Erase from selection (D)");
         this.loopBtn = iconButton("loop", "Close loops (Photoshop-style): end a brush stroke where it started and the inside is filled too. Also for the subtract brush.", () => {
             this.fillEnclosed = !this.fillEnclosed;
@@ -1058,6 +1064,8 @@ class InpaintEditor {
         });
         this.loopBtn.classList.toggle("ipc-toggle-on", this.fillEnclosed);
         tools.appendChild(this.loopBtn);
+        this.quickMaskBtn = iconButton("quickmask", "Quick mask (Q): while on, the paint and erase tools edit the selection (paint selects, erase deselects, the bucket works like the wand) and the selection is shown as a red tint.", () => this.toggleQuickMask());
+        tools.appendChild(this.quickMaskBtn);
         tools.appendChild(el("div", "ipc-sep"));
         tools.appendChild(el("div", "ipc-grp", "Layer"));
         addTool("paint", "Paint on the active layer (P). On the base it creates a paint layer.");
@@ -1162,7 +1170,28 @@ class InpaintEditor {
             const clr = iconButton("erase", "Clear: delete the selected pixels of the active layer (Del). Invert the selection first to keep only the selection.", () => this.clearSelectedPixels(), "Clear");
             clr.classList.add("ipc-small");
             sec.appendChild(clr);
+            this.featherInput = numberInput(8, 1, 512, "Feather radius in pixels", 56);
+            sec.appendChild(el("span", null, "Feather"));
+            sec.appendChild(this.featherInput);
+            const fe = iconButton("blur", "Feather: soften the selection's edge by the radius (a gaussian blur of the selection mask)", () => this.featherSelection(+this.featherInput.value), "Feather");
+            fe.classList.add("ipc-small");
+            sec.appendChild(fe);
             d.appendChild(sec);
+
+            // saved selections (stored with the workflow)
+            const sv = el("div", "ipc-sec");
+            const save = iconButton("save", "Store the current selection with the workflow", () => this.saveSelection(), "Save selection");
+            save.classList.add("ipc-small");
+            sv.appendChild(save);
+            this.selectionsSel = selectInput([], "", "Saved selections");
+            this.selectionsSel.classList.add("ipc-narrow");
+            sv.appendChild(this.selectionsSel);
+            const load = iconButton("fromLayer", "Load the saved selection (replaces; Shift+click adds, Alt+click subtracts)", (e) => this.loadSelection(this.selectionsSel.selectedIndex, e && e.altKey ? "subtract" : (e && e.shiftKey ? "add" : "replace")), "Load");
+            load.classList.add("ipc-small");
+            sv.appendChild(load);
+            sv.appendChild(miniButton("trash", "Delete the saved selection", () => this.deleteSelection(this.selectionsSel.selectedIndex), "ipc-del"));
+            d.appendChild(sv);
+            this.renderSelectionList();
 
             // select by text
             const seg = el("div", "ipc-sec");
@@ -1508,14 +1537,14 @@ class InpaintEditor {
         tol.type = "range"; tol.min = 0; tol.max = 255; tol.value = this.fillOpts.tolerance; tol.title = "Tolerance: how different a colour may be to count as the same area (0..255 per channel)";
         const tolVal = el("span", null, String(this.fillOpts.tolerance));
         tol.addEventListener("input", () => { this.fillOpts.tolerance = +tol.value; tolVal.textContent = tol.value; });
-        row("bucket", "Tolerance", tol, tolVal);
+        row("bucket wand", "Tolerance", tol, tolVal);
         const cont = document.createElement("input");
         cont.type = "checkbox"; cont.checked = true; cont.title = "Contiguous: only the connected area under the cursor; off fills every similar colour of the image";
         cont.addEventListener("change", () => { this.fillOpts.contiguous = cont.checked; });
-        row("bucket", cont, "Contiguous");
+        row("bucket wand", cont, "Contiguous");
         const sample = selectInput(["image", "layer"], "image", "What the fill looks at: the visible image (all layers) or the active layer alone");
         sample.addEventListener("change", () => { this.fillOpts.sample = sample.value; });
-        row("bucket eyedropper", "Sample", sample);
+        row("bucket eyedropper wand", "Sample", sample);
         const gtype = selectInput(["linear", "radial"], "linear", "Gradient shape");
         gtype.addEventListener("change", () => { this.gradientOpts.type = gtype.value; });
         row("gradient", "Type", gtype);
@@ -1545,11 +1574,11 @@ class InpaintEditor {
     updateOptsBar() {
         if (!this.optsBar) return;
         const tool = this.tool;
-        const on = ["bucket", "gradient", "eyedropper", "smudge", "clone", "heal"].includes(tool);
+        const on = ["bucket", "gradient", "eyedropper", "smudge", "clone", "heal", "wand"].includes(tool);
         this.optsBar.hidden = !on;
         if (!on) return;
         for (const lab of this.optsBar.querySelectorAll("label")) lab.hidden = !(lab.dataset.for || "").split(" ").includes(tool);
-        const hints = { bucket: "Click to fill; Shift+F fills the whole selection", gradient: "Drag from the colour to where it should have faded", eyedropper: "Click to pick a colour", smudge: "Drag across an edge to soften it", clone: this.cloneSource ? "Paint to copy from the source (Alt+click moves it)" : "Alt+click sets the source point", heal: this.cloneSource ? "Paint to repair with the source's texture (Alt+click moves it)" : "Alt+click sets the source point" };
+        const hints = { wand: "Click to select the similar area; Shift adds, Alt subtracts", bucket: "Click to fill; Shift+F fills the whole selection", gradient: "Drag from the colour to where it should have faded", eyedropper: "Click to pick a colour", smudge: "Drag across an edge to soften it", clone: this.cloneSource ? "Paint to copy from the source (Alt+click moves it)" : "Alt+click sets the source point", heal: this.cloneSource ? "Paint to repair with the source's texture (Alt+click moves it)" : "Alt+click sets the source point" };
         this.optsHint.textContent = hints[tool] || "";
     }
 
@@ -1920,6 +1949,7 @@ class InpaintEditor {
         if (e.ctrlKey || e.metaKey || e.altKey) return;
         if (e.shiftKey && k === "f") { this.fillSelection(); return; }
         if (e.shiftKey && k === "l") { this.setTool("polygon"); return; }
+        if (e.shiftKey && k === "r") { this.setTool("ellipse"); return; }
         if (e.shiftKey && k === "t") { this.setTool("text"); return; }
         switch (k) {
             case "b": this.setTool("select"); break;
@@ -1933,6 +1963,8 @@ class InpaintEditor {
             case "h": this.setTool("hand"); break;
             case "c": this.setTool("canvas"); break;
             case "i": this.setTool("eyedropper"); break;
+            case "w": this.setTool("wand"); break;
+            case "q": this.toggleQuickMask(); break;
             case "s": this.setTool(e.shiftKey ? "smudge" : "clone"); break;
             case "j": this.setTool("heal"); break;
             case "g": this.setTool(e.shiftKey ? "gradient" : "bucket"); break;
@@ -2210,7 +2242,7 @@ class InpaintEditor {
         }
         if (e.button !== 0) return;
         const [ix, iy] = this.toImage(e);
-        if (e.ctrlKey && !e.altKey && !e.shiftKey && ["transform", "paint", "erase", "text", "select", "rect", "lasso", "polygon", "deselect"].includes(this.tool)) {
+        if (e.ctrlKey && !e.altKey && !e.shiftKey && !this.quickMask && ["transform", "paint", "erase", "text"].includes(this.tool)) {
             // Ctrl+click: the topmost layer with a visible pixel under the cursor becomes active (Photoshop's auto-select)
             const l = this.pickLayerAt(ix, iy);
             if (this.pending) this.cancelPending();
@@ -2226,9 +2258,19 @@ class InpaintEditor {
             this.pushUndo({ kind: "selection" });
             this.pointer = { kind: "selpaint", last: [ix, iy], path: [[ix, iy]], subtract: this.tool === "deselect" || e.altKey };
             this.selectionDab(ix, iy, ix, iy);
-        } else if (this.tool === "rect") {
+        } else if (this.tool === "wand") {
+            this.wandSelect(ix, iy, selMode);
+            return;
+        } else if (this.tool === "rect" || this.tool === "ellipse") {
             this.pushUndo({ kind: "selection" });
-            this.pointer = { kind: "rect", start: [ix, iy], cur: [ix, iy], mode: selMode };
+            if (selMode === "replace" && !e.ctrlKey && this.selectedAt(ix, iy)) {
+                // dragging inside the selection moves its outline (Photoshop's marquee tools)
+                const orig = makeCanvas(this.width, this.height);
+                orig.getContext("2d").drawImage(this.selection, 0, 0);
+                this.pointer = { kind: "selmove", start: [ix, iy], orig };
+            } else {
+                this.pointer = { kind: "rect", ellipse: this.tool === "ellipse", square: e.ctrlKey, start: [ix, iy], cur: [ix, iy], mode: selMode };
+            }
         } else if (this.tool === "lasso") {
             this.pushUndo({ kind: "selection" });
             this.pointer = { kind: "lasso", mode: selMode };
@@ -2251,7 +2293,7 @@ class InpaintEditor {
             this.pickColor(ix, iy);
             return;
         } else if (this.tool === "bucket") {
-            this.bucketFill(ix, iy);
+            if (this.quickMask) this.wandSelect(ix, iy, selMode); else this.bucketFill(ix, iy);
             return;
         } else if (this.tool === "smudge") {
             let layer = this.activeLayer();
@@ -2291,6 +2333,11 @@ class InpaintEditor {
             this.pushUndo({ kind: "layer", id: layer.id });
             const stroke = makeCanvas(layer.canvas.width, layer.canvas.height);
             this.pointer = { kind: "layerpaint", grad: true, layer, stroke, clip: this.strokeClip(layer, layer.canvas), erase: false, start: [ix, iy], last: [ix, iy] };
+        } else if ((this.tool === "paint" || this.tool === "erase") && this.quickMask) {
+            // quick mask: the brushes edit the selection
+            this.pushUndo({ kind: "selection" });
+            this.pointer = { kind: "selpaint", last: [ix, iy], path: [[ix, iy]], subtract: this.tool === "erase" || e.altKey };
+            this.selectionDab(ix, iy, ix, iy);
         } else if (this.tool === "paint" || this.tool === "erase") {
             let layer = this.activeLayer();
             if (layer && layer.locked) { this.setStatus(`${layer.name} is locked.`); return; }
@@ -2394,8 +2441,17 @@ class InpaintEditor {
             this.smudgeDab(p, p.last[0], p.last[1], ix, iy);
             p.last = [ix, iy];
         } else if (p.kind === "rect") {
-            p.cur = [ix, iy];
+            if (p.square || e.ctrlKey) {
+                const dx = ix - p.start[0], dy = iy - p.start[1], m = Math.max(Math.abs(dx), Math.abs(dy));
+                p.cur = [p.start[0] + Math.sign(dx || 1) * m, p.start[1] + Math.sign(dy || 1) * m];
+            } else p.cur = [ix, iy];
             p.mode = e.altKey ? "subtract" : (e.shiftKey ? "add" : p.mode === "replace" && !e.shiftKey ? "replace" : "add");
+        } else if (p.kind === "selmove") {
+            const sctx = this.selection.getContext("2d");
+            sctx.globalCompositeOperation = "source-over";
+            sctx.clearRect(0, 0, this.width, this.height);
+            sctx.drawImage(p.orig, Math.round(ix - p.start[0]), Math.round(iy - p.start[1]));
+            this.selectionDirty = true;
         } else if (p.kind === "lasso") {
             this.lassoPoints.push([ix, iy]);
             p.mode = e.altKey ? "subtract" : (e.shiftKey ? "add" : p.mode === "replace" && !e.shiftKey ? "replace" : "add");
@@ -2465,9 +2521,18 @@ class InpaintEditor {
             if (p.mode === "replace") { sctx.globalCompositeOperation = "source-over"; sctx.clearRect(0, 0, this.width, this.height); this.selectionLabel = ""; }
             sctx.globalCompositeOperation = p.mode === "subtract" ? "destination-out" : "source-over";
             sctx.fillStyle = "#ff0000";
-            sctx.fillRect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0));
+            if (p.ellipse) {
+                sctx.beginPath();
+                sctx.ellipse((x0 + x1) / 2, (y0 + y1) / 2, Math.abs(x1 - x0) / 2, Math.abs(y1 - y0) / 2, 0, 0, Math.PI * 2);
+                sctx.fill();
+            } else {
+                sctx.fillRect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0));
+            }
             sctx.globalCompositeOperation = "source-over";
             this.markSelectionChanged();
+        } else if (p.kind === "selmove") {
+            this.markSelectionChanged();
+            this.setStatus("Selection outline moved.");
         } else if (p.kind === "lasso") {
             const pts = this.lassoPoints;
             this.lassoPoints = null;
@@ -2632,6 +2697,119 @@ class InpaintEditor {
             ctx.fill();
             ctx.restore();
         }
+    }
+
+    // ---- selection tools: wand, feather, saved selections, quick mask ------------------------
+
+    selectedAt(ix, iy) {
+        const x = Math.floor(ix), y = Math.floor(iy);
+        if (x < 0 || y < 0 || x >= this.width || y >= this.height || !this.getBounds()) return false;
+        return this.selection.getContext("2d").getImageData(x, y, 1, 1).data[3] > 127;
+    }
+
+    /** Combine a W×H region mask (1 = inside) with the selection: replace, add or subtract. */
+    applyMaskToSelection(mask, mode = "replace") {
+        this.pushUndo({ kind: "selection" });
+        const sctx = this.selection.getContext("2d");
+        const shape = maskToColorCanvas(mask, this.width, this.height, "#ff0000");
+        if (mode === "replace") { sctx.globalCompositeOperation = "source-over"; sctx.clearRect(0, 0, this.width, this.height); this.selectionLabel = ""; }
+        sctx.globalCompositeOperation = mode === "subtract" ? "destination-out" : "source-over";
+        sctx.drawImage(shape, 0, 0);
+        sctx.globalCompositeOperation = "source-over";
+        this.markSelectionChanged();
+        this.draw();
+    }
+
+    /** Magic wand: the area of similar colour under (ix, iy) becomes the selection. */
+    wandSelect(ix, iy, mode = "replace") {
+        if (!this.width) return;
+        const x = Math.floor(ix), y = Math.floor(iy);
+        if (x < 0 || y < 0 || x >= this.width || y >= this.height) return;
+        const o = this.fillOpts || { tolerance: 32, contiguous: true, sample: "image" };
+        const t0 = performance.now();
+        const src = this.sampleCanvas(o.sample).getContext("2d").getImageData(0, 0, this.width, this.height).data;
+        const mask = floodMask(src, this.width, this.height, x, y, o.tolerance, o.contiguous);
+        let n = 0;
+        for (let i = 0; i < mask.length; i++) n += mask[i];
+        this.applyMaskToSelection(mask, mode);
+        this.setStatus(`${n.toLocaleString()} px ${mode === "replace" ? "selected" : mode === "add" ? "added" : "subtracted"} (${Math.round(performance.now() - t0)} ms).`);
+    }
+
+    /** Soften the selection edge: gaussian blur of the mask. */
+    featherSelection(r) {
+        if (!this.getBounds()) { this.setStatus("Nothing selected to feather."); return; }
+        r = Math.max(0.5, Math.min(512, +r || 0));
+        this.pushUndo({ kind: "selection" });
+        const tmp = makeCanvas(this.width, this.height);
+        const tctx = tmp.getContext("2d");
+        tctx.filter = `blur(${r}px)`;
+        tctx.drawImage(this.selection, 0, 0);
+        tctx.filter = "none";
+        const sctx = this.selection.getContext("2d");
+        sctx.globalCompositeOperation = "source-over";
+        sctx.clearRect(0, 0, this.width, this.height);
+        sctx.drawImage(tmp, 0, 0);
+        this.markSelectionChanged();
+        this.draw();
+        this.setStatus(`Selection feathered by ${r} px (soft edge for painting, filling and the mask).`);
+    }
+
+    renderSelectionList() {
+        if (!this.selectionsSel) return;
+        const sel = this.selectionsSel;
+        const keep = sel.selectedIndex;
+        sel.innerHTML = "";
+        for (const s of this.savedSelections || []) { const o = document.createElement("option"); o.value = s.name; o.textContent = s.name; sel.appendChild(o); }
+        sel.selectedIndex = Math.min(sel.options.length - 1, Math.max(0, keep));
+        sel.disabled = !sel.options.length;
+    }
+
+    saveSelection() {
+        if (!this.getBounds()) { this.setStatus("Nothing selected to save."); return; }
+        if (!this.savedSelections) this.savedSelections = [];
+        const name = this.selectionLabel ? this.selectionLabel : `Selection ${this.savedSelections.length + 1}`;
+        this.savedSelections.push({ name, url: this.selection.toDataURL("image/png") });
+        this.renderSelectionList();
+        this.selectionsSel.selectedIndex = this.savedSelections.length - 1;
+        this.notifyChanged();
+        this.setStatus(`"${name}" saved with the workflow.`);
+    }
+
+    async loadSelection(index, mode = "replace") {
+        const s = (this.savedSelections || [])[index];
+        if (!s) { this.setStatus("No saved selection chosen."); return; }
+        try {
+            const img = await loadImageEl(s.url);
+            this.pushUndo({ kind: "selection" });
+            const sctx = this.selection.getContext("2d");
+            if (mode === "replace") { sctx.globalCompositeOperation = "source-over"; sctx.clearRect(0, 0, this.width, this.height); }
+            sctx.globalCompositeOperation = mode === "subtract" ? "destination-out" : "source-over";
+            sctx.drawImage(img, 0, 0);
+            sctx.globalCompositeOperation = "source-over";
+            this.selectionLabel = mode === "replace" ? s.name : this.selectionLabel;
+            this.markSelectionChanged();
+            this.draw();
+            this.setStatus(`"${s.name}" ${mode === "replace" ? "loaded" : mode === "add" ? "added" : "subtracted"}.`);
+        } catch (err) {
+            console.error(err);
+            this.setStatus("Could not load the saved selection.");
+        }
+    }
+
+    deleteSelection(index) {
+        if (!this.savedSelections || !this.savedSelections[index]) return;
+        const [s] = this.savedSelections.splice(index, 1);
+        this.renderSelectionList();
+        this.notifyChanged();
+        this.setStatus(`"${s.name}" deleted.`);
+    }
+
+    toggleQuickMask() {
+        this.quickMask = !this.quickMask;
+        if (this.quickMaskBtn) this.quickMaskBtn.classList.toggle("ipc-toggle-on", this.quickMask);
+        if (this.quickMask && !["paint", "erase", "bucket"].includes(this.tool)) this.setTool("paint");
+        this.draw();
+        this.setStatus(this.quickMask ? "Quick mask on: paint selects, erase deselects, the bucket selects similar colours. Q switches back." : "Quick mask off.");
     }
 
     /** A soft round alpha mask of radius r (canvas 2r × 2r), cached per size and hardness. */
@@ -5451,8 +5629,8 @@ class InpaintEditor {
         ctx.imageSmoothingEnabled = s < 1;
         this.drawComposite(ctx);
 
-        if (this.selectionDisplay === "tint" || !this.getBounds()) {
-            ctx.globalAlpha = 0.4;
+        if (this.selectionDisplay === "tint" || this.quickMask || !this.getBounds()) {
+            ctx.globalAlpha = this.quickMask ? 0.5 : 0.4;
             ctx.drawImage(this.selection, 0, 0);
             ctx.globalAlpha = 1;
         } else {
@@ -5599,7 +5777,13 @@ class InpaintEditor {
             ctx.lineWidth = 1 / s;
             ctx.strokeStyle = "#fff";
             ctx.setLineDash([4 / s, 3 / s]);
-            ctx.strokeRect(p.start[0], p.start[1], p.cur[0] - p.start[0], p.cur[1] - p.start[1]);
+            if (p.ellipse) {
+                ctx.beginPath();
+                ctx.ellipse((p.start[0] + p.cur[0]) / 2, (p.start[1] + p.cur[1]) / 2, Math.abs(p.cur[0] - p.start[0]) / 2, Math.abs(p.cur[1] - p.start[1]) / 2, 0, 0, Math.PI * 2);
+                ctx.stroke();
+            } else {
+                ctx.strokeRect(p.start[0], p.start[1], p.cur[0] - p.start[0], p.cur[1] - p.start[1]);
+            }
             ctx.restore();
         }
         if (this.lassoPoints && this.lassoPoints.length > 1) {
@@ -5845,6 +6029,7 @@ class InpaintEditor {
             })),
             history: this.history.slice(-100).map((h) => ({ key: h.key, name: h.name, ref: h.ref, x: h.x, y: h.y, w: h.w, h: h.h, prompt: h.prompt, layerId: h.layerId, time: h.time, seed: h.seed, mode: h.mode, denoise: h.denoise })),
             selection: this.selectionDataUrl,
+            selections: (this.savedSelections || []).map((s) => ({ name: s.name, url: s.url })),
             seen: Array.from(this.seenResults).slice(-200),
             crop: this.cropSettings,
             upsample: this.upsampleSettings,
@@ -5958,6 +6143,8 @@ class InpaintEditor {
                 if (stale()) return;
             }
             this.history = (state.history || []).map((h) => ({ ...h }));
+            this.savedSelections = Array.isArray(state.selections) ? state.selections.filter((s) => s && s.url).map((s) => ({ name: s.name || "Selection", url: s.url })) : [];
+            this.renderSelectionList();
             for (const key of state.seen || []) this.seenResults.add(key);
             if (state.selection) {
                 const sel = await loadImageEl(state.selection);
