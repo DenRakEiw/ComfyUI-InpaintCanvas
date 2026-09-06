@@ -23,6 +23,7 @@ const STITCH_CLASS = "InpaintCanvasStitch";
 const SUBFOLDER = "inpaint_canvas";
 const MAX_UNDO = 30;
 const HANDLE_PX = 9;
+const RULER_PX = 18;
 const CURSOR_CLASSES = ["ipc-scale", "ipc-scale-ne", "ipc-scale-x", "ipc-scale-y", "ipc-rotate"];
 const BLEND_MODES = ["normal", "multiply", "screen", "overlay", "darken", "lighten", "soft-light", "hard-light", "difference"];
 const ROLES = ["none", "reference", "scribble", "lineart", "depth", "pose", "canny", "other"];
@@ -567,6 +568,10 @@ function objectBackendAvailable() {
 
 const ICONS = {
     text: '<path d="M5 5h14"/><path d="M12 5v14"/><path d="M9 19h6"/>',
+    ruler: '<path d="M3 17L17 3l4 4L7 21z"/><path d="M8 12l2 2M11 9l2 2M14 6l2 2"/>',
+    grid: '<rect x="3" y="3" width="18" height="18"/><path d="M9 3v18M15 3v18M3 9h18M3 15h18"/>',
+    peek: '<path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><path d="M12 5v14" stroke-dasharray="2 2"/>',
+    compare: '<rect x="3" y="4" width="18" height="16"/><path d="M12 4v16"/><path d="M6 12h3M15 12h3"/>',
     flipH: '<path d="M12 3v18" stroke-dasharray="2 2"/><path d="M9 7L4 12l5 5"/><path d="M15 7l5 5-5 5"/>',
     flipV: '<path d="M3 12h18" stroke-dasharray="2 2"/><path d="M7 9l5-5 5 5"/><path d="M7 15l5 5 5-5"/>',
     rotCW: '<path d="M4 12a8 8 0 018-8h5"/><path d="M14 1l3 3-3 3"/><rect x="11" y="12" width="9" height="8"/>',
@@ -827,6 +832,7 @@ const STYLE = `
 .ipc-subbar label { display:flex; align-items:center; gap:4px; color:#aaa; }
 .ipc-subbar input[type=range] { width:90px; }
 .ipc-subbar .ipc-geo { display:flex; align-items:center; gap:4px; }
+.ipc-textedit { position:absolute; z-index:3; background:transparent; color:transparent; caret-color:#fff; border:1px dashed #7cc7ff; outline:none; resize:none; margin:0; overflow:hidden; white-space:pre; box-sizing:border-box; }
 .ipc-subbar .ipc-geo label { gap:2px; }
 .ipc-subbar .ipc-geo .ipc-num { width:58px; }
 .ipc-subbar input[type=checkbox] { margin:0; }
@@ -856,7 +862,13 @@ class InpaintEditor {
         this.activeLayerId = null;   // null = base
         this.selection = null;       // canvas WxH, red pixels where selected
         this.history = [];           // { key, ref, x, y, w, h, prompt, layerId, thumb }
-        this.view = { scale: 1, x: 0, y: 0 };
+        this.view = { scale: 1, x: 0, y: 0, angle: 0 };
+        this.guides = { x: [], y: [] };
+        let showRulers = false, showGrid = false, gridSize = 64;
+        try { showRulers = localStorage.getItem("ipc.rulers") === "1"; showGrid = localStorage.getItem("ipc.grid") === "1"; gridSize = +localStorage.getItem("ipc.gridSize") || 64; } catch (_) { /* no storage */ }
+        this.showRulers = showRulers;
+        this.showGrid = showGrid;
+        this.gridSize = gridSize;
         this.tool = "select";
         this.brushSize = 40;
         this.hardness = 1;
@@ -1093,6 +1105,16 @@ class InpaintEditor {
         tools.appendChild(el("div", "ipc-sep"));
         tools.appendChild(iconButton("undo", "Undo (Ctrl+Z)", () => this.undoStep()));
         tools.appendChild(iconButton("redo", "Redo (Ctrl+Shift+Z)", () => this.redoStep()));
+        tools.appendChild(el("div", "ipc-sep"));
+        tools.appendChild(el("div", "ipc-grp", "View"));
+        this.rulersBtn = iconButton("ruler", "Rulers (Ctrl+Shift+R). Drag a guide out of a ruler; drag it back to remove it; double-click a ruler clears all guides. Layers snap to guides.", () => this.toggleRulers());
+        this.rulersBtn.classList.toggle("ipc-toggle-on", this.showRulers);
+        tools.appendChild(this.rulersBtn);
+        this.gridBtn = iconButton("grid", "Grid (Ctrl+Shift+G): lines every 64 px (the spacing follows the node's multiple_of)", () => this.toggleGrid());
+        this.gridBtn.classList.toggle("ipc-toggle-on", this.showGrid);
+        tools.appendChild(this.gridBtn);
+        this.peekBtn = iconButton("peek", "Before / after: show the base image without any layer. Hold \\ for a quick look, click to toggle.", () => { this.peekBase = !this.peekBase; this.peekHold = false; this.peekBtn.classList.toggle("ipc-toggle-on", this.peekBase); this.draw(); });
+        tools.appendChild(this.peekBtn);
         tools.appendChild(el("div", "ipc-sep"));
         tools.appendChild(iconButton("clear", "Clear selection (Ctrl+D)", () => this.clearSelection()));
         tools.appendChild(iconButton("invert", "Invert selection (Ctrl+I)", () => this.invertSelection()));
@@ -1434,6 +1456,9 @@ class InpaintEditor {
             sum.appendChild(el("span", "ipc-grow"));
             const clr = miniButton("trash", "Clear the history list (layers and files stay)", () => this.clearHistory(), "ipc-del");
             clr.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); });
+            this.compareBtn = miniButton("compare", "Compare two results side by side (the two newest, or Ctrl+click a thumbnail for A and Shift+click for B). Drag the divider; Esc or click again ends it.", () => this.toggleCompare());
+            this.compareBtn.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); });
+            sum.appendChild(this.compareBtn);
             sum.appendChild(clr);
             this.historyList = el("div", "ipc-hist");
             d.appendChild(this.historyList);
@@ -1840,6 +1865,8 @@ class InpaintEditor {
                 if (this.pending) this.cancelPending();
                 else if (this.polyPoints) { this.polyPoints = null; this.draw(); this.setStatus("Polygon cancelled."); }
                 else if (this.tool === "canvas" && this.extendPending()) { this.resetExtend(); this.setStatus("Canvas extension reset."); }
+                else if (this.textEdit) this.endTextEdit(false);
+                else if (this.compare) { this.compare = null; if (this.compareBtn) this.compareBtn.classList.remove("ipc-on"); this.draw(); this.setStatus("Compare ended."); }
                 else this.close();
                 return;
             }
@@ -1848,6 +1875,10 @@ class InpaintEditor {
             this.onKey(e);
         };
         window.addEventListener("keydown", this._docKey, true);
+        this._docKeyUp = (e) => {
+            if (e.key === "\\" && this.peekHold) { this.peekHold = false; this.peekBase = false; if (this.peekBtn) this.peekBtn.classList.remove("ipc-toggle-on"); this.draw(); }
+        };
+        window.addEventListener("keyup", this._docKeyUp, true);
         this.promptInput.value = this.promptText;
         this.refreshSegmentBackends();
         this.syncRefControls();
@@ -1869,6 +1900,12 @@ class InpaintEditor {
         this.lassoPoints = null;
         if (this._docKey) window.removeEventListener("keydown", this._docKey, true);
         this._docKey = null;
+        if (this._docKeyUp) window.removeEventListener("keyup", this._docKeyUp, true);
+        this._docKeyUp = null;
+        if (this.textEdit) this.endTextEdit(true);
+        clearTimeout(this._autosave);
+        this.compare = null;
+        this.peekBase = false;
         this.root.remove();
         this.drawThumb();
         this.notifyChanged();
@@ -1984,6 +2021,8 @@ class InpaintEditor {
             return;
         }
         if ((e.ctrlKey || e.metaKey) && e.shiftKey && k === "n") { e.preventDefault(); this.addPaintLayer(); return; }
+        if ((e.ctrlKey || e.metaKey) && e.shiftKey && k === "r") { e.preventDefault(); this.toggleRulers(); return; }
+        if ((e.ctrlKey || e.metaKey) && e.shiftKey && k === "g") { e.preventDefault(); this.toggleGrid(); return; }
         if ((e.ctrlKey || e.metaKey) && k === "j") { e.preventDefault(); this.duplicateLayer(); return; }
         if ((e.ctrlKey || e.metaKey) && k === "e") { e.preventDefault(); this.mergeDown(); return; }
         if ((e.ctrlKey || e.metaKey) && (e.key === "]" || e.key === "[")) { e.preventDefault(); const l = this.activeLayer(); if (l) this.moveLayer(l.id, e.key === "]" ? +1 : -1, { undo: true }); return; }
@@ -2001,7 +2040,12 @@ class InpaintEditor {
         if (e.shiftKey && k === "l") { this.setTool("polygon"); return; }
         if (e.shiftKey && k === "r") { this.setTool("ellipse"); return; }
         if (e.shiftKey && k === "t") { this.setTool("text"); return; }
+        if (e.key === "\\") { e.preventDefault(); if (!e.repeat && !this.peekBase) { this.peekBase = true; this.peekHold = true; this.draw(); } return; }
         switch (k) {
+            case "1": this.zoomTo(1); break;
+            case "4": this.rotateView(-Math.PI / 12); break;
+            case "6": this.rotateView(Math.PI / 12); break;
+            case "5": if (this.view.angle) this.rotateView(-this.view.angle); break;
             case "b": this.setTool("select"); break;
             case "r": this.setTool("rect"); break;
             case "l": this.setTool("lasso"); break;
@@ -2077,7 +2121,56 @@ class InpaintEditor {
 
     toImage(e) {
         const [cx, cy] = this.toCanvasPx(e);
-        return [(cx - this.view.x) / this.view.scale, (cy - this.view.y) / this.view.scale];
+        return this.canvasToImage(cx, cy);
+    }
+
+    /** Device pixel on the canvas -> image coordinate (the view may be rotated). */
+    canvasToImage(cx, cy) {
+        const a = -(this.view.angle || 0), c = Math.cos(a), s = Math.sin(a);
+        const dx = cx - this.view.x, dy = cy - this.view.y;
+        return [(dx * c - dy * s) / this.view.scale, (dx * s + dy * c) / this.view.scale];
+    }
+
+    /** Image coordinate -> device pixel on the canvas. */
+    imageToScreen(ix, iy) {
+        const a = this.view.angle || 0, c = Math.cos(a), s = Math.sin(a);
+        const x = ix * this.view.scale, y = iy * this.view.scale;
+        return [this.view.x + x * c - y * s, this.view.y + x * s + y * c];
+    }
+
+    /** Set a context's transform to the view (optionally shifted by device pixels). */
+    applyViewTransform(ctx, dx = 0, dy = 0) {
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.translate(this.view.x + dx, this.view.y + dy);
+        if (this.view.angle) ctx.rotate(this.view.angle);
+        ctx.scale(this.view.scale, this.view.scale);
+    }
+
+    /** Rotate the view about the middle of the canvas (Krita's 4 / 6 keys). */
+    rotateView(delta) {
+        if (!this.width) return;
+        const qx = this.canvas.width / 2, qy = this.canvas.height / 2;
+        const c = Math.cos(delta), s = Math.sin(delta);
+        const vx = this.view.x - qx, vy = this.view.y - qy;
+        this.view.x = qx + vx * c - vy * s;
+        this.view.y = qy + vx * s + vy * c;
+        this.view.angle = ((this.view.angle || 0) + delta) % (Math.PI * 2);
+        if (Math.abs(this.view.angle) < 1e-9) this.view.angle = 0;
+        this._fitted = false;
+        this.draw();
+        this.setStatus(this.view.angle ? `View rotated ${Math.round(this.view.angle * 180 / Math.PI)}° (5 resets).` : "View rotation reset.");
+    }
+
+    /** Zoom to a scale about the middle of the canvas (1 = one image pixel per device pixel). */
+    zoomTo(ns) {
+        if (!this.width) return;
+        const qx = this.canvas.width / 2, qy = this.canvas.height / 2;
+        this.view.x = qx - (qx - this.view.x) * (ns / this.view.scale);
+        this.view.y = qy - (qy - this.view.y) * (ns / this.view.scale);
+        this.view.scale = ns;
+        this._fitted = false;
+        this.draw();
+        this.setStatus(`Zoom ${Math.round(ns * 100)} %.`);
     }
 
     fitView() {
@@ -2085,6 +2178,7 @@ class InpaintEditor {
         const pad = 24;
         const s = Math.max(0.01, Math.min((this.canvas.width - pad * 2) / this.width, (this.canvas.height - pad * 2) / this.height));
         this.view.scale = s;
+        this.view.angle = 0;
         this.view.x = (this.canvas.width - this.width * s) / 2;
         this.view.y = (this.canvas.height - this.height * s) / 2;
         this._fitted = true;
@@ -2225,6 +2319,222 @@ class InpaintEditor {
         this.setHandleCursor(this.canvasHandleAt(ix, iy));
     }
 
+    // ---- view: rulers, grid, guides, before/after, compare, on-canvas text ----------------------
+
+    toggleRulers() {
+        this.showRulers = !this.showRulers;
+        try { localStorage.setItem("ipc.rulers", this.showRulers ? "1" : "0"); } catch (_) { /* ignore */ }
+        if (this.rulersBtn) this.rulersBtn.classList.toggle("ipc-toggle-on", this.showRulers);
+        this.draw();
+        this.setStatus(this.showRulers ? "Rulers on. Drag guides out of them." : "Rulers off.");
+    }
+
+    toggleGrid() {
+        this.showGrid = !this.showGrid;
+        try { localStorage.setItem("ipc.grid", this.showGrid ? "1" : "0"); } catch (_) { /* ignore */ }
+        if (this.gridBtn) this.gridBtn.classList.toggle("ipc-toggle-on", this.showGrid);
+        this.draw();
+    }
+
+    /** Guide near a device pixel (within 5 css px), or null. */
+    guideAt(cx, cy) {
+        const th = 5 * (window.devicePixelRatio || 1);
+        const g = this.guides || { x: [], y: [] };
+        for (let i = 0; i < g.x.length; i++) { const [sx] = this.imageToScreen(g.x[i], 0); if (Math.abs(sx - cx) <= th && !this.view.angle) return { axis: "x", index: i }; }
+        for (let i = 0; i < g.y.length; i++) { const [, sy] = this.imageToScreen(0, g.y[i]); if (Math.abs(sy - cy) <= th && !this.view.angle) return { axis: "y", index: i }; }
+        return null;
+    }
+
+    /** Everything drawn on top of the scene: grid, guides, compare divider, rulers, the text editor's position. */
+    drawOverlays() {
+        if (!this.isOpen || !this.base) return;
+        const ctx = this.ctx;
+        const W = this.canvas.width, H = this.canvas.height;
+        const dpr = window.devicePixelRatio || 1;
+        const s = this.view.scale;
+        this.applyViewTransform(ctx);
+        if (this.showGrid) {
+            let step = Math.max(1, this.gridSize || 64);
+            while (step * s < 8 * dpr) step *= 2;
+            ctx.save();
+            ctx.strokeStyle = "rgba(255,255,255,0.22)";
+            ctx.lineWidth = 1 / s;
+            ctx.beginPath();
+            for (let x = 0; x <= this.width; x += step) { ctx.moveTo(x, 0); ctx.lineTo(x, this.height); }
+            for (let y = 0; y <= this.height; y += step) { ctx.moveTo(0, y); ctx.lineTo(this.width, y); }
+            ctx.stroke();
+            ctx.restore();
+        }
+        const g = this.guides || { x: [], y: [] };
+        const p = this.pointer;
+        if (g.x.length || g.y.length || (p && p.kind === "guide" && p.pos != null)) {
+            ctx.save();
+            ctx.strokeStyle = "#7cc7ff";
+            ctx.lineWidth = 1 / s;
+            ctx.beginPath();
+            for (const gx of g.x) { ctx.moveTo(gx, -1e5); ctx.lineTo(gx, 1e5); }
+            for (const gy of g.y) { ctx.moveTo(-1e5, gy); ctx.lineTo(1e5, gy); }
+            ctx.stroke();
+            if (p && p.kind === "guide" && p.pos != null && p.index < 0) {
+                ctx.setLineDash([6 / s, 4 / s]);
+                ctx.beginPath();
+                if (p.axis === "x") { ctx.moveTo(p.pos, -1e5); ctx.lineTo(p.pos, 1e5); } else { ctx.moveTo(-1e5, p.pos); ctx.lineTo(1e5, p.pos); }
+                ctx.stroke();
+            }
+            ctx.restore();
+        }
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        if (this.compare && this.compare.a && this.compare.b) {
+            const split = Math.min(0.95, Math.max(0.05, this.compare.split ?? 0.5));
+            const x = W * split;
+            ctx.save();
+            ctx.strokeStyle = "#fff";
+            ctx.lineWidth = 2 * dpr;
+            ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+            ctx.font = `${12 * dpr}px system-ui, sans-serif`;
+            ctx.textBaseline = "top";
+            const name = (id) => { const l = this.layers.find((q) => q.id === id); return l ? l.name : "?"; };
+            const label = (txt, lx, align) => { ctx.textAlign = align; const w = ctx.measureText(txt).width + 12 * dpr; ctx.fillStyle = "rgba(0,0,0,0.6)"; ctx.fillRect(align === "right" ? lx - w : lx, 8 * dpr, w, 18 * dpr); ctx.fillStyle = "#fff"; ctx.fillText(txt, align === "right" ? lx - 6 * dpr : lx + 6 * dpr, 11 * dpr); };
+            label("A · " + name(this.compare.a), x - 8 * dpr, "right");
+            label("B · " + name(this.compare.b), x + 8 * dpr, "left");
+            ctx.restore();
+        }
+        if (this.showRulers) this.drawRulers(ctx, W, H, dpr);
+        if (this.textEdit) this.positionTextEdit();
+    }
+
+    drawRulers(ctx, W, H, dpr) {
+        const rp = RULER_PX * dpr;
+        ctx.save();
+        ctx.fillStyle = "#1c1c1c";
+        ctx.fillRect(0, 0, W, rp);
+        ctx.fillRect(0, 0, rp, H);
+        ctx.strokeStyle = "#3a3a3a";
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(0, rp + 0.5); ctx.lineTo(W, rp + 0.5); ctx.moveTo(rp + 0.5, 0); ctx.lineTo(rp + 0.5, H); ctx.stroke();
+        if (!this.view.angle) {
+            const s = this.view.scale;
+            const cands = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
+            const step = cands.find((c) => c * s >= 48 * dpr) || 10000;
+            const minor = step / 5;
+            ctx.fillStyle = "#9a9a9a";
+            ctx.strokeStyle = "#777";
+            ctx.font = `${9 * dpr}px system-ui, sans-serif`;
+            ctx.textBaseline = "top";
+            ctx.textAlign = "left";
+            const [ix0] = this.canvasToImage(rp, rp), [ix1] = this.canvasToImage(W, rp);
+            const [, iy0] = this.canvasToImage(rp, rp), [, iy1] = this.canvasToImage(rp, H);
+            ctx.beginPath();
+            for (let v = Math.floor(ix0 / minor) * minor; v <= ix1; v += minor) {
+                const [sx] = this.imageToScreen(v, 0);
+                if (sx < rp) continue;
+                const major = Math.abs(v / step - Math.round(v / step)) < 1e-6;
+                ctx.moveTo(Math.round(sx) + 0.5, rp); ctx.lineTo(Math.round(sx) + 0.5, major ? rp * 0.35 : rp * 0.7);
+                if (major) ctx.fillText(String(Math.round(v)), sx + 2 * dpr, 1 * dpr);
+            }
+            for (let v = Math.floor(iy0 / minor) * minor; v <= iy1; v += minor) {
+                const [, sy] = this.imageToScreen(0, v);
+                if (sy < rp) continue;
+                const major = Math.abs(v / step - Math.round(v / step)) < 1e-6;
+                ctx.moveTo(rp, Math.round(sy) + 0.5); ctx.lineTo(major ? rp * 0.35 : rp * 0.7, Math.round(sy) + 0.5);
+                if (major) { ctx.save(); ctx.translate(2 * dpr, sy + 2 * dpr); ctx.rotate(Math.PI / 2); ctx.fillText(String(Math.round(v)), 0, -9 * dpr); ctx.restore(); }
+            }
+            ctx.stroke();
+        }
+        ctx.fillStyle = "#1c1c1c";
+        ctx.fillRect(0, 0, rp, rp);
+        ctx.restore();
+    }
+
+    setCompare(side, h) {
+        if (!this.compare) this.compare = { a: null, b: null, split: 0.5 };
+        this.compare[side] = h.layerId;
+        if (!this.compare.a || !this.compare.b) {
+            const others = this.layers.filter((l) => l.kind === "result" && l.id !== h.layerId);
+            const other = others[others.length - 1];
+            if (other) this.compare[side === "a" ? "b" : "a"] = other.id;
+        }
+        if (this.compareBtn) this.compareBtn.classList.toggle("ipc-on", !!(this.compare.a && this.compare.b));
+        this.draw();
+        this.setStatus(this.compare.a && this.compare.b ? "Comparing A (left) and B (right). Drag the divider; Esc ends it." : `${side.toUpperCase()} set; choose the other result too.`);
+    }
+
+    toggleCompare() {
+        if (this.compare) {
+            this.compare = null;
+            if (this.compareBtn) this.compareBtn.classList.remove("ipc-on");
+            this.draw();
+            this.setStatus("Compare ended.");
+            return;
+        }
+        const res = this.layers.filter((l) => l.kind === "result");
+        if (res.length < 2) { this.setStatus("Compare needs two result layers."); return; }
+        this.compare = { a: res[res.length - 2].id, b: res[res.length - 1].id, split: 0.5 };
+        if (this.compareBtn) this.compareBtn.classList.add("ipc-on");
+        this.draw();
+        this.setStatus(`Comparing A (${res[res.length - 2].name}, left) and B (${res[res.length - 1].name}, right). Drag the divider; Ctrl / Shift+click a history thumbnail changes A / B; Esc ends it.`);
+    }
+
+    /** Edit a text layer right on the canvas: a transparent text box over the layer, the layer renders live. */
+    beginTextEdit(layer) {
+        if (!layer || layer.kind !== "text" || !layer.text) return;
+        if (this.textEdit) this.endTextEdit(true);
+        const ta = document.createElement("textarea");
+        ta.className = "ipc-textedit";
+        ta.value = layer.text.content;
+        ta.spellcheck = false;
+        this.textEdit = { layer, ta, before: this.snapshot({ kind: "text", id: layer.id }) };
+        for (const type of ["pointerdown", "pointerup", "click", "dblclick", "wheel", "contextmenu", "mousedown", "mouseup"]) ta.addEventListener(type, (e) => e.stopPropagation());
+        ta.addEventListener("keydown", (e) => {
+            e.stopPropagation();
+            if (e.key === "Escape") { e.preventDefault(); this.endTextEdit(false); }
+            else if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); this.endTextEdit(true); }
+        });
+        ta.addEventListener("input", () => { layer.text.content = ta.value; this.scheduleTextRender(layer); });
+        ta.addEventListener("blur", () => { if (this.textEdit && this.textEdit.ta === ta) this.endTextEdit(true); });
+        this.viewEl.appendChild(ta);
+        this.positionTextEdit();
+        ta.focus();
+        ta.select();
+        this.setStatus("Editing the text on the canvas: Enter applies, Shift+Enter starts a new line, Esc cancels.");
+    }
+
+    positionTextEdit() {
+        const te = this.textEdit;
+        if (!te) return;
+        const l = te.layer, t = l.text, dpr = window.devicePixelRatio || 1;
+        const [sx, sy] = this.imageToScreen(l.x, l.y);
+        const k = l.canvas && l.canvas.width > 1 ? l.w / (l.canvas.width / (t.res || 2)) : 1;
+        const z = this.view.scale / dpr;
+        const fs = Math.max(4, t.size * k * z);
+        const pad = Math.max(0, (t.size * 0.15 + (t.outline || 0)) * k * z);
+        Object.assign(te.ta.style, {
+            left: `${sx / dpr}px`, top: `${sy / dpr}px`,
+            width: `${Math.max(24, l.w * z + 2)}px`, height: `${Math.max(fs * 1.4, l.h * z + 2)}px`,
+            padding: `${pad}px`, fontSize: `${fs}px`, lineHeight: String(t.lineHeight || 1.2),
+            fontFamily: `"${t.font}", sans-serif`, fontWeight: t.bold ? "700" : "400", fontStyle: t.italic ? "italic" : "normal",
+            textAlign: t.align || "left", letterSpacing: `${(t.letterSpacing || 0) * k * z}px`,
+            transform: this.view.angle ? `rotate(${this.view.angle}rad)` : "", transformOrigin: "0 0",
+        });
+    }
+
+    endTextEdit(commit) {
+        const te = this.textEdit;
+        if (!te) return;
+        this.textEdit = null;
+        te.ta.remove();
+        clearTimeout(te.layer._textTimer);
+        if (!commit) {
+            te.layer.text.content = te.before.text.content;
+            this.renderTextLayer(te.layer);
+        } else {
+            if (te.layer.text.content !== te.before.text.content) this.pushUndoSnapshot(te.before);
+            this.renderTextLayer(te.layer);
+        }
+        this.renderLayers();
+        this.root.focus({ preventScroll: true });
+    }
+
     /** Numeric X / Y / W / H from the transform bar. */
     setLayerGeometry() {
         const l = this.activeLayer();
@@ -2243,11 +2553,13 @@ class InpaintEditor {
     snapLayer(l) {
         const th = 8 / this.view.scale;
         const gx = [], gy = [];
+        const tx = [0, this.width / 2, this.width, ...((this.guides && this.guides.x) || [])];
+        const ty = [0, this.height / 2, this.height, ...((this.guides && this.guides.y) || [])];
         let best = null;
-        for (const [a, b] of [[l.x, 0], [l.x + l.w / 2, this.width / 2], [l.x + l.w, this.width]]) { const d = Math.abs(a - b); if (d <= th && (!best || d < best[0])) best = [d, b - a, b]; }
+        for (const a of [l.x, l.x + l.w / 2, l.x + l.w]) for (const b of tx) { const d = Math.abs(a - b); if (d <= th && (!best || d < best[0])) best = [d, b - a, b]; }
         if (best) { l.x = Math.round(l.x + best[1]); gx.push(best[2]); }
         best = null;
-        for (const [a, b] of [[l.y, 0], [l.y + l.h / 2, this.height / 2], [l.y + l.h, this.height]]) { const d = Math.abs(a - b); if (d <= th && (!best || d < best[0])) best = [d, b - a, b]; }
+        for (const a of [l.y, l.y + l.h / 2, l.y + l.h]) for (const b of ty) { const d = Math.abs(a - b); if (d <= th && (!best || d < best[0])) best = [d, b - a, b]; }
         if (best) { l.y = Math.round(l.y + best[1]); gy.push(best[2]); }
         this.snapGuides = gx.length || gy.length ? { x: gx, y: gy } : null;
     }
@@ -2474,6 +2786,24 @@ class InpaintEditor {
         }
         if (e.button !== 0) return;
         const [ix, iy] = this.toImage(e);
+        if (this.base) {
+            const [cx, cy] = this.toCanvasPx(e);
+            const dpr = window.devicePixelRatio || 1;
+            if (this.compare && Math.abs(cx - this.canvas.width * (this.compare.split ?? 0.5)) <= 6 * dpr) {
+                this.pointer = { kind: "split" };
+                return;
+            }
+            if (this.showRulers) {
+                const rp = RULER_PX * dpr;
+                if (cx < rp || cy < rp) {
+                    if (e.detail >= 2) { this.guides = { x: [], y: [] }; this.draw(); this.notifyChanged(); this.setStatus("Guides cleared."); return; }
+                    this.pointer = { kind: "guide", axis: cy < rp ? "y" : "x", index: -1, pos: null };
+                    return;
+                }
+                const g = this.guideAt(cx, cy);
+                if (g && this.tool !== "hand") { this.pointer = { kind: "guide", axis: g.axis, index: g.index, pos: this.guides[g.axis][g.index] }; return; }
+            }
+        }
         if (e.ctrlKey && !e.altKey && !e.shiftKey && !this.quickMask && ["transform", "paint", "erase", "text"].includes(this.tool)) {
             // Ctrl+click: the topmost layer with a visible pixel under the cursor becomes active (Photoshop's auto-select)
             const l = this.pickLayerAt(ix, iy);
@@ -2622,6 +2952,7 @@ class InpaintEditor {
             if (hit) {
                 this.activeLayerId = hit.id;
                 this.renderLayers();
+                if (e.detail >= 2 && !hit.locked) { this.beginTextEdit(hit); this.draw(); return; }
                 if (hit.locked) { this.setStatus(`${hit.name} is locked.`); this.draw(); return; }
                 this.pushUndo({ kind: "transform", id: hit.id });
                 this.pointer = { kind: "move", layer: hit, start: [ix, iy], orig: { x: hit.x, y: hit.y } };
@@ -2704,6 +3035,11 @@ class InpaintEditor {
             } else {
                 this.applyScale(p, ix, iy);
             }
+        } else if (p.kind === "guide") {
+            p.pos = Math.round(p.axis === "x" ? ix : iy);
+        } else if (p.kind === "split") {
+            const [cx] = this.toCanvasPx(e);
+            this.compare.split = Math.min(0.95, Math.max(0.05, cx / this.canvas.width));
         } else if (p.kind === "canvasext") {
             const dx = ix - p.start[0], dy = iy - p.start[1], step = e.altKey ? 1 : 8;
             // outward extends, inward crops; the canvas never goes below 8 px
@@ -2807,6 +3143,14 @@ class InpaintEditor {
             this.updateSubbar();
             this.drawThumb();
             this.notifyChanged();
+        } else if (p.kind === "guide") {
+            const list = this.guides[p.axis];
+            const limit = p.axis === "x" ? this.width : this.height;
+            const inside = p.pos != null && p.pos >= 0 && p.pos <= limit;
+            if (p.index >= 0) { if (inside) list[p.index] = p.pos; else list.splice(p.index, 1); }
+            else if (inside) list.push(p.pos);
+            this.notifyChanged();
+            this.setStatus(inside ? `Guide at ${p.axis} = ${p.pos}.` : (p.index >= 0 ? "Guide removed." : "Drag the guide onto the image to place it."));
         } else if (p.kind === "canvasext") {
             // like a crop handle in Photoshop: releasing applies; Ctrl+Z takes it back
             if (this.extendPending()) this.applyCanvasFrame();
@@ -4096,6 +4440,17 @@ class InpaintEditor {
         this.uploaded.controlHash = null;
         this.drawThumb();
         this.notifyChanged();
+        this.scheduleAutosave();
+    }
+
+    /** Upload edited layers 15 s after the last change, so a crash loses at most that much. */
+    scheduleAutosave() {
+        clearTimeout(this._autosave);
+        this._autosave = setTimeout(() => {
+            if (!this.isOpen) return;
+            if (this.pointer || this.pending || this.textEdit) { this.scheduleAutosave(); return; }
+            this.syncLayers().catch((err) => console.warn("Inpaint Canvas: autosave failed", err));
+        }, 15000);
     }
 
     /** The upload cache; clearing baseHash means "the composite changed" and bumps compositeVersion. */
@@ -4256,6 +4611,7 @@ class InpaintEditor {
     }
 
     markMaskChanged(layer) {
+        this.scheduleAutosave();
         layer.maskDirty = !!layer.mask;
         if (!layer.mask) layer.maskRef = null;
         layer._maskedValid = false;
@@ -5508,7 +5864,7 @@ class InpaintEditor {
             thumb.width = 112; thumb.height = 112;
             thumb.title = "Solo: show only this result";
             this.drawHistoryThumb(thumb, h);
-            thumb.addEventListener("click", (e) => { e.stopPropagation(); this.soloResult(h); });
+            thumb.addEventListener("click", (e) => { e.stopPropagation(); if (e.ctrlKey || e.shiftKey) { this.setCompare(e.ctrlKey ? "a" : "b", h); return; } this.soloResult(h); });
             item.appendChild(thumb);
             const text = el("div", "ipc-htext");
             const title = el("b", null, h.name + (layer ? "" : " (discarded)"));
@@ -5616,7 +5972,8 @@ class InpaintEditor {
         }
         for (let i = 0; i < this.layers.length; i++) {
             const layer = this.layers[i];
-            if (!layer.visible || !layer.canvas) continue;
+            if (this.compareShow && layer.kind === "result" && layer.id !== this.compareShow) continue;
+            if ((!layer.visible && !(this.compareShow && layer.id === this.compareShow)) || !layer.canvas) continue;
             if (layer.kind === "filter") { if (!controlOnly) this.applyFilterLayer(ctx, layer, i, forRun); continue; }
             const ctrl = this.isControl(layer);
             if (controlOnly && !ctrl) continue;
@@ -5818,10 +6175,10 @@ class InpaintEditor {
         a.imageSmoothingEnabled = s < 1;
         const r = 1.25;
         for (const [dx, dy] of [[r, 0], [-r, 0], [0, r], [0, -r], [r, r], [-r, -r], [r, -r], [-r, r]]) {
-            a.setTransform(s, 0, 0, s, vx + dx, vy + dy);
+            this.applyViewTransform(a, dx, dy);
             a.drawImage(this.selection, 0, 0);
         }
-        a.setTransform(s, 0, 0, s, vx, vy);
+        this.applyViewTransform(a);
         a.globalCompositeOperation = "destination-out";
         a.drawImage(this.selection, 0, 0);
         a.setTransform(1, 0, 0, 1, 0, 0);
@@ -5855,6 +6212,11 @@ class InpaintEditor {
     }
 
     draw() {
+        this.drawScene();
+        this.drawOverlays();
+    }
+
+    drawScene() {
         if (!this.isOpen) return;
         const ctx = this.ctx;
         const W = this.canvas.width, H = this.canvas.height;
@@ -5862,9 +6224,31 @@ class InpaintEditor {
         ctx.clearRect(0, 0, W, H);
         if (!this.base) return;
         const s = this.view.scale;
-        ctx.setTransform(s, 0, 0, s, this.view.x, this.view.y);
+        this.applyViewTransform(ctx);
         ctx.imageSmoothingEnabled = s < 1;
-        this.drawComposite(ctx);
+        if (this.peekBase) {
+            ctx.drawImage(this.base.img, 0, 0);
+        } else if (this.compare && this.compare.a && this.compare.b) {
+            // A left, B right: two passes with the other result hidden; caches are invalidated between them
+            const split = Math.min(0.95, Math.max(0.05, this.compare.split ?? 0.5));
+            for (const side of ["a", "b"]) {
+                ctx.save();
+                ctx.setTransform(1, 0, 0, 1, 0, 0);
+                ctx.beginPath();
+                if (side === "a") ctx.rect(0, 0, W * split, H); else ctx.rect(W * split, 0, W * (1 - split), H);
+                ctx.clip();
+                this.applyViewTransform(ctx);
+                this.compareShow = this.compare[side];
+                this.uploaded.baseHash = null;
+                this.drawComposite(ctx);
+                ctx.restore();
+            }
+            this.compareShow = null;
+            this.uploaded.baseHash = null;
+            this.applyViewTransform(ctx);
+        } else {
+            this.drawComposite(ctx);
+        }
 
         if (this.selectionDisplay === "tint" || this.quickMask || !this.getBounds()) {
             ctx.globalAlpha = this.quickMask ? 0.5 : 0.4;
@@ -6278,6 +6662,7 @@ class InpaintEditor {
             history: this.history.slice(-100).map((h) => ({ key: h.key, name: h.name, ref: h.ref, x: h.x, y: h.y, w: h.w, h: h.h, prompt: h.prompt, layerId: h.layerId, time: h.time, seed: h.seed, mode: h.mode, denoise: h.denoise })),
             selection: this.selectionDataUrl,
             selections: (this.savedSelections || []).map((s) => ({ name: s.name, url: s.url })),
+            guides: this.guides && (this.guides.x.length || this.guides.y.length) ? this.guides : undefined,
             seen: Array.from(this.seenResults).slice(-200),
             crop: this.cropSettings,
             upsample: this.upsampleSettings,
@@ -6392,6 +6777,7 @@ class InpaintEditor {
             }
             this.history = (state.history || []).map((h) => ({ ...h }));
             this.savedSelections = Array.isArray(state.selections) ? state.selections.filter((s) => s && s.url).map((s) => ({ name: s.name || "Selection", url: s.url })) : [];
+            this.guides = state.guides && Array.isArray(state.guides.x) && Array.isArray(state.guides.y) ? { x: state.guides.x.map(Number), y: state.guides.y.map(Number) } : { x: [], y: [] };
             this.renderSelectionList();
             for (const key of state.seen || []) this.seenResults.add(key);
             if (state.selection) {

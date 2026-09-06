@@ -482,6 +482,9 @@ and files stay.
 | P, E, T, H                   | paint, erase, transform, hand            |
 | I, G, Shift+G                | eyedropper, bucket, gradient             |
 | Shift+S, S, J                | smudge, clone stamp, healing brush       |
+| 1, F, 4 / 6, 5               | zoom 100 %, fit, rotate the view, reset  |
+| Ctrl+Shift+R, Ctrl+Shift+G   | rulers, grid                             |
+| \ (hold)                    | before / after: the base without layers  |
 | Shift+T, C                   | text tool, canvas tool                   |
 | `[` `]`                      | brush size                               |
 | Ctrl+Z, Ctrl+Shift+Z, Ctrl+Y | undo, redo                               |
@@ -502,6 +505,22 @@ and files stay.
 
 While the editor is open all shortcuts belong to it: Ctrl+Z undoes the last
 editor step, not the workflow.
+
+### View
+
+Zoom with the wheel, pan with Space, the middle mouse or H; F fits, 1 shows
+100 % (one image pixel per screen pixel), 4 / 6 rotate the view by 15° like
+Krita and 5 resets it. The View buttons at the bottom of the tool column
+toggle **rulers** (Ctrl+Shift+R; drag a guide out of a ruler, drag it back
+to remove it, double-click a ruler clears them, layers snap to guides), the
+**grid** (Ctrl+Shift+G, 64 px) and **before / after** (hold \ or click:
+the base image without any layer). **Compare** in the History header shows
+two results side by side with a draggable divider: the two newest, or
+Ctrl+click a history thumbnail for A and Shift+click for B; Esc ends it.
+Double-click a text layer with the text tool to edit the text right on the
+canvas (Enter applies, Shift+Enter is a new line, Esc cancels). Edited layers
+are uploaded automatically 15 s after the last change, so a browser crash
+loses at most that much; the workflow itself is saved by ComfyUI.
 
 ## Node reference
 
