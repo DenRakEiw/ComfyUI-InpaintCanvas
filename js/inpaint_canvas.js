@@ -1243,7 +1243,6 @@ class InpaintEditor {
             clr.classList.add("ipc-small");
             sec.appendChild(clr);
             this.featherInput = numberInput(8, 1, 512, "Feather radius in pixels", 56);
-            sec.appendChild(el("span", null, "Feather"));
             sec.appendChild(this.featherInput);
             const fe = iconButton("blur", "Feather: soften the selection's edge by the radius (a gaussian blur of the selection mask)", () => this.featherSelection(+this.featherInput.value), "Feather");
             fe.classList.add("ipc-small");
