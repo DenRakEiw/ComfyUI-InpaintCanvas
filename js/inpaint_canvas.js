@@ -694,6 +694,8 @@ const STYLE = `
 .ipc-top { display:flex; align-items:center; gap:10px; padding:6px 10px; background:#242424; border-bottom:1px solid #0d0d0d; flex-wrap:wrap; }
 .ipc-top .ipc-title { font-weight:600; margin-right:6px; }
 .ipc-top .ipc-grow { flex:1; }
+.ipc-top .ipc-viewbox { display:inline-flex; gap:4px; margin-left:4px; }
+.ipc-top .ipc-viewbox .ipc-ib { padding:4px 7px; min-width:0; }
 .ipc-top label { display:flex; align-items:center; gap:6px; color:#aaa; font-size:12px; }
 .ipc-top label span { min-width:36px; text-align:right; color:#ccc; }
 .ipc-top input[type=range] { width:100px; }
@@ -1054,6 +1056,18 @@ class InpaintEditor {
         this.colorInput.addEventListener("input", () => { this.color = this.colorInput.value; });
         colorLabel.appendChild(this.colorInput);
         top.appendChild(colorLabel);
+        // view toggles
+        const viewBox = el("span", "ipc-viewbox");
+        this.rulersBtn = iconButton("ruler", "Rulers (Ctrl+Shift+R). Drag a guide out of a ruler; drag it back to remove it; double-click a ruler clears all guides. Layers snap to guides.", () => this.toggleRulers());
+        this.rulersBtn.classList.toggle("ipc-toggle-on", this.showRulers);
+        viewBox.appendChild(this.rulersBtn);
+        this.gridBtn = iconButton("grid", "Grid (Ctrl+Shift+G): lines every 64 px", () => this.toggleGrid());
+        this.gridBtn.classList.toggle("ipc-toggle-on", this.showGrid);
+        viewBox.appendChild(this.gridBtn);
+        this.peekBtn = iconButton("peek", "Before / after: the base image without any layer. Hold \\ for a quick look, click to toggle.", () => { this.peekBase = !this.peekBase; this.peekHold = false; this.peekBtn.classList.toggle("ipc-toggle-on", this.peekBase); this.draw(); });
+        viewBox.appendChild(this.peekBtn);
+        viewBox.appendChild(iconButton("fit", "Fit to view (F); 1 shows 100 %", () => this.fitView()));
+        top.appendChild(viewBox);
 
         top.appendChild(el("span", "ipc-grow"));
         this.modeSel = selectInput(["api", "local"], "api", "Which chain the result comes back from: API = the result input, Local = the result_local input. Only that chain runs.");
@@ -1109,16 +1123,6 @@ class InpaintEditor {
             this.refreshGroupButton(g);
             return g;
         };
-        // a menu button: click opens a flyout of actions and toggles
-        const addMenu = (iconName, title, actions) => {
-            const g = { items: [], tools: [], actions, menu: true, btn: null };
-            const btn = iconButton(iconName, title, () => { if (this.flyout && this.flyout.group === g) this.closeFlyout(); else this.openFlyout(g, btn); });
-            btn.classList.add("ipc-groupbtn");
-            btn.innerHTML += '<span class="ipc-tri"></span>';
-            g.btn = btn;
-            tools.appendChild(btn);
-            return g;
-        };
 
         tools.appendChild(el("div", "ipc-grp", "Select"));
         addGroup([
@@ -1139,16 +1143,6 @@ class InpaintEditor {
         ]);
         this.quickMaskBtn = iconButton("quickmask", "Quick mask (Q): while on, the paint and erase tools edit the selection (paint selects, erase deselects, the bucket works like the wand) and the selection is shown as a red tint.", () => this.toggleQuickMask());
         tools.appendChild(this.quickMaskBtn);
-        addMenu("clear", "Selection: clear (Ctrl+D), invert (Ctrl+I), outline or tint display", [
-            { icon: "clear", label: "Clear", key: "Ctrl+D", title: "Clear selection (Ctrl+D)", onClick: () => this.clearSelection() },
-            { icon: "invert", label: "Invert", key: "Ctrl+I", title: "Invert selection (Ctrl+I)", onClick: () => this.invertSelection() },
-            { icon: "ants", label: "Marching ants", title: "Selection display: marching ants outline (on) or red tint (off)", toggle: () => this.selectionDisplay === "ants", onClick: () => {
-                this.selectionDisplay = this.selectionDisplay === "ants" ? "tint" : "ants";
-                try { localStorage.setItem("ipc.selectionDisplay", this.selectionDisplay); } catch (_) { /* ignore */ }
-                this.draw();
-                this.setStatus(this.selectionDisplay === "ants" ? "Selection shown as an outline." : "Selection shown as a red tint.");
-            } },
-        ]);
         tools.appendChild(el("div", "ipc-sep"));
         tools.appendChild(el("div", "ipc-grp", "Layer"));
         addGroup([
@@ -1175,13 +1169,6 @@ class InpaintEditor {
         tools.appendChild(iconButton("undo", "Undo (Ctrl+Z)", () => this.undoStep()));
         tools.appendChild(iconButton("redo", "Redo (Ctrl+Shift+Z)", () => this.redoStep()));
         tools.appendChild(el("div", "ipc-sep"));
-        tools.appendChild(el("div", "ipc-grp", "View"));
-        addMenu("peek", "View: fit, 100 %, rulers, grid, before / after", [
-            { icon: "fit", label: "Fit to view", key: "F", title: "Fit the image to the window (F)", onClick: () => this.fitView() },
-            { icon: "ruler", label: "Rulers", key: "Ctrl+Shift+R", title: "Rulers (Ctrl+Shift+R). Drag a guide out of a ruler; drag it back to remove it; double-click a ruler clears all guides. Layers snap to guides.", toggle: () => this.showRulers, onClick: () => this.toggleRulers() },
-            { icon: "grid", label: "Grid", key: "Ctrl+Shift+G", title: "Grid (Ctrl+Shift+G): lines every 64 px", toggle: () => this.showGrid, onClick: () => this.toggleGrid() },
-            { icon: "peek", label: "Before / after", key: "\\", title: "Show the base image without any layer. Hold \\ for a quick look, click to toggle.", toggle: () => !!this.peekBase, onClick: () => { this.peekBase = !this.peekBase; this.peekHold = false; this.draw(); } },
-        ]);
         tools.appendChild(iconButton("flatten", "Flatten all visible layers into the base", () => this.flatten()));
         body.appendChild(tools);
 
@@ -1242,6 +1229,24 @@ class InpaintEditor {
             sec.appendChild(el("span", null, "by"));
             sec.appendChild(this.growInput);
             sec.appendChild(el("span", null, "px"));
+            const selRow = el("div", "ipc-sec");
+            const clrSel = iconButton("clear", "Clear the selection (Ctrl+D)", () => this.clearSelection(), "None");
+            clrSel.classList.add("ipc-small");
+            selRow.appendChild(clrSel);
+            const inv = iconButton("invert", "Invert the selection (Ctrl+I)", () => this.invertSelection(), "Invert");
+            inv.classList.add("ipc-small");
+            selRow.appendChild(inv);
+            this.antsBtn = iconButton("ants", "Selection display: marching ants outline (on) or red tint (off)", () => {
+                this.selectionDisplay = this.selectionDisplay === "ants" ? "tint" : "ants";
+                try { localStorage.setItem("ipc.selectionDisplay", this.selectionDisplay); } catch (_) { /* ignore */ }
+                this.antsBtn.classList.toggle("ipc-toggle-on", this.selectionDisplay === "ants");
+                this.draw();
+                this.setStatus(this.selectionDisplay === "ants" ? "Selection shown as an outline." : "Selection shown as a red tint.");
+            }, "Ants");
+            this.antsBtn.classList.add("ipc-small");
+            this.antsBtn.classList.toggle("ipc-toggle-on", this.selectionDisplay === "ants");
+            selRow.appendChild(this.antsBtn);
+            d.appendChild(selRow);
             const grow = iconButton("grow", "Grow the selection by n pixels", () => this.growSelection(+this.growInput.value), "Grow");
             grow.classList.add("ipc-small");
             sec.appendChild(grow);

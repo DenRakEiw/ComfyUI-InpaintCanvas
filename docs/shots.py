@@ -72,6 +72,17 @@ window.__ipcEv(ed, 'pointermove', 888, 1000, { buttons: 0 });                   
 await window.__wait(300);
 return { status: ed.status, hover: ed.hoverObjectId };
 """),
+    ("layers", r"""
+const ed = window.__ed;
+ed.modeSel.value = 'api'; ed.modeSel.dispatchEvent(new Event('change'));
+ed.clearSelection();
+// a text layer, a film grain filter layer and the result layer, transform bar open
+const T = await ed.addTextLayer(120, 120); T.text.content = 'Inpaint\nCanvas'; T.text.font = 'Bebas Neue'; T.text.size = 220; T.text.color = '#ffffff'; T.text.outline = 6; T.text.outlineColor = '#000000';
+await ed.renderTextLayer(T); await window.__wait(600);
+const F = ed.addFilterLayer('grain'); F.params.preset = 'portra400'; F.params.amount = 18; F.params.size = 1.5; F.params.chroma = 30; F.name = 'Kodak Portra 400'; ed.markFilterChanged(F);
+ed.activeLayerId = T.id; ed.setTool('transform'); ed.renderLayers(); ed.draw(); await window.__wait(600);
+return { layers: ed.layers.map(l => l.name) };
+"""),
     ("result", r"""
 const ed = window.__ed;
 // the local-settings scene left the editor in local mode, where the result is expected on result_local

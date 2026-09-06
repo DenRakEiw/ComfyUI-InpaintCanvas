@@ -14,32 +14,43 @@ reference image, prompt upsampling and a film grain finish.
 
 Highlights
 
-- Full-window editor with selection brush, rectangle, lasso, loop closing,
-  object selection by hovering (SAM2), select by text (SAM3 or GroundingDINO +
-  SAM), grow / shrink, layers with blend modes, paint and erase, transform
-  with rotate, distort and warp, control layers for ControlNet, outpainting.
-- Reference layers for Flux.2 / Kontext multi-reference editing: drop images
-  onto the canvas, they travel with `crop_image` as extra batch images.
-- Layer masks and cutouts: background removal with the installed RMBG nodes
-  (RMBG-2.0, BiRefNet, BEN2, BRIA) becomes an editable transparency mask.
-- Filter layers to finish the picture: grain, sharpen, blur, levels, curves,
-  brightness / contrast, hue / saturation, colour balance, black & white,
-  LUT (.cube) and vignette, non-destructive, with masks and undo.
-- Prompt upsampling with a local vision-language model (Qwen3-VL) or Gemini,
-  tuned per use case: an edit instruction for Flux.2 / Kontext by default,
-  or fill, add, remove, outpaint descriptions.
-- Save the finished image with the workflow embedded, and clean up the
-  node's working files from inside the editor.
-- Auto context and auto feather derived from the selection size, fill modes
-  for the masked area, colour matching when the result is stitched back.
-- An API / Local switch with two result inputs: only the chain of the chosen
-  mode runs, so a paid API node stays idle while you work locally.
-- Denoise, seed, negative prompt and up to eight editor-driven setting outputs
-  (LoRA name, checkpoint, steps, anything with a widget) so you can steer the
-  graph from inside the editor.
-- Helper prompts for segmentation and upsampling run at the front of the
-  queue with only the model nodes they need. Your generation chain is never
-  triggered by them.
+- **Selection like a paint program**: brush with loop closing, rectangle,
+  ellipse, lasso, polygon, magic wand, object selection by hovering (SAM2),
+  select by text (SAM3 or GroundingDINO + SAM), quick mask, grow / shrink /
+  feather, saved selections, marching ants.
+- **Layers**: thumbnails, rename, drag to reorder, duplicate, merge down,
+  lock and alpha lock, solo, blend modes, per-layer colour match, masks and
+  cutouts with the installed RMBG nodes, Ctrl+click picks the layer under the
+  cursor, everything undoable.
+- **Painting and retouch**: soft brush and eraser, pen pressure, straight
+  lines, eyedropper, bucket, gradient, smudge, clone stamp and healing brush,
+  text layers with 17 bundled open-source fonts (or your own) edited right on
+  the canvas.
+- **Transform**: move, scale, rotate at the corners, distort, warp, numeric
+  fields, flip, 90°, snapping to edges, centre and guides; a canvas tool that
+  extends (outpainting) or crops by dragging the frame; resize the image.
+- **Filter layers** to finish the picture: film grain with 46 stock presets
+  and real grain plates, sharpen, blur, levels, curves, brightness / contrast,
+  hue / saturation, colour balance, black & white, LUT (.cube) and vignette,
+  non-destructive, with masks and undo.
+- **Reference layers** for Flux.2 / Kontext multi-reference editing: drop
+  images onto the canvas, switch a layer to *reference* and it travels with
+  `crop_image` as an extra batch image.
+- **Prompt upsampling** with a local vision-language model (Qwen3-VL) or
+  Gemini, tuned per use case: an edit instruction for Flux.2 / Kontext by
+  default, or fill, add, remove, outpaint descriptions.
+- **View**: rulers with guides, grid, before / after, side-by-side compare of
+  two results, rotate the view, 100 % zoom; a tool column with grouped tools
+  and flyouts like Photoshop.
+- **Export**: PNG with the workflow embedded, JPEG, WebP, and layered
+  **PSD** or **ORA** (Krita / GIMP), plus the active layer or the selection
+  mask as PNG; cleanup of the node's working files from inside the editor.
+- **The round trip**: auto context and auto feather from the selection size,
+  fill modes for the masked area, colour matching and alignment when the
+  result is stitched back, an API / Local switch with two result inputs so a
+  paid API node stays idle while you work locally, denoise, seed, negative
+  prompt and up to eight editor-driven setting outputs, helper prompts that
+  never trigger your generation chain.
 
 ## Installation
 
@@ -103,10 +114,12 @@ Rectangle and lasso replace the selection like in Krita and Photoshop; hold
 Shift to add, Alt to subtract. The brush adds, with Alt it subtracts.
 
 The tool column on the left groups related tools Photoshop-style: a button
-shows the group's current tool and a small triangle; hover, right-click or
-hold it to open the group (selection brushes, marquees, smart selection,
-brushes, retouch, fill), and the shortcuts pick any tool directly. Two menu
-buttons hold the selection actions and the view toggles.
+shows the group's current tool and a small triangle. Left-click picks that
+tool; right-click, holding the button or clicking the triangle opens the
+group (selection brushes, marquees, smart selection, brushes, retouch,
+fill), and the shortcuts pick any tool directly. Selection actions (none,
+invert, marching ants) sit in the Selection panel, the view toggles (rulers,
+grid, before / after, fit) in the top bar.
 
 Tools: brush (B), rectangle (R) and ellipse (Shift+R; Ctrl keeps
 them square or round, dragging inside an existing selection moves its
@@ -206,6 +219,8 @@ size, hardness, opacity and the paint colour.
   where they stay available. Text layers are ordinary pixel layers for
   everything else: move them with the text tool, scale and rotate with T,
   mask them, blend them; editing the text renders them again.
+![The layer panel with thumbnails, a text layer, a filter layer and the transform bar](docs/img/layers.jpg)
+
 - The layer list (right): click to activate, Ctrl+click on the canvas
   activates the topmost layer with a pixel under the cursor. Each row has a
   thumbnail, the eye (Alt+click: solo, again to restore), the name
@@ -512,9 +527,8 @@ and files stay.
 | Ctrl+U                       | upsample prompt                          |
 | Ctrl+S                       | save the finished image                  |
 | Ctrl+Enter                   | generate                                 |
-| F                            | fit to view                              |
 | Space / middle mouse / right mouse | pan (wheel zooms)                  |
-| Esc                          | cancel transform, close editor           |
+| Esc                          | cancel transform / text edit / compare / flyout, then close the editor |
 
 While the editor is open all shortcuts belong to it: Ctrl+Z undoes the last
 editor step, not the workflow.
@@ -523,7 +537,7 @@ editor step, not the workflow.
 
 Zoom with the wheel, pan with Space, the middle mouse or H; F fits, 1 shows
 100 % (one image pixel per screen pixel), 4 / 6 rotate the view by 15° like
-Krita and 5 resets it. The View buttons at the bottom of the tool column
+Krita and 5 resets it. The view buttons in the top bar
 toggle **rulers** (Ctrl+Shift+R; drag a guide out of a ruler, drag it back
 to remove it, double-click a ruler clears them, layers snap to guides), the
 **grid** (Ctrl+Shift+G, 64 px) and **before / after** (hold \ or click:
