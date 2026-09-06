@@ -567,6 +567,12 @@ function objectBackendAvailable() {
 
 const ICONS = {
     text: '<path d="M5 5h14"/><path d="M12 5v14"/><path d="M9 19h6"/>',
+    flipH: '<path d="M12 3v18" stroke-dasharray="2 2"/><path d="M9 7L4 12l5 5"/><path d="M15 7l5 5-5 5"/>',
+    flipV: '<path d="M3 12h18" stroke-dasharray="2 2"/><path d="M7 9l5-5 5 5"/><path d="M7 15l5 5 5-5"/>',
+    rotCW: '<path d="M4 12a8 8 0 018-8h5"/><path d="M14 1l3 3-3 3"/><rect x="11" y="12" width="9" height="8"/>',
+    rotCCW: '<path d="M20 12a8 8 0 00-8-8H7"/><path d="M10 1L7 4l3 3"/><rect x="4" y="12" width="9" height="8"/>',
+    center: '<rect x="3" y="3" width="18" height="18"/><path d="M12 8v8M8 12h8"/>',
+    resize: '<rect x="3" y="3" width="18" height="18"/><path d="M8 16l8-8"/><path d="M12 8h4v4"/><path d="M12 16H8v-4"/>',
     wand: '<path d="M4 20L15 9"/><path d="M15 9l-2-2 4-4 2 2z"/><path d="M19 2v2M22 5h-2M21 9l-1.5-.5M17 1l-.5 1.5"/>',
     ellipse: '<ellipse cx="12" cy="12" rx="9" ry="6" stroke-dasharray="3 2"/>',
     quickmask: '<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="4" fill="currentColor" stroke="none"/>',
@@ -820,6 +826,9 @@ const STYLE = `
 .ipc-subbar .ipc-sep { width:1px; height:18px; background:#444; margin:0 2px; }
 .ipc-subbar label { display:flex; align-items:center; gap:4px; color:#aaa; }
 .ipc-subbar input[type=range] { width:90px; }
+.ipc-subbar .ipc-geo { display:flex; align-items:center; gap:4px; }
+.ipc-subbar .ipc-geo label { gap:2px; }
+.ipc-subbar .ipc-geo .ipc-num { width:58px; }
 .ipc-subbar input[type=checkbox] { margin:0; }
 .ipc-subbar .ipc-hint { color:#888; }
 `;
@@ -1247,7 +1256,7 @@ class InpaintEditor {
             this.extendInputs = {};
             for (const [key, label] of [["top", "Top"], ["right", "Right"], ["bottom", "Bottom"], ["left", "Left"]]) {
                 grid.appendChild(el("span", null, label));
-                this.extendInputs[key] = numberInput(0, 0, 8192, `Pixels to add at the ${key}`, 64);
+                this.extendInputs[key] = numberInput(0, -8192, 8192, `Pixels to add at the ${key} (negative: crop)`, 64);
                 this.extendInputs[key].addEventListener("input", () => this.draw());
                 grid.appendChild(this.extendInputs[key]);
             }
@@ -1258,12 +1267,30 @@ class InpaintEditor {
             this.extendFillSel.addEventListener("change", () => { this.cropSettings.extendFill = this.extendFillSel.value; this.notifyChanged(); });
             fillLab.appendChild(this.extendFillSel);
             sec.appendChild(fillLab);
-            const ext = iconButton("extend", "Extend the canvas (outpainting) by the pixels above; the canvas tool (C) sets them by dragging the frame. The new border becomes the selection.", () => this.extendCanvas(), "Extend canvas");
+            const ext = iconButton("extend", "Extend the canvas (outpainting) by the pixels above, negative values crop; the canvas tool (C) sets them by dragging the frame. A new border becomes the selection.", () => this.applyCanvasFrame(), "Apply");
             ext.classList.add("ipc-small");
             sec.appendChild(ext);
             this.canvasInfo = el("span", null, "");
             sec.appendChild(this.canvasInfo);
             d.appendChild(sec);
+
+            // resize the whole image
+            const rs = el("div", "ipc-sec");
+            rs.appendChild(el("span", null, "Resize"));
+            this.resizeW = numberInput(0, 8, 16384, "New width", 64);
+            this.resizeH = numberInput(0, 8, 16384, "New height", 64);
+            this.resizeLock = document.createElement("input");
+            this.resizeLock.type = "checkbox"; this.resizeLock.checked = true; this.resizeLock.title = "Keep the aspect ratio";
+            this.resizeW.addEventListener("input", () => { if (this.resizeLock.checked && this.width) this.resizeH.value = Math.max(8, Math.round(+this.resizeW.value * this.height / this.width)); });
+            this.resizeH.addEventListener("input", () => { if (this.resizeLock.checked && this.height) this.resizeW.value = Math.max(8, Math.round(+this.resizeH.value * this.width / this.height)); });
+            rs.appendChild(this.resizeW);
+            rs.appendChild(el("span", null, "×"));
+            rs.appendChild(this.resizeH);
+            const lockLab = el("label", null, ""); lockLab.appendChild(this.resizeLock); lockLab.appendChild(el("span", null, "aspect")); rs.appendChild(lockLab);
+            const rbtn = iconButton("resize", "Scale the image, all layers and the selection to the new size (undoable)", () => this.resizeImage(+this.resizeW.value, +this.resizeH.value), "Resize");
+            rbtn.classList.add("ipc-small");
+            rs.appendChild(rbtn);
+            d.appendChild(rs);
 
             // reference layers ride along in crop_image, fitted to the crop size
             const refs = el("div", "ipc-sec");
@@ -1517,6 +1544,25 @@ class InpaintEditor {
         bar.appendChild(this.applyBtn);
         this.cancelBtn = iconButton("close", "Cancel the transform (Esc)", () => this.cancelPending(), "Cancel");
         bar.appendChild(this.cancelBtn);
+        // numeric geometry and one-click operations, shown in scale mode
+        this.geoBox = el("span", "ipc-geo");
+        this.geoInputs = {};
+        for (const [k, title] of [["x", "Left edge"], ["y", "Top edge"], ["w", "Width"], ["h", "Height"]]) {
+            const lab = el("label", null, k.toUpperCase());
+            const inp = numberInput(0, -99999, 99999, `${title} of the layer in image pixels`, 62);
+            inp.addEventListener("change", () => this.setLayerGeometry());
+            inp.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); inp.blur(); } });
+            this.geoInputs[k] = inp;
+            lab.appendChild(inp);
+            this.geoBox.appendChild(lab);
+        }
+        this.geoBox.appendChild(el("span", "ipc-sep"));
+        this.geoBox.appendChild(iconButton("flipH", "Flip horizontally", () => this.flipLayer("h")));
+        this.geoBox.appendChild(iconButton("flipV", "Flip vertically", () => this.flipLayer("v")));
+        this.geoBox.appendChild(iconButton("rotCCW", "Rotate 90° counter-clockwise", () => this.rotateLayer90(-1)));
+        this.geoBox.appendChild(iconButton("rotCW", "Rotate 90° clockwise", () => this.rotateLayer90(1)));
+        this.geoBox.appendChild(iconButton("center", "Centre the layer on the canvas", () => this.centerLayer()));
+        bar.appendChild(this.geoBox);
         this.subHint = el("span", "ipc-hint", "");
         bar.appendChild(this.subHint);
         for (const type of ["pointerdown", "pointermove", "pointerup", "wheel"]) bar.addEventListener(type, (e) => e.stopPropagation());
@@ -1596,6 +1642,10 @@ class InpaintEditor {
         this.angleInput.parentElement.hidden = mode !== "rotate";
         if (this.pending && this.pending.mode === "rotate") this.angleInput.value = Math.round(this.pending.angle * 180 / Math.PI);
         const active = this.activeLayer();
+        if (this.geoBox) {
+            this.geoBox.hidden = !(mode === "scale" && active && !pending);
+            if (!this.geoBox.hidden && document.activeElement && !this.geoBox.contains(document.activeElement)) for (const k of ["x", "y", "w", "h"]) this.geoInputs[k].value = Math.round(active[k]);
+        }
         this.subHint.textContent = !active ? "Select a layer first" : (pending ? (mode === "rotate" ? "Drag outside to rotate (Shift snaps), handles scale, inside moves. Enter applies, Esc cancels" : "Enter applies, Esc cancels") : (mode === "scale" ? "Drag outside a corner to rotate, arrow keys nudge" : "Click a mode to start"));
     }
 
@@ -1918,7 +1968,7 @@ class InpaintEditor {
         if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); this.generate(); return; }
         if (e.key === "Enter" && this.pending) { e.preventDefault(); this.applyPending(); return; }
         if (e.key === "Enter" && this.polyPoints) { e.preventDefault(); this.closePolygon(); this.draw(); return; }
-        if (e.key === "Enter" && this.tool === "canvas") { e.preventDefault(); if (this.extendPending()) this.extendCanvas(); else this.setStatus("Drag the frame outward first."); return; }
+        if (e.key === "Enter" && this.tool === "canvas") { e.preventDefault(); if (this.extendPending()) this.applyCanvasFrame(); else this.setStatus("Drag the frame first: outward extends, inward crops."); return; }
         if ((e.key === "Backspace" || e.key === "Delete") && this.polyPoints) { e.preventDefault(); this.polyPoints.pop(); if (!this.polyPoints.length) this.polyPoints = null; this.draw(); return; }
         if (this.tool === "transform" && !this.pending && e.key.startsWith("Arrow")) {
             const l = this.activeLayer();
@@ -2175,6 +2225,89 @@ class InpaintEditor {
         this.setHandleCursor(this.canvasHandleAt(ix, iy));
     }
 
+    /** Numeric X / Y / W / H from the transform bar. */
+    setLayerGeometry() {
+        const l = this.activeLayer();
+        if (!l || l.kind === "filter" || l.locked) return;
+        const g = this.geoInputs;
+        const x = Math.round(+g.x.value), y = Math.round(+g.y.value), w = Math.max(1, Math.round(+g.w.value)), h = Math.max(1, Math.round(+g.h.value));
+        if (![x, y, w, h].every(Number.isFinite)) return;
+        if (x === l.x && y === l.y && w === l.w && h === l.h) return;
+        this.pushUndo({ kind: "transform", id: l.id });
+        l.x = x; l.y = y; l.w = w; l.h = h;
+        this.uploaded.baseHash = null; this.uploaded.controlHash = null;
+        this.renderLayers(); this.draw(); this.drawThumb(); this.notifyChanged();
+    }
+
+    /** Snap a moving layer's edges and centre to the canvas edges and centre (within 8 screen px). */
+    snapLayer(l) {
+        const th = 8 / this.view.scale;
+        const gx = [], gy = [];
+        let best = null;
+        for (const [a, b] of [[l.x, 0], [l.x + l.w / 2, this.width / 2], [l.x + l.w, this.width]]) { const d = Math.abs(a - b); if (d <= th && (!best || d < best[0])) best = [d, b - a, b]; }
+        if (best) { l.x = Math.round(l.x + best[1]); gx.push(best[2]); }
+        best = null;
+        for (const [a, b] of [[l.y, 0], [l.y + l.h / 2, this.height / 2], [l.y + l.h, this.height]]) { const d = Math.abs(a - b); if (d <= th && (!best || d < best[0])) best = [d, b - a, b]; }
+        if (best) { l.y = Math.round(l.y + best[1]); gy.push(best[2]); }
+        this.snapGuides = gx.length || gy.length ? { x: gx, y: gy } : null;
+    }
+
+    centerLayer() {
+        const l = this.activeLayer();
+        if (!l || l.kind === "filter" || l.locked) return;
+        this.pushUndo({ kind: "transform", id: l.id });
+        l.x = Math.round((this.width - l.w) / 2);
+        l.y = Math.round((this.height - l.h) / 2);
+        this.uploaded.baseHash = null; this.uploaded.controlHash = null;
+        this.renderLayers(); this.updateSubbar(); this.draw(); this.drawThumb(); this.notifyChanged();
+    }
+
+    /** Mirror the active layer's pixels (and mask) horizontally or vertically. */
+    flipLayer(axis) {
+        const l = this.activeLayer();
+        if (!l || l.kind === "filter") { this.setStatus("Select a pixel layer to flip."); return; }
+        if (l.locked) { this.setStatus(`${l.name} is locked.`); return; }
+        if (this.pending) this.cancelPending();
+        this.pushUndo({ kind: "layerfull", id: l.id });
+        const flip = (src) => {
+            const c = makeCanvas(src.width, src.height);
+            const ctx = c.getContext("2d");
+            if (axis === "h") { ctx.translate(src.width, 0); ctx.scale(-1, 1); } else { ctx.translate(0, src.height); ctx.scale(1, -1); }
+            ctx.drawImage(src, 0, 0);
+            return c;
+        };
+        l.canvas = flip(l.canvas);
+        if (l.mask) { l.mask = flip(l.mask); l.maskDirty = true; }
+        this.markLayerChanged(l);
+        this.renderLayers(); this.draw();
+        this.setStatus(`${l.name} flipped ${axis === "h" ? "horizontally" : "vertically"}.`);
+    }
+
+    /** Rotate the active layer by 90° (dir 1 = clockwise), keeping its centre. */
+    rotateLayer90(dir) {
+        const l = this.activeLayer();
+        if (!l || l.kind === "filter") { this.setStatus("Select a pixel layer to rotate."); return; }
+        if (l.locked) { this.setStatus(`${l.name} is locked.`); return; }
+        if (this.pending) this.cancelPending();
+        this.pushUndo({ kind: "layerfull", id: l.id });
+        const rot = (src) => {
+            const c = makeCanvas(src.height, src.width);
+            const ctx = c.getContext("2d");
+            ctx.translate(c.width / 2, c.height / 2);
+            ctx.rotate(dir * Math.PI / 2);
+            ctx.drawImage(src, -src.width / 2, -src.height / 2);
+            return c;
+        };
+        l.canvas = rot(l.canvas);
+        if (l.mask) { l.mask = rot(l.mask); l.maskDirty = true; }
+        const cx = l.x + l.w / 2, cy = l.y + l.h / 2;
+        [l.w, l.h] = [l.h, l.w];
+        l.x = Math.round(cx - l.w / 2); l.y = Math.round(cy - l.h / 2);
+        this.markLayerChanged(l);
+        this.renderLayers(); this.updateSubbar(); this.draw();
+        this.setStatus(`${l.name} rotated 90° ${dir > 0 ? "clockwise" : "counter-clockwise"}.`);
+    }
+
     /** (ix, iy) in a layer's un-rotated frame: the inverse rotation about its centre (or a given one). */
     toLayerLocal(l, angle, ix, iy, center = null) {
         const cx = center ? center[0] : l.x + l.w / 2, cy = center ? center[1] : l.y + l.h / 2;
@@ -2196,8 +2329,107 @@ class InpaintEditor {
 
     extendValues() {
         const v = {};
-        for (const k of ["top", "right", "bottom", "left"]) v[k] = Math.max(0, Math.round(+(this.extendInputs && this.extendInputs[k] ? this.extendInputs[k].value : 0) || 0));
+        for (const k of ["top", "right", "bottom", "left"]) v[k] = Math.round(+(this.extendInputs && this.extendInputs[k] ? this.extendInputs[k].value : 0) || 0);
         return v;
+    }
+
+    /** Apply the canvas frame: positive sides extend (outpainting border), negative sides crop. */
+    async applyCanvasFrame() {
+        const v = this.extendValues();
+        const pos = {}, neg = {};
+        for (const k of Object.keys(v)) { pos[k] = Math.max(0, v[k]); neg[k] = Math.min(0, v[k]); }
+        if (Object.values(pos).some((x) => x > 0)) await this.extendCanvas(pos);
+        if (Object.values(neg).some((x) => x < 0)) await this.cropCanvas(neg);
+        if (this.extendInputs) for (const k of Object.keys(this.extendInputs)) this.extendInputs[k].value = 0;
+        this.draw();
+    }
+
+    /** Crop the canvas: negative amounts per side. Layers keep their pixels and shift; nothing is baked. */
+    async cropCanvas(v) {
+        if (!this.base) return;
+        const W = this.width, H = this.height;
+        const left = -Math.min(0, v.left || 0), top = -Math.min(0, v.top || 0);
+        const right = -Math.min(0, v.right || 0), bottom = -Math.min(0, v.bottom || 0);
+        const nw = W - left - right, nh = H - top - bottom;
+        if (nw < 8 || nh < 8) { this.setStatus("The canvas would be smaller than 8 px."); return; }
+        if (!(left || top || right || bottom)) return;
+        try {
+            this.setStatus(`Cropping canvas to ${nw} × ${nh} ...`);
+            const before = this.snapshot({ kind: "canvas" });
+            if (this.pending) this.cancelPending();
+            const nb = makeCanvas(nw, nh);
+            nb.getContext("2d").drawImage(this.base.img, -left, -top);
+            const { ref } = await uploadCanvas(nb, `n${this.node.id}_base`);
+            const img = await loadImageEl(viewUrl(ref));
+            for (const l of this.layers) {
+                if (l.kind === "filter") {
+                    l.w = nw; l.h = nh; l._fcache = null;
+                    if (l.mask) { const m = makeCanvas(nw, nh); m.getContext("2d").drawImage(l.mask, -left, -top); l.mask = m; l.maskDirty = true; }
+                } else {
+                    l.x -= left; l.y -= top;
+                }
+            }
+            const sel = makeCanvas(nw, nh);
+            sel.getContext("2d").drawImage(this.selection, -left, -top);
+            this.selection = sel;
+            this.base = { ref, img };
+            this.width = nw; this.height = nh;
+            this.pushUndoSnapshot(before);
+            this.uploaded = this.makeUploaded();
+            this.selectionDirty = true;
+            this.selectionDataUrl = null;
+            this.renderLayers(); this.renderInfo(); this.fitView(); this.drawThumb(); this.notifyChanged();
+            this.setStatus(`Canvas cropped to ${nw} × ${nh}; the layers keep their pixels (Ctrl+Z takes it back).`);
+        } catch (err) {
+            console.error(err);
+            this.setStatus(String(err.message || err));
+        }
+    }
+
+    /** Scale the whole image (base, layers, selection) to a new size. */
+    async resizeImage(nw, nh) {
+        if (!this.base) return;
+        nw = Math.round(nw); nh = Math.round(nh);
+        if (!(nw >= 8 && nh >= 8) || (nw === this.width && nh === this.height)) { this.setStatus("Enter a new size."); return; }
+        const W = this.width, H = this.height, sx = nw / W, sy = nh / H;
+        try {
+            this.setStatus(`Resizing to ${nw} × ${nh} ...`);
+            const before = this.snapshot({ kind: "canvas" });
+            if (this.pending) this.cancelPending();
+            const nb = makeCanvas(nw, nh);
+            const nctx = nb.getContext("2d");
+            nctx.imageSmoothingEnabled = true;
+            nctx.imageSmoothingQuality = "high";
+            nctx.drawImage(this.base.img, 0, 0, nw, nh);
+            const { ref } = await uploadCanvas(nb, `n${this.node.id}_base`);
+            const img = await loadImageEl(viewUrl(ref));
+            for (const l of this.layers) {
+                if (l.kind === "filter") {
+                    l.w = nw; l.h = nh; l._fcache = null;
+                    if (l.mask) { const m = makeCanvas(nw, nh); const mc = m.getContext("2d"); mc.imageSmoothingEnabled = true; mc.drawImage(l.mask, 0, 0, nw, nh); l.mask = m; l.maskDirty = true; }
+                } else {
+                    l.x = Math.round(l.x * sx); l.y = Math.round(l.y * sy);
+                    l.w = Math.max(1, Math.round(l.w * sx)); l.h = Math.max(1, Math.round(l.h * sy));
+                    l._maskedValid = false; l._mcache = null;
+                }
+            }
+            const sel = makeCanvas(nw, nh);
+            const sc = sel.getContext("2d");
+            sc.imageSmoothingEnabled = true;
+            sc.drawImage(this.selection, 0, 0, nw, nh);
+            this.selection = sel;
+            this.base = { ref, img };
+            this.width = nw; this.height = nh;
+            this.pushUndoSnapshot(before);
+            this.uploaded = this.makeUploaded();
+            this.selectionDirty = true;
+            this.selectionDataUrl = null;
+            this.renderLayers(); this.renderInfo(); this.fitView(); this.drawThumb(); this.notifyChanged();
+            this.setStatus(`Image resized to ${nw} × ${nh} (Ctrl+Z takes it back). Layers keep their own resolution.`);
+        } catch (err) {
+            console.error(err);
+            this.setStatus(String(err.message || err));
+        }
     }
 
     extendPending() {
@@ -2458,6 +2690,8 @@ class InpaintEditor {
         } else if (p.kind === "move") {
             p.layer.x = Math.round(p.orig.x + (ix - p.start[0]));
             p.layer.y = Math.round(p.orig.y + (iy - p.start[1]));
+            this.snapGuides = null;
+            if (!e.altKey) this.snapLayer(p.layer);
         } else if (p.kind === "scale") {
             if (p.angle) {
                 const [lx, ly] = this.toLayerLocal(p.layer, p.angle, ix, iy, p.center);
@@ -2472,14 +2706,15 @@ class InpaintEditor {
             }
         } else if (p.kind === "canvasext") {
             const dx = ix - p.start[0], dy = iy - p.start[1], step = e.altKey ? 1 : 8;
-            const q = (v) => Math.max(0, Math.round(v / step) * step);
+            // outward extends, inward crops; the canvas never goes below 8 px
+            const q = (v, limit) => Math.max(-(limit - 8), Math.round(v / step) * step);
             const h = p.handle, o = p.orig;
-            if (h.includes("e")) this.extendInputs.right.value = q(o.right + dx);
-            if (h.includes("w")) this.extendInputs.left.value = q(o.left - dx);
-            if (h.includes("n")) this.extendInputs.top.value = q(o.top - dy);
-            if (h.includes("s")) this.extendInputs.bottom.value = q(o.bottom + dy);
+            if (h.includes("e")) this.extendInputs.right.value = q(o.right + dx, this.width + Math.min(0, o.left));
+            if (h.includes("w")) this.extendInputs.left.value = q(o.left - dx, this.width + Math.min(0, o.right));
+            if (h.includes("n")) this.extendInputs.top.value = q(o.top - dy, this.height + Math.min(0, o.bottom));
+            if (h.includes("s")) this.extendInputs.bottom.value = q(o.bottom + dy, this.height + Math.min(0, o.top));
             const R = this.extendRect();
-            this.setStatus(`Canvas ${this.width} × ${this.height} → ${R.w} × ${R.h}, applied on release.`);
+            this.setStatus(`Canvas ${this.width} × ${this.height} → ${R.w} × ${R.h} (${R.w > this.width || R.h > this.height ? "extend" : "crop"}), applied on release.`);
         } else if (p.kind === "pending") {
             this.pendingPointerMove(ix, iy, e);
         }
@@ -2565,14 +2800,16 @@ class InpaintEditor {
             this.markMaskChanged(p.layer);
             this.lastStrokeEnd = { layerId: p.layer.id, x: p.last[0], y: p.last[1], mask: true };
         } else if (p.kind === "move" || p.kind === "scale") {
+            this.snapGuides = null;
             this.uploaded.baseHash = null;
             this.uploaded.controlHash = null;
             this.renderLayers();
+            this.updateSubbar();
             this.drawThumb();
             this.notifyChanged();
         } else if (p.kind === "canvasext") {
             // like a crop handle in Photoshop: releasing applies; Ctrl+Z takes it back
-            if (this.extendPending()) this.extendCanvas();
+            if (this.extendPending()) this.applyCanvasFrame();
         }
         this.draw();
     }
@@ -3577,13 +3814,12 @@ class InpaintEditor {
 
     // ---- outpainting ---------------------------------------------------------
 
-    async extendCanvas() {
+    async extendCanvas(vals = null) {
         if (!this.base) { this.setStatus("Load an image first."); return; }
-        const top = Math.max(0, +this.extendInputs.top.value || 0);
-        const right = Math.max(0, +this.extendInputs.right.value || 0);
-        const bottom = Math.max(0, +this.extendInputs.bottom.value || 0);
-        const left = Math.max(0, +this.extendInputs.left.value || 0);
-        if (!(top || right || bottom || left)) { this.setStatus("Enter how many pixels to add on each side."); return; }
+        if (!vals && this.extendInputs && Object.values(this.extendValues()).some((x) => x < 0)) { await this.applyCanvasFrame(); return; }
+        const v = vals || this.extendValues();
+        const top = Math.max(0, v.top || 0), right = Math.max(0, v.right || 0), bottom = Math.max(0, v.bottom || 0), left = Math.max(0, v.left || 0);
+        if (!(top || right || bottom || left)) { this.setStatus("Enter how many pixels to add on each side (negative crops)."); return; }
         const W = this.width, H = this.height;
         const nw = W + left + right, nh = H + top + bottom;
         const before = this.snapshot({ kind: "canvas" });
@@ -4740,6 +4976,7 @@ class InpaintEditor {
     }
 
     renderInfo() {
+        if (this.resizeW && this.width && document.activeElement !== this.resizeW && document.activeElement !== this.resizeH) { this.resizeW.value = this.width; this.resizeH.value = this.height; }
         if (!this.infoEl) return;
         const rows = [];
         if (this.base) {
@@ -5763,11 +6000,22 @@ class InpaintEditor {
             ctx.textAlign = "center";
             ctx.textBaseline = "middle";
             const label = (txt, x, y) => { const w = ctx.measureText(txt).width + 10 / s; ctx.fillStyle = "rgba(0,0,0,0.65)"; ctx.fillRect(x - w / 2, y - 8 / s, w, 16 / s); ctx.fillStyle = "#fff"; ctx.fillText(txt, x, y); };
-            if (v.top) label(`+${v.top}`, this.width / 2, -v.top / 2);
-            if (v.bottom) label(`+${v.bottom}`, this.width / 2, this.height + v.bottom / 2);
-            if (v.left) label(`+${v.left}`, -v.left / 2, this.height / 2);
-            if (v.right) label(`+${v.right}`, this.width + v.right / 2, this.height / 2);
+            const sg = (n) => (n > 0 ? "+" : "") + n;
+            if (v.top) label(sg(v.top), this.width / 2, -v.top / 2);
+            if (v.bottom) label(sg(v.bottom), this.width / 2, this.height + v.bottom / 2);
+            if (v.left) label(sg(v.left), -v.left / 2, this.height / 2);
+            if (v.right) label(sg(v.right), this.width + v.right / 2, this.height / 2);
             label(`${R.w} × ${R.h}`, R.x + R.w / 2, R.y - 14 / s);
+            ctx.restore();
+        }
+
+        if (this.snapGuides && this.pointer && this.pointer.kind === "move") {
+            ctx.save();
+            ctx.strokeStyle = "#ff66cc";
+            ctx.lineWidth = 1 / s;
+            ctx.setLineDash([6 / s, 4 / s]);
+            for (const gx of this.snapGuides.x) { ctx.beginPath(); ctx.moveTo(gx, -1e5); ctx.lineTo(gx, 1e5); ctx.stroke(); }
+            for (const gy of this.snapGuides.y) { ctx.beginPath(); ctx.moveTo(-1e5, gy); ctx.lineTo(1e5, gy); ctx.stroke(); }
             ctx.restore();
         }
 

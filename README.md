@@ -185,7 +185,10 @@ size, hardness, opacity and the paint colour.
   Enter bakes it. *Rotate* does the same from the bar with an angle field.
   *Distort*: drag the four corners (perspective). *Warp*: bend the layer with
   a 3 to 6 point grid. Rotate, distort and warp preview live and are baked
-  with Enter or Apply, Esc cancels, undo restores the layer completely.
+  with Enter or Apply, Esc cancels, undo restores the layer completely. The
+  bar also has numeric X / Y / W / H fields, flip horizontal / vertical,
+  rotate 90° either way and centre. While moving, the layer snaps to the
+  canvas edges and centre (pink guide, Alt moves freely).
 - **Text (Shift+T)**: click on the canvas to add a text layer. The layer
   panel holds the text (several lines), font, size, colour, bold / italic,
   alignment, line height, letter spacing and an outline. 17 open-source fonts
@@ -421,11 +424,13 @@ feather, no fill and no colour match, so nothing changes for them.
 ### Outpainting
 
 The **canvas tool (C)** shows the canvas as a frame: drag its edges or corners
-outward, the new size and the pixels per side are shown while you drag, and
-releasing applies it (8 px steps, Alt for single pixels); Ctrl+Z takes an
-extension back. The Canvas section does the same with numbers and the
-**Extend canvas** button. The visible image is baked into the new
-base and the border becomes the selection. **Border** chooses
+outward to extend, inward to crop; the new size and the pixels per side are
+shown while you drag, and releasing applies it (8 px steps, Alt for single
+pixels); Ctrl+Z takes it back. Cropping keeps every layer's pixels, they just
+shift. The Canvas section does the same with numbers (negative crops) and the
+**Apply** button, and **Resize** scales the whole image with its layers and
+selection to a new size. When extending, the visible image is baked into the
+new base and the border becomes the selection. **Border** chooses
 what fills it before the model sees it: the image's average colour (default),
 neutral grey, green for edit models, black, random noise for latent models, or
 stretched edge pixels. Press Generate to fill it; the *outpaint* use case of
