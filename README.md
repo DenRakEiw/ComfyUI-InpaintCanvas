@@ -503,3 +503,9 @@ pixels of the layers.
 
 See `DEVELOPMENT.md` for the mechanisms, measurements and test recipes, and
 `CLAUDE.md` for the invariants that must not be broken.
+
+## License
+
+GPL-3.0, the same license as ComfyUI. See `LICENSE`. Free to use, modify and
+redistribute, including commercially; forks and derived works must stay under
+the GPL.
