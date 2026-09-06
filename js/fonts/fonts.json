@@ -1,0 +1,138 @@
+[
+ {
+  "family": "Roboto",
+  "file": "Roboto[wdth,wght].ttf",
+  "category": "sans",
+  "variable": true,
+  "license": "OFL-1.1",
+  "licenseFile": "licenses/Roboto-OFL.txt"
+ },
+ {
+  "family": "Open Sans",
+  "file": "OpenSans[wdth,wght].ttf",
+  "category": "sans",
+  "variable": true,
+  "license": "OFL-1.1",
+  "licenseFile": "licenses/OpenSans-OFL.txt"
+ },
+ {
+  "family": "Montserrat",
+  "file": "Montserrat[wght].ttf",
+  "category": "sans",
+  "variable": true,
+  "license": "OFL-1.1",
+  "licenseFile": "licenses/Montserrat-OFL.txt"
+ },
+ {
+  "family": "Oswald",
+  "file": "Oswald[wght].ttf",
+  "category": "sans",
+  "variable": true,
+  "license": "OFL-1.1",
+  "licenseFile": "licenses/Oswald-OFL.txt"
+ },
+ {
+  "family": "Bebas Neue",
+  "file": "BebasNeue-Regular.ttf",
+  "category": "display",
+  "variable": false,
+  "license": "OFL-1.1",
+  "licenseFile": "licenses/BebasNeue-OFL.txt"
+ },
+ {
+  "family": "Anton",
+  "file": "Anton-Regular.ttf",
+  "category": "display",
+  "variable": false,
+  "license": "OFL-1.1",
+  "licenseFile": "licenses/Anton-OFL.txt"
+ },
+ {
+  "family": "Abril Fatface",
+  "file": "AbrilFatface-Regular.ttf",
+  "category": "display",
+  "variable": false,
+  "license": "OFL-1.1",
+  "licenseFile": "licenses/AbrilFatface-OFL.txt"
+ },
+ {
+  "family": "Bangers",
+  "file": "Bangers-Regular.ttf",
+  "category": "display",
+  "variable": false,
+  "license": "OFL-1.1",
+  "licenseFile": "licenses/Bangers-OFL.txt"
+ },
+ {
+  "family": "Playfair Display",
+  "file": "PlayfairDisplay[wght].ttf",
+  "category": "serif",
+  "variable": true,
+  "license": "OFL-1.1",
+  "licenseFile": "licenses/PlayfairDisplay-OFL.txt"
+ },
+ {
+  "family": "Lora",
+  "file": "Lora[wght].ttf",
+  "category": "serif",
+  "variable": true,
+  "license": "OFL-1.1",
+  "licenseFile": "licenses/Lora-OFL.txt"
+ },
+ {
+  "family": "Cinzel",
+  "file": "Cinzel[wght].ttf",
+  "category": "serif",
+  "variable": true,
+  "license": "OFL-1.1",
+  "licenseFile": "licenses/Cinzel-OFL.txt"
+ },
+ {
+  "family": "Lobster",
+  "file": "Lobster-Regular.ttf",
+  "category": "script",
+  "variable": false,
+  "license": "OFL-1.1",
+  "licenseFile": "licenses/Lobster-OFL.txt"
+ },
+ {
+  "family": "Pacifico",
+  "file": "Pacifico-Regular.ttf",
+  "category": "script",
+  "variable": false,
+  "license": "OFL-1.1",
+  "licenseFile": "licenses/Pacifico-OFL.txt"
+ },
+ {
+  "family": "Dancing Script",
+  "file": "DancingScript[wght].ttf",
+  "category": "script",
+  "variable": true,
+  "license": "OFL-1.1",
+  "licenseFile": "licenses/DancingScript-OFL.txt"
+ },
+ {
+  "family": "Caveat",
+  "file": "Caveat[wght].ttf",
+  "category": "hand",
+  "variable": true,
+  "license": "OFL-1.1",
+  "licenseFile": "licenses/Caveat-OFL.txt"
+ },
+ {
+  "family": "Permanent Marker",
+  "file": "PermanentMarker-Regular.ttf",
+  "category": "hand",
+  "variable": false,
+  "license": "Apache-2.0",
+  "licenseFile": "licenses/PermanentMarker-LICENSE.txt"
+ },
+ {
+  "family": "Roboto Mono",
+  "file": "RobotoMono[wght].ttf",
+  "category": "mono",
+  "variable": true,
+  "license": "OFL-1.1",
+  "licenseFile": "licenses/RobotoMono-OFL.txt"
+ }
+]

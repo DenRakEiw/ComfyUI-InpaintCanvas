@@ -153,11 +153,24 @@ size, hardness, opacity and the paint colour.
   tool's value, both are remembered.
 - **Transform (T)** has four modes in the bar above the canvas. *Scale*: drag
   inside to move, corners scale proportionally (Shift for free aspect), edge
-  handles scale one axis, arrow keys nudge (Shift: 10 px). *Rotate*: drag
-  around the centre or type an angle (Shift snaps to 15°). *Distort*: drag the
-  four corners (perspective). *Warp*: bend the layer with a 3 to 6 point grid.
-  Rotate, distort and warp preview live and are baked with Enter or Apply, Esc
-  cancels, undo restores the layer completely.
+  handles scale one axis, arrow keys nudge (Shift: 10 px). Drag just outside
+  a corner to rotate, as in Krita and Photoshop (Shift snaps to 15°); while
+  the rotation is pending the handles still scale and the inside still moves,
+  Enter bakes it. *Rotate* does the same from the bar with an angle field.
+  *Distort*: drag the four corners (perspective). *Warp*: bend the layer with
+  a 3 to 6 point grid. Rotate, distort and warp preview live and are baked
+  with Enter or Apply, Esc cancels, undo restores the layer completely.
+- **Text (Shift+T)**: click on the canvas to add a text layer. The layer
+  panel holds the text (several lines), font, size, colour, bold / italic,
+  alignment, line height, letter spacing and an outline. 17 open-source fonts
+  come with the node (Roboto, Open Sans, Montserrat, Oswald, Bebas Neue,
+  Anton, Abril Fatface, Bangers, Playfair Display, Lora, Cinzel, Lobster,
+  Pacifico, Dancing Script, Caveat, Permanent Marker, Roboto Mono; OFL /
+  Apache licensed, see `js/fonts/licenses`). The + next to the font list
+  uploads your own .ttf / .otf / .woff files to `input/inpaint_canvas/fonts`,
+  where they stay available. Text layers are ordinary pixel layers for
+  everything else: move them with the text tool, scale and rotate with T,
+  mask them, blend them; editing the text renders them again.
 - The layer list (right): click to activate, toggle visibility, opacity, blend
   mode (multiply, screen, overlay, ...), move up / down, delete (Delete key),
   plus button for an empty paint layer (Ctrl+Shift+N). Flatten bakes all
@@ -351,8 +364,11 @@ feather, no fill and no colour match, so nothing changes for them.
 
 ### Outpainting
 
-The Canvas section extends the canvas on any side. The visible image is baked
-into the new base and the border becomes the selection. **Border** chooses
+The **canvas tool (C)** shows the canvas as a frame: drag its edges or corners
+outward, the new size and the pixels per side are shown, Enter or **Extend
+canvas** applies (8 px steps, Alt for single pixels, Esc resets). The Canvas
+section does the same with numbers. The visible image is baked into the new
+base and the border becomes the selection. **Border** chooses
 what fills it before the model sees it: the image's average colour (default),
 neutral grey, green for edit models, black, random noise for latent models, or
 stretched edge pixels. Press Generate to fill it; the *outpaint* use case of
@@ -401,6 +417,7 @@ and files stay.
 | ---------------------------- | ---------------------------------------- |
 | B, R, L, Shift+L, O, D       | selection brush, rectangle, lasso, polygon, object, deselect |
 | P, E, T, H                   | paint, erase, transform, hand            |
+| Shift+T, C                   | text tool, canvas tool                   |
 | `[` `]`                      | brush size                               |
 | Ctrl+Z, Ctrl+Shift+Z, Ctrl+Y | undo, redo                               |
 | Ctrl+D, Ctrl+I               | clear, invert selection                  |

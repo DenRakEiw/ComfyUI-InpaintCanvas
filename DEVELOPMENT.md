@@ -820,3 +820,63 @@ variance was 145 against 1366 for the base (rendered at 1024 px, upscaled).
 
 The remaining softness is resolution: `target_size` 0 (native) or above the
 region size for API models (Flux.2 accepts up to 2048 px).
+
+## 16. Corner rotation, canvas tool, text layers (2026-09-06)
+
+### Rotation at the corners (transform tool)
+
+`rotateZoneAt(l, ix, iy)`: outside the layer frame (beyond the handle radius)
+and within 5 handle radii of a corner. In scale mode a pointer-down there calls
+`startPending("rotate")` and hands the event to `pendingPointerDown`, so the
+rotation is the usual pending transform (bar switches to Rotate, angle field,
+Enter bakes via `applyPending`, Esc cancels). While it is pending,
+`pendingPointerDown` maps the pointer into the un-rotated frame
+(`toLayerLocal`, inverse rotation about the centre): a handle there scales,
+inside moves, outside rotates. Scaling while rotated: `applyScale` runs in the
+local frame with the centre fixed at gesture start (`p.center`); because the
+preview rotates about the *current* centre, the rect is then shifted by
+`(R - I)(c_new - c_orig)` so the anchor corner stays put on screen (measured
+in the headless test: 1 px drift at 20°). Cursors: `CURSOR_CLASSES`,
+`setHandleCursor(handle, rotate)`; the rotate cursor is an inline SVG.
+
+### Canvas tool (extend by dragging)
+
+Tool `canvas` (key C). The four Canvas-section inputs are the single source of
+truth: `extendRect()` derives the planned rectangle from them, `draw()` shows
+it as a dashed frame with handles, a tint over the new border and the pixel
+counts per side, `canvasHandleAt` hit-tests the frame. Dragging a handle
+writes the inputs (`pointer.kind === "canvasext"`, 8 px steps, Alt = 1 px,
+never below 0: shrinking is not a crop). Enter (or the button) calls
+`extendCanvas()`, Esc resets the inputs while something is pending, then
+closes as usual.
+
+### Text layers
+
+Layer kind `text` with `layer.text = {content, font, fontRef, size, color,
+bold, italic, align, lineHeight, letterSpacing, outline, outlineColor, res}`
+(`TEXT_DEFAULTS` in `js/inpaint_text.js`). `renderText()` measures with
+`fontBoundingBoxAscent/Descent`, draws at `res = 2` (stroke for the outline,
+then fill) and `renderTextLayer()` puts the result into the layer keeping the
+user's scale factor (`layer.w / (canvas.width / res)`). Everything else treats
+it as a pixel layer: transform (a baked rotation is lost on the next text
+edit), masks, match, blend, flatten, upload (`syncLayers`) and reload from
+`ref`; `getValue` also stores `text`, and a text layer that was never uploaded
+is rendered again on load (`textToRender` in `setValue`). Undo kind `text`
+(canvas + geometry + description); the text area snapshots on focus and pushes
+on change, the colour inputs likewise, everything else through `change()`.
+
+Fonts: `js/fonts/fonts.json` lists the 17 bundled families (variable-weight
+files get a `100 900` FontFace weight so bold uses the axis, static ones are
+synthesised), licences in `js/fonts/licenses`. User fonts: uploaded through
+the plain `/upload/image` endpoint (it accepts any file) to
+`input/inpaint_canvas/fonts`, listed by `GET /inpaint_canvas/fonts`,
+registered with `addUserFont`; a layer remembers `fontRef` so another browser
+can load the face without the listing. The cleanup only looks at files
+directly in `input/inpaint_canvas`, so the fonts folder is never touched.
+The `familyOf()` name comes from the file name (brackets, "Regular", "VF"
+stripped).
+
+Test: scratchpad `scenes_text.py` (rotate zone cursor, pending rotate, scale
+in the rotated frame with anchor check, move, Enter; canvas tool drag with
+and without Alt, Enter; text layer creation, font list, re-render on input,
+bold + undo, kind select round trip, persistence).

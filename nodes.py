@@ -1023,6 +1023,18 @@ def _register_routes():
         result = _cleanup_files(keep if isinstance(keep, list) else [], dry_run=dry_run, min_age=max(0.0, min_age))
         return web.json_response(result)
 
+    @server.routes.get("/inpaint_canvas/fonts")
+    async def _fonts_route(request):
+        """Font files the user uploaded for text layers (input/inpaint_canvas/fonts)."""
+        folder = os.path.join(folder_paths.get_input_directory(), SUBFOLDER, "fonts")
+        try:
+            names = sorted(os.listdir(folder))
+        except OSError:
+            names = []
+        fonts = [{"filename": n, "subfolder": SUBFOLDER + "/fonts", "type": "input"}
+                 for n in names if n.lower().endswith((".ttf", ".otf", ".woff", ".woff2")) and os.path.isfile(os.path.join(folder, n))]
+        return web.json_response(fonts)
+
 
 _register_routes()
 

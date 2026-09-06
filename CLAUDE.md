@@ -24,6 +24,10 @@ Flux.2 [max] API node (returns RGBA, square unless width/height are wired).
   One HTTP route, `POST /inpaint_canvas/cleanup` (file housekeeping).
 - `js/inpaint_canvas.js` — the whole frontend: node thumbnail widget, the
   full-window editor (`InpaintEditor`), state persistence, prompt rewriting.
+- `js/inpaint_text.js` — text layers: bundled fonts (`js/fonts/*.ttf`,
+  manifest `fonts.json`, OFL / Apache licences in `js/fonts/licenses`), user
+  fonts from `input/inpaint_canvas/fonts` (route `GET /inpaint_canvas/fonts`),
+  `renderText()` draws a layer's `text` description at 2x.
 - `js/inpaint_filters.js` — the filter layers (grain, sharpen, levels, LUT,
   vignette): pure Canvas 2D / pixel loops, registry `FILTERS`. New filters go
   here, not into the editor file.

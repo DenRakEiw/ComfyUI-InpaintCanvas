@@ -15,12 +15,14 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { FILTERS, FILTER_IDS, filterDefaults, applyFilter, lutFromCube, lutToCanvas, lutFromImage, plateStats } from "./inpaint_filters.js";
+import { TEXT_DEFAULTS, FONT_CATEGORIES, loadFontList, fontList, addUserFont, renderText } from "./inpaint_text.js";
 
 const NODE_CLASS = "InpaintCanvas";
 const STITCH_CLASS = "InpaintCanvasStitch";
 const SUBFOLDER = "inpaint_canvas";
 const MAX_UNDO = 30;
 const HANDLE_PX = 9;
+const CURSOR_CLASSES = ["ipc-scale", "ipc-scale-ne", "ipc-scale-x", "ipc-scale-y", "ipc-rotate"];
 const BLEND_MODES = ["normal", "multiply", "screen", "overlay", "darken", "lighten", "soft-light", "hard-light", "difference"];
 const ROLES = ["none", "reference", "scribble", "lineart", "depth", "pose", "canny", "other"];
 // Outputs after the setting slots (none at the moment). The backend would declare
@@ -563,6 +565,10 @@ function objectBackendAvailable() {
 // ---------------------------------------------------------------------------
 
 const ICONS = {
+    text: '<path d="M5 5h14"/><path d="M12 5v14"/><path d="M9 19h6"/>',
+    bold: '<path d="M7 4h6a4 4 0 010 8H7z"/><path d="M7 12h7a4 4 0 010 8H7z"/>',
+    italic: '<path d="M14 4h6"/><path d="M4 20h6"/><path d="M15 4l-6 16"/>',
+    canvas: '<rect x="4" y="4" width="16" height="16" stroke-dasharray="3 2"/><path d="M12 1v3"/><path d="M12 20v3"/><path d="M1 12h3"/><path d="M20 12h3"/><path d="M10 2l2-1 2 1"/><path d="M10 22l2 1 2-1"/><path d="M2 10l-1 2 1 2"/><path d="M22 10l1 2-1 2"/>',
     select: '<circle cx="11" cy="12" r="7" stroke-dasharray="3 2"/><path d="M11 9v6"/><path d="M8 12h6"/>',
     deselect: '<circle cx="11" cy="12" r="7" stroke-dasharray="3 2"/><path d="M8 12h6"/>',
     loop: '<circle cx="12" cy="12" r="7" stroke-dasharray="3 2"/><circle cx="12" cy="12" r="3.5" fill="currentColor" stroke="none"/>',
@@ -689,6 +695,10 @@ const STYLE = `
 .ipc-view.ipc-panning { cursor:grabbing; }
 .ipc-view.ipc-move { cursor:move; }
 .ipc-view.ipc-scale { cursor:nwse-resize; }
+.ipc-view.ipc-scale-ne { cursor:nesw-resize; }
+.ipc-view.ipc-scale-x { cursor:ew-resize; }
+.ipc-view.ipc-scale-y { cursor:ns-resize; }
+.ipc-view.ipc-rotate { cursor:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'><path d='M19 12a7 7 0 1 1-2-4.9' fill='none' stroke='black' stroke-width='4.5' stroke-linecap='round'/><path d='M19 3v5h-5' fill='none' stroke='black' stroke-width='4.5' stroke-linecap='round' stroke-linejoin='round'/><path d='M19 12a7 7 0 1 1-2-4.9' fill='none' stroke='white' stroke-width='2' stroke-linecap='round'/><path d='M19 3v5h-5' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/></svg>") 12 12, alias; }
 .ipc-drop { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; text-align:center;
   color:#888; pointer-events:none; padding:20px; white-space:pre-line; font-size:15px; }
 .ipc-side { width:290px; display:flex; flex-direction:column; background:#202020; border-left:1px solid #0d0d0d; overflow:auto; }
@@ -719,6 +729,14 @@ const STYLE = `
 .ipc-layer .ipc-kind.ipc-ctrl { color:#ffb347; }
 .ipc-layer .ipc-kind.ipc-ref { color:#7cc7ff; }
 .ipc-layer .ipc-kind.ipc-fxk { color:#c7a2ff; }
+.ipc-layer select.ipc-kindsel { background:#262626; border:1px solid #3a3a3a; border-radius:4px; padding:0 1px; font:inherit; font-size:10px; text-transform:uppercase; color:#888; cursor:pointer; max-width:92px; }
+.ipc-layer select.ipc-kindsel.ipc-ref { color:#7cc7ff; border-color:#2b4a63; }
+.ipc-text { display:flex; flex-direction:column; gap:3px; font-size:11px; color:#888; }
+.ipc-text .ipc-row { display:flex; align-items:center; gap:4px; }
+.ipc-text textarea { width:100%; box-sizing:border-box; min-height:38px; resize:vertical; background:#151515; color:#eee; border:1px solid #3a3a3a; border-radius:4px; font:inherit; padding:3px 5px; }
+.ipc-text input[type=color] { width:26px; height:22px; padding:0; border:1px solid #4a4a4a; border-radius:4px; background:#333; cursor:pointer; }
+.ipc-text .ipc-sel { flex:1; min-width:0; }
+.ipc-text .ipc-num { width:52px; }
 .ipc-fx { display:grid; grid-template-columns:auto 1fr auto; gap:3px 6px; align-items:center; font-size:11px; color:#888; }
 .ipc-fx .ipc-sel { grid-column:1 / -1; max-width:none; }
 .ipc-fx input[type=range] { width:100%; min-width:0; margin:0; }
@@ -1022,8 +1040,10 @@ class InpaintEditor {
         addTool("paint", "Paint on the active layer (P). On the base it creates a paint layer.");
         addTool("erase", "Erase from the active layer (E)");
         tools.appendChild(iconButton("fill", "Fill the selection with the color on the active layer (Shift+F)", () => this.fillSelection()));
-        addTool("transform", "Move / scale the active layer (T). Drag corners to scale, Shift for free aspect.");
+        addTool("transform", "Move / scale / rotate the active layer (T). Drag inside to move, corners scale (Shift: free aspect), edges scale one axis, drag just outside a corner to rotate (Shift snaps to 15°). Rotation is applied with Enter.");
+        addTool("text", "Text (Shift+T): click on the canvas to add a text layer, click a text layer to select it, drag to move it. Text, font, size and colour are edited in the layer panel.");
         addTool("hand", "Pan (H, Space or middle mouse)");
+        addTool("canvas", "Canvas size (C): drag the frame's edges or corners outward to extend the canvas (outpainting). Snaps to 8 px, Alt for single pixels. Enter or \"Extend canvas\" applies, Esc resets.");
         tools.appendChild(el("div", "ipc-sep"));
         tools.appendChild(iconButton("undo", "Undo (Ctrl+Z)", () => this.undoStep()));
         tools.appendChild(iconButton("redo", "Redo (Ctrl+Shift+Z)", () => this.redoStep()));
@@ -1076,6 +1096,8 @@ class InpaintEditor {
         };
         this.imageInput = fileInput((files) => this.addImageLayers(files, "none", { place: "fit" }));
         this.refInput = fileInput((files) => this.addImageLayers(files, "reference"));
+        this.fontInput = fileInput((files) => this.addFontFiles(files));
+        this.fontInput.accept = ".ttf,.otf,.woff,.woff2,font/ttf,font/otf,font/woff,font/woff2";
         layersHead.appendChild(miniButton("image", "Import images as layers (one layer per file, part of the image, fitted to the canvas). Dropping files on this list does the same.", () => this.imageInput.click()));
         layersHead.appendChild(miniButton("refImage", "Add reference images (one layer per file, role \"reference\"). They are not part of the image; they travel with crop_image as extra batch images for Flux.2 / Kontext. Shift+drop on the canvas does the same (a plain drop adds an image layer).", () => this.refInput.click()));
         layersHead.appendChild(miniButton("fx", "Add a filter layer (grain, sharpen, levels, LUT, vignette). It filters everything below it; give it a mask to limit where it applies.", () => this.addFilterLayer()));
@@ -1167,6 +1189,7 @@ class InpaintEditor {
             for (const [key, label] of [["top", "Top"], ["right", "Right"], ["bottom", "Bottom"], ["left", "Left"]]) {
                 grid.appendChild(el("span", null, label));
                 this.extendInputs[key] = numberInput(0, 0, 8192, `Pixels to add at the ${key}`, 64);
+                this.extendInputs[key].addEventListener("input", () => this.draw());
                 grid.appendChild(this.extendInputs[key]);
             }
             sec.appendChild(grid);
@@ -1176,7 +1199,7 @@ class InpaintEditor {
             this.extendFillSel.addEventListener("change", () => { this.cropSettings.extendFill = this.extendFillSel.value; this.notifyChanged(); });
             fillLab.appendChild(this.extendFillSel);
             sec.appendChild(fillLab);
-            const ext = iconButton("extend", "Extend the canvas (outpainting). The new border becomes the selection.", () => this.extendCanvas(), "Extend canvas");
+            const ext = iconButton("extend", "Extend the canvas (outpainting) by the pixels above; the canvas tool (C) sets them by dragging the frame. The new border becomes the selection.", () => this.extendCanvas(), "Extend canvas");
             ext.classList.add("ipc-small");
             sec.appendChild(ext);
             this.canvasInfo = el("span", null, "");
@@ -1457,7 +1480,7 @@ class InpaintEditor {
         this.angleInput.parentElement.hidden = mode !== "rotate";
         if (this.pending && this.pending.mode === "rotate") this.angleInput.value = Math.round(this.pending.angle * 180 / Math.PI);
         const active = this.activeLayer();
-        this.subHint.textContent = !active ? "Select a layer first" : (pending ? "Enter applies, Esc cancels" : (mode === "scale" ? "Arrow keys nudge" : "Click a mode to start"));
+        this.subHint.textContent = !active ? "Select a layer first" : (pending ? (mode === "rotate" ? "Drag outside to rotate (Shift snaps), handles scale, inside moves. Enter applies, Esc cancels" : "Enter applies, Esc cancels") : (mode === "scale" ? "Drag outside a corner to rotate, arrow keys nudge" : "Click a mode to start"));
     }
 
     setTransformMode(mode) {
@@ -1543,7 +1566,21 @@ class InpaintEditor {
     pendingPointerDown(ix, iy, e) {
         const p = this.pending;
         if (p.mode === "rotate") {
-            const cx = p.layer.x + p.layer.w / 2, cy = p.layer.y + p.layer.h / 2;
+            const l = p.layer;
+            const cx = l.x + l.w / 2, cy = l.y + l.h / 2;
+            const [lx, ly] = this.toLayerLocal(l, p.angle, ix, iy);
+            const handle = this.handleAt(lx, ly);
+            if (handle) {
+                // scale in the un-rotated frame; the corner opposite the handle stays put on screen
+                this.pushUndo({ kind: "transform", id: l.id });
+                this.pointer = { kind: "scale", layer: l, handle, start: [lx, ly], orig: { x: l.x, y: l.y, w: l.w, h: l.h }, keepAspect: handle.length === 2 && !e.shiftKey, angle: p.angle, center: [cx, cy] };
+                return;
+            }
+            if (lx >= l.x && lx <= l.x + l.w && ly >= l.y && ly <= l.y + l.h) {
+                this.pushUndo({ kind: "transform", id: l.id });
+                this.pointer = { kind: "move", layer: l, start: [ix, iy], orig: { x: l.x, y: l.y } };
+                return;
+            }
             this.pointer = { kind: "pending", start: Math.atan2(iy - cy, ix - cx), startAngle: p.angle, snap: e.shiftKey };
             return;
         }
@@ -1636,6 +1673,7 @@ class InpaintEditor {
                 e.stopImmediatePropagation(); e.preventDefault();
                 if (this.pending) this.cancelPending();
                 else if (this.polyPoints) { this.polyPoints = null; this.draw(); this.setStatus("Polygon cancelled."); }
+                else if (this.tool === "canvas" && this.extendPending()) { this.resetExtend(); this.setStatus("Canvas extension reset."); }
                 else this.close();
                 return;
             }
@@ -1647,6 +1685,7 @@ class InpaintEditor {
         this.promptInput.value = this.promptText;
         this.refreshSegmentBackends();
         this.syncRefControls();
+        loadFontList().then(() => { if (this.isOpen && this.layers.some((l) => l.kind === "text")) this.renderLayers(); }).catch(() => {});
         this.root.focus({ preventScroll: true });
         this.resizeCanvas();
         this.fitView();
@@ -1747,7 +1786,9 @@ class InpaintEditor {
         for (const [id, b] of Object.entries(this.toolButtons)) b.classList.toggle("ipc-active", id === tool);
         this.viewEl.classList.toggle("ipc-pan", tool === "hand");
         this.viewEl.classList.toggle("ipc-move", tool === "transform");
-        if (tool !== "transform") this.viewEl.classList.remove("ipc-scale", "ipc-scale-x", "ipc-scale-y", "ipc-rotate");
+        if (tool !== "transform" && tool !== "canvas") this.viewEl.classList.remove(...CURSOR_CLASSES);
+        if (tool === "canvas") this.setStatus("Drag the frame's edges or corners outward to extend the canvas (8 px steps, Alt for single pixels). Enter or \"Extend canvas\" applies, Esc resets.");
+        if (tool === "text") this.setStatus("Click on the canvas to add a text layer; click a text layer to select it, drag to move it.");
         if (tool !== "object") { this.hoverObjectId = 0; this.hoverObjectCanvas = null; }
         else this.ensureObjects();
         this.updateSubbar();
@@ -1760,6 +1801,7 @@ class InpaintEditor {
         if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); this.generate(); return; }
         if (e.key === "Enter" && this.pending) { e.preventDefault(); this.applyPending(); return; }
         if (e.key === "Enter" && this.polyPoints) { e.preventDefault(); this.closePolygon(); this.draw(); return; }
+        if (e.key === "Enter" && this.tool === "canvas") { e.preventDefault(); if (this.extendPending()) this.extendCanvas(); else this.setStatus("Drag the frame outward first."); return; }
         if ((e.key === "Backspace" || e.key === "Delete") && this.polyPoints) { e.preventDefault(); this.polyPoints.pop(); if (!this.polyPoints.length) this.polyPoints = null; this.draw(); return; }
         if (this.tool === "transform" && !this.pending && e.key.startsWith("Arrow")) {
             const l = this.activeLayer();
@@ -1787,6 +1829,7 @@ class InpaintEditor {
         if (e.ctrlKey || e.metaKey || e.altKey) return;
         if (e.shiftKey && k === "f") { this.fillSelection(); return; }
         if (e.shiftKey && k === "l") { this.setTool("polygon"); return; }
+        if (e.shiftKey && k === "t") { this.setTool("text"); return; }
         switch (k) {
             case "b": this.setTool("select"); break;
             case "r": this.setTool("rect"); break;
@@ -1797,6 +1840,7 @@ class InpaintEditor {
             case "e": this.setTool("erase"); break;
             case "t": this.setTool("transform"); break;
             case "h": this.setTool("hand"); break;
+            case "c": this.setTool("canvas"); break;
             case "f": this.fitView(); break;
             case "delete": case "backspace": {
                 // with a selection: clear the selected pixels of the active layer (Krita / Photoshop); without: delete the layer
@@ -1974,12 +2018,86 @@ class InpaintEditor {
 
     updateTransformCursor(ix, iy) {
         const cls = this.viewEl.classList;
-        cls.remove("ipc-scale", "ipc-scale-x", "ipc-scale-y", "ipc-rotate");
-        if (this.pending) { if (this.pending.mode === "rotate") cls.add("ipc-rotate"); return; }
-        const h = this.handleAt(ix, iy);
-        if (h === "n" || h === "s") cls.add("ipc-scale-y");
+        cls.remove(...CURSOR_CLASSES);
+        const l = this.activeLayer();
+        if (!l) return;
+        let h = null, rot = false;
+        if (this.pending) {
+            if (this.pending.mode !== "rotate") return;
+            const [lx, ly] = this.toLayerLocal(l, this.pending.angle, ix, iy);
+            h = this.handleAt(lx, ly);
+            rot = !h && (lx < l.x || lx > l.x + l.w || ly < l.y || ly > l.y + l.h);
+        } else {
+            h = this.handleAt(ix, iy);
+            rot = !h && this.rotateZoneAt(l, ix, iy);
+        }
+        this.setHandleCursor(h, rot);
+    }
+
+    setHandleCursor(h, rot = false) {
+        const cls = this.viewEl.classList;
+        cls.remove(...CURSOR_CLASSES);
+        if (rot) cls.add("ipc-rotate");
+        else if (h === "n" || h === "s") cls.add("ipc-scale-y");
         else if (h === "e" || h === "w") cls.add("ipc-scale-x");
+        else if (h === "ne" || h === "sw") cls.add("ipc-scale-ne");
         else if (h) cls.add("ipc-scale");
+    }
+
+    updateCanvasCursor(ix, iy) {
+        this.setHandleCursor(this.canvasHandleAt(ix, iy));
+    }
+
+    /** (ix, iy) in a layer's un-rotated frame: the inverse rotation about its centre (or a given one). */
+    toLayerLocal(l, angle, ix, iy, center = null) {
+        const cx = center ? center[0] : l.x + l.w / 2, cy = center ? center[1] : l.y + l.h / 2;
+        const c = Math.cos(-angle), s = Math.sin(-angle);
+        const dx = ix - cx, dy = iy - cy;
+        return [cx + dx * c - dy * s, cy + dx * s + dy * c];
+    }
+
+    /** Just outside the layer frame near a corner: the rotate zone, as in Krita and Photoshop. */
+    rotateZoneAt(l, ix, iy) {
+        const r = HANDLE_PX / this.view.scale;
+        const outside = ix < l.x - r || ix > l.x + l.w + r || iy < l.y - r || iy > l.y + l.h + r;
+        if (!outside) return false;
+        const reach = 5 * r;
+        return [[l.x, l.y], [l.x + l.w, l.y], [l.x, l.y + l.h], [l.x + l.w, l.y + l.h]].some(([cx, cy]) => Math.hypot(ix - cx, iy - cy) <= reach);
+    }
+
+    // ---- canvas tool: extend by dragging the frame ---------------------------------
+
+    extendValues() {
+        const v = {};
+        for (const k of ["top", "right", "bottom", "left"]) v[k] = Math.max(0, Math.round(+(this.extendInputs && this.extendInputs[k] ? this.extendInputs[k].value : 0) || 0));
+        return v;
+    }
+
+    extendPending() {
+        const v = this.extendValues();
+        return !!(v.top || v.right || v.bottom || v.left);
+    }
+
+    resetExtend() {
+        if (this.extendInputs) for (const k of Object.keys(this.extendInputs)) this.extendInputs[k].value = 0;
+        this.draw();
+    }
+
+    /** The planned canvas rectangle in image coordinates (the current canvas is 0,0 .. width,height). */
+    extendRect() {
+        const v = this.extendValues();
+        return { x: -v.left, y: -v.top, w: this.width + v.left + v.right, h: this.height + v.top + v.bottom };
+    }
+
+    canvasHandleAt(ix, iy) {
+        if (!this.width) return null;
+        const r = HANDLE_PX / this.view.scale;
+        const handles = this.layerHandles(this.extendRect());
+        for (const name of ["nw", "ne", "sw", "se", "n", "s", "w", "e"]) {
+            const [cx, cy] = handles[name];
+            if (Math.abs(ix - cx) <= r && Math.abs(iy - cy) <= r) return name;
+        }
+        return null;
     }
 
     // ---- pointer gestures --------------------------------------------------
@@ -2051,6 +2169,13 @@ class InpaintEditor {
             if (layer.kind === "filter") { this.setStatus("Filter layers cover the whole canvas and cannot be transformed."); return; }
             if (this.pending) { this.pendingPointerDown(ix, iy, e); this.draw(); return; }
             const handle = this.handleAt(ix, iy);
+            if (!handle && this.rotateZoneAt(layer, ix, iy)) {
+                // just outside a corner: start rotating right away; the rotation stays pending until Enter
+                this.startPending("rotate");
+                if (this.pending) this.pendingPointerDown(ix, iy, e);
+                this.draw();
+                return;
+            }
             this.pushUndo({ kind: "transform", id: layer.id });
             if (handle) {
                 const corner = handle.length === 2;
@@ -2058,6 +2183,20 @@ class InpaintEditor {
             } else {
                 this.pointer = { kind: "move", layer, start: [ix, iy], orig: { x: layer.x, y: layer.y } };
             }
+        } else if (this.tool === "text") {
+            const hit = [...this.layers].reverse().find((l) => l.kind === "text" && l.visible && ix >= l.x && ix <= l.x + l.w && iy >= l.y && iy <= l.y + l.h);
+            if (hit) {
+                this.activeLayerId = hit.id;
+                this.renderLayers();
+                this.pushUndo({ kind: "transform", id: hit.id });
+                this.pointer = { kind: "move", layer: hit, start: [ix, iy], orig: { x: hit.x, y: hit.y } };
+            } else {
+                this.addTextLayer(ix, iy);
+            }
+        } else if (this.tool === "canvas") {
+            const handle = this.canvasHandleAt(ix, iy);
+            if (!handle) { this.setStatus("Drag an edge or corner of the canvas frame outward to extend it. Enter applies."); return; }
+            this.pointer = { kind: "canvasext", handle, start: [ix, iy], orig: this.extendValues() };
         }
         this.draw();
     }
@@ -2069,6 +2208,7 @@ class InpaintEditor {
         const p = this.pointer;
         if (!p) {
             if (this.tool === "transform") this.updateTransformCursor(ix, iy);
+            if (this.tool === "canvas") this.updateCanvasCursor(ix, iy);
             if (this.tool === "object") this.updateObjectHover(ix, iy);
             this.draw();
             return;
@@ -2100,7 +2240,27 @@ class InpaintEditor {
             p.layer.x = Math.round(p.orig.x + (ix - p.start[0]));
             p.layer.y = Math.round(p.orig.y + (iy - p.start[1]));
         } else if (p.kind === "scale") {
-            this.applyScale(p, ix, iy);
+            if (p.angle) {
+                const [lx, ly] = this.toLayerLocal(p.layer, p.angle, ix, iy, p.center);
+                this.applyScale(p, lx, ly);
+                // the rotation is about the layer's centre, which just moved: shift so the anchor corner stays put on screen
+                const l = p.layer, dx = l.x + l.w / 2 - p.center[0], dy = l.y + l.h / 2 - p.center[1];
+                const c = Math.cos(p.angle), s = Math.sin(p.angle);
+                l.x = Math.round(l.x + (c * dx - s * dy) - dx);
+                l.y = Math.round(l.y + (s * dx + c * dy) - dy);
+            } else {
+                this.applyScale(p, ix, iy);
+            }
+        } else if (p.kind === "canvasext") {
+            const dx = ix - p.start[0], dy = iy - p.start[1], step = e.altKey ? 1 : 8;
+            const q = (v) => Math.max(0, Math.round(v / step) * step);
+            const h = p.handle, o = p.orig;
+            if (h.includes("e")) this.extendInputs.right.value = q(o.right + dx);
+            if (h.includes("w")) this.extendInputs.left.value = q(o.left - dx);
+            if (h.includes("n")) this.extendInputs.top.value = q(o.top - dy);
+            if (h.includes("s")) this.extendInputs.bottom.value = q(o.bottom + dy);
+            const R = this.extendRect();
+            this.setStatus(`Canvas ${this.width} × ${this.height} → ${R.w} × ${R.h}. Enter or "Extend canvas" applies, Esc resets.`);
         } else if (p.kind === "pending") {
             this.pendingPointerMove(ix, iy, e);
         }
@@ -2978,6 +3138,7 @@ class InpaintEditor {
         if (step.kind === "mask") return { kind: "mask", id: layer.id, url: layer.mask ? layer.mask.toDataURL("image/png") : null, mw: layer.mask ? layer.mask.width : 0, mh: layer.mask ? layer.mask.height : 0 };
         if (step.kind === "match") return { kind: "match", id: layer.id, match: { ...(layer.match || { strength: 0, source: "surroundings" }) } };
         if (step.kind === "filter") return { kind: "filter", id: layer.id, filter: layer.filter, params: { ...(layer.params || {}) }, lut: layer.lut ? { ...layer.lut } : null, lutData: layer._lutData || null, plate: layer.plate ? { ...layer.plate } : null, plateImg: layer._plateImg || null, name: layer.name };
+        if (step.kind === "text") return { kind: "text", id: layer.id, text: JSON.parse(JSON.stringify(layer.text || TEXT_DEFAULTS)), url: layer.canvas.toDataURL("image/png"), cw: layer.canvas.width, ch: layer.canvas.height, x: layer.x, y: layer.y, w: layer.w, h: layer.h };
         if (step.kind === "layerfull") return { kind: "layerfull", id: layer.id, url: layer.canvas.toDataURL("image/png"), cw: layer.canvas.width, ch: layer.canvas.height, x: layer.x, y: layer.y, w: layer.w, h: layer.h,
             mask: layer.mask ? layer.mask.toDataURL("image/png") : null, mw: layer.mask ? layer.mask.width : 0, mh: layer.mask ? layer.mask.height : 0 };
         return null;
@@ -3038,6 +3199,14 @@ class InpaintEditor {
                 layer.mask = snap.url ? imageToCanvas(await loadImageEl(snap.url), snap.mw, snap.mh) : null;
                 if (!layer.mask) layer.maskEdit = false;
                 this.markMaskChanged(layer);
+                this.renderLayers();
+            } else if (snap.kind === "text") {
+                const img = await loadImageEl(snap.url);
+                layer.canvas = imageToCanvas(img, snap.cw, snap.ch);
+                Object.assign(layer, { x: snap.x, y: snap.y, w: snap.w, h: snap.h });
+                layer.text = JSON.parse(JSON.stringify(snap.text));
+                layer._maskedValid = false;
+                this.markLayerChanged(layer);
                 this.renderLayers();
             } else if (snap.kind === "layerfull") {
                 const img = await loadImageEl(snap.url);
@@ -3480,6 +3649,170 @@ class InpaintEditor {
         }
     }
 
+    // ---- text layers -------------------------------------------------------------------
+
+    /** Add a text layer with its top left at (ix, iy) and focus its text field. */
+    async addTextLayer(ix, iy) {
+        if (!this.width) { this.setStatus("Load an image first."); return null; }
+        this.textCounter = (this.textCounter || 0) + 1;
+        const t = { ...TEXT_DEFAULTS, ...(this.textDefaults || {}) };
+        if (!this.textDefaults) t.size = Math.max(12, Math.round(Math.min(this.width, this.height) / 12));
+        t.color = this.color;
+        const layer = this.addLayer({ name: "Text " + this.textCounter, kind: "text", ref: null, text: t, canvas: makeCanvas(1, 1), x: Math.round(ix), y: Math.round(iy), w: 1, h: 1, dirty: true });
+        await loadFontList();
+        await this.renderTextLayer(layer, { keepScale: false });
+        this.renderLayers();
+        const ta = this.layerList.querySelector(`[data-layer="${layer.id}"] textarea`);
+        if (ta) { ta.focus(); ta.select(); }
+        this.setStatus(`${layer.name} added. Type in the layer panel; move it with the text tool or T, scale and rotate with T.`);
+        return layer;
+    }
+
+    /** Render a text layer's description into its pixels, keeping the scale the user gave it. */
+    async renderTextLayer(layer, { keepScale = true } = {}) {
+        if (!layer || layer.kind !== "text" || !layer.text) return;
+        const token = (layer._textToken = (layer._textToken || 0) + 1);
+        const { canvas, res, missing } = await renderText(layer.text);
+        if (layer._textToken !== token || !this.layers.includes(layer)) return;
+        const oldRes = (layer.text && layer.text.res) || 2;
+        const k = keepScale && layer.canvas && layer.canvas.width > 1 ? layer.w / (layer.canvas.width / oldRes) : 1;
+        layer.canvas = canvas;
+        layer.text.res = res;
+        layer.w = Math.max(1, Math.round(canvas.width / res * k));
+        layer.h = Math.max(1, Math.round(canvas.height / res * k));
+        layer._maskedValid = false;
+        this.textDefaults = { ...layer.text, content: TEXT_DEFAULTS.content };
+        if (missing) this.setStatus(`Font "${layer.text.font}" is not available here; a fallback was used.`);
+        this.markLayerChanged(layer);
+        this.draw();
+    }
+
+    scheduleTextRender(layer) {
+        clearTimeout(layer._textTimer);
+        layer._textTimer = setTimeout(() => this.renderTextLayer(layer), 120);
+    }
+
+    fillFontSelect(sel, value) {
+        sel.innerHTML = "";
+        const list = fontList();
+        const groups = new Map();
+        for (const f of list) { if (!groups.has(f.category)) groups.set(f.category, []); groups.get(f.category).push(f); }
+        for (const [cat, fonts] of groups) {
+            const g = document.createElement("optgroup");
+            g.label = FONT_CATEGORIES[cat] || cat;
+            for (const f of fonts) { const o = document.createElement("option"); o.value = f.family; o.textContent = f.family; g.appendChild(o); }
+            sel.appendChild(g);
+        }
+        if (value && !list.some((f) => f.family === value)) { const o = document.createElement("option"); o.value = value; o.textContent = value + " (missing)"; sel.appendChild(o); }
+        sel.value = value || (list[0] && list[0].family) || "";
+    }
+
+    /** The controls of a text layer row: text, font, size, colour, style, alignment, spacing, outline. */
+    buildTextControls(layer) {
+        const t = layer.text;
+        const box = el("div", "ipc-text");
+        const stop = (e) => e.stopPropagation();
+        const begin = () => { if (!layer._textUndo) layer._textUndo = this.snapshot({ kind: "text", id: layer.id }); };
+        const commit = () => { if (layer._textUndo) { this.pushUndoSnapshot(layer._textUndo); layer._textUndo = null; } };
+        const change = (fn) => { this.pushUndo({ kind: "text", id: layer.id }); fn(); this.renderTextLayer(layer); };
+
+        const ta = document.createElement("textarea");
+        ta.value = t.content;
+        ta.title = "The text; Enter starts a new line, Esc leaves the field";
+        ta.addEventListener("click", stop);
+        ta.addEventListener("pointerdown", stop);
+        ta.addEventListener("keydown", (e) => { e.stopPropagation(); if (e.key === "Escape") { ta.blur(); this.root.focus({ preventScroll: true }); } });
+        ta.addEventListener("focus", begin);
+        ta.addEventListener("input", () => { t.content = ta.value; this.scheduleTextRender(layer); });
+        ta.addEventListener("change", commit);
+        box.appendChild(ta);
+
+        const fontRow = el("div", "ipc-row");
+        const fontSel = document.createElement("select");
+        fontSel.className = "ipc-sel";
+        fontSel.title = "Font. The bundled fonts are open source (OFL / Apache, see js/fonts/licenses); + adds your own .ttf / .otf / .woff, stored in input/inpaint_canvas/fonts.";
+        this.fillFontSelect(fontSel, t.font);
+        fontSel.addEventListener("click", stop);
+        fontSel.addEventListener("keydown", stop);
+        fontSel.addEventListener("change", () => change(() => { t.font = fontSel.value; const f = fontList().find((x) => x.family === t.font); t.fontRef = f && f.ref ? f.ref : null; }));
+        fontRow.appendChild(fontSel);
+        fontRow.appendChild(miniButton("plus", "Add a font file (.ttf, .otf, .woff, .woff2). Uploaded to input/inpaint_canvas/fonts and available from then on.", () => { this.fontTarget = layer; this.fontInput.click(); }));
+        box.appendChild(fontRow);
+
+        const r1 = el("div", "ipc-row");
+        r1.appendChild(el("span", null, "Size"));
+        const size = numberInput(t.size, 1, 4096, "Font size in image pixels", 52);
+        size.addEventListener("change", () => change(() => { t.size = Math.max(1, +size.value || 1); }));
+        r1.appendChild(size);
+        const col = document.createElement("input");
+        col.type = "color"; col.value = t.color; col.title = "Text colour";
+        col.addEventListener("click", stop);
+        col.addEventListener("focus", begin);
+        col.addEventListener("input", () => { t.color = col.value; this.scheduleTextRender(layer); });
+        col.addEventListener("change", commit);
+        r1.appendChild(col);
+        const bold = miniButton("bold", "Bold", () => change(() => { t.bold = !t.bold; }), t.bold ? "ipc-on" : "");
+        const ital = miniButton("italic", "Italic", () => change(() => { t.italic = !t.italic; }), t.italic ? "ipc-on" : "");
+        r1.appendChild(bold); r1.appendChild(ital);
+        const align = selectInput(["left", "center", "right"], t.align || "left", "Alignment of several lines");
+        align.addEventListener("change", () => change(() => { t.align = align.value; }));
+        r1.appendChild(align);
+        box.appendChild(r1);
+
+        const r2 = el("div", "ipc-row");
+        r2.appendChild(el("span", null, "Line"));
+        const lh = numberInput(t.lineHeight, 0.5, 4, "Line height as a multiple of the size", 52);
+        lh.step = 0.05;
+        lh.addEventListener("change", () => change(() => { t.lineHeight = Math.min(4, Math.max(0.5, +lh.value || 1.2)); }));
+        r2.appendChild(lh);
+        r2.appendChild(el("span", null, "Spacing"));
+        const ls = numberInput(t.letterSpacing, -50, 200, "Letter spacing in image pixels", 52);
+        ls.addEventListener("change", () => change(() => { t.letterSpacing = +ls.value || 0; }));
+        r2.appendChild(ls);
+        r2.appendChild(el("span", null, "Outline"));
+        const ow = numberInput(t.outline, 0, 200, "Outline width in image pixels (0 = none)", 48);
+        ow.addEventListener("change", () => change(() => { t.outline = Math.max(0, +ow.value || 0); }));
+        r2.appendChild(ow);
+        const ocol = document.createElement("input");
+        ocol.type = "color"; ocol.value = t.outlineColor || "#000000"; ocol.title = "Outline colour";
+        ocol.addEventListener("click", stop);
+        ocol.addEventListener("focus", begin);
+        ocol.addEventListener("input", () => { t.outlineColor = ocol.value; this.scheduleTextRender(layer); });
+        ocol.addEventListener("change", commit);
+        r2.appendChild(ocol);
+        box.appendChild(r2);
+        return box;
+    }
+
+    /** Upload font files to input/inpaint_canvas/fonts and use the first one on the layer the + came from. */
+    async addFontFiles(files) {
+        files = Array.from(files || []).filter((f) => f && /\.(ttf|otf|woff2?)$/i.test(f.name || ""));
+        if (!files.length) { this.setStatus("Font files only (.ttf, .otf, .woff, .woff2)."); return; }
+        let first = null;
+        for (const file of files) {
+            try {
+                const name = (file.name || "font.ttf").replace(/[^a-z0-9._ \-\[\],]/gi, "_");
+                const ref = await uploadBlob(file, name, { overwrite: true, subfolder: SUBFOLDER + "/fonts" });
+                const entry = addUserFont(ref);
+                if (!first) first = entry;
+            } catch (err) {
+                console.error(err);
+                this.setStatus(String(err.message || err));
+            }
+        }
+        if (!first) return;
+        const target = this.fontTarget && this.layers.includes(this.fontTarget) ? this.fontTarget : null;
+        this.fontTarget = null;
+        if (target && target.kind === "text") {
+            this.pushUndo({ kind: "text", id: target.id });
+            target.text.font = first.family;
+            target.text.fontRef = first.ref;
+            await this.renderTextLayer(target);
+        }
+        this.renderLayers();
+        this.setStatus(`${files.length} font${files.length > 1 ? "s" : ""} added (${first.family}). Stored in input/inpaint_canvas/fonts.`);
+    }
+
     // ---- file cleanup ---------------------------------------------------------------
 
     /** File names every open editor and every open workflow tab still reference. */
@@ -3811,6 +4144,7 @@ class InpaintEditor {
         for (let i = this.layers.length - 1; i >= 0; i--) {
             const layer = this.layers[i];
             const row = el("div", "ipc-layer" + (layer.id === this.activeLayerId ? " ipc-selected" : ""));
+            row.dataset.layer = layer.id;
             row.addEventListener("click", () => { if (this.pending) this.cancelPending(); this.activeLayerId = layer.id; this.renderLayers(); this.updateSubbar(); this.draw(); });
             const top = el("div", "ipc-row");
             top.appendChild(miniButton(layer.visible ? "eye" : "eyeOff", "Toggle visibility", () => {
@@ -3825,7 +4159,26 @@ class InpaintEditor {
             const refIndex = this.isReference(layer) ? this.referenceLayers().indexOf(layer) : -1;
             const isFx = layer.kind === "filter";
             const kindText = isFx ? "filter" : (this.isControl(layer) ? layer.role : (this.isReference(layer) ? (refIndex >= 0 ? `ref ${refIndex + 1}` : "ref (hidden)") : layer.kind));
-            top.appendChild(el("span", "ipc-kind" + (isFx ? " ipc-fxk" : (this.isControl(layer) ? " ipc-ctrl" : (this.isReference(layer) ? " ipc-ref" : ""))), kindText));
+            if (isFx || this.isControl(layer)) {
+                top.appendChild(el("span", "ipc-kind" + (isFx ? " ipc-fxk" : " ipc-ctrl"), kindText));
+            } else {
+                // image / result / paint / text layers switch between "part of the image" and "reference" right here
+                const ks = document.createElement("select");
+                ks.className = "ipc-kindsel" + (this.isReference(layer) ? " ipc-ref" : "");
+                ks.title = "Part of the image, or a reference: not in the image, sent along with crop_image as an extra batch image (Flux.2 / Kontext multi-reference)";
+                for (const [v, label] of [[layer.kind, layer.kind], ["reference", this.isReference(layer) ? kindText : "reference"]]) { const o = document.createElement("option"); o.value = v; o.textContent = label; ks.appendChild(o); }
+                ks.value = this.isReference(layer) ? "reference" : layer.kind;
+                ks.addEventListener("click", (e) => e.stopPropagation());
+                ks.addEventListener("keydown", (e) => e.stopPropagation());
+                ks.addEventListener("change", () => {
+                    layer.role = ks.value === "reference" ? "reference" : "none";
+                    layer.exportRef = null;
+                    this.uploaded.baseHash = null;
+                    this.uploaded.controlHash = null;
+                    this.renderLayers(); this.renderInfo(); this.draw(); this.drawThumb(); this.notifyChanged();
+                });
+                top.appendChild(ks);
+            }
             const up = miniButton("up", "Move layer up", () => this.moveLayer(layer.id, +1));
             up.disabled = i === this.layers.length - 1;
             top.appendChild(up);
@@ -3856,6 +4209,7 @@ class InpaintEditor {
             row.appendChild(opRow);
 
             if (isFx) row.appendChild(this.buildFilterControls(layer));
+            if (layer.kind === "text") row.appendChild(this.buildTextControls(layer));
             if (!isFx) {
                 // colour match against the composite below, non-destructive
                 const mRow = el("div", "ipc-op");
@@ -4519,12 +4873,13 @@ class InpaintEditor {
             const r = HANDLE_PX / s / 2;
             if (pend.mode === "rotate") {
                 const l = pend.layer;
-                const corners = [[0, 0], [1, 0], [1, 1], [0, 1]].map(([u, v]) => this.pendingDst(pend, u, v));
-                ctx.beginPath();
-                corners.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
-                ctx.closePath();
-                ctx.stroke();
                 const cx = l.x + l.w / 2, cy = l.y + l.h / 2;
+                ctx.translate(cx, cy); ctx.rotate(pend.angle); ctx.translate(-cx, -cy);
+                ctx.strokeRect(l.x, l.y, l.w, l.h);
+                const handles = this.layerHandles(l);
+                for (const name of ["nw", "ne", "sw", "se"]) { const [hx, hy] = handles[name]; ctx.fillRect(hx - r, hy - r, r * 2, r * 2); }
+                ctx.fillStyle = "#1e1e1e";
+                for (const name of ["n", "s", "w", "e"]) { const [hx, hy] = handles[name]; ctx.beginPath(); ctx.arc(hx, hy, r, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); }
                 ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke();
             } else if (pend.mode === "distort") {
                 ctx.beginPath();
@@ -4555,6 +4910,37 @@ class InpaintEditor {
                 ctx.fillStyle = "#1e1e1e";
                 for (const name of ["n", "s", "w", "e"]) { const [cx, cy] = handles[name]; ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); }
             }
+            ctx.restore();
+        }
+
+        if (this.tool === "canvas" && this.width) {
+            const R = this.extendRect();
+            const v = this.extendValues();
+            ctx.save();
+            if (R.w !== this.width || R.h !== this.height) {
+                ctx.fillStyle = "rgba(124,199,255,0.18)";
+                ctx.beginPath(); ctx.rect(R.x, R.y, R.w, R.h); ctx.rect(0, 0, this.width, this.height); ctx.fill("evenodd");
+            }
+            ctx.lineWidth = 1 / s;
+            ctx.strokeStyle = "#7cc7ff";
+            ctx.setLineDash([6 / s, 4 / s]);
+            ctx.strokeRect(R.x, R.y, R.w, R.h);
+            ctx.setLineDash([]);
+            const r = HANDLE_PX / s / 2;
+            const handles = this.layerHandles(R);
+            ctx.fillStyle = "#7cc7ff";
+            for (const name of ["nw", "ne", "sw", "se"]) { const [hx, hy] = handles[name]; ctx.fillRect(hx - r, hy - r, r * 2, r * 2); }
+            ctx.fillStyle = "#1e1e1e";
+            for (const name of ["n", "s", "w", "e"]) { const [hx, hy] = handles[name]; ctx.beginPath(); ctx.arc(hx, hy, r, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); }
+            ctx.font = `${12 / s}px system-ui, sans-serif`;
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            const label = (txt, x, y) => { const w = ctx.measureText(txt).width + 10 / s; ctx.fillStyle = "rgba(0,0,0,0.65)"; ctx.fillRect(x - w / 2, y - 8 / s, w, 16 / s); ctx.fillStyle = "#fff"; ctx.fillText(txt, x, y); };
+            if (v.top) label(`+${v.top}`, this.width / 2, -v.top / 2);
+            if (v.bottom) label(`+${v.bottom}`, this.width / 2, this.height + v.bottom / 2);
+            if (v.left) label(`+${v.left}`, -v.left / 2, this.height / 2);
+            if (v.right) label(`+${v.right}`, this.width + v.right / 2, this.height / 2);
+            label(`${R.w} × ${R.h}`, R.x + R.w / 2, R.y - 14 / s);
             ctx.restore();
         }
 
@@ -4793,6 +5179,7 @@ class InpaintEditor {
                 x: l.x, y: l.y, w: l.w, h: l.h, opacity: l.opacity, visible: l.visible, mask: l.maskRef || null,
                 ...(l.match && l.match.strength > 0 ? { match: l.match } : {}),
                 ...(l.kind === "filter" ? { filter: l.filter, params: l.params, lut: l.lut || null, plate: l.plate || null } : {}),
+                ...(l.kind === "text" && l.text ? { text: l.text } : {}),
             })),
             history: this.history.slice(-100).map((h) => ({ key: h.key, name: h.name, ref: h.ref, x: h.x, y: h.y, w: h.w, h: h.h, prompt: h.prompt, layerId: h.layerId, time: h.time, seed: h.seed, mode: h.mode, denoise: h.denoise })),
             selection: this.selectionDataUrl,
@@ -4836,6 +5223,7 @@ class InpaintEditor {
             this.syncRefControls();
             this.syncGenControls();
             this.renderSettings();
+            const textToRender = [];
             for (const l of state.layers || []) {
                 if (l.kind === "filter") {
                     try {
@@ -4869,6 +5257,14 @@ class InpaintEditor {
                     }
                     continue;
                 }
+                if (l.kind === "text" && l.text && !l.ref) {
+                    // never uploaded (editor closed without sync): render it again from its description
+                    const layer = { id: l.id, name: l.name, kind: "text", role: l.role || "none", blend: l.blend || "normal", ref: null, canvas: makeCanvas(1, 1), x: l.x, y: l.y, w: 1, h: 1, opacity: l.opacity ?? 1, visible: l.visible !== false, dirty: true, mask: null, maskRef: null, maskDirty: false, maskEdit: false, match: { strength: 0, source: "surroundings" }, text: { ...TEXT_DEFAULTS, ...l.text } };
+                    this.layers.push(layer);
+                    this.textCounter = (this.textCounter || 0) + 1;
+                    textToRender.push(layer);
+                    continue;
+                }
                 if (!l.ref) continue;
                 try {
                     const limg = await loadImageEl(viewUrl(l.ref));
@@ -4885,11 +5281,19 @@ class InpaintEditor {
                         x: l.x, y: l.y, w: l.w, h: l.h, opacity: l.opacity ?? 1, visible: l.visible !== false, dirty: false,
                         mask, maskRef: mask ? l.mask : null, maskDirty: false, maskEdit: false,
                         match: l.match && typeof l.match === "object" ? { strength: +l.match.strength || 0, source: l.match.source === "underneath" ? "underneath" : "surroundings" } : { strength: 0, source: "surroundings" },
+                        ...(l.kind === "text" && l.text ? { text: { ...TEXT_DEFAULTS, ...l.text } } : {}),
                     });
                     if (l.kind === "paint") this.paintCounter += 1;
+                    if (l.kind === "text") this.textCounter = (this.textCounter || 0) + 1;
                 } catch (err) {
                     console.warn("Inpaint Canvas: layer missing", l.ref, err);
                 }
+            }
+            if (textToRender.length) {
+                await loadFontList();
+                if (stale()) return;
+                for (const layer of textToRender) await this.renderTextLayer(layer, { keepScale: false });
+                if (stale()) return;
             }
             this.history = (state.history || []).map((h) => ({ ...h }));
             for (const key of state.seen || []) this.seenResults.add(key);
