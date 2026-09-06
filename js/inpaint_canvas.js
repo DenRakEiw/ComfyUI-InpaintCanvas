@@ -567,6 +567,9 @@ function objectBackendAvailable() {
 
 const ICONS = {
     text: '<path d="M5 5h14"/><path d="M12 5v14"/><path d="M9 19h6"/>',
+    smudge: '<path d="M8 21c-3 0-5-2-5-5v-6a2 2 0 014 0v3"/><path d="M7 13V5a2 2 0 014 0v7"/><path d="M11 12V7a2 2 0 014 0v5"/><path d="M15 12v-1a2 2 0 014 0v5c0 3-2 5-5 5H8"/>',
+    clone: '<path d="M5 21h14"/><path d="M4 17h16v-4H4z"/><path d="M9 13V7a3 3 0 016 0v6"/>',
+    heal: '<rect x="2" y="9" width="20" height="6" rx="3" transform="rotate(-45 12 12)"/><path d="M10 10l4 4"/><path d="M14 10l-4 4"/>',
     eyedropper: '<path d="M4 20l1-4 9-9 3 3-9 9z"/><path d="M14 7l3-3 3 3-3 3"/>',
     bucket: '<path d="M4 11l7-7 8 8-7 7z"/><path d="M4 11h11"/><path d="M19 14c0 2 1.5 3 1.5 4.5a1.5 1.5 0 01-3 0C17.5 17 19 16 19 14z" fill="currentColor" stroke="none"/>',
     gradient: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M8 4v16" stroke-dasharray="1 2"/><path d="M12 4v16" stroke-dasharray="2 2"/><path d="M16 4v16" stroke-dasharray="3 1"/>',
@@ -1059,6 +1062,9 @@ class InpaintEditor {
         tools.appendChild(el("div", "ipc-grp", "Layer"));
         addTool("paint", "Paint on the active layer (P). On the base it creates a paint layer.");
         addTool("erase", "Erase from the active layer (E)");
+        addTool("smudge", "Smudge (Shift+S): drag pixels along the stroke, like a finger in wet paint. Strength in the bar above the canvas; on the base it first makes a copy layer.");
+        addTool("clone", "Clone stamp (S): Alt+click sets the source, then paint to copy from there onto the active layer. Aligned keeps the offset between strokes; Sample chooses the visible image or the layer.");
+        addTool("heal", "Healing brush (J): like the clone stamp, but the copied texture takes on the colour and brightness of where it lands.");
         tools.appendChild(iconButton("fill", "Fill the selection with the color on the active layer (Shift+F)", () => this.fillSelection()));
         addTool("bucket", "Bucket fill (G): fills the connected area of similar colour under the cursor on the active layer, limited to the selection. Tolerance, contiguous and the sample source are in the bar above the canvas.");
         addTool("gradient", "Gradient (Shift+G): drag on the active layer to draw a gradient from the colour to transparent, white or black (linear or radial, bar above the canvas), limited to the selection.");
@@ -1516,6 +1522,20 @@ class InpaintEditor {
         const gto = selectInput(["transparent", "white", "black"], "transparent", "What the colour fades to");
         gto.addEventListener("change", () => { this.gradientOpts.to = gto.value; });
         row("gradient", "To", gto);
+        this.smudgeOpts = { strength: 60 };
+        this.cloneOpts = { sample: "image", aligned: true };
+        const str = document.createElement("input");
+        str.type = "range"; str.min = 1; str.max = 100; str.value = this.smudgeOpts.strength; str.title = "Strength: how much of the picked-up paint is dragged along";
+        const strVal = el("span", null, this.smudgeOpts.strength + "%");
+        str.addEventListener("input", () => { this.smudgeOpts.strength = +str.value; strVal.textContent = str.value + "%"; });
+        row("smudge", "Strength", str, strVal);
+        const csample = selectInput(["image", "layer"], "image", "Where the copied pixels come from: the visible image (all layers) or the active layer alone");
+        csample.addEventListener("change", () => { this.cloneOpts.sample = csample.value; });
+        row("clone heal", "Sample", csample);
+        const aligned = document.createElement("input");
+        aligned.type = "checkbox"; aligned.checked = true; aligned.title = "Aligned: the offset between source and brush stays the same for every stroke; off starts every stroke at the source point again";
+        aligned.addEventListener("change", () => { this.cloneOpts.aligned = aligned.checked; });
+        row("clone heal", aligned, "Aligned");
         this.optsHint = el("span", "ipc-hint", "");
         bar.appendChild(this.optsHint);
         for (const type of ["pointerdown", "pointermove", "pointerup", "wheel"]) bar.addEventListener(type, (e) => e.stopPropagation());
@@ -1525,11 +1545,12 @@ class InpaintEditor {
     updateOptsBar() {
         if (!this.optsBar) return;
         const tool = this.tool;
-        const on = tool === "bucket" || tool === "gradient" || tool === "eyedropper";
+        const on = ["bucket", "gradient", "eyedropper", "smudge", "clone", "heal"].includes(tool);
         this.optsBar.hidden = !on;
         if (!on) return;
         for (const lab of this.optsBar.querySelectorAll("label")) lab.hidden = !(lab.dataset.for || "").split(" ").includes(tool);
-        this.optsHint.textContent = tool === "bucket" ? "Click to fill; Shift+F fills the whole selection" : tool === "gradient" ? "Drag from the colour to where it should have faded" : "Click to pick a colour";
+        const hints = { bucket: "Click to fill; Shift+F fills the whole selection", gradient: "Drag from the colour to where it should have faded", eyedropper: "Click to pick a colour", smudge: "Drag across an edge to soften it", clone: this.cloneSource ? "Paint to copy from the source (Alt+click moves it)" : "Alt+click sets the source point", heal: this.cloneSource ? "Paint to repair with the source's texture (Alt+click moves it)" : "Alt+click sets the source point" };
+        this.optsHint.textContent = hints[tool] || "";
     }
 
     updateSubbar() {
@@ -1912,6 +1933,8 @@ class InpaintEditor {
             case "h": this.setTool("hand"); break;
             case "c": this.setTool("canvas"); break;
             case "i": this.setTool("eyedropper"); break;
+            case "s": this.setTool(e.shiftKey ? "smudge" : "clone"); break;
+            case "j": this.setTool("heal"); break;
             case "g": this.setTool(e.shiftKey ? "gradient" : "bucket"); break;
             case "f": this.fitView(); break;
             case "delete": case "backspace": {
@@ -2230,6 +2253,36 @@ class InpaintEditor {
         } else if (this.tool === "bucket") {
             this.bucketFill(ix, iy);
             return;
+        } else if (this.tool === "smudge") {
+            let layer = this.activeLayer();
+            if (layer && layer.locked) { this.setStatus(`${layer.name} is locked.`); return; }
+            if (layer && layer.kind === "filter") { this.setStatus("Filter layers have no pixels to smudge."); return; }
+            if (!layer) layer = this.baseCopyLayer();
+            this.pushUndo({ kind: "layer", id: layer.id });
+            this.pointer = { kind: "smudge", layer, last: [ix, iy], clip: this.strokeClip(layer, layer.canvas), pressure: e.pointerType === "pen" && e.pressure > 0 ? e.pressure : 1 };
+        } else if (this.tool === "clone" || this.tool === "heal") {
+            if (e.altKey) {
+                this.cloneSource = { x: ix, y: iy };
+                this.cloneOffset = null;
+                this.updateOptsBar();
+                this.setStatus("Source set. Paint to copy from there; Alt+click moves the source.");
+                this.draw();
+                return;
+            }
+            if (!this.cloneSource) { this.setStatus("Alt+click to set the source point first."); return; }
+            let layer = this.activeLayer();
+            if (layer && layer.locked) { this.setStatus(`${layer.name} is locked.`); return; }
+            if (layer && layer.kind === "filter") { this.setStatus("Filter layers have no pixels. Select a paint or image layer."); return; }
+            if (!layer) layer = this.addPaintLayer();
+            const o = this.cloneOpts || { sample: "image", aligned: true };
+            if (!o.aligned || !this.cloneOffset) this.cloneOffset = { x: this.cloneSource.x - ix, y: this.cloneSource.y - iy };
+            const sample = this.sampleCanvas(o.sample);
+            const heal = this.tool === "heal";
+            this.pushUndo({ kind: "layer", id: layer.id });
+            const stroke = makeCanvas(layer.canvas.width, layer.canvas.height);
+            this.pointer = { kind: "layerpaint", layer, stroke, clip: this.strokeClip(layer, layer.canvas), erase: false, last: [ix, iy], pressure: e.pointerType === "pen" && e.pressure > 0 ? e.pressure : 1,
+                clone: { sample, dest: heal ? (o.sample === "image" ? sample : this.flattenToCanvas()) : null, off: this.cloneOffset, heal } };
+            this.cloneDab(this.pointer, ix, iy, ix, iy);
         } else if (this.tool === "gradient") {
             let layer = this.activeLayer();
             if (layer && layer.locked) { this.setStatus(`${layer.name} is locked.`); return; }
@@ -2333,7 +2386,12 @@ class InpaintEditor {
         } else if (p.kind === "layerpaint" || p.kind === "maskpaint") {
             if (e.pointerType === "pen" && e.pressure > 0) p.pressure = e.pressure;
             if (p.grad) this.gradientDab(p, ix, iy);
+            else if (p.clone) this.cloneDab(p, p.last[0], p.last[1], ix, iy);
             else this.layerDab(p, p.last[0], p.last[1], ix, iy);
+            p.last = [ix, iy];
+        } else if (p.kind === "smudge") {
+            if (e.pointerType === "pen" && e.pressure > 0) p.pressure = e.pressure;
+            this.smudgeDab(p, p.last[0], p.last[1], ix, iy);
             p.last = [ix, iy];
         } else if (p.kind === "rect") {
             p.cur = [ix, iy];
@@ -2435,6 +2493,8 @@ class InpaintEditor {
             this.commitStroke(p);
             this.markLayerChanged(p.layer);
             if (!p.grad) this.lastStrokeEnd = { layerId: p.layer.id, x: p.last[0], y: p.last[1], mask: false };
+        } else if (p.kind === "smudge") {
+            this.markLayerChanged(p.layer);
         } else if (p.kind === "maskpaint") {
             this.commitStroke(p);
             this.markMaskChanged(p.layer);
@@ -2571,6 +2631,117 @@ class InpaintEditor {
             ctx.arc(0, 0, radius, 0, Math.PI * 2);
             ctx.fill();
             ctx.restore();
+        }
+    }
+
+    /** A soft round alpha mask of radius r (canvas 2r × 2r), cached per size and hardness. */
+    dabMask(r, hardness) {
+        const key = `${r}|${hardness}`;
+        if (this._dabMask && this._dabMask.key === key) return this._dabMask.c;
+        const size = Math.max(1, Math.ceil(r * 2));
+        const c = makeCanvas(size, size);
+        const ctx = c.getContext("2d");
+        const g = ctx.createRadialGradient(r, r, 0, r, r, r);
+        g.addColorStop(0, "rgba(0,0,0,1)");
+        g.addColorStop(Math.max(0, Math.min(0.97, hardness)), "rgba(0,0,0,1)");
+        g.addColorStop(1, "rgba(0,0,0,0)");
+        ctx.fillStyle = g;
+        ctx.fillRect(0, 0, size, size);
+        this._dabMask = { key, c };
+        return c;
+    }
+
+    /** The base as an image layer (for tools that need pixels of their own, e.g. smudge on the base). */
+    baseCopyLayer() {
+        const c = makeCanvas(this.width, this.height);
+        c.getContext("2d").drawImage(this.base.img, 0, 0);
+        const layer = this.addLayer({ name: "Base copy", kind: "image", ref: null, canvas: c, x: 0, y: 0, w: this.width, h: this.height, dirty: true }, { activate: true });
+        this.setStatus("The base cannot be edited directly: a copy layer was added.");
+        return layer;
+    }
+
+    /** Smudge: drag the pixels under the brush along the stroke, directly on the layer canvas. */
+    smudgeDab(p, x0, y0, x1, y1) {
+        const layer = p.layer, c = layer.canvas;
+        const sx = c.width / layer.w, sy = c.height / layer.h;
+        const lx0 = (x0 - layer.x) * sx, ly0 = (y0 - layer.y) * sy, lx1 = (x1 - layer.x) * sx, ly1 = (y1 - layer.y) * sy;
+        const r = Math.max(1, this.brushSize * (sx + sy) / 4 * Math.max(0.05, Math.min(1, p.pressure || 1)));
+        const size = Math.ceil(r * 2);
+        const strength = Math.max(0.01, Math.min(1, (this.smudgeOpts ? this.smudgeOpts.strength : 60) / 100));
+        if (!this._smudgeDab || this._smudgeDab.width !== size) this._smudgeDab = makeCanvas(size, size);
+        const d = this._smudgeDab, dctx = d.getContext("2d");
+        const mask = this.dabMask(r, this.hardness);
+        const ctx = c.getContext("2d");
+        const dist = Math.hypot(lx1 - lx0, ly1 - ly0);
+        const steps = Math.max(1, Math.ceil(dist / Math.max(1, r * 0.25)));
+        let px = lx0, py = ly0;
+        for (let i = 1; i <= steps; i++) {
+            const x = lx0 + (lx1 - lx0) * i / steps, y = ly0 + (ly1 - ly0) * i / steps;
+            dctx.globalCompositeOperation = "source-over";
+            dctx.clearRect(0, 0, size, size);
+            dctx.drawImage(c, px - r, py - r, size, size, 0, 0, size, size);
+            dctx.globalCompositeOperation = "destination-in";
+            dctx.drawImage(mask, 0, 0);
+            if (p.clip) dctx.drawImage(p.clip, -(x - r), -(y - r));
+            ctx.save();
+            ctx.globalAlpha = strength;
+            ctx.globalCompositeOperation = layer.alphaLock ? "source-atop" : "source-over";
+            ctx.drawImage(d, x - r, y - r);
+            ctx.restore();
+            px = x; py = y;
+        }
+        layer._maskedValid = false;
+        layer._mcache = null;
+    }
+
+    /** Mean RGB of a region of an image-sized canvas, via an 8 × 8 downscale. */
+    regionMean(src, x, y, w, h) {
+        if (!this._meanCanvas) this._meanCanvas = makeCanvas(8, 8);
+        const m = this._meanCanvas, mctx = m.getContext("2d");
+        mctx.clearRect(0, 0, 8, 8);
+        mctx.drawImage(src, x, y, w, h, 0, 0, 8, 8);
+        const d = mctx.getImageData(0, 0, 8, 8).data;
+        let r = 0, g = 0, b = 0, n = 0;
+        for (let i = 0; i < d.length; i += 4) { if (d[i + 3] < 8) continue; r += d[i]; g += d[i + 1]; b += d[i + 2]; n++; }
+        return n ? [r / n, g / n, b / n] : null;
+    }
+
+    /** Clone / heal: copy the source patch (offset by the stroke's offset) into the stroke buffer; heal shifts its colour to the destination's. */
+    cloneDab(p, x0, y0, x1, y1) {
+        const layer = p.layer, s = p.stroke, cl = p.clone;
+        const sx = s.width / layer.w, sy = s.height / layer.h;
+        const R = Math.max(0.5, this.brushSize / 2 * Math.max(0.05, Math.min(1, p.pressure || 1)));   // image px
+        const r = Math.max(1, R * (sx + sy) / 2);                                                       // layer px
+        const size = Math.ceil(r * 2);
+        if (!this._cloneDab || this._cloneDab.width !== size) this._cloneDab = makeCanvas(size, size);
+        const d = this._cloneDab, dctx = d.getContext("2d");
+        const mask = this.dabMask(r, this.hardness);
+        const sctx = s.getContext("2d");
+        const dist = Math.hypot(x1 - x0, y1 - y0);
+        const steps = Math.max(1, Math.ceil(dist / Math.max(1, R * 0.25)));
+        for (let i = 0; i <= steps; i++) {
+            if (i === 0 && dist > 0) continue;
+            const x = x0 + (x1 - x0) * i / steps, y = y0 + (y1 - y0) * i / steps;
+            const qx = x + cl.off.x, qy = y + cl.off.y;
+            dctx.globalCompositeOperation = "source-over";
+            dctx.clearRect(0, 0, size, size);
+            dctx.drawImage(cl.sample, qx - R, qy - R, R * 2, R * 2, 0, 0, size, size);
+            if (cl.heal) {
+                const ms = this.regionMean(cl.sample, qx - R, qy - R, R * 2, R * 2);
+                const md = this.regionMean(cl.dest, x - R, y - R, R * 2, R * 2);
+                if (ms && md) {
+                    const dr = md[0] - ms[0], dg = md[1] - ms[1], db = md[2] - ms[2];
+                    if (Math.abs(dr) + Math.abs(dg) + Math.abs(db) > 1) {
+                        const img = dctx.getImageData(0, 0, size, size), a = img.data;
+                        for (let k = 0; k < a.length; k += 4) { a[k] += dr; a[k + 1] += dg; a[k + 2] += db; }
+                        dctx.putImageData(img, 0, 0);
+                    }
+                }
+            }
+            dctx.globalCompositeOperation = "destination-in";
+            dctx.drawImage(mask, 0, 0);
+            const lx = (x - layer.x) * sx, ly = (y - layer.y) * sy;
+            sctx.drawImage(d, lx - r, ly - r);
         }
     }
 
@@ -5462,7 +5633,18 @@ class InpaintEditor {
             ctx.beginPath(); ctx.arc(pts[0][0], pts[0][1], (closeNear ? 8 : 5) / s, 0, Math.PI * 2); ctx.stroke();
             ctx.restore();
         }
-        const brushTools = ["select", "deselect", "paint", "erase"];
+        if ((this.tool === "clone" || this.tool === "heal") && this.cloneSource) {
+            // the source: a crosshair; during a stroke it follows the brush at the stroke's offset
+            const q = this.pointer && this.pointer.clone && this.hover ? [this.hover[0] + this.pointer.clone.off.x, this.hover[1] + this.pointer.clone.off.y] : [this.cloneSource.x, this.cloneSource.y];
+            ctx.save();
+            ctx.strokeStyle = "#7cc7ff";
+            ctx.lineWidth = 1 / s;
+            const cr = this.brushSize / 2, k = 6 / s;
+            ctx.beginPath(); ctx.arc(q[0], q[1], cr, 0, Math.PI * 2); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(q[0] - k, q[1]); ctx.lineTo(q[0] + k, q[1]); ctx.moveTo(q[0], q[1] - k); ctx.lineTo(q[0], q[1] + k); ctx.stroke();
+            ctx.restore();
+        }
+        const brushTools = ["select", "deselect", "paint", "erase", "smudge", "clone", "heal"];
         if (this.hover && brushTools.includes(this.tool) && !(p && p.kind === "pan") && !this.spaceDown) {
             ctx.save();
             ctx.lineWidth = 1 / s;
