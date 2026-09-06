@@ -257,12 +257,13 @@ size, hardness, opacity and the paint colour.
   image pasted from the system clipboard lands as a layer too. Ctrl+drop
   replaces the base image instead; with no image loaded a drop loads the
   base.
-- **Reference layers** (Flux.2 / Kontext multi-reference editing): the
-  dashed image button in the Layers header uploads one or more files as
-  layers with the role *reference* (dropping files onto the canvas with
-  Shift does the same). Reference layers are shown on the canvas with a
-  cyan frame and their batch number, but they are not part of the image your
-  chain sees. Instead they are appended to the `crop_image` batch, top of the
+- **Reference layers** (Flux.2 / Kontext multi-reference editing) have their
+  own **References** list under the layers: the button in its header or a
+  drop on the list uploads files (Shift+drop on the canvas does the same),
+  the fit select in the header says how they are brought to the crop's size,
+  the header counts how many are sent. Hidden references are not sent. A
+  reference is shown on the canvas with a cyan frame and its batch number,
+  but it is not part of the image your chain sees. Instead they are appended to the `crop_image` batch, top of the
   list first, fitted to the crop's size (cutout masks applied, transparency
   on white). The Flux.2 API nodes flatten batches into their image inputs,
   so the one link you already have carries the crop and all references;

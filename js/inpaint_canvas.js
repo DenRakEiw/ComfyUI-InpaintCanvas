@@ -763,6 +763,10 @@ const STYLE = `
 .ipc-num { background:#161616; color:#ddd; border:1px solid #3a3a3a; border-radius:4px; padding:3px 5px; font:inherit; }
 .ipc-sel { background:#161616; color:#ccc; border:1px solid #3a3a3a; border-radius:4px; padding:2px 4px; font:11px system-ui, sans-serif; max-width:110px; }
 .ipc-list { overflow:auto; flex:none; min-height:90px; max-height:56vh; }
+.ipc-list.ipc-reflist { min-height:0; max-height:30vh; }
+.ipc-list.ipc-reflist:empty::after { content:"No references. Drop images here or use the button above."; display:block; padding:8px 10px; color:#666; font-size:11px; }
+.ipc-refcount { color:#7cc7ff; font-size:10px; margin-left:6px; text-transform:none; letter-spacing:0; }
+.ipc-side h4 .ipc-sel.ipc-narrow { max-width:80px; font-size:11px; padding:1px 4px; }
 .ipc-layer { display:flex; flex-direction:column; gap:4px; padding:6px 8px; border-bottom:1px solid #161616; cursor:pointer; }
 .ipc-layer:hover { background:#262b33; }
 .ipc-layer.ipc-selected { background:#2b3a4f; box-shadow: inset 3px 0 0 #4a90d9; }
@@ -1232,7 +1236,6 @@ class InpaintEditor {
         this.fontInput = fileInput((files) => this.addFontFiles(files));
         this.fontInput.accept = ".ttf,.otf,.woff,.woff2,font/ttf,font/otf,font/woff,font/woff2";
         layersHead.appendChild(miniButton("image", "Import images as layers (one layer per file, part of the image, fitted to the canvas). Dropping files on this list does the same.", () => this.imageInput.click()));
-        layersHead.appendChild(miniButton("refImage", "Add reference images (one layer per file, role \"reference\"). They are not part of the image; they travel with crop_image as extra batch images for Flux.2 / Kontext. Shift+drop on the canvas does the same (a plain drop adds an image layer).", () => this.refInput.click()));
         layersHead.appendChild(miniButton("fx", "Add a filter layer (film grain, sharpen, blur, levels, curves, brightness / contrast, hue / saturation, colour balance, black & white, invert, LUT, vignette). It filters everything below it; give it a mask to limit where it applies.", () => this.addFilterLayer()));
         layersHead.appendChild(miniButton("plus", "Add a paint layer (Ctrl+Shift+N)", () => this.addPaintLayer()));
         this.panes.image.appendChild(layersHead);
@@ -1246,6 +1249,29 @@ class InpaintEditor {
             if (files.length) this.addImageLayers(files, e.shiftKey ? "reference" : "none", e.shiftKey ? {} : { place: "fit" });
         });
         this.panes.image.appendChild(this.layerList);
+
+        // references: their own list, they are not part of the image
+        const refHead = el("h4", null, "References");
+        refHead.title = "Reference images travel with crop_image as extra batch images (Flux.2 / Kontext multi-reference). They are not part of the image. Hidden references are not sent.";
+        this.refCount = el("span", "ipc-refcount", "");
+        refHead.appendChild(this.refCount);
+        refHead.appendChild(el("span", "ipc-grow"));
+        this.refFitSel = selectInput(REF_FITS, REF_DEFAULTS.fit, "How a reference is brought to the crop's size: pad scales it to fit and fills the rest with the image's border colour, crop scales to cover and cuts the middle, stretch distorts.");
+        this.refFitSel.classList.add("ipc-narrow");
+        this.refFitSel.addEventListener("change", () => { this.refSettings.fit = this.refFitSel.value; this.notifyChanged(); });
+        refHead.appendChild(this.refFitSel);
+        refHead.appendChild(miniButton("refImage", "Add reference images (one per file). Shift+drop on the canvas or a drop on this list does the same.", () => this.refInput.click()));
+        this.panes.image.appendChild(refHead);
+        this.refList = el("div", "ipc-list ipc-reflist");
+        this.refList.addEventListener("dragover", (e) => { e.preventDefault(); e.stopPropagation(); this.refList.classList.add("ipc-dropping"); });
+        this.refList.addEventListener("dragleave", () => this.refList.classList.remove("ipc-dropping"));
+        this.refList.addEventListener("drop", (e) => {
+            e.preventDefault(); e.stopPropagation();
+            this.refList.classList.remove("ipc-dropping");
+            const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []).filter((f) => f.type.startsWith("image/"));
+            if (files.length) this.addImageLayers(files, "reference");
+        });
+        this.panes.image.appendChild(this.refList);
 
         section("Selection", true, (d) => {
             const sec = el("div", "ipc-sec");
@@ -1395,16 +1421,6 @@ class InpaintEditor {
             rbtn.classList.add("ipc-small");
             rs.appendChild(rbtn);
             d.appendChild(rs);
-
-            // reference layers ride along in crop_image, fitted to the crop size
-            const refs = el("div", "ipc-sec");
-            refs.appendChild(el("span", null, "References"));
-            const fitLab = el("label", null, "fit");
-            this.refFitSel = selectInput(REF_FITS, REF_DEFAULTS.fit, "Reference layers are added to the crop_image batch at the crop's size: pad scales them to fit and fills the rest with the image's border colour, crop scales to cover and cuts the middle, stretch distorts.");
-            this.refFitSel.addEventListener("change", () => { this.refSettings.fit = this.refFitSel.value; this.notifyChanged(); });
-            fitLab.appendChild(this.refFitSel);
-            refs.appendChild(fitLab);
-            d.appendChild(refs);
 
             // files
             const files = el("div", "ipc-sec");
@@ -5752,6 +5768,7 @@ class InpaintEditor {
         list.innerHTML = "";
         for (let i = this.layers.length - 1; i >= 0; i--) {
             const layer = this.layers[i];
+            if (this.isReference(layer)) continue;   // references have their own list below
             const row = el("div", "ipc-layer" + (layer.id === this.activeLayerId ? " ipc-selected" : ""));
             row.dataset.layer = layer.id;
             row.addEventListener("click", () => { if (this.pending) this.cancelPending(); this.activeLayerId = layer.id; this.renderLayers(); this.updateSubbar(); this.draw(); });
@@ -5950,6 +5967,55 @@ class InpaintEditor {
         top.appendChild(el("span", "ipc-kind", "base"));
         row.appendChild(top);
         list.appendChild(row);
+        this.renderReferences();
+    }
+
+    /** The reference list: batch order top first, thumbnail, name, eye, order, back to image, delete. */
+    renderReferences() {
+        if (!this.refList) return;
+        const list = this.refList;
+        list.innerHTML = "";
+        const refs = this.layers.filter((l) => this.isReference(l));
+        const sent = this.referenceLayers();
+        if (this.refCount) this.refCount.textContent = refs.length ? `${sent.length} of ${refs.length} sent` : "";
+        for (let i = refs.length - 1; i >= 0; i--) {
+            const layer = refs[i];
+            const row = el("div", "ipc-layer ipc-refrow" + (layer.id === this.activeLayerId ? " ipc-selected" : ""));
+            row.dataset.layer = layer.id;
+            row.addEventListener("click", () => { if (this.pending) this.cancelPending(); this.activeLayerId = layer.id; this.renderLayers(); this.updateSubbar(); this.draw(); });
+            const top = el("div", "ipc-row");
+            top.appendChild(miniButton(layer.visible ? "eye" : "eyeOff", layer.visible ? "Shown and sent with crop_image. Click to hide: a hidden reference is not sent." : "Hidden: not sent. Click to show", () => {
+                layer.visible = !layer.visible;
+                this.uploaded.baseHash = null;
+                this.renderLayers(); this.renderInfo(); this.draw(); this.drawThumb(); this.notifyChanged();
+            }, layer.visible ? "" : "ipc-off"));
+            const th = document.createElement("canvas");
+            th.className = "ipc-lthumb";
+            th.width = 40; th.height = 28;
+            this.drawLayerThumb(th, layer);
+            top.appendChild(th);
+            const name = el("span", "ipc-name", layer.name);
+            name.title = `${layer.w} × ${layer.h} at ${layer.x}, ${layer.y}. Double-click to rename`;
+            name.addEventListener("dblclick", (e) => { e.stopPropagation(); this.renameLayerInline(layer, name); });
+            top.appendChild(name);
+            const idx = sent.indexOf(layer);
+            top.appendChild(el("span", "ipc-kind ipc-ref", idx >= 0 ? `ref ${idx + 1}` : "hidden"));
+            const up = miniButton("up", "Earlier in the batch", () => this.moveLayer(layer.id, +1, { undo: true }));
+            up.disabled = i === refs.length - 1;
+            top.appendChild(up);
+            const down = miniButton("down", "Later in the batch", () => this.moveLayer(layer.id, -1, { undo: true }));
+            down.disabled = i === 0;
+            top.appendChild(down);
+            top.appendChild(miniButton("image", "Turn into a normal image layer (part of the picture)", () => {
+                layer.role = "none"; layer.exportRef = null;
+                this.uploaded.baseHash = null; this.uploaded.controlHash = null;
+                this.activeLayerId = layer.id;
+                this.renderLayers(); this.renderInfo(); this.draw(); this.drawThumb(); this.notifyChanged();
+            }));
+            top.appendChild(miniButton("trash", "Remove the reference", () => this.removeLayer(layer.id), "ipc-del"));
+            row.appendChild(top);
+            list.appendChild(row);
+        }
     }
 
     /** Type select, one slider per parameter, LUT loader: the controls of a filter layer row. */
