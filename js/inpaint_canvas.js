@@ -16,6 +16,7 @@ import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { FILTERS, FILTER_IDS, filterDefaults, applyFilter, lutFromCube, lutToCanvas, lutFromImage, plateStats } from "./inpaint_filters.js";
 import { TEXT_DEFAULTS, FONT_CATEGORIES, loadFontList, fontList, addUserFont, renderText } from "./inpaint_text.js";
+import { installBridge } from "./inpaint_bridge.js";
 import { floodMask, maskToColorCanvas, clipMaskToSelection, rgbToHex } from "./inpaint_raster.js";
 import { buildPsd, buildOra } from "./inpaint_export.js";
 
@@ -6231,10 +6232,10 @@ class InpaintEditor {
     }
 
     /** A fresh white canvas after a confirmation; the size is asked for in the same dialog. */
-    async newCanvas() {
+    async newCanvas(size = null) {
         const cur = this.width ? `${this.width}x${this.height}` : "1024x1024";
         const what = this.base ? `This discards the current image, ${this.layers.length} layer${this.layers.length === 1 ? "" : "s"}, the selection and ${this.history.length} history entr${this.history.length === 1 ? "y" : "ies"} in this editor.` : "";
-        const answer = window.prompt(`New empty canvas.${what ? " " + what : ""}
+        const answer = size != null ? String(size) : window.prompt(`New empty canvas.${what ? " " + what : ""}
 
 Size as width x height:`, cur);
         if (answer == null) { this.setStatus("New canvas cancelled."); return; }
@@ -7378,6 +7379,9 @@ app.registerExtension({
     },
 
     setup() {
+        // Commands from the MCP server (mcp/inpaint_canvas_mcp.py) arrive over the websocket.
+        installBridge({ api, app, viewUrl, loadImageEl, makeCanvas, FILTERS, filterDefaults, NODE_CLASS });
+
         // The result back-link is a cycle from the graph's point of view. Strip it
         // from the prompt and pass the source node instead; the backend expands an
         // ephemeral stitch node that reads from that source.

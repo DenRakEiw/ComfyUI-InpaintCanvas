@@ -595,6 +595,16 @@ canvas (Enter applies, Shift+Enter is a new line, Esc cancels). Edited layers
 are uploaded automatically 15 s after the last change, so a browser crash
 loses at most that much; the workflow itself is saved by ComfyUI.
 
+## Driving the editor from an agent (MCP)
+
+`mcp/inpaint_canvas_mcp.py` is a local [MCP](https://modelcontextprotocol.io) server:
+Claude Code, Claude Desktop, Cursor or any MCP client can load an image, select by
+rectangle or by text, set the prompt, generate, look at the result, blend it with
+colour match, add filters and text and export, all in the editor that is open in your
+browser tab, step by step and undoable. Setup, the tool list and how it works are in
+[mcp/README.md](mcp/README.md). It needs `pip install mcp` in the Python that runs the
+server and only answers requests from localhost.
+
 ## Node reference
 
 ### Inpaint Canvas (`InpaintCanvas`)

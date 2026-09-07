@@ -85,3 +85,12 @@ The **Export** section in the Image tab and the Save button (Ctrl+S) write the v
 - Wheel zooms, Space or the middle mouse pans, F fits, 1 shows 100 %, 4 / 6 rotate the view, 5 resets. Rulers (Ctrl+Shift+R, drag guides out of them), grid (Ctrl+Shift+G) and before / after (hold \) are in the top bar.
 - Undo Ctrl+Z, redo Ctrl+Shift+Z. Clear selection Ctrl+D, invert Ctrl+I, fill the selection Shift+F, generate Ctrl+Enter, save Ctrl+S.
 - Tools: B R L O D P E T H C I G S J W Q, with Shift for the second tool of a group (Shift+R ellipse, Shift+L polygon, Shift+G gradient, Shift+S smudge, Shift+T text). The tool column groups related tools: left-click picks the shown tool, right-click, holding or the small triangle opens the group.
+
+## Driving the editor from an agent
+
+The pack ships a local MCP server (`mcp/inpaint_canvas_mcp.py`). Connected to Claude
+Code, Claude Desktop or Cursor, an agent can load an image, select by text, set the
+prompt, generate, judge the result from a screenshot, set the colour match, add filters
+and text and export, in the editor you have open. Every step shows up in the editor
+and stays undoable. Setup and the tool list are in `mcp/README.md`.
+

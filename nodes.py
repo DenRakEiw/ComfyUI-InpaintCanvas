@@ -17,6 +17,7 @@ Two nodes:
   explicitly as well.
 """
 
+import asyncio
 import json
 import math
 import os
@@ -1046,6 +1047,110 @@ def _register_routes():
         fonts = [{"filename": n, "subfolder": SUBFOLDER + "/fonts", "type": "input"}
                  for n in names if n.lower().endswith((".ttf", ".otf", ".woff", ".woff2")) and os.path.isfile(os.path.join(folder, n))]
         return web.json_response(fonts)
+
+    # ---- command bridge for the MCP server (mcp/inpaint_canvas_mcp.py) -----------------
+    # A command is pushed to the browser over ComfyUI's own websocket as the event
+    # "inpaint_canvas.command"; the editor runs it and posts the answer to /reply. The
+    # first tab that answered a "ping" is remembered and later commands go to that
+    # tab only, so two open tabs never both execute a "generate". Loopback only: the
+    # bridge is a remote control for the editor.
+    bridge = {"seq": 0, "futures": {}, "sid": None}
+
+    def _is_local(request):
+        peer = request.remote or ""
+        return peer in ("127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1")
+
+    def _version():
+        try:
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "pyproject.toml"), encoding="utf-8") as f:
+                m = re.search(r'^version\s*=\s*"([^"]+)"', f.read(), re.M)
+                return m.group(1) if m else ""
+        except OSError:
+            return ""
+
+    @server.routes.get("/inpaint_canvas/info")
+    async def _info_route(request):
+        """Folders and version for the MCP server; also its health check."""
+        return web.json_response({
+            "version": _version(),
+            "input_dir": folder_paths.get_input_directory(),
+            "output_dir": folder_paths.get_output_directory(),
+            "temp_dir": folder_paths.get_temp_directory(),
+            "subfolder": SUBFOLDER,
+            "clients": len(getattr(server, "sockets", {}) or {}),
+            "editor_client": bridge["sid"],
+        })
+
+    @server.routes.post("/inpaint_canvas/command")
+    async def _command_route(request):
+        if not _is_local(request):
+            return web.json_response({"ok": False, "error": "the command bridge only answers local requests"}, status=403)
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "body must be JSON"}, status=400)
+        cmd = str(data.get("cmd") or "")
+        if not cmd:
+            return web.json_response({"ok": False, "error": "cmd missing"}, status=400)
+        try:
+            timeout = max(1.0, min(3600.0, float(data.get("timeout", 30))))
+        except (TypeError, ValueError):
+            timeout = 30.0
+        bridge["seq"] += 1
+        cid = f"c{int(time.time() * 1000)}_{bridge['seq']}"
+        # ping and list_nodes are broadcast to every tab and collect all answers for a moment; the tab
+        # that holds an Inpaint Canvas node becomes the target of the commands that follow
+        discover = cmd in ("ping", "list_nodes")
+        entry = {"fut": asyncio.get_running_loop().create_future(), "replies": [], "collect": discover}
+        bridge["futures"][cid] = entry
+        sockets = getattr(server, "sockets", {}) or {}
+        if bridge["sid"] and bridge["sid"] not in sockets:
+            bridge["sid"] = None
+        sid = bridge["sid"] if bridge["sid"] and not discover else None
+        if not sockets:
+            bridge["futures"].pop(cid, None)
+            return web.json_response({"ok": False, "error": "no ComfyUI tab is connected: open ComfyUI in a browser with an Inpaint Canvas node in the graph"}, status=503)
+        payload = {"id": cid, "cmd": cmd, "args": data.get("args") or {}, "node": data.get("node")}
+        server.send_sync("inpaint_canvas.command", payload, sid)
+        try:
+            if discover:
+                # first answer, then a short grace period for the other tabs
+                await asyncio.wait_for(entry["fut"], timeout)
+                await asyncio.sleep(0.5)
+                replies = entry["replies"]
+                with_nodes = [r for r in replies if isinstance(r.get("result"), dict) and r["result"].get("nodes")]
+                result = (with_nodes or replies)[0]
+                if isinstance(result.get("result"), dict):
+                    nodes = []
+                    for r in with_nodes:
+                        for n in r["result"].get("nodes", []):
+                            nodes.append({**n, "client": r.get("client")})
+                    result = {**result, "result": {**result["result"], "nodes": nodes, "tabs": len(replies)}}
+                if with_nodes:
+                    bridge["sid"] = with_nodes[0].get("client")
+            else:
+                result = await asyncio.wait_for(entry["fut"], timeout)
+                if result.get("client") and result.get("node") is not None:
+                    bridge["sid"] = result["client"]
+        except asyncio.TimeoutError:
+            return web.json_response({"ok": False, "error": f"no editor answered '{cmd}' within {timeout:.0f} s. Is a ComfyUI tab with an Inpaint Canvas node open? Long jobs: raise the timeout."}, status=504)
+        finally:
+            bridge["futures"].pop(cid, None)
+        return web.json_response(result)
+
+    @server.routes.post("/inpaint_canvas/reply")
+    async def _reply_route(request):
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"ok": False}, status=400)
+        entry = bridge["futures"].get(str(data.get("id")))
+        if entry is not None:
+            reply = {k: data.get(k) for k in ("ok", "result", "error", "node", "client") if k in data}
+            entry["replies"].append(reply)
+            if not entry["fut"].done():
+                entry["fut"].set_result(reply)
+        return web.json_response({"ok": True})
 
 
 _register_routes()

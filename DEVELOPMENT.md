@@ -1018,3 +1018,54 @@ eyedropper, transform, text, hand, canvas, undo / redo, flatten.
   `compareShow` and invalidates the composite caches between them. The text
   overlay is a transparent textarea over the layer (caret only), the layer
   renders live. Autosave = `syncLayers` 15 s after the last change.
+
+## 19. MCP server and command bridge (2026-09-07)
+
+**What.** `mcp/inpaint_canvas_mcp.py` (stdio MCP server, mcp 1.x or 2.x), the routes
+`POST /inpaint_canvas/command`, `POST /inpaint_canvas/reply` and `GET
+/inpaint_canvas/info` in `nodes.py`, and `js/inpaint_bridge.js`, which runs the
+commands against the editor. An agent drives the editor that is open in a browser
+tab; nothing runs without a tab, because layers, filters and colour match live in the
+browser.
+
+**Mechanism.** The route creates a future per command, pushes
+`{id, cmd, args, node}` with `PromptServer.send_sync("inpaint_canvas.command", …)`
+and awaits the future with the caller's timeout (1..3600 s). The bridge handles the
+event, picks the editor (node id or the first `InpaintCanvas` node), runs
+`COMMANDS[cmd](editor, args)` and posts `{id, ok, result|error, node, client}` to
+`/reply`, which resolves the future. Loopback only (`request.remote`).
+
+**Tabs.** `ping` / `list_nodes` are broadcast; the route collects the answers for
+0.5 s after the first and remembers the client id of the first tab that reported a
+node. Later commands are sent to that sid only, so two tabs never both run a
+`generate`. A tab that vanished (sid not in `server.sockets`) drops the target and the
+next ping picks a new one.
+
+**Long jobs.** `select_by_text`, `upsample_prompt` and `cutout_layer` start the
+editor's own helper prompt and wait for its pending flag; `segmentPending` drops when
+the mask *file* arrives, the selection is applied after the image load, so the bridge
+additionally waits for the status text to leave "Segmenting…". `generate` calls
+`editor.generate()` and waits for `history.length` to grow; it also polls `/queue`
+and gives up 2.5 s after the queue went idle without a result (the run failed elsewhere
+in the graph, the status carries the error). `resultInputState().wired` is checked
+first, so an agent gets "nothing is wired into result_local" instead of a silent run.
+
+**Screenshots.** `screenshot` flattens with `forRun: true` (what the chain sees),
+scales to `max_size`, tints the selection and outlines its bounds in magenta,
+optionally draws layer frames, returns a base64 JPEG. The MCP tool hands it back as
+image content, so the model looks at the composite between steps.
+
+**Testing.** Scratchpad `test_bridge.py` runs ~60 commands through
+`inpaint_canvas_mcp.cmd()` against the headless tab (scene `scenes_bridge.json` builds
+one node with `test_base.png`; `scenes_bridge_chain.json` wires
+`crop_image -> ImageInvert -> result_local`, a model-free round trip that makes
+`generate` return a result layer in about a second). `test_mcp_client.py` talks to the
+server over stdio with the mcp client: 43 tools, `inpaint_status`, `screenshot` as
+`ImageContent`, an error path (`ToolError` keeps the editor's message), the guide
+resource. Both passed on 2026-09-07.
+
+**Adding a command.** One entry in `COMMANDS` (`inpaint_bridge.js`, keep the result
+JSON-safe, throw with a message the model can act on) and one tool in
+`inpaint_canvas_mcp.py`. Validate arguments in the bridge: unknown filter parameters,
+crop keys and layer names are refused with the list of valid ones.
+
