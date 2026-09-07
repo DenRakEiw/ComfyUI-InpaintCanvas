@@ -8,6 +8,10 @@ So ComfyUI must be running and a browser tab with an Inpaint Canvas node in the 
 Run:   python mcp/inpaint_canvas_mcp.py            (stdio transport, what MCP clients expect)
 Env:   COMFYUI_URL   default http://127.0.0.1:8188
        INPAINT_CANVAS_NODE   optional node id when the graph holds several Inpaint Canvas nodes
+       INPAINT_CANVAS_HEADLESS=1   start a headless Edge/Chrome tab on the first command (no visible tab needed)
+       INPAINT_CANVAS_WORKFLOW     workflow .json to load into that tab (your inpainting chain, for generate)
+       INPAINT_CANVAS_BROWSER      path to msedge/chrome if it is not found automatically
+       INPAINT_CANVAS_BROWSER_ARGS extra browser flags (e.g. --remote-debugging-port=9444 to inspect the tab)
 
 Client config (Claude Code: `claude mcp add inpaint-canvas -- <python> <this file>`, or in .mcp.json):
   {"mcpServers": {"inpaint-canvas": {"command": "<python>", "args": ["<path>/mcp/inpaint_canvas_mcp.py"],
@@ -17,11 +21,16 @@ Needs the `mcp` package (pip install mcp); works with mcp 1.x (FastMCP) and 2.x 
 """
 from __future__ import annotations
 
+import atexit
 import base64
 import json
 import mimetypes
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -36,6 +45,13 @@ except ImportError:  # mcp 1.x
 
 COMFYUI_URL = os.environ.get("COMFYUI_URL", "http://127.0.0.1:8188").rstrip("/")
 NODE = os.environ.get("INPAINT_CANVAS_NODE") or None
+HEADLESS_ENV = os.environ.get("INPAINT_CANVAS_HEADLESS", "").strip().lower() in ("1", "true", "yes", "on")
+WORKFLOW_ENV = os.environ.get("INPAINT_CANVAS_WORKFLOW") or None
+BROWSER_ENV = os.environ.get("INPAINT_CANVAS_BROWSER") or None
+BROWSER_ARGS_ENV = os.environ.get("INPAINT_CANVAS_BROWSER_ARGS") or ""   # extra browser flags, e.g. --remote-debugging-port=9444
+BROWSER_FLAGS = ["--headless=new", "--disable-gpu", "--hide-scrollbars", "--no-first-run", "--no-default-browser-check",
+                 "--disable-extensions", "--disable-background-timer-throttling", "--disable-renderer-backgrounding",
+                 "--window-size=1600,1000", "--remote-allow-origins=*"]
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
@@ -75,13 +91,155 @@ def _http(path: str, body: dict | None = None, timeout: float = 30.0) -> dict:
         raise BridgeError(f"ComfyUI is not reachable at {COMFYUI_URL} ({e.reason}). Start ComfyUI, or set COMFYUI_URL.") from None
 
 
-def cmd(name: str, args: dict | None = None, timeout: float = 30.0, node: str | None = None) -> Any:
+def cmd(name: str, args: dict | None = None, timeout: float = 30.0, node: str | None = None, client: str | None = None) -> Any:
     """Run one editor command and return its result (raises BridgeError with the editor's message)."""
-    body = {"cmd": name, "args": {k: v for k, v in (args or {}).items() if v is not None}, "timeout": timeout, "node": node or NODE}
+    if HEADLESS_ENV and headless.client is None and name not in ("ping", "list_nodes"):
+        headless.start(WORKFLOW_ENV)
+    body = {"cmd": name, "args": {k: v for k, v in (args or {}).items() if v is not None}, "timeout": timeout, "node": node or NODE,
+            "client": client or headless.client}
     res = _http("/inpaint_canvas/command", body, timeout=timeout + 15)
     if not res.get("ok"):
-        raise BridgeError(res.get("error") or "the editor reported an error")
+        err = res.get("error") or "the editor reported an error"
+        if headless.client and "no longer connected" in err:
+            headless.client = None
+        raise BridgeError(err)
     return res.get("result")
+
+
+# ---------------------------------------------------------------------------------------------
+# headless browser: a Chromium tab of ComfyUI nobody looks at, so the bridge works on a server
+
+class Headless:
+    """Starts Edge or Chrome headless on the ComfyUI page, finds its bridge client id, prepares a node
+    (or loads a workflow) and pins every later command to that tab."""
+
+    def __init__(self):
+        self.proc: subprocess.Popen | None = None
+        self.client: str | None = None
+        self.profile: str | None = None
+        self.workflow: str | None = None
+
+    @staticmethod
+    def find_browser() -> str | None:
+        if BROWSER_ENV and os.path.isfile(BROWSER_ENV):
+            return BROWSER_ENV
+        candidates = []
+        if sys.platform.startswith("win"):
+            for base in (os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), os.environ.get("ProgramFiles", r"C:\Program Files"), os.environ.get("LOCALAPPDATA", "")):
+                candidates += [os.path.join(base, "Microsoft", "Edge", "Application", "msedge.exe"),
+                               os.path.join(base, "Google", "Chrome", "Application", "chrome.exe"),
+                               os.path.join(base, "Chromium", "Application", "chrome.exe")]
+        elif sys.platform == "darwin":
+            candidates += ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                           "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                           "/Applications/Chromium.app/Contents/MacOS/Chromium"]
+        for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "microsoft-edge", "msedge", "chrome"):
+            path = shutil.which(name)
+            if path:
+                candidates.append(path)
+        for c in candidates:
+            if c and os.path.isfile(c):
+                return c
+        return None
+
+    def _tabs(self) -> set[str]:
+        try:
+            r = cmd("ping", timeout=5)
+            return set(r.get("tabs") or [])
+        except BridgeError:
+            return set()
+
+    def start(self, workflow_path: str | None = None) -> dict:
+        if self.proc and self.proc.poll() is None and self.client:
+            return {"running": True, "client": self.client, "profile": self.profile, "workflow": self.workflow}
+        browser = self.find_browser()
+        if not browser:
+            raise BridgeError("no Chromium browser found (Edge or Chrome). Install one or set INPAINT_CANVAS_BROWSER to its path.")
+        try:
+            info = _http("/inpaint_canvas/info")
+        except BridgeError:
+            raise
+        base = info.get("temp_dir") or tempfile.gettempdir()
+        self.profile = os.path.join(base, "inpaint_canvas_headless")
+        os.makedirs(self.profile, exist_ok=True)
+        before = self._tabs()
+        args = [browser] + list(BROWSER_FLAGS) + [f"--user-data-dir={self.profile}"] + BROWSER_ARGS_ENV.split() + [COMFYUI_URL + "/"]
+        creation = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform.startswith("win") else {}
+        self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **creation)
+        self.client = None
+        t0 = time.time()
+        while time.time() - t0 < 90:
+            if self.proc.poll() is not None:
+                raise BridgeError(f"the browser exited right away (code {self.proc.returncode}); try INPAINT_CANVAS_BROWSER with another browser")
+            now = self._tabs() - before
+            if now:
+                self.client = sorted(now)[0]
+                break
+            time.sleep(1.0)
+        if not self.client:
+            self.stop()
+            raise BridgeError("the headless tab did not connect to ComfyUI within 90 s")
+        self._wait_ready()
+        path = workflow_path or WORKFLOW_ENV
+        if path:
+            res = self.load_workflow(path)
+        else:
+            res = cmd("ensure_node", timeout=30, client=self.client)
+        return {"running": True, "client": self.client, "profile": self.profile, "workflow": self.workflow, "nodes": res.get("nodes")}
+
+    def _wait_ready(self, limit: float = 180.0) -> None:
+        """The frontend answers the bridge before it has finished starting; the persisted workflow is restored
+        a few seconds later and would replace anything prepared earlier. Wait for ready, then for the graph
+        to hold still."""
+        t0 = time.time()
+        last = None
+        stable_since = None
+        while time.time() - t0 < limit:
+            try:
+                info = cmd("ping", timeout=5, client=self.client)
+            except BridgeError:
+                info = None
+            if info and info.get("ready"):
+                key = (info.get("nodes_total"), len(info.get("nodes") or []))
+                if key == last:
+                    if stable_since is None:
+                        stable_since = time.time()
+                    elif time.time() - stable_since >= 3.0:
+                        return
+                else:
+                    last, stable_since = key, None
+            time.sleep(1.0)
+        raise BridgeError("the headless tab did not finish loading ComfyUI within %d s" % limit)
+
+    def load_workflow(self, path: str) -> dict:
+        path = os.path.abspath(os.path.expanduser(path))
+        try:
+            with open(path, encoding="utf-8") as f:
+                wf = json.load(f)
+        except (OSError, ValueError) as e:
+            raise BridgeError(f"cannot read workflow {path}: {e}") from None
+        res = cmd("load_workflow", {"workflow": wf}, timeout=60, client=self.client)
+        self.workflow = path
+        return res
+
+    def stop(self) -> dict:
+        was = self.proc is not None and self.proc.poll() is None
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+                self.proc.wait(10)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+        self.proc = None
+        self.client = None
+        return {"stopped": was}
+
+
+headless = Headless()
+atexit.register(headless.stop)
 
 
 def _text(obj: Any) -> str:
@@ -138,6 +296,30 @@ def inpaint_status() -> str:
         except BridgeError as e2:
             return f"error: {e2}"
         return f"error: {e}\nComfyUI {info.get('version', '')} is running with {info.get('clients', 0)} browser tab(s) connected."
+
+
+@mcp.tool()
+def start_headless(workflow_path: str | None = None) -> str:
+    """Start a headless Edge/Chrome tab of ComfyUI that this server drives from now on, so no visible browser tab
+    is needed. workflow_path: a saved ComfyUI workflow (.json) with an Inpaint Canvas node and your inpainting
+    chain; without it an empty Inpaint Canvas node is created (generate then has nothing to run). The tab's
+    state (workflow, image, layers) persists in its own browser profile between starts. Results are only
+    visible through screenshot and export."""
+    return _text(headless.start(workflow_path))
+
+
+@mcp.tool()
+def stop_headless() -> str:
+    """Close the headless browser started by start_headless; commands go back to the visible tab."""
+    return _text(headless.stop())
+
+
+@mcp.tool()
+def load_workflow(path: str) -> str:
+    """Replace the graph in the driven tab with a saved ComfyUI workflow (.json). It must contain an Inpaint
+    Canvas node; the inpainting chain wired to it is what generate runs. In the visible tab this replaces
+    what the user has open, so prefer it for the headless tab."""
+    return _text(headless.load_workflow(path) if headless.client else cmd("load_workflow", {"workflow": json.load(open(os.path.abspath(os.path.expanduser(path)), encoding="utf-8"))}, timeout=60))
 
 
 @mcp.tool()
@@ -198,7 +380,7 @@ def select_by_text(text: str, mode: str = "replace", threshold: float | None = N
     """Select an object by describing it ("the car", "left headlight", "sky"). Runs the segmentation model the
     editor is set to (SAM3 by default) and waits for the mask. mode: replace, add, subtract. threshold 0.05..0.95,
     lower finds more. Returns the selection bounds; an empty result means nothing matched."""
-    return _text(cmd("select_by_text", {"text": text, "mode": mode, "threshold": threshold, "timeout": timeout}, timeout=timeout))
+    return _text(cmd("select_by_text", {"text": text, "mode": mode, "threshold": threshold, "timeout": timeout}, timeout=timeout + 45))
 
 
 @mcp.tool()
@@ -269,7 +451,7 @@ def set_crop(context: str | None = None, feather: str | None = None, fill: str |
 @mcp.tool()
 def upsample_prompt(timeout: int = 300) -> str:
     """Let the language model the editor is set to (Qwen-VL or Gemini) rewrite the prompt with the image in view."""
-    return _text(cmd("upsample_prompt", {"timeout": timeout}, timeout=timeout))
+    return _text(cmd("upsample_prompt", {"timeout": timeout}, timeout=timeout + 45))
 
 
 @mcp.tool()
@@ -278,7 +460,7 @@ def generate(timeout: int = 600) -> str:
     node, the result comes back as a new layer placed over the selection. Waits for the result. Needs a
     selection (or the whole image is used) and a prompt. Returns the new layer; then screenshot to judge it and
     set_layer(match=...) to blend its colours."""
-    return _text(cmd("generate", {"timeout": timeout}, timeout=timeout))
+    return _text(cmd("generate", {"timeout": timeout}, timeout=timeout + 45))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -352,7 +534,7 @@ def center_layer(layer: str = "active") -> str:
 def cutout_layer(layer: str = "active", timeout: int = 300) -> str:
     """Remove the background of a layer with the cutout model the editor is set to (RMBG-2.0 by default);
     the result is a layer mask, the pixels stay."""
-    return _text(cmd("cutout_layer", {"layer": layer, "timeout": timeout}, timeout=timeout))
+    return _text(cmd("cutout_layer", {"layer": layer, "timeout": timeout}, timeout=timeout + 45))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -480,7 +662,12 @@ if __name__ == "__main__":
     if "--check" in sys.argv:
         try:
             print(_text(_http("/inpaint_canvas/info")))
-            print(_text(cmd("ping")))
+            if "--headless" in sys.argv:
+                print(_text(headless.start(WORKFLOW_ENV)))
+                print(_text(cmd("status")))
+                headless.stop()
+            else:
+                print(_text(cmd("ping")))
         except BridgeError as e:
             print("error:", e)
             sys.exit(1)

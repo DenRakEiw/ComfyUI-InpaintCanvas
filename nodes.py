@@ -1106,7 +1106,12 @@ def _register_routes():
         sockets = getattr(server, "sockets", {}) or {}
         if bridge["sid"] and bridge["sid"] not in sockets:
             bridge["sid"] = None
-        sid = bridge["sid"] if bridge["sid"] and not discover else None
+        # a caller may pin a tab (the headless browser); otherwise the remembered one
+        want = data.get("client")
+        if want and want not in sockets:
+            bridge["futures"].pop(cid, None)
+            return web.json_response({"ok": False, "error": "that browser tab is no longer connected"}, status=410)
+        sid = want or (bridge["sid"] if bridge["sid"] and not discover else None)
         if not sockets:
             bridge["futures"].pop(cid, None)
             return web.json_response({"ok": False, "error": "no ComfyUI tab is connected: open ComfyUI in a browser with an Inpaint Canvas node in the graph"}, status=503)
@@ -1125,12 +1130,12 @@ def _register_routes():
                     for r in with_nodes:
                         for n in r["result"].get("nodes", []):
                             nodes.append({**n, "client": r.get("client")})
-                    result = {**result, "result": {**result["result"], "nodes": nodes, "tabs": len(replies)}}
+                    result = {**result, "result": {**result["result"], "nodes": nodes, "tabs": [r.get("client") for r in replies if r.get("client")]}}
                 if with_nodes:
                     bridge["sid"] = with_nodes[0].get("client")
             else:
                 result = await asyncio.wait_for(entry["fut"], timeout)
-                if result.get("client") and result.get("node") is not None:
+                if not want and result.get("client") and result.get("node") is not None:
                     bridge["sid"] = result["client"]
         except asyncio.TimeoutError:
             return web.json_response({"ok": False, "error": f"no editor answered '{cmd}' within {timeout:.0f} s. Is a ComfyUI tab with an Inpaint Canvas node open? Long jobs: raise the timeout."}, status=504)

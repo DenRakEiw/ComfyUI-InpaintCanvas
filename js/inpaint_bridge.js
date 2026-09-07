@@ -111,8 +111,6 @@ export function installBridge({ api, app, viewUrl, loadImageEl, makeCanvas, FILT
     }
 
     const COMMANDS = {
-        async ping(ed) { return { bridge: VERSION, nodes: editors().map(nodeSummary) }; },
-        async list_nodes() { return { nodes: editors().map(nodeSummary) }; },
         async status(ed) { return status(ed); },
         async open_editor(ed) { if (!ed.isOpen) ed.open(); await wait(150); return { open: !!ed.isOpen }; },
         async close_editor(ed) { if (ed.isOpen) ed.close(); return { open: !!ed.isOpen }; },
@@ -241,7 +239,8 @@ export function installBridge({ api, app, viewUrl, loadImageEl, makeCanvas, FILT
                     if (idle && Date.now() - t0 > 3000) { idleSince = idleSince || Date.now(); if (Date.now() - idleSince > 2500) break; } else idleSince = 0;
                 } catch (_) { /* ignore */ }
             }
-            await until(() => ed.history.length > n0, 1500);
+            // the queue is idle: the result may still be decoding and compositing in a slow (headless, software-rendered) tab
+            await until(() => ed.history.length > n0 || /^Error|failed/i.test(ed.status || ""), Math.max(30000, Math.min(limit - (Date.now() - t0), 180000)), 250);
             if (ed.history.length <= n0) throw new Error("no result arrived: " + (ed.status || "the run produced nothing for this node"));
             const h = ed.history[ed.history.length - 1];
             const layer = ed.layers.find((l) => l.id === h.layerId);
@@ -432,17 +431,59 @@ export function installBridge({ api, app, viewUrl, loadImageEl, makeCanvas, FILT
         async get_state(ed) { const v = JSON.parse(ed.getValue() || "{}"); delete v.selection; delete v.selections; return v; },
     };
 
+    /** Whether the frontend finished starting: Vue mounted, no loading overlay. The persisted workflow is
+     *  restored right after that, so a caller should also wait until the node count stops changing. */
+    function tabInfo() {
+        const mask = document.querySelector(".p-blockui-mask");
+        return {
+            bridge: VERSION, nodes: editors().map(nodeSummary),
+            ready: !!(app.vueAppReady && app.graph) && !(mask && mask.offsetWidth),
+            nodes_total: app.graph && app.graph._nodes ? app.graph._nodes.length : 0,
+            uptime: Math.round(performance.now()),
+        };
+    }
+
+    // Commands that need no editor: used by the headless mode to prepare a fresh tab.
+    const TAB_COMMANDS = {
+        async ping() { return tabInfo(); },
+        async list_nodes() { return tabInfo(); },
+        /** Make sure the graph holds an Inpaint Canvas node; creates one when there is none. */
+        async ensure_node() {
+            if (!editors().length) {
+                const node = LiteGraph.createNode(NODE_CLASS);
+                if (!node) throw new Error("the Inpaint Canvas node type is not registered in this tab");
+                node.pos = [80, 80];
+                app.graph.add(node);
+                await until(() => editors().length, 5000);
+            }
+            return { nodes: editors().map(nodeSummary) };
+        },
+        /** Replace the graph with a workflow (the JSON of a saved workflow file); it must contain an Inpaint Canvas node. */
+        async load_workflow(_, a) {
+            const wf = typeof a.workflow === "string" ? JSON.parse(a.workflow) : a.workflow;
+            if (!wf || !Array.isArray(wf.nodes)) throw new Error("workflow must be the JSON of a ComfyUI workflow (with a nodes array)");
+            await app.loadGraphData(wf, true, true);
+            await until(() => editors().length, 8000);
+            await wait(500);
+            const eds = editors();
+            if (!eds.length) throw new Error("the workflow has no Inpaint Canvas node");
+            return { nodes: eds.map(nodeSummary), node_count: app.graph._nodes.length };
+        },
+    };
+
     async function handle(msg) {
         if (!msg || !msg.id) return;
         const reply = (body) => api.fetchApi("/inpaint_canvas/reply", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: msg.id, client: api.clientId, ...body }) }).catch(() => {});
         const cmd = String(msg.cmd || "");
+        if (TAB_COMMANDS[cmd]) {
+            try { return reply({ ok: true, result: await TAB_COMMANDS[cmd](null, msg.args || {}) }); }
+            catch (err) { console.warn("Inpaint Canvas bridge:", cmd, err); return reply({ ok: false, error: String((err && err.message) || err) }); }
+        }
         const fn = cmd.startsWith("_") ? null : COMMANDS[cmd];
-        if (!fn) return reply({ ok: false, error: `unknown command "${cmd}" (${Object.keys(COMMANDS).filter((k) => !k.startsWith("_")).join(", ")})` });
+        if (!fn) return reply({ ok: false, error: `unknown command "${cmd}" (${Object.keys(TAB_COMMANDS).concat(Object.keys(COMMANDS).filter((k) => !k.startsWith("_"))).join(", ")})` });
         let eds = editors();
         if (msg.node != null && msg.node !== "") eds = eds.filter((e) => String(e.node.id) === String(msg.node));
-        if (!eds.length && cmd === "ensure_node") { /* reserved */ }
         if (!eds.length) {
-            if (cmd === "ping" || cmd === "list_nodes") return reply({ ok: true, result: { bridge: VERSION, nodes: [] } });
             return reply({ ok: false, error: msg.node != null && msg.node !== "" ? `no Inpaint Canvas node with id ${msg.node} in the open graph` : "no Inpaint Canvas node in the open graph: add one (double-click the canvas, search \"Inpaint Canvas\")" });
         }
         const ed = eds[0];

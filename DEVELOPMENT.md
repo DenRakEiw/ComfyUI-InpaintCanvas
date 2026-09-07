@@ -1069,3 +1069,23 @@ JSON-safe, throw with a message the model can act on) and one tool in
 `inpaint_canvas_mcp.py`. Validate arguments in the bridge: unknown filter parameters,
 crop keys and layer names are refused with the list of valid ones.
 
+**Headless (2026-09-07, later).** `Headless` in the MCP server starts Edge/Chrome with
+`--headless=new` on the ComfyUI URL (profile `temp/inpaint_canvas_headless`, flags in
+`BROWSER_FLAGS`, extras from `INPAINT_CANVAS_BROWSER_ARGS`), finds the new tab by
+diffing `ping.tabs` before and after, and pins every later command to that client id
+(`client` in the command body; the route answers 410 when that socket is gone).
+Two lessons: (1) the bridge answers as soon as the extension's `setup()` ran, but the
+frontend restores its persisted workflow about six seconds later and replaces the
+graph, destroying anything prepared before. `ping` therefore reports `ready`
+(`app.vueAppReady` and no `.p-blockui-mask`) and `nodes_total`; `_wait_ready()` waits
+for ready plus three seconds of unchanged node count before `load_workflow` /
+`ensure_node` (both tab-level commands that need no editor). (2) A "missing result"
+in the headless tab was the prompt waiting behind the user's own jobs in the shared
+queue; the bridge's `generate` only gives up once `/queue` is idle, and its grace after
+that now uses the remaining budget (up to 180 s) because a software-rendered tab
+composites a 16-megapixel image slowly. The route timeout for long jobs is `timeout +
+45 s` so the bridge's wait always ends first. Scratchpad tests: `wf_invert.json`
+(canvas + ImageInvert wired to result_local, exported through `/userdata`), `diag2.py`
+and `diag3.py` (CDP on port 9444, step through graphToPrompt / api.queuePrompt and list
+the api events that arrive).
+

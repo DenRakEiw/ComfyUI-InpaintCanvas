@@ -69,6 +69,7 @@ Environment: `COMFYUI_URL` (default `http://127.0.0.1:8188`), `INPAINT_CANVAS_NO
 | Layers | `set_layer` (visibility, opacity, blend, **colour match**, role, position, size), `set_active_layer`, `remove_layer`, `duplicate_layer`, `merge_down`, `move_layer`, `flip_layer`, `center_layer`, `cutout_layer` (RMBG) |
 | Filters, text | `filter_types`, `add_filter`, `set_filter`, `add_text`, `set_text` |
 | Rest | `undo`, `redo`, `compare`, `export_image` (png/jpg/webp/psd/ora), `export_mask`, `open_editor`, `close_editor` |
+| Headless | `start_headless`, `stop_headless`, `load_workflow` (see below) |
 
 Resource `inpaint-canvas://guide` returns the manual (GUIDE.md), so the agent can read up
 on the settings it changes.
@@ -81,6 +82,41 @@ on the settings it changes.
 The agent runs `load_image`, `select_by_text("the car")`, `set_prompt(...)`,
 `generate`, `screenshot`, `set_layer(match=60)`, `add_filter("grain", {"amount": 20})`,
 `export_image("psd")`. Every step is visible in the editor and stays undoable.
+
+## Headless: no visible tab
+
+The server can run its own invisible browser, so an agent can work on a machine
+nobody is looking at (a render box, a scheduled job):
+
+```bash
+python_embeded\python.exe custom_nodes\ComfyUI-InpaintCanvas\mcp\inpaint_canvas_mcp.py --check --headless
+```
+
+or, for the agent, the tools `start_headless(workflow_path)`, `load_workflow(path)` and
+`stop_headless()`. With the environment `INPAINT_CANVAS_HEADLESS=1` the server starts
+the tab on its first command by itself, and `INPAINT_CANVAS_WORKFLOW` names the
+workflow to load into it.
+
+What happens: Edge or Chrome is started with `--headless=new` on the ComfyUI page, using
+its own profile in ComfyUI's `temp/inpaint_canvas_headless` folder. The server waits
+until the frontend has finished starting (it restores its last workflow a few seconds
+after the page is up), then loads the workflow you gave it or creates an empty Inpaint
+Canvas node. From then on every command is pinned to that tab, so your own browser
+tab is left alone. The profile keeps the workflow, image and layers between starts.
+
+Things to know:
+
+- `generate` needs a workflow with your inpainting chain wired to the node, as a
+  `.json` file: `start_headless("...\examples\inpaint_canvas_flux2_klein_local.json")`.
+- Nobody sees the editor. The agent judges results from `screenshot` and gets files
+  out with `export_image`; the state also survives in the headless profile.
+- Chromium without a screen renders on the CPU. Small and medium images behave like
+  the visible tab; a 16-megapixel image takes noticeably longer per step.
+- A headless Chromium is a full browser process, roughly 300 to 500 MB of RAM.
+- `INPAINT_CANVAS_BROWSER` points to the browser if none is found;
+  `INPAINT_CANVAS_BROWSER_ARGS` adds flags (for example
+  `--remote-debugging-port=9444` to inspect the tab with DevTools).
+- Commands share ComfyUI's queue: a `generate` waits behind whatever else is queued.
 
 ## Several tabs
 
