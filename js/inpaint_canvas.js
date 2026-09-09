@@ -4704,10 +4704,10 @@ class InpaintEditor {
     setFilterType(layer, id) {
         if (!FILTERS[id] || layer.filter === id) return;
         this.pushUndo({ kind: "filter", id: layer.id });
-        const auto = FILTER_IDS.some((k) => (layer.name || "").startsWith(FILTERS[k].label + " "));
         layer.filter = id;
         layer.params = filterDefaults(id);
-        if (auto) layer.name = `${FILTERS[id].label} ${this.filterCounter}`;
+        // layer names are not editable: the type (or a preset, see the preset select) names the layer
+        layer.name = `${FILTERS[id].label} ${this.filterCounter}`;
         this.markFilterChanged(layer);
         this.renderLayers();
     }
