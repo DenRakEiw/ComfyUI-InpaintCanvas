@@ -1206,3 +1206,26 @@ Rules when you touch this:
   a snapshot taken before an edit still shows the state before it (verified).
 - The worker's output must stay byte-identical to the main thread's; the writers are shared
   code for exactly that reason.
+
+### 21d. Selection work in the worker (2026-09-10, phase 4)
+
+Grow, shrink, feather, invert, the magic wand and the bucket used to run on the main thread
+over the whole image (one to four seconds at 96 MP). They are worker jobs now:
+
+- `inpaint_raster.js` owns what both sides need: `distanceTransform`, `growMask`,
+  `invertMask`, `maskBounds`, `floodMask`, `maskToColorCanvas`, `clipMaskToSelection` and
+  `makeRasterCanvas` (an `OffscreenCanvas` when there is no `document`). One implementation,
+  so the worker and the fallback cannot drift apart.
+- `growMask` runs the distance transform on the selection's bounding box padded by the
+  radius: only pixels within n of the edge can change. It clears with a `Uint32Array.fill`
+  of "red, transparent" (`RED_CLEAR`, built at run time so byte order does not matter).
+- The editor's `selectionInWorker(kind, args)` and `floodShape(src, x, y, opts)` do the
+  round trip and return null / a CPU result when there is no worker. The five methods
+  (`growSelection`, `featherSelection`, `invertSelection`, `wandSelect`, `bucketFill`) are
+  **async** now; the command bridge awaits them, the UI handlers do not have to.
+- **Every worker answer carries the new bounding box.** Without it `markSelectionChanged`
+  triggers a full scan through `renderInfo`, which was most of what remained after the
+  algorithms moved out. `applyShapeToSelection(shape, mode, box)` turns the region's box
+  into the selection's new box with `boundsAfter`.
+- Undo still works because `pushUndo({kind: "selection"})` runs before the worker call and
+  `canvas.toBlob` snapshots the canvas at that moment.

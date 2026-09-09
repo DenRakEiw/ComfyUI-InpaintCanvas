@@ -154,9 +154,9 @@ export function installBridge({ api, app, viewUrl, loadImageEl, makeCanvas, FILT
         },
         async select_all(ed) { requireImage(ed); ed.applyMaskToSelection(rectMask(ed, 0, 0, ed.width, ed.height), "replace"); return { selection: bounds(ed) }; },
         async select_none(ed) { requireImage(ed); ed.clearSelection(); return { selection: bounds(ed) }; },
-        async select_invert(ed) { requireImage(ed); ed.invertSelection(); return { selection: bounds(ed) }; },
-        async select_feather(ed, a) { requireImage(ed); ed.featherSelection(+a.radius || 8); return { selection: bounds(ed), status: ed.status }; },
-        async select_grow(ed, a) { requireImage(ed); const n = Math.round(+a.px || 0); if (n) ed.growSelection(n); return { selection: bounds(ed) }; },
+        async select_invert(ed) { requireImage(ed); await ed.invertSelection(); return { selection: bounds(ed) }; },
+        async select_feather(ed, a) { requireImage(ed); await ed.featherSelection(+a.radius || 8); return { selection: bounds(ed), status: ed.status }; },
+        async select_grow(ed, a) { requireImage(ed); const n = Math.round(+a.px || 0); if (n) await ed.growSelection(n); return { selection: bounds(ed) }; },
         async select_from_layer(ed, a) {
             requireImage(ed);
             const l = findLayer(ed, a.layer);

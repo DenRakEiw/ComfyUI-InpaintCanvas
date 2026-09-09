@@ -17,7 +17,7 @@ import { api } from "../../scripts/api.js";
 import { FILTERS, FILTER_IDS, filterDefaults, applyFilter, matchCanvas, lutFromCube, lutToCanvas, lutFromImage, plateStats } from "./inpaint_filters.js";
 import { TEXT_DEFAULTS, FONT_CATEGORIES, loadFontList, fontList, addUserFont, renderText } from "./inpaint_text.js";
 import { installBridge } from "./inpaint_bridge.js";
-import { floodMask, maskToColorCanvas, clipMaskToSelection, rgbToHex } from "./inpaint_raster.js";
+import { floodMask, maskToColorCanvas, clipMaskToSelection, rgbToHex, growMask, invertMask, maskBounds } from "./inpaint_raster.js";
 import { buildPsd, buildOra } from "./inpaint_export.js";
 
 const NODE_CLASS = "InpaintCanvas";
@@ -305,49 +305,6 @@ function selectInput(options, value, title) {
     return s;
 }
 
-/**
- * Exact squared Euclidean distance transform (Felzenszwalb & Huttenlocher).
- * `feature` is a Uint8Array with 1 where the feature is; returns Float32Array of
- * squared distances to the nearest feature pixel.
- */
-function distanceTransform(feature, W, H) {
-    const INF = 1e20;
-    const f = new Float32Array(Math.max(W, H));
-    const d = new Float32Array(Math.max(W, H));
-    const v = new Int32Array(Math.max(W, H));
-    const z = new Float32Array(Math.max(W, H) + 1);
-    const out = new Float32Array(W * H);
-    for (let i = 0; i < W * H; i++) out[i] = feature[i] ? 0 : INF;
-    const edt1d = (n) => {
-        let k = 0;
-        v[0] = 0; z[0] = -INF; z[1] = INF;
-        for (let q = 1; q < n; q++) {
-            let s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
-            while (s <= z[k]) {
-                k--;
-                s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
-            }
-            k++;
-            v[k] = q; z[k] = s; z[k + 1] = INF;
-        }
-        k = 0;
-        for (let q = 0; q < n; q++) {
-            while (z[k + 1] < q) k++;
-            d[q] = (q - v[k]) * (q - v[k]) + f[v[k]];
-        }
-    };
-    for (let x = 0; x < W; x++) {
-        for (let y = 0; y < H; y++) f[y] = out[y * W + x];
-        edt1d(H);
-        for (let y = 0; y < H; y++) out[y * W + x] = d[y];
-    }
-    for (let y = 0; y < H; y++) {
-        for (let x = 0; x < W; x++) f[x] = out[y * W + x];
-        edt1d(W);
-        for (let x = 0; x < W; x++) out[y * W + x] = d[x];
-    }
-    return out;
-}
 
 // ---------------------------------------------------------------------------
 // geometry helpers for the transform tool
@@ -3718,47 +3675,116 @@ class InpaintEditor {
 
     /** Combine a W×H region mask (1 = inside) with the selection: replace, add or subtract. */
     applyMaskToSelection(mask, mode = "replace") {
+        this.applyShapeToSelection(maskToColorCanvas(mask, this.width, this.height, "#ff0000"), mode);
+    }
+
+    /**
+     * The same with the region already drawn (a canvas or an ImageBitmap from the worker).
+     * `box` is the region's bounding box when the caller knows it, so the new selection's
+     * bounds do not have to be scanned for.
+     */
+    applyShapeToSelection(shape, mode = "replace", box = null) {
+        const hint = box ? this.boundsAfter(mode, box) : undefined;
         this.pushUndo({ kind: "selection" });
         const sctx = this.selection.getContext("2d");
-        const shape = maskToColorCanvas(mask, this.width, this.height, "#ff0000");
         if (mode === "replace") { sctx.globalCompositeOperation = "source-over"; sctx.clearRect(0, 0, this.width, this.height); this.selectionLabel = ""; }
         sctx.globalCompositeOperation = mode === "subtract" ? "destination-out" : "source-over";
         sctx.drawImage(shape, 0, 0);
         sctx.globalCompositeOperation = "source-over";
-        this.markSelectionChanged();
+        this.markSelectionChanged(hint);
         this.draw();
     }
 
+    /**
+     * Run a selection algorithm (grow, feather, invert) in the worker and put the result
+     * back; the answer carries the new bounding box. Null means there was no worker or it
+     * failed and the caller has to do the work itself.
+     */
+    async selectionInWorker(kind, args) {
+        if (!this.selection || !editorWorker()) return null;
+        try {
+            const bitmap = await createImageBitmap(this.selection);
+            const r = await workerCall("selection", { kind, bitmap, ...args }, [bitmap]);
+            if (!r.bitmap) return null;
+            const sctx = this.selection.getContext("2d");
+            sctx.save();
+            sctx.setTransform(1, 0, 0, 1, 0, 0);
+            sctx.globalAlpha = 1;
+            sctx.globalCompositeOperation = "copy";
+            sctx.drawImage(r.bitmap, 0, 0);
+            sctx.restore();
+            r.bitmap.close();
+            return { bounds: r.bounds === undefined ? undefined : r.bounds };
+        } catch (err) {
+            console.warn(`Inpaint Canvas: ${kind} in the worker failed, using the main thread:`, (err && err.message) || err);
+            return null;
+        }
+    }
+
+    /**
+     * The region of similar pixels around (x, y) of `src`, as a shape in `color`
+     * (a canvas or an ImageBitmap) plus the number of pixels it covers. Runs in the
+     * worker when there is one; `clip` limits it to the selection.
+     */
+    async floodShape(src, x, y, { tolerance = 32, contiguous = true, color = "#ff0000", clip = false } = {}) {
+        if (editorWorker()) {
+            const transfer = [];
+            try {
+                const bitmap = await createImageBitmap(src);
+                transfer.push(bitmap);
+                const args = { bitmap, x, y, tolerance, contiguous, color };
+                if (clip && this.getBounds()) {
+                    const selBitmap = await createImageBitmap(this.selection);
+                    transfer.push(selBitmap);
+                    args.selBitmap = selBitmap;
+                }
+                const r = await workerCall("flood", args, transfer);
+                if (r.bitmap) return { shape: r.bitmap, count: r.count, bounds: r.bounds, close: true };
+            } catch (err) {
+                console.warn("Inpaint Canvas: the region in the worker failed, using the main thread:", (err && err.message) || err);
+                for (const b of transfer) { try { b.close(); } catch (_) { /* already transferred */ } }
+            }
+        }
+        const data = src.getContext("2d").getImageData(0, 0, this.width, this.height).data;
+        const mask = floodMask(data, this.width, this.height, x, y, tolerance, contiguous);
+        if (clip && this.getBounds()) clipMaskToSelection(mask, this.selection);
+        let count = 0;
+        for (let i = 0; i < mask.length; i++) count += mask[i];
+        const shape = maskToColorCanvas(mask, this.width, this.height, color);
+        return { shape, count, bounds: maskBounds(shape.getContext("2d").getImageData(0, 0, this.width, this.height).data, this.width, this.height), close: false };
+    }
+
     /** Magic wand: the area of similar colour under (ix, iy) becomes the selection. */
-    wandSelect(ix, iy, mode = "replace") {
+    async wandSelect(ix, iy, mode = "replace") {
         if (!this.width) return;
         const x = Math.floor(ix), y = Math.floor(iy);
         if (x < 0 || y < 0 || x >= this.width || y >= this.height) return;
         const o = this.fillOpts || { tolerance: 32, contiguous: true, sample: "image" };
         const t0 = performance.now();
-        const src = this.sampleCanvas(o.sample).getContext("2d").getImageData(0, 0, this.width, this.height).data;
-        const mask = floodMask(src, this.width, this.height, x, y, o.tolerance, o.contiguous);
-        let n = 0;
-        for (let i = 0; i < mask.length; i++) n += mask[i];
-        this.applyMaskToSelection(mask, mode);
-        this.setStatus(`${n.toLocaleString()} px ${mode === "replace" ? "selected" : mode === "add" ? "added" : "subtracted"} (${Math.round(performance.now() - t0)} ms).`);
+        const { shape, count, bounds, close } = await this.floodShape(this.sampleCanvas(o.sample), x, y, { tolerance: o.tolerance, contiguous: o.contiguous });
+        this.applyShapeToSelection(shape, mode, bounds);
+        if (close) shape.close();
+        this.setStatus(`${count.toLocaleString()} px ${mode === "replace" ? "selected" : mode === "add" ? "added" : "subtracted"} (${Math.round(performance.now() - t0)} ms).`);
     }
 
     /** Soften the selection edge: gaussian blur of the mask. */
-    featherSelection(r) {
+    async featherSelection(r) {
         if (!this.getBounds()) { this.setStatus("Nothing selected to feather."); return; }
         r = Math.max(0.5, Math.min(512, +r || 0));
         this.pushUndo({ kind: "selection" });
-        const tmp = makeCanvas(this.width, this.height);
-        const tctx = tmp.getContext("2d");
-        tctx.filter = `blur(${r}px)`;
-        tctx.drawImage(this.selection, 0, 0);
-        tctx.filter = "none";
-        const sctx = this.selection.getContext("2d");
-        sctx.globalCompositeOperation = "source-over";
-        sctx.clearRect(0, 0, this.width, this.height);
-        sctx.drawImage(tmp, 0, 0);
-        this.markSelectionChanged();
+        const done = await this.selectionInWorker("feather", { radius: r });
+        if (!done) {
+            const tmp = makeCanvas(this.width, this.height);
+            const tctx = tmp.getContext("2d");
+            tctx.filter = `blur(${r}px)`;
+            tctx.drawImage(this.selection, 0, 0);
+            tctx.filter = "none";
+            const sctx = this.selection.getContext("2d");
+            sctx.globalCompositeOperation = "source-over";
+            sctx.clearRect(0, 0, this.width, this.height);
+            sctx.drawImage(tmp, 0, 0);
+        }
+        this.markSelectionChanged(done ? done.bounds : undefined);
         this.draw();
         this.setStatus(`Selection feathered by ${r} px (soft edge for painting, filling and the mask).`);
     }
@@ -3986,7 +4012,7 @@ class InpaintEditor {
     }
 
     /** Bucket: fill the area of similar colour under (ix, iy) on the active layer, within the selection. */
-    bucketFill(ix, iy) {
+    async bucketFill(ix, iy) {
         if (!this.width) return;
         let layer = this.activeLayer();
         if (layer && layer.locked) { this.setStatus(`${layer.name} is locked.`); return; }
@@ -3994,16 +4020,11 @@ class InpaintEditor {
         const x = Math.floor(ix), y = Math.floor(iy);
         if (x < 0 || y < 0 || x >= this.width || y >= this.height) return;
         const o = this.fillOpts || { tolerance: 32, contiguous: true, sample: "image" };
-        const src = this.sampleCanvas(o.sample).getContext("2d").getImageData(0, 0, this.width, this.height).data;
         const t0 = performance.now();
-        const mask = floodMask(src, this.width, this.height, x, y, o.tolerance, o.contiguous);
-        if (this.getBounds()) clipMaskToSelection(mask, this.selection);
-        let n = 0;
-        for (let i = 0; i < mask.length; i++) n += mask[i];
-        if (!n) { this.setStatus("Nothing to fill here (outside the selection?)."); return; }
+        const { shape: fill, count: n, close } = await this.floodShape(this.sampleCanvas(o.sample), x, y, { tolerance: o.tolerance, contiguous: o.contiguous, color: this.color, clip: true });
+        if (!n) { if (close) fill.close(); this.setStatus("Nothing to fill here (outside the selection?)."); return; }
         if (!layer) layer = this.addPaintLayer();
         this.pushUndo({ kind: "layer", id: layer.id });
-        const fill = maskToColorCanvas(mask, this.width, this.height, this.color);
         const ctx = layer.canvas.getContext("2d");
         ctx.save();
         ctx.globalAlpha = this.brushOpacity;
@@ -4011,6 +4032,7 @@ class InpaintEditor {
         ctx.setTransform(layer.canvas.width / layer.w, 0, 0, layer.canvas.height / layer.h, 0, 0);
         ctx.drawImage(fill, -layer.x, -layer.y);
         ctx.restore();
+        if (close) fill.close();
         this.markLayerChanged(layer);
         this.draw();
         this.setStatus(`Filled ${n.toLocaleString()} px on ${layer.name} (${Math.round(performance.now() - t0)} ms).`);
@@ -4176,28 +4198,19 @@ class InpaintEditor {
 
     // ---- selection: grow / shrink / from layer ------------------------------
 
-    growSelection(n) {
+    async growSelection(n) {
         if (!this.selection || !n) return;
         const W = this.width, H = this.height;
-        const sctx = this.selection.getContext("2d");
-        const img = sctx.getImageData(0, 0, W, H);
-        const d = img.data;
-        const grow = n > 0;
-        const r = Math.abs(n);
-        const feature = new Uint8Array(W * H);
-        for (let i = 0; i < W * H; i++) {
-            const sel = d[i * 4 + 3] > 127;
-            feature[i] = grow ? (sel ? 1 : 0) : (sel ? 0 : 1);
-        }
+        const grow = n > 0, r = Math.abs(n);
         this.pushUndo({ kind: "selection" });
-        const dist = distanceTransform(feature, W, H);
-        const r2 = r * r;
-        for (let i = 0; i < W * H; i++) {
-            const inside = grow ? dist[i] <= r2 : dist[i] > r2;
-            d[i * 4] = 255; d[i * 4 + 1] = 0; d[i * 4 + 2] = 0; d[i * 4 + 3] = inside ? 255 : 0;
+        const done = await this.selectionInWorker("grow", { n });
+        if (!done) {
+            const sctx = this.selection.getContext("2d");
+            const img = sctx.getImageData(0, 0, W, H);
+            growMask(img.data, W, H, n);
+            sctx.putImageData(img, 0, 0);
         }
-        sctx.putImageData(img, 0, 0);
-        this.markSelectionChanged();
+        this.markSelectionChanged(done ? done.bounds : undefined);
         this.draw();
         this.setStatus(`Selection ${grow ? "grown" : "shrunk"} by ${r}px.`);
     }
@@ -4935,18 +4948,17 @@ class InpaintEditor {
         this.draw();
     }
 
-    invertSelection() {
+    async invertSelection() {
         if (!this.selection) return;
         this.pushUndo({ kind: "selection" });
-        const sctx = this.selection.getContext("2d");
-        const data = sctx.getImageData(0, 0, this.width, this.height);
-        const d = data.data;
-        for (let i = 0; i < d.length; i += 4) {
-            d[i] = 255; d[i + 1] = 0; d[i + 2] = 0;
-            d[i + 3] = 255 - d[i + 3];
+        const done = await this.selectionInWorker("invert", {});
+        if (!done) {
+            const sctx = this.selection.getContext("2d");
+            const data = sctx.getImageData(0, 0, this.width, this.height);
+            invertMask(data.data);
+            sctx.putImageData(data, 0, 0);
         }
-        sctx.putImageData(data, 0, 0);
-        this.markSelectionChanged();
+        this.markSelectionChanged(done ? done.bounds : undefined);
         this.draw();
     }
 
