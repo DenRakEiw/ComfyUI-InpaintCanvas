@@ -738,6 +738,13 @@ const STYLE = `
 .ipc-groupbtn { position:relative; }
 .ipc-groupbtn .ipc-tri { position:absolute; right:2px; bottom:2px; width:0; height:0; border-left:6px solid transparent; border-bottom:6px solid #c0c0c0; }
 .ipc-sec .ipc-gap { width:6px; }
+.ipc-ask { position:absolute; inset:0; z-index:20; display:flex; align-items:center; justify-content:center; background:rgba(0,0,0,.55); }
+.ipc-askbox { min-width:320px; max-width:520px; display:flex; flex-direction:column; gap:10px; padding:16px;
+  background:#242424; border:1px solid #4a4a4a; border-radius:10px; box-shadow:0 12px 40px rgba(0,0,0,.6); }
+.ipc-askbox .ipc-asktitle { font-weight:600; font-size:14px; }
+.ipc-askbox .ipc-askmsg { color:#aaa; white-space:pre-line; }
+.ipc-askbox .ipc-askinput { background:#1b1b1b; color:#eee; border:1px solid #4a4a4a; border-radius:6px; padding:7px 9px; font:inherit; }
+.ipc-askbox .ipc-askrow { display:flex; gap:8px; align-items:center; }
 .ipc-flyout { position:absolute; z-index:6; display:flex; flex-direction:column; gap:3px; padding:5px; background:#262626; border:1px solid #444; border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.55); min-width:170px; }
 .ipc-flyout .ipc-ib { justify-content:flex-start; padding:5px 10px; width:auto; height:auto; text-align:left; white-space:nowrap; }
 .ipc-flyout .ipc-key { margin-left:auto; padding-left:14px; color:#8a8a8a; font-size:11px; }
@@ -1995,6 +2002,7 @@ class InpaintEditor {
         this._docKey = (e) => {
             if (!this.isOpen) return;
             const t = e.target;
+            if (this.askOpen) return;   // the question dialog has its own keys
             const inField = t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT");
             if (e.key === "Escape") {
                 if (t === this.promptInput) return;
@@ -2103,6 +2111,58 @@ class InpaintEditor {
         this.canvas.addEventListener("pointerup", (e) => this.onPointerUp(e));
         this.canvas.addEventListener("pointercancel", (e) => this.onPointerUp(e));
         this.canvas.addEventListener("pointerleave", () => { this.hover = null; this.hoverObjectId = 0; this.hoverObjectCanvas = null; this.draw(); });
+    }
+
+    /**
+     * A question inside the editor: Electron has no window.prompt (it throws
+     * "prompt() is not supported"), and a native dialog would block the canvas.
+     * Resolves with the entered text, with true for a plain confirm, or with null
+     * when the question was cancelled.
+     */
+    ask({ title = "", message = "", value = null, ok = "OK", cancel = "Cancel", danger = false } = {}) {
+        return new Promise((resolve) => {
+            const wrap = el("div", "ipc-ask");
+            const box = el("div", "ipc-askbox");
+            if (title) box.appendChild(el("div", "ipc-asktitle", title));
+            if (message) box.appendChild(el("div", "ipc-askmsg", message));
+            let input = null;
+            if (value != null) {
+                input = document.createElement("input");
+                input.type = "text";
+                input.className = "ipc-askinput";
+                input.value = String(value);
+                box.appendChild(input);
+            }
+            const row = el("div", "ipc-askrow");
+            const cancelBtn = el("button", "ipc-ib", cancel);
+            const okBtn = el("button", "ipc-ib " + (danger ? "ipc-danger" : "ipc-primary"), ok);
+            cancelBtn.type = "button";
+            okBtn.type = "button";
+            row.appendChild(el("span", "ipc-grow"));
+            row.appendChild(cancelBtn);
+            row.appendChild(okBtn);
+            box.appendChild(row);
+            wrap.appendChild(box);
+            const finish = (val) => {
+                if (this.askOpen !== wrap) return;
+                this.askOpen = null;
+                window.removeEventListener("keydown", onKey, true);
+                wrap.remove();
+                try { this.root.focus({ preventScroll: true }); } catch (_) { /* ignore */ }
+                resolve(val);
+            };
+            const onKey = (e) => {
+                if (e.key === "Escape") { e.preventDefault(); e.stopImmediatePropagation(); finish(null); }
+                else if (e.key === "Enter") { e.preventDefault(); e.stopImmediatePropagation(); finish(input ? input.value : true); }
+            };
+            cancelBtn.addEventListener("click", () => finish(null));
+            okBtn.addEventListener("click", () => finish(input ? input.value : true));
+            wrap.addEventListener("pointerdown", (e) => { if (e.target === wrap) finish(null); });
+            this.askOpen = wrap;
+            window.addEventListener("keydown", onKey, true);
+            this.root.appendChild(wrap);
+            if (input) { input.focus(); input.select(); } else okBtn.focus();
+        });
     }
 
     setStatus(text) {
@@ -6252,9 +6312,15 @@ class InpaintEditor {
     async newCanvas(size = null) {
         const cur = this.width ? `${this.width}x${this.height}` : "1024x1024";
         const what = this.base ? `This discards the current image, ${this.layers.length} layer${this.layers.length === 1 ? "" : "s"}, the selection and ${this.history.length} history entr${this.history.length === 1 ? "y" : "ies"} in this editor.` : "";
-        const answer = size != null ? String(size) : window.prompt(`New empty canvas.${what ? " " + what : ""}
+        const answer = size != null ? String(size) : await this.ask({
+            title: "New empty canvas",
+            message: what ? `${what}
 
-Size as width x height:`, cur);
+Size as width x height:` : "Size as width x height:",
+            value: cur,
+            ok: "Create",
+            danger: !!this.base,
+        });
         if (answer == null) { this.setStatus("New canvas cancelled."); return; }
         const m = /^\s*(\d{2,5})\s*[x×*,\s]\s*(\d{2,5})\s*$/i.exec(answer);
         if (!m) { this.setStatus("Size not understood. Use width x height, e.g. 1024x1024."); return; }
