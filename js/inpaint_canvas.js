@@ -28,6 +28,7 @@ const MAX_UNDO_BYTES = 384 * 1024 * 1024;   // rect undo copies: older steps are
 const PYRAMID_MIN_PX = 1 << 20;             // sources below 1 MP are drawn straight, no levels
 const PYRAMID_LEVELS = 8;
 const SYNC_ENCODE_PX = 16 * 1024 * 1024;    // above this the selection PNG for getValue is encoded off the main thread
+const WORKER_TIMEOUT = 180000;              // a worker job that never answers falls back to the main thread
 const HANDLE_PX = 9;
 const RULER_PX = 18;
 const CURSOR_CLASSES = ["ipc-scale", "ipc-scale-ne", "ipc-scale-x", "ipc-scale-y", "ipc-rotate"];
@@ -69,8 +70,111 @@ function loadImageEl(src) {
     });
 }
 
+// ---- the worker: PNG encoding, upload hashes and the layered export writers ----------
+// canvas.toBlob keeps the main thread busy for 755 ms on a 96 MP canvas (measured), and
+// the PSD writer for 3 s. Both move into js/inpaint_worker.js; the editor only pays for
+// createImageBitmap (25 ms) and the transfer. Without a worker (old browser, blocked
+// module worker) everything falls back to the main thread, so nothing depends on it.
+
+let WORKER = null;
+let WORKER_OFF = false;
+let workerSeq = 0;
+const workerJobs = new Map();
+
+function editorWorker() {
+    if (WORKER_OFF) return null;
+    if (WORKER) return WORKER;
+    try {
+        WORKER = new Worker(new URL("./inpaint_worker.js", import.meta.url), { type: "module" });
+        WORKER.onmessage = (e) => {
+            const msg = e.data || {};
+            const job = workerJobs.get(msg.id);
+            if (!job) return;
+            workerJobs.delete(msg.id);
+            if (msg.ok) job.resolve(msg); else job.reject(new Error(msg.error || "worker job failed"));
+        };
+        WORKER.onerror = (err) => {
+            console.warn("Inpaint Canvas: worker unavailable, doing this on the main thread:", (err && err.message) || err);
+            WORKER_OFF = true;
+            WORKER = null;
+            for (const job of workerJobs.values()) job.reject(new Error("worker gone"));
+            workerJobs.clear();
+        };
+    } catch (err) {
+        console.warn("Inpaint Canvas: no worker:", (err && err.message) || err);
+        WORKER_OFF = true;
+        WORKER = null;
+    }
+    return WORKER;
+}
+
+function workerCall(op, args = {}, transfer = []) {
+    const w = editorWorker();
+    if (!w) return Promise.reject(new Error("no worker"));
+    const id = ++workerSeq;
+    return new Promise((resolve, reject) => {
+        // a worker that never answers must not hang an upload or an export for good: the
+        // job is dropped and the caller falls back to the main thread
+        const timer = setTimeout(() => {
+            if (!workerJobs.delete(id)) return;
+            reject(new Error(`worker job ${op} timed out`));
+        }, WORKER_TIMEOUT);
+        workerJobs.set(id, {
+            resolve: (v) => { clearTimeout(timer); resolve(v); },
+            reject: (e) => { clearTimeout(timer); reject(e); },
+        });
+        try {
+            w.postMessage({ id, op, ...args }, transfer);
+        } catch (err) {
+            clearTimeout(timer);
+            workerJobs.delete(id);
+            reject(err);
+        }
+    });
+}
+
+/** PNG of a canvas, plus the upload hash when asked for; encoded in the worker if there is one. */
+async function encodeCanvas(canvas, { hash = false } = {}) {
+    if (editorWorker()) {
+        try {
+            const bitmap = await createImageBitmap(canvas);
+            const r = await workerCall("png", { bitmap, hash }, [bitmap]);
+            if (r.blob) return { blob: r.blob, hash: r.hash };
+        } catch (err) {
+            console.warn("Inpaint Canvas: encoding in the worker failed, using the main thread:", (err && err.message) || err);
+        }
+    }
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+    return { blob, hash: hash ? await hashBlob(blob) : null };
+}
+
+/**
+ * A layered PSD or ORA file. The worker takes the layers one at a time, so only one
+ * layer's pixels are in flight; without a worker the writers run on the main thread.
+ */
+async function buildLayered(format, { width, height, layers, composite }) {
+    if (editorWorker()) {
+        const job = "x" + (++workerSeq);
+        try {
+            await workerCall("export_begin", { job, format, width, height });
+            for (const L of layers) {
+                const bitmap = await createImageBitmap(L.canvas);
+                const meta = { name: L.name, x: L.x, y: L.y, opacity: L.opacity, visible: L.visible, blend: L.blend };
+                await workerCall("export_layer", { job, meta, bitmap }, [bitmap]);
+            }
+            const bitmap = await createImageBitmap(composite);
+            const r = await workerCall("export_finish", { job, bitmap }, [bitmap]);
+            if (r.blob) return r.blob;
+        } catch (err) {
+            console.warn("Inpaint Canvas: export in the worker failed, using the main thread:", (err && err.message) || err);
+            workerCall("export_cancel", { job }).catch(() => {});
+        }
+    }
+    return format === "psd" ? buildPsd({ width, height, layers, composite }) : buildOra({ width, height, layers, composite });
+}
+
 function canvasToBlob(canvas) {
-    return new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+    return encodeCanvas(canvas).then((r) => r.blob);
 }
 
 async function hashBlob(blob) {
@@ -111,8 +215,7 @@ async function uploadBlob(blob, filename, { overwrite = true, type = "input", su
 }
 
 async function uploadCanvas(canvas, prefix) {
-    const blob = await canvasToBlob(canvas);
-    const hash = await hashBlob(blob);
+    const { blob, hash } = await encodeCanvas(canvas, { hash: true });
     return { ref: await uploadBlob(blob, `${prefix}_${hash}.png`), hash };
 }
 
@@ -5723,7 +5826,7 @@ class InpaintEditor {
             if (fmt === "psd" || fmt === "ora") {
                 const t0 = performance.now();
                 const { layers, skipped } = this.exportLayerStack();
-                blob = fmt === "psd" ? buildPsd({ width: this.width, height: this.height, layers, composite: canvas }) : await buildOra({ width: this.width, height: this.height, layers, composite: canvas });
+                blob = await buildLayered(fmt, { width: this.width, height: this.height, layers, composite: canvas });
                 note = `, ${layers.length} layers${skipped ? `, ${skipped} filter layer${skipped > 1 ? "s" : ""} only in the merged image` : ""}, ${Math.round(performance.now() - t0)} ms`;
             } else {
                 blob = await new Promise((r) => canvas.toBlob(r, fmt === "jpg" ? "image/jpeg" : fmt === "webp" ? "image/webp" : "image/png", 0.92));

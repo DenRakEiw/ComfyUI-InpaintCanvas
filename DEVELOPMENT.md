@@ -1176,3 +1176,33 @@ Benchmark: `python tools/perf_test.py` in the app repo (it drives the app over D
   (`markLayerChanged(layer, rect)`) and a selection stroke pass the box they touched.
 - **`selectionBounds()`** scans a display level first and makes the box exact only inside
   the region the level marked, which keeps a 96 MP selection under 100 ms.
+
+### 21c. The editor's worker (2026-09-10, phase 3)
+
+`js/inpaint_worker.js` is a module worker, created from
+`new Worker(new URL("./inpaint_worker.js", import.meta.url), { type: "module" })`, so it
+works in the ComfyUI page and in the app without either host knowing about it. Jobs:
+
+- `png`: an ImageBitmap in, a PNG blob (and the short SHA-1 upload hash) out. The editor
+  calls it through `encodeCanvas(canvas, {hash})`, which `uploadCanvas`, the undo snapshots
+  (`snapUrl`) and the autosave's selection PNG use. On a 96 MP canvas `canvas.toBlob` holds
+  the main thread for 738 ms, `createImageBitmap` plus the transfer for 17 ms.
+- `export_begin` / `export_layer` / `export_finish`: a PSD or ORA file, one layer at a
+  time. `inpaint_export.js` has `PsdWriter` and `OraWriter` for that (`buildPsd` /
+  `buildOra` are thin wrappers over them and stay the main-thread fallback); the module no
+  longer needs a `document`, it uses `OffscreenCanvas` when there is none. 4146 ms of
+  blocking became 101 ms.
+
+Rules when you touch this:
+
+- Everything the worker does must have a main-thread fallback. `editorWorker()` returns
+  null once a worker failed to start, `workerCall` times out after `WORKER_TIMEOUT`, and
+  every caller catches and does the work itself. The node must keep working in browsers
+  that block module workers.
+- Only transferables cross the line: ImageBitmaps (transferred, then closed in the worker),
+  plain objects, blobs. Never a canvas or a layer object - `postMessage` throws
+  `DataCloneError` on an HTMLCanvasElement.
+- `createImageBitmap(canvas)` and `canvas.toBlob` both snapshot the canvas at call time, so
+  a snapshot taken before an edit still shows the state before it (verified).
+- The worker's output must stay byte-identical to the main thread's; the writers are shared
+  code for exactly that reason.

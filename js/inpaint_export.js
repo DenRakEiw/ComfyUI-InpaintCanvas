@@ -7,6 +7,16 @@
  * image. Filter layers cannot be represented and are left out by the caller.
  */
 
+/** A 2D canvas in the window or in a worker. */
+function makeExportCanvas(w, h) {
+    const width = Math.max(1, w | 0), height = Math.max(1, h | 0);
+    if (typeof document === "undefined") return new OffscreenCanvas(width, height);
+    const c = document.createElement("canvas");
+    c.width = width;
+    c.height = height;
+    return c;
+}
+
 const PSD_BLEND = { normal: "norm", multiply: "mul ", screen: "scrn", overlay: "over", darken: "dark", lighten: "lite", "soft-light": "sLit", "hard-light": "hLit", difference: "diff" };
 const ORA_BLEND = { normal: "svg:src-over", multiply: "svg:multiply", screen: "svg:screen", overlay: "svg:overlay", darken: "svg:darken", lighten: "svg:lighten", "soft-light": "svg:soft-light", "hard-light": "svg:hard-light", difference: "svg:difference" };
 
@@ -73,19 +83,24 @@ function pascal(name, pad) {
     return out;
 }
 
-/** Build a PSD file (Blob) from the layered description. */
-export function buildPsd({ width, height, layers, composite }) {
-    const w = new ByteWriter();
-    w.ascii("8BPS"); w.u16(1); w.push(new Uint8Array(6)); w.u16(3); w.u32(height); w.u32(width); w.u16(8); w.u16(3);
-    w.u32(0);   // colour mode data
-    w.u32(0);   // image resources
-    // layer records + channel data
-    const records = new ByteWriter();
-    const channelData = new ByteWriter();
-    records.i16(layers.length);
-    for (const L of layers) {
-        const lw = L.canvas.width, lh = L.canvas.height;
-        const [r, g, b, a] = planes(L.canvas);
+/**
+ * PSD writer that takes its layers one at a time (bottom first), so a worker can pack a
+ * layer as soon as its pixels arrive and never holds the whole document at once.
+ */
+export class PsdWriter {
+    constructor({ width, height }) {
+        this.width = width;
+        this.height = height;
+        this.records = new ByteWriter();
+        this.channelData = new ByteWriter();
+        this.count = 0;
+    }
+
+    /** One layer: `L` is the description, `canvas` its pixels. */
+    layer(L, canvas = L.canvas) {
+        const records = this.records, channelData = this.channelData;
+        const lw = canvas.width, lh = canvas.height;
+        const [r, g, b, a] = planes(canvas);
         const packed = [[-1, packPlane(a, lw, lh)], [0, packPlane(r, lw, lh)], [1, packPlane(g, lw, lh)], [2, packPlane(b, lw, lh)]];
         records.i32(L.y); records.i32(L.x); records.i32(L.y + lh); records.i32(L.x + lw);
         records.u16(4);
@@ -105,23 +120,43 @@ export function buildPsd({ width, height, layers, composite }) {
             for (const row of pk.rows) channelData.u16(row.length);
             for (const row of pk.rows) channelData.push(row);
         }
+        this.count++;
     }
-    let layerInfoLen = records.size + channelData.size;
-    const padLayerInfo = layerInfoLen % 2;
-    layerInfoLen += padLayerInfo;
-    w.u32(4 + layerInfoLen + 4);
-    w.u32(layerInfoLen);
-    w.push(records.bytes());
-    w.push(channelData.bytes());
-    if (padLayerInfo) w.u8(0);
-    w.u32(0);   // global layer mask info
-    // merged image: RGB, PackBits, all row lengths first
-    const [cr, cg, cb] = planes(composite);
-    const cp = [packPlane(cr, width, height), packPlane(cg, width, height), packPlane(cb, width, height)];
-    w.u16(1);
-    for (const pk of cp) for (const row of pk.rows) w.u16(row.length);
-    for (const pk of cp) for (const row of pk.rows) w.push(row);
-    return new Blob([w.bytes()], { type: "image/vnd.adobe.photoshop" });
+
+    /** The flattened image closes the file. */
+    finish(composite) {
+        const width = this.width, height = this.height;
+        const w = new ByteWriter();
+        w.ascii("8BPS"); w.u16(1); w.push(new Uint8Array(6)); w.u16(3); w.u32(height); w.u32(width); w.u16(8); w.u16(3);
+        w.u32(0);   // colour mode data
+        w.u32(0);   // image resources
+        const head = new ByteWriter();
+        head.i16(this.count);
+        let layerInfoLen = head.size + this.records.size + this.channelData.size;
+        const padLayerInfo = layerInfoLen % 2;
+        layerInfoLen += padLayerInfo;
+        w.u32(4 + layerInfoLen + 4);
+        w.u32(layerInfoLen);
+        w.push(head.bytes());
+        w.push(this.records.bytes());
+        w.push(this.channelData.bytes());
+        if (padLayerInfo) w.u8(0);
+        w.u32(0);   // global layer mask info
+        // merged image: RGB, PackBits, all row lengths first
+        const [cr, cg, cb] = planes(composite);
+        const cp = [packPlane(cr, width, height), packPlane(cg, width, height), packPlane(cb, width, height)];
+        w.u16(1);
+        for (const pk of cp) for (const row of pk.rows) w.u16(row.length);
+        for (const pk of cp) for (const row of pk.rows) w.push(row);
+        return new Blob([w.bytes()], { type: "image/vnd.adobe.photoshop" });
+    }
+}
+
+/** Build a PSD file (Blob) from the layered description. */
+export function buildPsd({ width, height, layers, composite }) {
+    const w = new PsdWriter({ width, height });
+    for (const L of layers) w.layer(L);
+    return w.finish(composite);
 }
 
 // ---- zip (stored) for ORA ---------------------------------------------------------
@@ -157,30 +192,51 @@ export function zipStore(entries) {
     return w.bytes();
 }
 
-function pngBytes(canvas) {
-    return new Promise((resolve) => canvas.toBlob((b) => b.arrayBuffer().then((buf) => resolve(new Uint8Array(buf))), "image/png"));
+async function pngBytes(canvas) {
+    const blob = canvas.convertToBlob ? await canvas.convertToBlob({ type: "image/png" })
+        : await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+    return new Uint8Array(await blob.arrayBuffer());
 }
 
 function xmlEsc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
 
+/**
+ * OpenRaster writer that takes its layers one at a time (bottom first), like PsdWriter.
+ * Krita and GIMP open the result with all layers.
+ */
+export class OraWriter {
+    constructor({ width, height }) {
+        this.width = width;
+        this.height = height;
+        this.entries = [{ name: "mimetype", data: new TextEncoder().encode("image/openraster") }];
+        this.stackLines = [];
+        this.count = 0;
+    }
+
+    async layer(L, canvas = L.canvas) {
+        const file = `data/layer${this.count}.png`;
+        this.entries.push({ name: file, data: await pngBytes(canvas) });
+        // ORA lists layers top first, they arrive bottom first
+        this.stackLines.unshift(`    <layer name="${xmlEsc(L.name || "Layer")}" src="${file}" x="${L.x}" y="${L.y}" opacity="${(L.opacity ?? 1).toFixed(3)}" visibility="${L.visible === false ? "hidden" : "visible"}" composite-op="${ORA_BLEND[L.blend] || "svg:src-over"}" />`);
+        this.count++;
+    }
+
+    async finish(composite) {
+        const width = this.width, height = this.height;
+        const stack = `<?xml version="1.0" encoding="UTF-8"?>\n<image version="0.0.3" w="${width}" h="${height}" xres="72" yres="72">\n  <stack>\n${this.stackLines.join("\n")}\n  </stack>\n</image>\n`;
+        this.entries.push({ name: "stack.xml", data: new TextEncoder().encode(stack) });
+        this.entries.push({ name: "mergedimage.png", data: await pngBytes(composite) });
+        const ts = Math.min(1, 256 / Math.max(width, height));
+        const thumb = makeExportCanvas(Math.round(width * ts), Math.round(height * ts));
+        thumb.getContext("2d").drawImage(composite, 0, 0, thumb.width, thumb.height);
+        this.entries.push({ name: "Thumbnails/thumbnail.png", data: await pngBytes(thumb) });
+        return new Blob([zipStore(this.entries)], { type: "image/openraster" });
+    }
+}
+
 /** Build an OpenRaster file (Blob). Krita and GIMP open it with all layers. */
 export async function buildOra({ width, height, layers, composite }) {
-    const entries = [{ name: "mimetype", data: new TextEncoder().encode("image/openraster") }];
-    const stackLines = [];
-    // ORA lists layers top first
-    for (let i = layers.length - 1; i >= 0; i--) {
-        const L = layers[i];
-        const file = `data/layer${i}.png`;
-        entries.push({ name: file, data: await pngBytes(L.canvas) });
-        stackLines.push(`    <layer name="${xmlEsc(L.name || "Layer")}" src="${file}" x="${L.x}" y="${L.y}" opacity="${(L.opacity ?? 1).toFixed(3)}" visibility="${L.visible === false ? "hidden" : "visible"}" composite-op="${ORA_BLEND[L.blend] || "svg:src-over"}" />`);
-    }
-    const stack = `<?xml version="1.0" encoding="UTF-8"?>\n<image version="0.0.3" w="${width}" h="${height}" xres="72" yres="72">\n  <stack>\n${stackLines.join("\n")}\n  </stack>\n</image>\n`;
-    entries.push({ name: "stack.xml", data: new TextEncoder().encode(stack) });
-    entries.push({ name: "mergedimage.png", data: await pngBytes(composite) });
-    const ts = Math.min(1, 256 / Math.max(width, height));
-    const thumb = document.createElement("canvas");
-    thumb.width = Math.max(1, Math.round(width * ts)); thumb.height = Math.max(1, Math.round(height * ts));
-    thumb.getContext("2d").drawImage(composite, 0, 0, thumb.width, thumb.height);
-    entries.push({ name: "Thumbnails/thumbnail.png", data: await pngBytes(thumb) });
-    return new Blob([zipStore(entries)], { type: "image/openraster" });
+    const w = new OraWriter({ width, height });
+    for (const L of layers) await w.layer(L);
+    return w.finish(composite);
 }
