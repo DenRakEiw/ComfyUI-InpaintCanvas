@@ -24,6 +24,10 @@ const NODE_CLASS = "InpaintCanvas";
 const STITCH_CLASS = "InpaintCanvasStitch";
 const SUBFOLDER = "inpaint_canvas";
 const MAX_UNDO = 30;
+const MAX_UNDO_BYTES = 384 * 1024 * 1024;   // rect undo copies: older steps are dropped past this
+const PYRAMID_MIN_PX = 1 << 20;             // sources below 1 MP are drawn straight, no levels
+const PYRAMID_LEVELS = 8;
+const SYNC_ENCODE_PX = 16 * 1024 * 1024;    // above this the selection PNG for getValue is encoded off the main thread
 const HANDLE_PX = 9;
 const RULER_PX = 18;
 const CURSOR_CLASSES = ["ipc-scale", "ipc-scale-ne", "ipc-scale-x", "ipc-scale-y", "ipc-rotate"];
@@ -49,6 +53,11 @@ function viewUrl(ref) {
         type: ref.type || "input",
     });
     return api.apiURL("/view?" + p.toString());
+}
+
+/** An undo snapshot's image: the URL may still be encoding when undo is pressed. */
+async function snapImage(u) {
+    return loadImageEl(typeof u === "string" ? u : await u);
 }
 
 function loadImageEl(src) {
@@ -946,6 +955,18 @@ class InpaintEditor {
         this.selectionDataUrl = null;
         this.cachedBounds = null;
         this.compositeVersion = 0;      // bumped whenever the composite changes (filter caches key on it)
+        this.pixelVersion = 0;          // bumped whenever a source canvas changed (the scene cache keys on it)
+        this.pyramids = new WeakMap();  // source canvas -> cached downscaled levels for drawing
+        this._pyramidBudget = Infinity; // new levels allowed in this frame (drawScene sets it to 1)
+        this._pyramidPending = false;
+        this.sceneCanvas = null;        // last composited view; overlays are drawn on top of it every frame
+        this.sceneSig = null;
+        this.viewCanvas = null;         // the visible region, composited at screen resolution
+        this.viewPass = null;           // {x, y, w, h, sx, sy} while a region is being composited
+        this.flatCache = null;          // {version, key, canvas} for eyedropper / clone / bucket / wand
+        this.undoBytes = 0;
+        this.selectionEncoded = false;  // the selection PNG in selectionDataUrl is up to date
+        this.selectionSeq = 0;
         this.uploaded = this.makeUploaded();
         this.filterCounter = 0;
         this.filterPreview = null;      // id of the filter layer whose slider is being dragged (low-res preview)
@@ -1035,10 +1056,17 @@ class InpaintEditor {
         const ctx = this.thumb.getContext("2d");
         ctx.setTransform(w / this.width, 0, 0, h / this.height, 0, 0);
         ctx.clearRect(0, 0, this.width, this.height);
-        this.drawComposite(ctx);
+        // one composite of the whole image at thumbnail scale, from the pyramid: no second full-size pass
+        const prev = this.viewPass;
+        this.viewPass = { x: 0, y: 0, w: this.width, h: this.height, sx: w / this.width, sy: h / this.height };
+        try {
+            this.drawComposite(ctx);
+        } finally {
+            this.viewPass = prev;
+        }
         if (this.selection) {
             ctx.globalAlpha = 0.45;
-            ctx.drawImage(this.selection, 0, 0);
+            ctx.drawImage(this.displaySource(this.selection, w / this.width), 0, 0, this.width, this.height);
             ctx.globalAlpha = 1;
         }
     }
@@ -2053,6 +2081,9 @@ class InpaintEditor {
         clearTimeout(this._autosave);
         this.compare = null;
         this.peekBase = false;
+        this.flatCache = null;
+        this.sceneCanvas = null;
+        this.sceneSig = null;
         this.root.remove();
         this.drawThumb();
         this.notifyChanged();
@@ -2299,7 +2330,7 @@ class InpaintEditor {
         this.brushSize = Math.min(400, Math.max(2, v));
         this.sizeCtl.input.value = this.brushSize;
         this.sizeCtl.value.textContent = this.brushSize + "px";
-        this.draw();
+        this.drawSoon();
     }
 
     // ---- geometry ----------------------------------------------------------
@@ -2401,7 +2432,7 @@ class InpaintEditor {
         this.view.y = cy - (cy - this.view.y) * (ns / this.view.scale);
         this.view.scale = ns;
         this._fitted = false;
-        this.draw();
+        this.drawSoon();
     }
 
     // ---- layers: lookup ----------------------------------------------------
@@ -2437,7 +2468,7 @@ class InpaintEditor {
         const mask = this.maskWithStroke(layer);
         let out;
         if (live) {
-            if (!this.maskedPreview || this.maskedPreview.width !== base.width || this.maskedPreview.height !== base.height) this.maskedPreview = makeCanvas(base.width, base.height);
+            if (!this.maskedPreview || this.maskedPreview.width !== base.width || this.maskedPreview.height !== base.height) { this.maskedPreview = makeCanvas(base.width, base.height); this.maskedPreview._livePreview = true; }
             out = this.maskedPreview;
         } else {
             if (!layer._masked || layer._masked.width !== base.width || layer._masked.height !== base.height) layer._masked = makeCanvas(base.width, base.height);
@@ -2451,7 +2482,7 @@ class InpaintEditor {
         ctx.globalCompositeOperation = "destination-in";
         ctx.drawImage(mask, 0, 0, out.width, out.height);
         ctx.globalCompositeOperation = "source-over";
-        if (!live) layer._maskedValid = true;
+        if (!live) { layer._maskedValid = true; this.touchSource(out); }
         return out;
     }
 
@@ -2459,7 +2490,7 @@ class InpaintEditor {
     maskWithStroke(layer) {
         const p = this.pointer;
         if (!p || p.kind !== "maskpaint" || p.layer !== layer) return layer.mask;
-        if (!this.maskPreview || this.maskPreview.width !== layer.mask.width || this.maskPreview.height !== layer.mask.height) this.maskPreview = makeCanvas(layer.mask.width, layer.mask.height);
+        if (!this.maskPreview || this.maskPreview.width !== layer.mask.width || this.maskPreview.height !== layer.mask.height) { this.maskPreview = makeCanvas(layer.mask.width, layer.mask.height); this.maskPreview._livePreview = true; }
         const ctx = this.maskPreview.getContext("2d");
         ctx.globalCompositeOperation = "source-over";
         ctx.globalAlpha = 1;
@@ -3107,7 +3138,7 @@ class InpaintEditor {
                 // dragging inside the selection moves its outline (Photoshop's marquee tools)
                 const orig = makeCanvas(this.width, this.height);
                 orig.getContext("2d").drawImage(this.selection, 0, 0);
-                this.pointer = { kind: "selmove", start: [ix, iy], orig };
+                this.pointer = { kind: "selmove", start: [ix, iy], orig, origBounds: this.getBounds() };
             } else {
                 this.pointer = { kind: "rect", ellipse: this.tool === "ellipse", square: e.ctrlKey, start: [ix, iy], cur: [ix, iy], mode: selMode };
             }
@@ -3160,17 +3191,15 @@ class InpaintEditor {
             if (!o.aligned || !this.cloneOffset) this.cloneOffset = { x: this.cloneSource.x - ix, y: this.cloneSource.y - iy };
             const sample = this.sampleCanvas(o.sample);
             const heal = this.tool === "heal";
-            this.pushUndo({ kind: "layer", id: layer.id });
             const stroke = makeCanvas(layer.canvas.width, layer.canvas.height);
             this.pointer = { kind: "layerpaint", layer, stroke, clip: this.strokeClip(layer, layer.canvas), erase: false, last: [ix, iy], pressure: e.pointerType === "pen" && e.pressure > 0 ? e.pressure : 1,
-                clone: { sample, dest: heal ? (o.sample === "image" ? sample : this.flattenToCanvas()) : null, off: this.cloneOffset, heal } };
+                clone: { sample, dest: heal ? (o.sample === "image" ? sample : this.compositeCanvas()) : null, off: this.cloneOffset, heal } };
             this.cloneDab(this.pointer, ix, iy, ix, iy);
         } else if (this.tool === "gradient") {
             let layer = this.activeLayer();
             if (layer && layer.locked) { this.setStatus(`${layer.name} is locked.`); return; }
             if (layer && layer.kind === "filter") { this.setStatus("Filter layers have no pixels. Select a paint or image layer."); return; }
             if (!layer) layer = this.addPaintLayer();
-            this.pushUndo({ kind: "layer", id: layer.id });
             const stroke = makeCanvas(layer.canvas.width, layer.canvas.height);
             this.pointer = { kind: "layerpaint", grad: true, layer, stroke, clip: this.strokeClip(layer, layer.canvas), erase: false, start: [ix, iy], last: [ix, iy] };
         } else if ((this.tool === "paint" || this.tool === "erase") && this.quickMask) {
@@ -3188,7 +3217,6 @@ class InpaintEditor {
             if (layer && layer.alphaLock && this.tool === "erase" && !(layer.mask && layer.maskEdit)) { this.setStatus(`${layer.name} has its alpha locked: nothing to erase. Unlock alpha first.`); return; }
             if (layer && layer.mask && layer.maskEdit) {
                 // Painting on the transparency mask: paint reveals, erase hides.
-                this.pushUndo({ kind: "mask", id: layer.id });
                 const stroke = makeCanvas(layer.mask.width, layer.mask.height);
                 this.pointer = { kind: "maskpaint", layer, stroke, clip: this.strokeClip(layer, layer.mask), erase: this.tool === "erase", white: true, last: [ix, iy], pressure };
                 if (lineFrom && prev.mask) this.layerDab(this.pointer, lineFrom[0], lineFrom[1], ix, iy); else this.layerDab(this.pointer, ix, iy, ix, iy);
@@ -3200,7 +3228,6 @@ class InpaintEditor {
                 if (this.tool === "erase") { this.setStatus("The base layer cannot be erased. Select a layer or add a paint layer."); return; }
                 layer = this.addPaintLayer();
             }
-            this.pushUndo({ kind: "layer", id: layer.id });
             const stroke = makeCanvas(layer.canvas.width, layer.canvas.height);
             this.pointer = { kind: "layerpaint", layer, stroke, clip: this.strokeClip(layer, layer.canvas), erase: this.tool === "erase", last: [ix, iy], pressure };
             if (lineFrom && !prev.mask) this.layerDab(this.pointer, lineFrom[0], lineFrom[1], ix, iy); else this.layerDab(this.pointer, ix, iy, ix, iy);
@@ -3254,7 +3281,7 @@ class InpaintEditor {
             if (this.tool === "transform") this.updateTransformCursor(ix, iy);
             if (this.tool === "canvas") this.updateCanvasCursor(ix, iy);
             if (this.tool === "object") this.updateObjectHover(ix, iy);
-            this.draw();
+            this.drawSoon();
             return;
         }
         if (p.kind === "object") {
@@ -3289,10 +3316,20 @@ class InpaintEditor {
             p.mode = e.altKey ? "subtract" : (e.shiftKey ? "add" : p.mode === "replace" && !e.shiftKey ? "replace" : "add");
         } else if (p.kind === "selmove") {
             const sctx = this.selection.getContext("2d");
+            const mx = Math.round(ix - p.start[0]), my = Math.round(iy - p.start[1]);
             sctx.globalCompositeOperation = "source-over";
             sctx.clearRect(0, 0, this.width, this.height);
-            sctx.drawImage(p.orig, Math.round(ix - p.start[0]), Math.round(iy - p.start[1]));
-            this.selectionDirty = true;
+            sctx.drawImage(p.orig, mx, my);
+            this.touchSource(this.selection);
+            if (p.origBounds) {
+                // the outline only moves: shift the known box instead of scanning the selection
+                const nb = [Math.max(0, p.origBounds[0] + mx), Math.max(0, p.origBounds[1] + my),
+                    Math.min(this.width, p.origBounds[2] + mx), Math.min(this.height, p.origBounds[3] + my)];
+                this.cachedBounds = (nb[2] > nb[0] && nb[3] > nb[1]) ? nb : null;
+                this.selectionDirty = false;
+            } else {
+                this.selectionDirty = true;
+            }
         } else if (p.kind === "lasso") {
             this.lassoPoints.push([ix, iy]);
             p.mode = e.altKey ? "subtract" : (e.shiftKey ? "add" : p.mode === "replace" && !e.shiftKey ? "replace" : "add");
@@ -3332,7 +3369,7 @@ class InpaintEditor {
         } else if (p.kind === "pending") {
             this.pendingPointerMove(ix, iy, e);
         }
-        this.draw();
+        this.drawSoon();
     }
 
     applyScale(p, ix, iy) {
@@ -3378,9 +3415,9 @@ class InpaintEditor {
                 sctx.fillRect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0));
             }
             sctx.globalCompositeOperation = "source-over";
-            this.markSelectionChanged();
+            this.markSelectionChanged(this.boundsAfter(p.mode, [Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1)]));
         } else if (p.kind === "selmove") {
-            this.markSelectionChanged();
+            this.markSelectionChanged(this.selectionDirty ? undefined : this.cachedBounds);
             this.setStatus("Selection outline moved.");
         } else if (p.kind === "lasso") {
             const pts = this.lassoPoints;
@@ -3396,7 +3433,9 @@ class InpaintEditor {
                 sctx.closePath();
                 sctx.fill();
                 sctx.globalCompositeOperation = "source-over";
-                this.markSelectionChanged();
+                let lx0 = pts[0][0], ly0 = pts[0][1], lx1 = lx0, ly1 = ly0;
+                for (const [px, py] of pts) { if (px < lx0) lx0 = px; if (px > lx1) lx1 = px; if (py < ly0) ly0 = py; if (py > ly1) ly1 = py; }
+                this.markSelectionChanged(this.boundsAfter(p.mode, [lx0, ly0, lx1, ly1]));
             }
         } else if (p.kind === "selpaint") {
             if (this.fillEnclosed) this.closeStrokeLoop(p.path, !!p.subtract);
@@ -3457,6 +3496,7 @@ class InpaintEditor {
     }
 
     selectionDab(x0, y0, x1, y1) {
+        this.touchSource(this.selection);
         const sctx = this.selection.getContext("2d");
         const subtract = this.pointer && this.pointer.kind === "selpaint" ? !!this.pointer.subtract : this.tool === "deselect";
         sctx.globalCompositeOperation = subtract ? "destination-out" : "source-over";
@@ -3517,6 +3557,8 @@ class InpaintEditor {
         const ctx = c.getContext("2d");
         const lx0 = (x0 - layer.x) * sx, ly0 = (y0 - layer.y) * sy;
         const lx1 = (x1 - layer.x) * sx, ly1 = (y1 - layer.y) * sy;
+        this.strokeBounds(p, x0, y0, x1, y1, this.brushSize / 2 + 2);
+        this.touchSource(c);
         // a pen's pressure scales the size (Krita's default "size by pressure"); the mouse paints at full size
         const radius = this.brushSize * (sx + sy) / 4 * (p.pressure == null ? 1 : Math.max(0.05, Math.min(1, p.pressure)));
         const color = p.white ? "#ffffff" : (p.erase ? "#000000" : this.color);
@@ -3729,6 +3771,8 @@ class InpaintEditor {
         }
         layer._maskedValid = false;
         layer._mcache = null;
+        layer._mcacheView = null;
+        this.touchSource(c);
     }
 
     /** Mean RGB of a region of an image-sized canvas, via an 8 × 8 downscale. */
@@ -3750,6 +3794,8 @@ class InpaintEditor {
         const R = Math.max(0.5, this.brushSize / 2 * Math.max(0.05, Math.min(1, p.pressure || 1)));   // image px
         const r = Math.max(1, R * (sx + sy) / 2);                                                       // layer px
         const size = Math.ceil(r * 2);
+        this.strokeBounds(p, x0, y0, x1, y1, R + 2);
+        this.touchSource(s);
         if (!this._cloneDab || this._cloneDab.width !== size) this._cloneDab = makeCanvas(size, size);
         const d = this._cloneDab, dctx = d.getContext("2d");
         const mask = this.dabMask(r, this.hardness);
@@ -3789,6 +3835,7 @@ class InpaintEditor {
         const x0 = (p.start[0] - layer.x) * sx, y0 = (p.start[1] - layer.y) * sy;
         const x1 = (ix - layer.x) * sx, y1 = (iy - layer.y) * sy;
         const ctx = c.getContext("2d");
+        this.touchSource(c);   // no bounds: a gradient covers the whole layer
         ctx.globalCompositeOperation = "source-over";
         ctx.clearRect(0, 0, c.width, c.height);
         const dist = Math.hypot(x1 - x0, y1 - y0);
@@ -3806,12 +3853,16 @@ class InpaintEditor {
     sampleCanvas(source = "image") {
         if (source === "layer") {
             const l = this.activeLayer();
-            if (!l || l.kind === "filter") return this.flattenToCanvas();
-            const c = makeCanvas(this.width, this.height);
-            c.getContext("2d").drawImage(this.layerPixels(l), l.x, l.y, l.w, l.h);
-            return c;
+            if (!l || l.kind === "filter") return this.compositeCanvas();
+            const key = "layer:" + l.id;
+            const c = this.flatCache;
+            if (c && c.version === this.compositeVersion && c.key === key) return c.canvas;
+            const canvas = makeCanvas(this.width, this.height);
+            canvas.getContext("2d").drawImage(this.layerPixels(l), l.x, l.y, l.w, l.h);
+            this.flatCache = { version: this.compositeVersion, key, canvas };
+            return canvas;
         }
-        return this.flattenToCanvas();
+        return this.compositeCanvas();
     }
 
     /** Eyedropper: the colour of the visible image under (ix, iy) becomes the paint colour. */
@@ -3874,7 +3925,7 @@ class InpaintEditor {
     /** The stroke buffer, limited to the selection when the gesture has a clip. */
     clippedStroke(p) {
         if (!p.clip) return p.stroke;
-        if (!this.clipScratch || this.clipScratch.width !== p.stroke.width || this.clipScratch.height !== p.stroke.height) this.clipScratch = makeCanvas(p.stroke.width, p.stroke.height);
+        if (!this.clipScratch || this.clipScratch.width !== p.stroke.width || this.clipScratch.height !== p.stroke.height) { this.clipScratch = makeCanvas(p.stroke.width, p.stroke.height); this.clipScratch._livePreview = true; }
         const ctx = this.clipScratch.getContext("2d");
         ctx.globalCompositeOperation = "source-over";
         ctx.globalAlpha = 1;
@@ -3888,7 +3939,10 @@ class InpaintEditor {
 
     /** Apply the stroke buffer to the layer (or its mask) with the brush opacity. */
     commitStroke(p) {
-        const ctx = (p.kind === "maskpaint" ? p.layer.mask : p.layer.canvas).getContext("2d");
+        const target = p.kind === "maskpaint" ? p.layer.mask : p.layer.canvas;
+        // the undo step is a copy of what the stroke touched, taken before it is applied
+        if (!p.noUndo) this.pushUndoSnapshot(this.strokeUndo(p, target));
+        const ctx = target.getContext("2d");
         ctx.save();
         ctx.globalAlpha = this.brushOpacity;
         ctx.globalCompositeOperation = p.erase ? "destination-out" : (p.kind === "layerpaint" && p.layer.alphaLock ? "source-atop" : "source-over");
@@ -3902,6 +3956,7 @@ class InpaintEditor {
         if (!p || p.kind !== "layerpaint" || p.layer !== layer) return layer.canvas;
         if (!this.strokePreview || this.strokePreview.width !== layer.canvas.width || this.strokePreview.height !== layer.canvas.height) {
             this.strokePreview = makeCanvas(layer.canvas.width, layer.canvas.height);
+            this.strokePreview._livePreview = true;
         }
         const ctx = this.strokePreview.getContext("2d");
         ctx.globalCompositeOperation = "source-over";
@@ -4529,23 +4584,84 @@ class InpaintEditor {
 
     // ---- undo ----------------------------------------------------------------
 
+    /** PNG of a canvas as a blob URL, encoded off the main thread; undo steps hold the promise. */
+    snapUrl(canvas) {
+        const p = canvasToBlob(canvas).then((blob) => URL.createObjectURL(blob));
+        p.catch(() => null);
+        return p;
+    }
+
+    /**
+     * A copy of the pixels of `layer` inside `rect` (in the target canvas's own pixels):
+     * the undo step of a brush stroke, so a stroke on a 100 MP layer costs what it covered.
+     */
+    snapshotRect(layer, rect, mask = false) {
+        const target = mask ? layer.mask : layer.canvas;
+        if (!target) return null;
+        const x = Math.max(0, Math.floor(rect.x) - 2), y = Math.max(0, Math.floor(rect.y) - 2);
+        const w = Math.min(target.width - x, Math.ceil(rect.w + (rect.x - x)) + 4);
+        const h = Math.min(target.height - y, Math.ceil(rect.h + (rect.y - y)) + 4);
+        if (w <= 0 || h <= 0) return null;
+        const c = makeCanvas(w, h);
+        c.getContext("2d").drawImage(target, x, y, w, h, 0, 0, w, h);
+        return { kind: "layerrect", id: layer.id, mask, x, y, w, h, canvas: c, bytes: w * h * 4 };
+    }
+
+    /** Widen the box a gesture has painted over (image coordinates). */
+    strokeBounds(p, x0, y0, x1, y1, pad) {
+        const nx0 = Math.min(x0, x1) - pad, ny0 = Math.min(y0, y1) - pad;
+        const nx1 = Math.max(x0, x1) + pad, ny1 = Math.max(y0, y1) + pad;
+        const b = p.bounds;
+        p.bounds = b ? [Math.min(b[0], nx0), Math.min(b[1], ny0), Math.max(b[2], nx1), Math.max(b[3], ny1)] : [nx0, ny0, nx1, ny1];
+    }
+
+    /** The undo step for a finished stroke: the touched rectangle, or the whole layer. */
+    strokeUndo(p, target) {
+        const layer = p.layer;
+        if (!target) return null;
+        const sx = target.width / layer.w, sy = target.height / layer.h;
+        let rect = { x: 0, y: 0, w: target.width, h: target.height };
+        if (p.bounds) {
+            const [x0, y0, x1, y1] = p.bounds;
+            rect = { x: (x0 - layer.x) * sx, y: (y0 - layer.y) * sy, w: (x1 - x0) * sx, h: (y1 - y0) * sy };
+        }
+        return this.snapshotRect(layer, rect, p.kind === "maskpaint");
+    }
+
+    /** Free a discarded undo step: its blob URL and its share of the memory budget. */
+    releaseSnapshot(snap) {
+        if (!snap) return;
+        this.undoBytes -= snap.bytes || 0;
+        for (const k of ["url", "mask", "selection"]) {
+            const v = snap[k];
+            if (!v) continue;
+            if (typeof v.then === "function") v.then((u) => { if (typeof u === "string" && u.startsWith("blob:")) URL.revokeObjectURL(u); }).catch(() => {});
+            else if (typeof v === "string" && v.startsWith("blob:")) URL.revokeObjectURL(v);
+        }
+        snap.canvas = null;
+    }
+
     snapshot(step) {
-        if (step.kind === "selection") return { kind: "selection", url: this.selection.toDataURL("image/png") };
+        if (step.kind === "layerrect") {
+            const l = this.layers.find((x) => x.id === step.id);
+            return l ? this.snapshotRect(l, step, step.mask) : null;
+        }
+        if (step.kind === "selection") return { kind: "selection", url: this.snapUrl(this.selection) };
         if (step.kind === "layers") return { kind: "layers", layers: this.layers.map((l) => ({ ...l })), activeLayerId: this.activeLayerId };
         if (step.kind === "canvas") {
             // base, size, selection and the layer list (shallow copies: the canvases themselves are never mutated by extend / crop, only replaced)
-            return { kind: "canvas", base: this.base, width: this.width, height: this.height, selection: this.selection.toDataURL("image/png"), layers: this.layers.map((l) => ({ ...l })), activeLayerId: this.activeLayerId };
+            return { kind: "canvas", base: this.base, width: this.width, height: this.height, selection: this.snapUrl(this.selection), layers: this.layers.map((l) => ({ ...l })), activeLayerId: this.activeLayerId };
         }
         const layer = this.layers.find((l) => l.id === step.id);
         if (!layer) return null;
-        if (step.kind === "layer") return { kind: "layer", id: layer.id, url: layer.canvas.toDataURL("image/png") };
+        if (step.kind === "layer") return { kind: "layer", id: layer.id, url: this.snapUrl(layer.canvas) };
         if (step.kind === "transform") return { kind: "transform", id: layer.id, x: layer.x, y: layer.y, w: layer.w, h: layer.h };
-        if (step.kind === "mask") return { kind: "mask", id: layer.id, url: layer.mask ? layer.mask.toDataURL("image/png") : null, mw: layer.mask ? layer.mask.width : 0, mh: layer.mask ? layer.mask.height : 0 };
+        if (step.kind === "mask") return { kind: "mask", id: layer.id, url: layer.mask ? this.snapUrl(layer.mask) : null, mw: layer.mask ? layer.mask.width : 0, mh: layer.mask ? layer.mask.height : 0 };
         if (step.kind === "match") return { kind: "match", id: layer.id, match: { ...(layer.match || { strength: 0, source: "surroundings" }) } };
         if (step.kind === "filter") return { kind: "filter", id: layer.id, filter: layer.filter, params: { ...(layer.params || {}) }, lut: layer.lut ? { ...layer.lut } : null, lutData: layer._lutData || null, plate: layer.plate ? { ...layer.plate } : null, plateImg: layer._plateImg || null, name: layer.name };
-        if (step.kind === "text") return { kind: "text", id: layer.id, text: JSON.parse(JSON.stringify(layer.text || TEXT_DEFAULTS)), url: layer.canvas.toDataURL("image/png"), cw: layer.canvas.width, ch: layer.canvas.height, x: layer.x, y: layer.y, w: layer.w, h: layer.h };
-        if (step.kind === "layerfull") return { kind: "layerfull", id: layer.id, url: layer.canvas.toDataURL("image/png"), cw: layer.canvas.width, ch: layer.canvas.height, x: layer.x, y: layer.y, w: layer.w, h: layer.h,
-            mask: layer.mask ? layer.mask.toDataURL("image/png") : null, mw: layer.mask ? layer.mask.width : 0, mh: layer.mask ? layer.mask.height : 0 };
+        if (step.kind === "text") return { kind: "text", id: layer.id, text: JSON.parse(JSON.stringify(layer.text || TEXT_DEFAULTS)), url: this.snapUrl(layer.canvas), cw: layer.canvas.width, ch: layer.canvas.height, x: layer.x, y: layer.y, w: layer.w, h: layer.h };
+        if (step.kind === "layerfull") return { kind: "layerfull", id: layer.id, url: this.snapUrl(layer.canvas), cw: layer.canvas.width, ch: layer.canvas.height, x: layer.x, y: layer.y, w: layer.w, h: layer.h,
+            mask: layer.mask ? this.snapUrl(layer.mask) : null, mw: layer.mask ? layer.mask.width : 0, mh: layer.mask ? layer.mask.height : 0 };
         return null;
     }
 
@@ -4557,7 +4673,9 @@ class InpaintEditor {
     pushUndoSnapshot(snap) {
         if (!snap) return;
         this.undo.push(snap);
-        if (this.undo.length > MAX_UNDO) this.undo.shift();
+        this.undoBytes += snap.bytes || 0;
+        while (this.undo.length > MAX_UNDO || (this.undoBytes > MAX_UNDO_BYTES && this.undo.length > 1)) this.releaseSnapshot(this.undo.shift());
+        for (const s of this.redo) this.releaseSnapshot(s);
         this.redo = [];
     }
 
@@ -4579,7 +4697,7 @@ class InpaintEditor {
             this.layers = snap.layers.map((l) => ({ ...l, dirty: true, exportRef: null, _maskedValid: false, _mcache: null, _fxCache: null, maskDirty: !!l.mask }));
             this.activeLayerId = snap.activeLayerId;
             this.selection = makeCanvas(this.width, this.height);
-            try { this.selection.getContext("2d").drawImage(await loadImageEl(snap.selection), 0, 0); } catch (_) { /* empty selection */ }
+            try { this.selection.getContext("2d").drawImage(await snapImage(snap.selection), 0, 0); } catch (_) { /* empty selection */ }
             this.uploaded = this.makeUploaded();
             this.selectionDirty = true;
             this.selectionDataUrl = null;
@@ -4593,7 +4711,7 @@ class InpaintEditor {
             return;
         }
         if (snap.kind === "selection") {
-            const img = await loadImageEl(snap.url);
+            const img = await snapImage(snap.url);
             const sctx = this.selection.getContext("2d");
             sctx.globalCompositeOperation = "source-over";
             sctx.clearRect(0, 0, this.width, this.height);
@@ -4603,7 +4721,7 @@ class InpaintEditor {
             const layer = this.layers.find((l) => l.id === snap.id);
             if (!layer) return;
             if (snap.kind === "layer") {
-                const img = await loadImageEl(snap.url);
+                const img = await snapImage(snap.url);
                 const ctx = layer.canvas.getContext("2d");
                 ctx.globalCompositeOperation = "source-over";
                 ctx.clearRect(0, 0, layer.canvas.width, layer.canvas.height);
@@ -4631,23 +4749,37 @@ class InpaintEditor {
                 this.markFilterChanged(layer);
                 this.renderLayers();
             } else if (snap.kind === "mask") {
-                layer.mask = snap.url ? imageToCanvas(await loadImageEl(snap.url), snap.mw, snap.mh) : null;
+                layer.mask = snap.url ? imageToCanvas(await snapImage(snap.url), snap.mw, snap.mh) : null;
                 if (!layer.mask) layer.maskEdit = false;
                 this.markMaskChanged(layer);
                 this.renderLayers();
             } else if (snap.kind === "text") {
-                const img = await loadImageEl(snap.url);
+                const img = await snapImage(snap.url);
                 layer.canvas = imageToCanvas(img, snap.cw, snap.ch);
                 Object.assign(layer, { x: snap.x, y: snap.y, w: snap.w, h: snap.h });
                 layer.text = JSON.parse(JSON.stringify(snap.text));
                 layer._maskedValid = false;
                 this.markLayerChanged(layer);
                 this.renderLayers();
+            } else if (snap.kind === "layerrect") {
+                const target = snap.mask ? layer.mask : layer.canvas;
+                if (target && snap.canvas) {
+                    const ctx = target.getContext("2d");
+                    ctx.save();
+                    ctx.setTransform(1, 0, 0, 1, 0, 0);
+                    ctx.globalAlpha = 1;
+                    ctx.globalCompositeOperation = "source-over";
+                    ctx.clearRect(snap.x, snap.y, snap.w, snap.h);
+                    ctx.drawImage(snap.canvas, snap.x, snap.y);
+                    ctx.restore();
+                }
+                if (snap.mask) this.markMaskChanged(layer); else this.markLayerChanged(layer);
+                this.renderLayers();
             } else if (snap.kind === "layerfull") {
-                const img = await loadImageEl(snap.url);
+                const img = await snapImage(snap.url);
                 layer.canvas = imageToCanvas(img, snap.cw, snap.ch);
                 Object.assign(layer, { x: snap.x, y: snap.y, w: snap.w, h: snap.h });
-                layer.mask = snap.mask ? imageToCanvas(await loadImageEl(snap.mask), snap.mw, snap.mh) : null;
+                layer.mask = snap.mask ? imageToCanvas(await snapImage(snap.mask), snap.mw, snap.mh) : null;
                 if (!layer.mask) layer.maskEdit = false;
                 layer.maskDirty = !!layer.mask;
                 layer._maskedValid = false;
@@ -4664,8 +4796,9 @@ class InpaintEditor {
         const snap = this.undo.pop();
         if (!snap) return;
         const current = this.snapshot(snap);
-        if (current) this.redo.push(current);
+        if (current) { this.redo.push(current); this.undoBytes += current.bytes || 0; }
         await this.applySnapshot(snap);
+        this.releaseSnapshot(snap);
     }
 
     async redoStep() {
@@ -4673,8 +4806,9 @@ class InpaintEditor {
         const snap = this.redo.pop();
         if (!snap) return;
         const current = this.snapshot(snap);
-        if (current) this.undo.push(current);
+        if (current) { this.undo.push(current); this.undoBytes += current.bytes || 0; }
         await this.applySnapshot(snap);
+        this.releaseSnapshot(snap);
     }
 
     // ---- selection ops -----------------------------------------------------
@@ -4684,7 +4818,7 @@ class InpaintEditor {
         this.selectionLabel = "";
         this.pushUndo({ kind: "selection" });
         this.selection.getContext("2d").clearRect(0, 0, this.width, this.height);
-        this.markSelectionChanged();
+        this.markSelectionChanged(null);
         this.draw();
     }
 
@@ -4703,9 +4837,21 @@ class InpaintEditor {
         this.draw();
     }
 
-    markSelectionChanged() {
-        this.selectionDirty = true;
-        this.selectionDataUrl = null;
+    /**
+     * The selection changed. `bounds` is its new bounding box when the caller knows it
+     * ([x0, y0, x1, y1] or null for an empty selection); left out it is scanned for on
+     * the next getBounds().
+     */
+    markSelectionChanged(bounds) {
+        if (bounds === undefined) {
+            this.selectionDirty = true;
+        } else {
+            this.cachedBounds = bounds;
+            this.selectionDirty = false;
+        }
+        this.selectionSeq++;
+        this.selectionEncoded = false;
+        this.touchSource(this.selection);
         this.uploaded.maskHash = null;
         this.renderInfo();
         this.drawThumb();
@@ -4716,7 +4862,12 @@ class InpaintEditor {
         layer.dirty = true;
         layer._maskedValid = false;
         layer._mcache = null;
+        layer._mcacheView = null;
+        layer._mstats = null;
+        layer._mstatsView = null;
         layer.exportRef = null;
+        this.touchSource(layer.canvas);
+        this.touchSource(layer._masked);
         this.uploaded.baseHash = null;
         this.uploaded.controlHash = null;
         this.drawThumb();
@@ -4774,6 +4925,7 @@ class InpaintEditor {
 
     markFilterChanged(layer, { soon = false } = {}) {
         layer._fcache = null;
+        layer._fcacheView = null;
         this.uploaded.baseHash = null;
         if (soon) { this.drawSoon(); return; }   // slider drag: one draw per frame, thumbnail and save on release
         this.draw();
@@ -4833,10 +4985,12 @@ class InpaintEditor {
 
     /** Filtered copy of `below` for a filter layer, cached until the composite or the parameters change. */
     filteredCanvas(layer, below, forRun, preview) {
-        const key = JSON.stringify([layer.filter, layer.params, layer.lut && layer.lut.ref && layer.lut.ref.filename, layer.plate && layer.plate.ref && layer.plate.ref.filename, !!forRun, !!preview, below.width, below.height]);
-        const c = layer._fcache;
+        const vp = this.viewPass;
+        const key = JSON.stringify([layer.filter, layer.params, layer.lut && layer.lut.ref && layer.lut.ref.filename, layer.plate && layer.plate.ref && layer.plate.ref.filename, !!forRun, !!preview, below.width, below.height, vp ? [vp.x, vp.y] : 0]);
+        const slot = vp ? "_fcacheView" : "_fcache";
+        const c = layer[slot];
         if (c && c.version === this.compositeVersion && c.key === key) return c.canvas;
-        let input = below, scale = 1;
+        let input = below, scale = vp ? vp.sx : 1;
         if (preview) {
             const s = Math.min(1, 1024 / Math.max(below.width, below.height));
             if (s < 1) {
@@ -4848,10 +5002,11 @@ class InpaintEditor {
             }
         }
         let canvas = null;
-        if (!layer._fxCache) layer._fxCache = {};
-        try { canvas = applyFilter(layer.filter, input, layer.params, { scale, seed: layer.id, lut: layer._lutData, plate: layer._plateImg || null, plateKey: layer.plate && layer.plate.ref && layer.plate.ref.filename, plateMean: layer.plate && layer.plate.mean, plateStd: layer.plate && layer.plate.std, cache: layer._fxCache }); }
+        const fxSlot = vp ? "_fxCacheView" : "_fxCache";
+        if (!layer[fxSlot]) layer[fxSlot] = {};
+        try { canvas = applyFilter(layer.filter, input, layer.params, { scale, seed: layer.id, lut: layer._lutData, plate: layer._plateImg || null, plateKey: layer.plate && layer.plate.ref && layer.plate.ref.filename, plateMean: layer.plate && layer.plate.mean, plateStd: layer.plate && layer.plate.std, cache: layer[fxSlot] }); }
         catch (err) { console.error(err); }
-        layer._fcache = { version: this.compositeVersion, key, canvas };
+        layer[slot] = { version: this.compositeVersion, key, canvas };
         return canvas;
     }
 
@@ -4867,9 +5022,13 @@ class InpaintEditor {
                 if (gi >= 0 && gi < index) return;
             }
         }
-        const preview = !forRun && (this.filterPreview === layer.id || this.filterPreview === "*");
+        const vp = this.viewPass;
+        // the region pass already works at screen resolution; the 1024 px preview is for the full-size path
+        const preview = !forRun && !vp && (this.filterPreview === layer.id || this.filterPreview === "*");
         const out = this.filteredCanvas(layer, ctx.canvas, forRun, preview);
         if (!out) return;
+        const rx = vp ? vp.x : 0, ry = vp ? vp.y : 0;
+        const rw = vp ? vp.w : this.width, rh = vp ? vp.h : this.height;
         let src = out;
         if (layer.mask) {
             if (!this.filterMaskCanvas || this.filterMaskCanvas.width !== out.width || this.filterMaskCanvas.height !== out.height) this.filterMaskCanvas = makeCanvas(out.width, out.height);
@@ -4880,13 +5039,15 @@ class InpaintEditor {
             mctx.clearRect(0, 0, m.width, m.height);
             mctx.drawImage(out, 0, 0);
             mctx.globalCompositeOperation = "destination-in";
-            mctx.drawImage(this.maskWithStroke(layer), 0, 0, m.width, m.height);
+            const mk = this.maskWithStroke(layer);
+            const ms = mk.width / this.width;   // a filter layer's mask covers the whole image
+            mctx.drawImage(mk, rx * ms, ry * ms, rw * ms, rh * ms, 0, 0, m.width, m.height);
             mctx.globalCompositeOperation = "source-over";
             src = m;
         }
         ctx.globalAlpha = layer.opacity;
         ctx.globalCompositeOperation = (layer.blend && layer.blend !== "normal") ? layer.blend : "source-over";
-        ctx.drawImage(src, 0, 0, this.width, this.height);
+        ctx.drawImage(src, rx, ry, rw, rh);
         ctx.globalAlpha = 1;
         ctx.globalCompositeOperation = "source-over";
     }
@@ -4897,6 +5058,9 @@ class InpaintEditor {
         if (!layer.mask) layer.maskRef = null;
         layer._maskedValid = false;
         layer._mcache = null;
+        layer._mcacheView = null;
+        this.touchSource(layer.mask);
+        this.touchSource(layer._masked);
         layer.exportRef = null;
         this.uploaded.baseHash = null;
         this.uploaded.controlHash = null;
@@ -5118,7 +5282,7 @@ class InpaintEditor {
         const w = px.width * s, h = px.height * s;
         ctx.imageSmoothingEnabled = true;
         ctx.imageSmoothingQuality = "medium";
-        ctx.drawImage(px, (canvas.width - w) / 2, (canvas.height - h) / 2, w, h);
+        ctx.drawImage(this.displaySource(px, s), (canvas.width - w) / 2, (canvas.height - h) / 2, w, h);
     }
 
     /** Swap the name span for an input; Enter or blur commits, Esc cancels. */
@@ -5606,21 +5770,41 @@ class InpaintEditor {
 
     selectionBounds() {
         if (!this.selection) return null;
-        const d = this.selection.getContext("2d").getImageData(0, 0, this.width, this.height).data;
-        let x0 = this.width, y0 = this.height, x1 = -1, y1 = -1;
-        for (let y = 0; y < this.height; y++) {
-            const row = y * this.width;
-            for (let x = 0; x < this.width; x++) {
-                if (d[(row + x) * 4 + 3] > 127) {
-                    if (x < x0) x0 = x;
-                    if (x > x1) x1 = x;
-                    if (y < y0) y0 = y;
-                    if (y > y1) y1 = y;
-                }
-            }
+        const W = this.width, H = this.height;
+        // one 32-bit word per pixel; alpha is the high byte, so "selected" is one bit test
+        const d = new Uint32Array(this.selection.getContext("2d").getImageData(0, 0, W, H).data.buffer);
+        let x0 = W, y0 = H, x1 = -1, y1 = -1;
+        for (let y = 0; y < H; y++) {
+            const row = y * W;
+            let rx0 = -1;
+            for (let x = 0; x < W; x++) if (d[row + x] & 0x80000000) { rx0 = x; break; }
+            if (rx0 < 0) continue;
+            let rx1 = rx0;
+            for (let x = W - 1; x > rx0; x--) if (d[row + x] & 0x80000000) { rx1 = x; break; }
+            if (rx0 < x0) x0 = rx0;
+            if (rx1 > x1) x1 = rx1;
+            if (y < y0) y0 = y;
+            y1 = y;
         }
         if (x1 < 0) return null;
         return [x0, y0, x1 + 1, y1 + 1];
+    }
+
+    /**
+     * The selection's bounding box after an op that filled `box` ([x0, y0, x1, y1] in
+     * image coordinates), or undefined when it has to be scanned for (every subtract).
+     */
+    boundsAfter(mode, box) {
+        if (mode === "subtract") return undefined;
+        const b = [Math.max(0, Math.floor(box[0])), Math.max(0, Math.floor(box[1])),
+            Math.min(this.width, Math.ceil(box[2])), Math.min(this.height, Math.ceil(box[3]))];
+        const empty = b[2] <= b[0] || b[3] <= b[1];
+        if (mode === "replace") return empty ? null : b;
+        if (this.selectionDirty) return undefined;
+        const old = this.cachedBounds;
+        if (empty) return old;
+        if (!old) return b;
+        return [Math.min(old[0], b[0]), Math.min(old[1], b[1]), Math.max(old[2], b[2]), Math.max(old[3], b[3])];
     }
 
     getBounds() {
@@ -5725,6 +5909,11 @@ class InpaintEditor {
         this.dropHint.style.display = "none";
         this.selectionDirty = true;
         this.selectionDataUrl = null;
+        this.selectionEncoded = false;
+        this._baseCanvas = null;
+        this.flatCache = null;
+        this.sceneSig = null;
+        this.touchSource(this.selection);
         this.renderLayers();
         this.renderInfo();
         this.fitView();
@@ -6380,10 +6569,138 @@ Size as width x height:` : "Size as width x height:",
 
     // ---- compositing -------------------------------------------------------
 
+    // ---- display pyramid and viewport composite (docs/PERFORMANCE.md phase 1) ----
+
+    /**
+     * Mark a source canvas as changed: its cached display levels are dropped and the
+     * composited scene is rebuilt on the next draw. Call this wherever pixels of the
+     * base, a layer, a mask or the selection are written.
+     */
+    touchSource(src) {
+        this.pixelVersion++;
+        if (src) src._dispVer = (src._dispVer || 0) + 1;
+    }
+
+    /**
+     * A cached downscaled copy of a source canvas for drawing at `scale` (destination
+     * pixels per source pixel). Levels are successive halvings, so a 12k image is drawn
+     * from a 1.5k copy at fit zoom instead of being resampled in full every frame.
+     * Live stroke previews change every frame and are never cached.
+     */
+    displaySource(src, scale) {
+        if (!src || src._livePreview) return src;
+        const w = src.width || src.naturalWidth || 0;
+        const h = src.height || src.naturalHeight || 0;
+        if (!w || !h || !(scale > 0) || scale >= 0.5 || w * h < PYRAMID_MIN_PX) return src;
+        let want = 0;
+        while (want + 1 < PYRAMID_LEVELS && (1 / (1 << (want + 2))) >= scale) want++;
+        const ver = src._dispVer || 0;
+        let entry = this.pyramids.get(src);
+        if (!entry || entry.version !== ver || entry.w !== w || entry.h !== h) {
+            entry = { version: ver, w, h, levels: [] };
+            this.pyramids.set(src, entry);
+        }
+        for (let i = 0; i <= want; i++) {
+            if (entry.levels[i]) continue;
+            // one new level per frame: after a zoom step every source would otherwise build
+            // its chain in the same frame (five sources at 24 MP are 200 ms). The frame uses
+            // the level it has, drawSoon() comes back for the next one.
+            if (this._pyramidBudget <= 0) { this._pyramidPending = true; return entry.levels[i - 1] || src; }
+            this._pyramidBudget--;
+            const lw = Math.max(1, Math.round(w / (1 << (i + 1))));
+            const lh = Math.max(1, Math.round(h / (1 << (i + 1))));
+            const c = makeCanvas(lw, lh);
+            const cx = c.getContext("2d");
+            cx.imageSmoothingEnabled = true;
+            cx.imageSmoothingQuality = "medium";
+            cx.drawImage(i === 0 ? src : entry.levels[i - 1], 0, 0, lw, lh);
+            entry.levels[i] = c;
+        }
+        return entry.levels[want] || src;
+    }
+
+    /** The base image as a canvas: an <img> that large is re-decoded by Chromium on every draw. */
+    baseSource() {
+        if (!this.base || !this.base.img) return null;
+        if (!this._baseCanvas || this._baseImg !== this.base.img) {
+            this._baseCanvas = imageToCanvas(this.base.img);
+            this._baseImg = this.base.img;
+        }
+        return this._baseCanvas;
+    }
+
+    /**
+     * The image rectangle the view shows (a little larger), and the scale to composite it
+     * at. Its size depends only on zoom, rotation and window size, never on where the view
+     * sits: with a size that changes per frame the viewport canvas would be reallocated on
+     * every pan step, which costs more than the composite itself. The rectangle may reach
+     * outside the image; the parts outside stay empty.
+     */
+    viewportRegion() {
+        if (!this.width || !this.canvas.width) return null;
+        const W = this.canvas.width, H = this.canvas.height;
+        let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+        for (const [cx, cy] of [[0, 0], [W, 0], [0, H], [W, H]]) {
+            const [ix, iy] = this.canvasToImage(cx, cy);
+            if (ix < x0) x0 = ix;
+            if (ix > x1) x1 = ix;
+            if (iy < y0) y0 = iy;
+            if (iy > y1) y1 = iy;
+        }
+        const pad = 4 / Math.max(0.01, this.view.scale);
+        const w = Math.ceil(x1 - x0 + 2 * pad) + 1, h = Math.ceil(y1 - y0 + 2 * pad) + 1;
+        if (w < 1 || h < 1) return null;
+        return { x: Math.floor(x0 - pad), y: Math.floor(y0 - pad), w, h, scale: Math.min(1, this.view.scale) };
+    }
+
+    /**
+     * Composite only what the view shows, at screen resolution, and blit that (Krita's
+     * prescaled projection). Layers come from their pyramid level, filters and colour
+     * match run on the small input; exports, runs and the thumbnail keep their own paths.
+     */
+    drawViewComposite(ctx) {
+        const region = this.viewportRegion();
+        if (!region) return;
+        const vw = Math.max(1, Math.round(region.w * region.scale));
+        const vh = Math.max(1, Math.round(region.h * region.scale));
+        if (!this.viewCanvas || this.viewCanvas.width !== vw || this.viewCanvas.height !== vh) this.viewCanvas = makeCanvas(vw, vh);
+        const v = this.viewCanvas.getContext("2d");
+        const sx = vw / region.w, sy = vh / region.h;
+        v.setTransform(1, 0, 0, 1, 0, 0);
+        v.globalAlpha = 1;
+        v.globalCompositeOperation = "source-over";
+        v.clearRect(0, 0, vw, vh);
+        v.imageSmoothingEnabled = true;
+        v.setTransform(sx, 0, 0, sy, -region.x * sx, -region.y * sy);
+        const prev = this.viewPass;
+        this.viewPass = { x: region.x, y: region.y, w: region.w, h: region.h, sx, sy };
+        try {
+            this.drawComposite(v, {});
+        } finally {
+            this.viewPass = prev;
+        }
+        ctx.save();
+        ctx.globalAlpha = 1;
+        ctx.globalCompositeOperation = "source-over";
+        ctx.drawImage(this.viewCanvas, region.x, region.y, region.w, region.h);
+        ctx.restore();
+    }
+
+    /** The visible composite at image resolution, cached: eyedropper, clone, bucket and wand read it. */
+    compositeCanvas(opts = {}) {
+        const key = JSON.stringify(opts);
+        const c = this.flatCache;
+        if (c && c.version === this.compositeVersion && c.key === key) return c.canvas;
+        const canvas = this.flattenToCanvas(opts);
+        this.flatCache = { version: this.compositeVersion, key, canvas };
+        return canvas;
+    }
+
     drawComposite(ctx, opts = {}) {
         if (!this.base) return;
         const hasFilters = !opts.controlOnly && this.layers.some((l) => l.visible && (l.kind === "filter" || this.matchActive(l)));
-        if (!hasFilters) { this.drawLayersInto(ctx, opts); return; }
+        // In a region pass the target canvas is already the filter input: no full-size copy.
+        if (this.viewPass || !hasFilters) { this.drawLayersInto(ctx, opts); return; }
         // Filters need the composite below them at image resolution: build it offscreen first.
         if (!this.flatCanvas || this.flatCanvas.width !== this.width || this.flatCanvas.height !== this.height) this.flatCanvas = makeCanvas(this.width, this.height);
         const fctx = this.flatCanvas.getContext("2d");
@@ -6402,7 +6719,9 @@ Size as width x height:` : "Size as width x height:",
             ctx.fillStyle = "#000";
             ctx.fillRect(0, 0, this.width, this.height);
         } else {
-            ctx.drawImage(this.base.img, 0, 0);
+            const bs = this.baseSource();
+            const vp = this.viewPass;
+            if (bs) ctx.drawImage(this.displaySource(bs, vp ? vp.sx : 1), 0, 0, this.width, this.height);
         }
         for (let i = 0; i < this.layers.length; i++) {
             const layer = this.layers[i];
@@ -6438,10 +6757,12 @@ Size as width x height:` : "Size as width x height:",
             }
             return;
         }
+        const vp = this.viewPass;
         const gesture = this.pointer && this.pointer.layer === layer;
-        const src = this.matchActive(layer) && !gesture && ctx.canvas.width === this.width && ctx.canvas.height === this.height
-            ? this.layerMatchedPixels(layer, ctx.canvas) : this.layerPixels(layer);
-        ctx.drawImage(src, layer.x, layer.y, layer.w, layer.h);
+        const full = ctx.canvas.width === this.width && ctx.canvas.height === this.height;
+        const src = this.matchActive(layer) && !gesture && (vp || full)
+            ? this.layerMatchedPixels(layer, ctx.canvas, vp) : this.layerPixels(layer);
+        ctx.drawImage(this.displaySource(src, vp ? (layer.w * vp.sx) / src.width : 1), layer.x, layer.y, layer.w, layer.h);
     }
 
     matchActive(layer) {
@@ -6450,6 +6771,9 @@ Size as width x height:` : "Size as width x height:",
 
     markMatchChanged(layer) {
         layer._mcache = null;
+        layer._mcacheView = null;
+        layer._mstats = null;
+        layer._mstatsView = null;
         this.uploaded.baseHash = null;
         this.uploaded.controlHash = null;
     }
@@ -6461,13 +6785,51 @@ Size as width x height:` : "Size as width x height:",
      * layer's opaque area) or the pixels underneath it. Cached per composite
      * version and settings.
      */
-    layerMatchedPixels(layer, below) {
+    layerMatchedPixels(layer, below, vp = null) {
         const m = layer.match || {};
         const strength = Math.min(1, Math.max(0, (m.strength || 0) / 100));
         const px = this.layerPixels(layer);
-        const key = JSON.stringify([m.strength, m.source, layer.x, layer.y, layer.w, layer.h, px.width, px.height]);
-        const c = layer._mcache;
+        // in a region pass the match is applied to the pyramid level that is actually drawn
+        const out0 = vp ? this.displaySource(px, (layer.w * vp.sx) / px.width) : px;
+        const key = JSON.stringify([m.strength, m.source, layer.x, layer.y, layer.w, layer.h, out0.width, out0.height]);
+        const slot = vp ? "_mcacheView" : "_mcache";
+        const c = layer[slot];
         if (c && c.version === this.compositeVersion && c.key === key) return c.canvas;
+        const st = this.matchStats(layer, below, vp, out0);
+        let out = out0;
+        if (st && strength > 0) {
+            const W = out0.width, H = out0.height;
+            const oc = makeCanvas(W, H);
+            const octx = oc.getContext("2d");
+            octx.drawImage(out0, 0, 0);
+            const img = octx.getImageData(0, 0, W, H);
+            const d = img.data;
+            for (let i = 0; i < d.length; i += 4) {
+                if (!d[i + 3]) continue;
+                for (let ch = 0; ch < 3; ch++) {
+                    const v = (d[i + ch] - st.meanT[ch]) * st.scale[ch] + st.meanS[ch];
+                    d[i + ch] = Math.max(0, Math.min(255, d[i + ch] + (v - d[i + ch]) * strength));
+                }
+            }
+            octx.putImageData(img, 0, 0);
+            out = oc;
+        }
+        layer[slot] = { version: this.compositeVersion, key, canvas: out };
+        return out;
+    }
+
+    /**
+     * Mean and spread of the layer and of what it is matched against, both at 256 px.
+     * Cached per composite version: in a region pass the statistics are taken once from
+     * whatever the view showed then, so panning and zooming never shift the colours.
+     */
+    matchStats(layer, below, vp, out0) {
+        const m = layer.match || {};
+        const key = JSON.stringify([m.strength, m.source, layer.x, layer.y, layer.w, layer.h]);
+        const slot = vp ? "_mstatsView" : "_mstats";
+        const cached = layer[slot];
+        if (cached && cached.version === this.compositeVersion && cached.key === key) return cached.stats;
+        const px = out0;
         const W = px.width, H = px.height;
         const s = Math.min(1, 256 / Math.max(layer.w, layer.h));
         const sw = Math.max(2, Math.round(layer.w * s)), sh = Math.max(2, Math.round(layer.h * s));
@@ -6481,7 +6843,10 @@ Size as width x height:` : "Size as width x height:",
         const bel = makeCanvas(pw, ph);
         const bctx = bel.getContext("2d");
         const padImg = pad / s;
-        bctx.drawImage(below, layer.x - padImg, layer.y - padImg, layer.w + 2 * padImg, layer.h + 2 * padImg, 0, 0, pw, ph);
+        // `below` covers the whole image, or the region of the pass
+        const bx = vp ? vp.x : 0, by = vp ? vp.y : 0;
+        const bs = below.width / (vp ? vp.w : this.width);
+        bctx.drawImage(below, (layer.x - padImg - bx) * bs, (layer.y - padImg - by) * bs, (layer.w + 2 * padImg) * bs, (layer.h + 2 * padImg) * bs, 0, 0, pw, ph);
         const bd = bctx.getImageData(0, 0, pw, ph).data;
         // ring: blurred alpha reaches, alpha itself does not
         const blur = makeCanvas(pw, ph);
@@ -6504,35 +6869,27 @@ Size as width x height:` : "Size as width x height:",
                 ns++;
             }
         }
-        let out = px;
-        if (ns >= 64 && nt >= 64 && strength > 0) {
+        let stats = null;
+        if (ns >= 64 && nt >= 64) {
             const meanS = sum.map((v) => v / ns), meanT = tsum.map((v) => v / nt);
             const stdS = sq.map((v, ch) => Math.sqrt(Math.max(1e-6, v / ns - meanS[ch] * meanS[ch])));
             const stdT = tsq.map((v, ch) => Math.sqrt(Math.max(1e-6, v / nt - meanT[ch] * meanT[ch])));
-            const scale = stdS.map((v, ch) => Math.min(2, Math.max(0.5, v / stdT[ch])));
-            const oc = makeCanvas(W, H);
-            const octx = oc.getContext("2d");
-            octx.drawImage(px, 0, 0);
-            const img = octx.getImageData(0, 0, W, H);
-            const d = img.data;
-            for (let i = 0; i < d.length; i += 4) {
-                if (!d[i + 3]) continue;
-                for (let ch = 0; ch < 3; ch++) {
-                    const v = (d[i + ch] - meanT[ch]) * scale[ch] + meanS[ch];
-                    d[i + ch] = Math.max(0, Math.min(255, d[i + ch] + (v - d[i + ch]) * strength));
-                }
-            }
-            octx.putImageData(img, 0, 0);
-            out = oc;
+            stats = { meanS, meanT, scale: stdS.map((v, ch) => Math.min(2, Math.max(0.5, v / stdT[ch]))) };
         }
-        layer._mcache = { version: this.compositeVersion, key, canvas: out };
-        return out;
+        layer[slot] = { version: this.compositeVersion, key, stats };
+        return stats;
     }
 
     flattenToCanvas(opts = {}) {
-        const c = makeCanvas(this.width, this.height);
-        this.drawComposite(c.getContext("2d"), opts);
-        return c;
+        const prev = this.viewPass;
+        this.viewPass = null;   // exports, runs and uploads always see the full-resolution composite
+        try {
+            const c = makeCanvas(this.width, this.height);
+            this.drawComposite(c.getContext("2d"), opts);
+            return c;
+        } finally {
+            this.viewPass = prev;
+        }
     }
 
     maskToCanvas() {
@@ -6608,13 +6965,14 @@ Size as width x height:` : "Size as width x height:",
         a.clearRect(0, 0, W, H);
         a.imageSmoothingEnabled = s < 1;
         const r = 1.25;
+        const sel = this.displaySource(this.selection, s);   // nine draws of the selection: never at full size
         for (const [dx, dy] of [[r, 0], [-r, 0], [0, r], [0, -r], [r, r], [-r, -r], [r, -r], [-r, r]]) {
             this.applyViewTransform(a, dx, dy);
-            a.drawImage(this.selection, 0, 0);
+            a.drawImage(sel, 0, 0, this.width, this.height);
         }
         this.applyViewTransform(a);
         a.globalCompositeOperation = "destination-out";
-        a.drawImage(this.selection, 0, 0);
+        a.drawImage(sel, 0, 0, this.width, this.height);
         a.setTransform(1, 0, 0, 1, 0, 0);
         a.globalCompositeOperation = "source-in";
         if (!this.antsPattern) {
@@ -6640,7 +6998,7 @@ Size as width x height:` : "Size as width x height:",
             // keep the ants walking while a selection is shown; stops itself when there is none or the editor closes
             this.antsTimer = setInterval(() => {
                 if (!this.isOpen || this.selectionDisplay !== "ants" || !this.getBounds()) { clearInterval(this.antsTimer); this.antsTimer = null; return; }
-                if (!this.pointer) this.draw();
+                if (!this.pointer) this.drawSoon();
             }, 120);
         }
     }
@@ -6648,6 +7006,27 @@ Size as width x height:` : "Size as width x height:",
     draw() {
         this.drawScene();
         this.drawOverlays();
+    }
+
+    /**
+     * Everything the composited image depends on. While it stays the same the last
+     * scene canvas is reused and only the overlays (ants, cursor, handles) are redrawn.
+     */
+    sceneSignature() {
+        const v = this.view;
+        const p = this.pointer, q = this.pending;
+        const parts = [this.pixelVersion, this.compositeVersion, this.width, this.height,
+            this.canvas.width, this.canvas.height, Math.round(v.x * 8), Math.round(v.y * 8), v.scale, v.angle || 0,
+            this.peekBase ? 1 : 0, this.compare ? `${this.compare.a}:${this.compare.b}:${this.compare.split}` : 0,
+            this.compareShow || 0, this.filterPreview || 0];
+        for (const l of this.layers) {
+            parts.push(l.id, l.visible ? 1 : 0, l.opacity, l.blend, l.role, l.x, l.y, l.w, l.h,
+                l.kind === "filter" ? l.filter + JSON.stringify(l.params || {}) : "",
+                l.match ? `${l.match.strength}:${l.match.source}` : "", l.mask ? 1 : 0, l.maskEdit ? 1 : 0);
+        }
+        if (p) parts.push("p", p.kind, p.layer ? p.layer.id : "");
+        if (q) parts.push("q", q.mode, q.angle || 0, q.points ? q.points.join(",") : "");
+        return parts.join("|");
     }
 
     drawScene() {
@@ -6658,11 +7037,43 @@ Size as width x height:` : "Size as width x height:",
         ctx.clearRect(0, 0, W, H);
         if (!this.base) return;
         const s = this.view.scale;
+        if (!this.sceneCanvas || this.sceneCanvas.width !== W || this.sceneCanvas.height !== H) {
+            this.sceneCanvas = makeCanvas(W, H);
+            this.sceneSig = null;
+        }
+        if (this.sceneSig !== this.sceneSignature()) {
+            const sctx = this.sceneCanvas.getContext("2d");
+            sctx.setTransform(1, 0, 0, 1, 0, 0);
+            sctx.globalAlpha = 1;
+            sctx.globalCompositeOperation = "source-over";
+            sctx.clearRect(0, 0, W, H);
+            this.applyViewTransform(sctx);
+            sctx.imageSmoothingEnabled = s < 1;
+            this._pyramidBudget = 1;
+            this._pyramidPending = false;
+            this.drawSceneImage(sctx, W, H);
+            this._pyramidBudget = Infinity;
+            this.sceneSig = this.sceneSignature();   // caches filled while drawing count as part of this scene
+            if (this._pyramidPending) {
+                // a source still has to build its level: draw again, sharper, on the next frame
+                this.sceneSig = null;
+                this.drawSoon();
+            }
+        }
+        ctx.drawImage(this.sceneCanvas, 0, 0);
         this.applyViewTransform(ctx);
         ctx.imageSmoothingEnabled = s < 1;
+        this.drawSceneOverlays(ctx);
+    }
+
+    /** The image itself: the base alone while peeking, the compare split, or the composite. */
+    drawSceneImage(ctx, W, H) {
         if (this.peekBase) {
-            ctx.drawImage(this.base.img, 0, 0);
-        } else if (this.compare && this.compare.a && this.compare.b) {
+            const bs = this.baseSource();
+            if (bs) ctx.drawImage(this.displaySource(bs, this.view.scale), 0, 0, this.width, this.height);
+            return;
+        }
+        if (this.compare && this.compare.a && this.compare.b) {
             // A left, B right: two passes with the other result hidden; caches are invalidated between them
             const split = Math.min(0.95, Math.max(0.05, this.compare.split ?? 0.5));
             for (const side of ["a", "b"]) {
@@ -6674,19 +7085,23 @@ Size as width x height:` : "Size as width x height:",
                 this.applyViewTransform(ctx);
                 this.compareShow = this.compare[side];
                 this.uploaded.baseHash = null;
-                this.drawComposite(ctx);
+                this.drawViewComposite(ctx);
                 ctx.restore();
             }
             this.compareShow = null;
             this.uploaded.baseHash = null;
             this.applyViewTransform(ctx);
-        } else {
-            this.drawComposite(ctx);
+            return;
         }
+        this.drawViewComposite(ctx);
+    }
 
+    /** Selection, crop frame, layer handles and the tool cursors, on top of the scene. */
+    drawSceneOverlays(ctx) {
+        const s = this.view.scale;
         if (this.selectionDisplay === "tint" || this.quickMask || !this.getBounds()) {
             ctx.globalAlpha = this.quickMask ? 0.5 : 0.4;
-            ctx.drawImage(this.selection, 0, 0);
+            ctx.drawImage(this.displaySource(this.selection, s), 0, 0, this.width, this.height);
             ctx.globalAlpha = 1;
         } else {
             this.drawMarchingAnts(ctx);
@@ -6697,7 +7112,7 @@ Size as width x height:` : "Size as width x height:",
             ctx.save();
             ctx.globalAlpha = 0.5;
             try { ctx.filter = "hue-rotate(180deg)"; } catch (_) { /* old canvas */ }
-            ctx.drawImage(this.hoverObjectCanvas, 0, 0);
+            ctx.drawImage(this.displaySource(this.hoverObjectCanvas, s), 0, 0, this.width, this.height);
             ctx.restore();
         }
 
@@ -7092,10 +7507,44 @@ Size as width x height:` : "Size as width x height:",
         try { app.canvas && app.canvas.setDirty && app.canvas.setDirty(true, true); } catch (_) { /* ignore */ }
     }
 
+    /** Encode the selection PNG for getValue off the main thread and save again when it lands. */
+    encodeSelectionSoon() {
+        if (this._selEncoding) return;
+        this._selEncoding = true;
+        const seq = this.selectionSeq;
+        const canvas = this.selection;
+        canvasToBlob(canvas)
+            .then((blob) => new Promise((res, rej) => {
+                const r = new FileReader();
+                r.onload = () => res(r.result);
+                r.onerror = () => rej(r.error);
+                r.readAsDataURL(blob);
+            }))
+            .then((url) => {
+                this._selEncoding = false;
+                if (canvas !== this.selection) return;
+                this.selectionDataUrl = url;
+                if (seq === this.selectionSeq) {
+                    this.selectionEncoded = true;
+                    this.notifyChanged();   // save again, now with the fresh selection
+                } else {
+                    this.encodeSelectionSoon();
+                }
+            })
+            .catch((err) => { this._selEncoding = false; console.warn("Inpaint Canvas: selection encode failed", err); });
+    }
+
     getValue() {
         if (!this.base) return this.lastValueString || "{}";
-        if (!this.selectionDataUrl && this.selection) {
-            this.selectionDataUrl = this.selection.toDataURL("image/png");
+        if (this.selection && (!this.selectionEncoded || !this.selectionDataUrl)) {
+            if (this.width * this.height <= SYNC_ENCODE_PX) {
+                this.selectionDataUrl = this.selection.toDataURL("image/png");
+                this.selectionEncoded = true;
+            } else {
+                // a 100 MP toDataURL blocks the editor for seconds: encode in the background,
+                // keep the last finished PNG until it lands
+                this.encodeSelectionSoon();
+            }
         }
         return JSON.stringify({
             width: this.width,

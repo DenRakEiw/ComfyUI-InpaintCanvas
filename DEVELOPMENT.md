@@ -1106,3 +1106,50 @@ refuses anything above ~178 MP. Unit test of the route logic: scratchpad
 `patch_bigupload.py` session, aiohttp app with a 1 MB limit, 5 MB body passes,
 dedup / suffix / overwrite / traversal / bad type / empty body covered.
 
+
+## 21. The drawing pipeline for large images (2026-09-10)
+
+Editing a 6k-12k image used to redraw everything at full resolution on every frame: an
+opacity slider tick on a 66 MP document cost 250-400 ms, a colour match tick 350-900 ms.
+The plan and the measurements live in the app repo (`F:\canvas\docs\PERFORMANCE.md`);
+phase 1 is in the editor here and is what the app syncs. In short:
+
+- **Display pyramid.** `displaySource(src, scale)` returns a cached halving of a source
+  canvas (base, layer, mask, selection, object shape) that is at or above the scale it is
+  drawn at; `touchSource(src)` drops the levels and bumps `pixelVersion`. Every place that
+  writes pixels calls `touchSource`, so a missing call shows as a stale picture, not as a
+  crash. Canvases that change every frame (`strokePreview`, `maskedPreview`, `maskPreview`,
+  `clipScratch`) carry `_livePreview = true` and are drawn straight. Only one new level is
+  built per frame (`_pyramidBudget`), the frame draws with the level it has and asks for
+  another frame through `drawSoon()`.
+- **The base is a canvas.** `baseSource()` converts `base.img` once; an `<img>` that big is
+  re-decoded by Chromium on every draw. The `<img>` stays for uploads and exports.
+- **Viewport composite.** `drawViewComposite()` composites only `viewportRegion()` at
+  screen resolution into `viewCanvas` and blits that. While it runs, `this.viewPass`
+  ({x, y, w, h, sx, sy}) is set: `drawLayersInto`, `drawLayer`, `applyFilterLayer`,
+  `filteredCanvas` and `layerMatchedPixels` then work on the region and at that scale.
+  `flattenToCanvas` clears `viewPass`, so exports, runs and uploads are always full
+  resolution and exact (verified: identical pixels at 100 % zoom).
+  The region's size depends only on zoom, rotation and canvas size, never on the pan
+  position, and it may reach outside the image - a size that changed per frame reallocated
+  the viewport canvas on every pan step, which cost more than the composite.
+- **Scene cache.** `sceneSignature()` lists everything the composited image depends on;
+  while it is unchanged `drawScene` blits the last `sceneCanvas` and only
+  `drawSceneOverlays` runs. That is what makes the marching-ants timer, hover and rubber
+  bands free. If you add state that changes the picture, add it to the signature.
+- **Undo.** A brush stroke stores the rectangle it painted over (`snapshotRect`, bounds
+  collected by `strokeBounds` in the dab functions, taken in `commitStroke` before the
+  stroke is applied), not a PNG of the whole layer at pointerdown. Every other snapshot
+  encodes with `canvas.toBlob` into a blob URL in the background; the step holds the
+  promise, `snapImage()` awaits it, `releaseSnapshot()` revokes it. Budget:
+  `MAX_UNDO_BYTES` next to `MAX_UNDO`.
+- **Selection bounds.** `markSelectionChanged(bounds)` takes the new box when the caller
+  knows it (`boundsAfter` for rectangle / ellipse / lasso / polygon, a shift for a moved
+  outline); only a subtract or an unknown op scans, and the scan reads alpha as one 32-bit
+  test per pixel.
+- `getValue()` encodes the selection PNG in the background above 16 MP and calls
+  `notifyChanged()` when it lands; below that it stays synchronous.
+- Eyedropper, clone, heal, bucket and wand read `compositeCanvas()` (cached per composite
+  version) instead of flattening the document on every press.
+
+Benchmark: `python tools/perf_test.py` in the app repo (it drives the app over DevTools).
