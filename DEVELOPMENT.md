@@ -1089,3 +1089,20 @@ composites a 16-megapixel image slowly. The route timeout for long jobs is `time
 and `diag3.py` (CDP on port 9444, step through graphToPrompt / api.queuePrompt and list
 the api events that arrive).
 
+## 20. Large images (2026-09-09)
+
+A 10500 × 7000 PNG (157 MB) failed to load: ComfyUI's `/upload/image` answers 413
+above `--max-upload-size` (100 MB default, aiohttp `client_max_size`). Fix without
+touching the user's launch script: `POST /inpaint_canvas/upload?filename&subfolder&
+type&overwrite` in `nodes.py` reads `request.content.iter_chunked()`, which the
+`client_max_size` check does not cover, writes to a `.part` file and renames it;
+naming follows ComfyUI (md5-equal file under the same name is reused, otherwise
+` (n)` suffixes, `overwrite=true` replaces). Own cap `UPLOAD_MAX_BYTES` = 4 GB. Path
+checks like `_ref_path`. `uploadBlob` in the editor uses `/upload/image` below 64 MB
+(`LARGE_UPLOAD`) and the new route above it or after a 413; a 404 from the new route
+means an old server and says so. The MCP server's `_upload` does the same. Pillow's
+`MAX_IMAGE_PIXELS` is raised to 400 MP (20000²) in `nodes.py`, otherwise `Image.open`
+refuses anything above ~178 MP. Unit test of the route logic: scratchpad
+`patch_bigupload.py` session, aiohttp app with a 1 MB limit, 5 MB body passes,
+dedup / suffix / overwrite / traversal / bad type / empty body covered.
+

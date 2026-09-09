@@ -70,15 +70,32 @@ async function hashBlob(blob) {
     return Array.from(new Uint8Array(digest)).slice(0, 6).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+// ComfyUI's /upload/image stops at --max-upload-size (100 MB by default). Files above this
+// go through the node's own streaming route, which has no such limit; a 413 from ComfyUI
+// falls back to it as well.
+const LARGE_UPLOAD = 64 * 1024 * 1024;
+
 async function uploadBlob(blob, filename, { overwrite = true, type = "input", subfolder = SUBFOLDER } = {}) {
-    const form = new FormData();
-    form.append("image", new File([blob], filename, { type: "image/png" }));
-    form.append("subfolder", subfolder);
-    form.append("type", type);
-    if (overwrite) form.append("overwrite", "true");
-    const resp = await api.fetchApi("/upload/image", { method: "POST", body: form });
+    if (blob.size < LARGE_UPLOAD) {
+        const form = new FormData();
+        form.append("image", new File([blob], filename, { type: "image/png" }));
+        form.append("subfolder", subfolder);
+        form.append("type", type);
+        if (overwrite) form.append("overwrite", "true");
+        const resp = await api.fetchApi("/upload/image", { method: "POST", body: form });
+        if (resp.status === 200) {
+            const data = await resp.json();
+            return { filename: data.name, subfolder: data.subfolder || subfolder, type: data.type || type };
+        }
+        if (resp.status !== 413) throw new Error("Inpaint Canvas: upload failed (" + resp.status + ")");
+    }
+    const q = new URLSearchParams({ filename, subfolder, type, overwrite: overwrite ? "true" : "false" });
+    const resp = await api.fetchApi("/inpaint_canvas/upload?" + q, { method: "POST", body: blob, headers: { "Content-Type": "application/octet-stream" } });
+    if (resp.status === 404) throw new Error(`Inpaint Canvas: ${Math.round(blob.size / 1048576)} MB is over ComfyUI's upload limit and the node's own upload route is missing: restart ComfyUI after updating the node (or start it with --max-upload-size 1000).`);
     if (resp.status !== 200) {
-        throw new Error("Inpaint Canvas: upload failed (" + resp.status + ")");
+        let msg = "";
+        try { msg = (await resp.json()).error || ""; } catch (_) { /* ignore */ }
+        throw new Error("Inpaint Canvas: upload failed (" + resp.status + (msg ? ", " + msg : "") + ")");
     }
     const data = await resp.json();
     return { filename: data.name, subfolder: data.subfolder || subfolder, type: data.type || type };

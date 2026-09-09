@@ -523,6 +523,19 @@ not create a second file, a changed image gets a counter appended. The
 node's `image` output is the same picture for chains that want to save or
 post-process it with nodes.
 
+### Large images
+
+Images above ComfyUI's upload limit (`--max-upload-size`, 100 MB by default; a
+10k PNG is easily 150 MB) go through the node's own upload route, which streams
+the file to disk without that limit. Nothing to configure; the editor switches
+routes by file size and falls back to it on a 413. The backend accepts images up
+to 20000 × 20000 pixels (Pillow's default stops at about 9500 × 9500). What
+remains is the browser: every full-size layer costs 4 bytes per pixel, so a
+70-megapixel image needs a few gigabytes of RAM with a handful of layers, and
+flatten, export and the base upload before a run take seconds instead of
+milliseconds. Work on a copy at half size when you only need the detail in a
+region.
+
 ### Cleaning up files
 
 Uploads, results and helper masks accumulate in `input/inpaint_canvas`,

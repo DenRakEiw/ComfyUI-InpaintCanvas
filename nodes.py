@@ -18,6 +18,7 @@ Two nodes:
 """
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -33,6 +34,11 @@ import folder_paths
 from comfy_execution.graph_utils import GraphBuilder
 
 SUBFOLDER = "inpaint_canvas"
+# Pillow refuses images above ~89 megapixels as "decompression bombs"; the editor's images are the
+# user's own files, so allow up to 20000 x 20000 (400 MP). Beyond that Pillow still raises.
+if Image.MAX_IMAGE_PIXELS is not None and Image.MAX_IMAGE_PIXELS < 400_000_000:
+    Image.MAX_IMAGE_PIXELS = 400_000_000
+UPLOAD_MAX_BYTES = 4 * 1024 ** 3   # our own upload route streams to disk, capped here (ComfyUI's /upload/image stops at --max-upload-size, 100 MB by default)
 MIN_AUTO_CROP = 512   # auto context never emits a region smaller than this (image permitting)
 SETTING_SLOTS = 8     # wildcard "setting_n" outputs the editor can drive (LoRA names, steps, ...)
 REFERENCE_FITS = ("pad", "crop", "stretch")   # how reference layers of different sizes become one batch
@@ -1047,6 +1053,70 @@ def _register_routes():
         fonts = [{"filename": n, "subfolder": SUBFOLDER + "/fonts", "type": "input"}
                  for n in names if n.lower().endswith((".ttf", ".otf", ".woff", ".woff2")) and os.path.isfile(os.path.join(folder, n))]
         return web.json_response(fonts)
+
+    # ---- large uploads ------------------------------------------------------------------
+    # ComfyUI's /upload/image is bound by aiohttp's client_max_size (--max-upload-size, 100 MB by
+    # default); a 10k PNG is easily 150 MB. This route reads the raw body as a stream, which that
+    # limit does not cover, and writes it straight to disk. Same naming rules as ComfyUI's route.
+    @server.routes.post("/inpaint_canvas/upload")
+    async def _upload_route(request):
+        q = request.rel_url.query
+        filename = os.path.basename(str(q.get("filename") or "")).strip()
+        if not filename or filename in (".", ".."):
+            return web.json_response({"error": "filename missing"}, status=400)
+        kind = str(q.get("type") or "input")
+        if kind not in ("input", "output", "temp"):
+            return web.json_response({"error": "type must be input, output or temp"}, status=400)
+        base = os.path.abspath(_dir_for_type(kind))
+        sub = os.path.normpath(str(q.get("subfolder") or "")).strip()
+        if sub in (".", ""):
+            sub = ""
+        folder = os.path.abspath(os.path.join(base, sub))
+        if os.path.commonpath((base, folder)) != base:
+            return web.json_response({"error": "subfolder outside of the ComfyUI directories"}, status=400)
+        os.makedirs(folder, exist_ok=True)
+        overwrite = str(q.get("overwrite") or "").lower() in ("1", "true")
+        tmp = os.path.join(folder, f".upload_{int(time.time() * 1000)}_{os.getpid()}.part")
+        size = 0
+        h = hashlib.md5()
+        try:
+            with open(tmp, "wb") as f:
+                async for chunk in request.content.iter_chunked(1 << 20):
+                    size += len(chunk)
+                    if size > UPLOAD_MAX_BYTES:
+                        raise web.HTTPRequestEntityTooLarge(max_size=UPLOAD_MAX_BYTES, actual_size=size)
+                    h.update(chunk)
+                    f.write(chunk)
+        except web.HTTPRequestEntityTooLarge:
+            try: os.remove(tmp)
+            except OSError: pass
+            return web.json_response({"error": f"file larger than {UPLOAD_MAX_BYTES // 1024 ** 3} GB"}, status=413)
+        except Exception as e:
+            try: os.remove(tmp)
+            except OSError: pass
+            return web.json_response({"error": str(e)}, status=500)
+        if size == 0:
+            os.remove(tmp)
+            return web.json_response({"error": "empty body"}, status=400)
+        stem, ext = os.path.splitext(filename)
+        path = os.path.join(folder, filename)
+        if not overwrite:
+            i = 1
+            while os.path.exists(path):
+                # same bytes under the same name: keep the existing file (ComfyUI does the same)
+                try:
+                    with open(path, "rb") as f:
+                        same = hashlib.md5(f.read()).digest() == h.digest()
+                except OSError:
+                    same = False
+                if same:
+                    os.remove(tmp)
+                    return web.json_response({"name": os.path.basename(path), "subfolder": sub, "type": kind, "size": size})
+                filename = f"{stem} ({i}){ext}"
+                path = os.path.join(folder, filename)
+                i += 1
+        os.replace(tmp, path)
+        return web.json_response({"name": filename, "subfolder": sub, "type": kind, "size": size})
 
     # ---- command bridge for the MCP server (mcp/inpaint_canvas_mcp.py) -----------------
     # A command is pushed to the browser over ComfyUI's own websocket as the event

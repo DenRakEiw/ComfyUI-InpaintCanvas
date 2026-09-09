@@ -254,10 +254,25 @@ def _upload(path: str, subfolder: str = "inpaint_canvas") -> dict:
     mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
     if not mime.startswith("image/"):
         raise BridgeError(f"not an image: {path} ({mime})")
-    boundary = "----InpaintCanvas" + uuid.uuid4().hex
     name = os.path.basename(path)
     with open(path, "rb") as f:
         content = f.read()
+    if len(content) >= 64 * 1024 * 1024:
+        # over ComfyUI's --max-upload-size: the node's streaming route
+        from urllib.parse import urlencode
+        req = urllib.request.Request(COMFYUI_URL + "/inpaint_canvas/upload?" + urlencode({"filename": name, "subfolder": subfolder, "type": "input", "overwrite": "false"}),
+                                     data=content, headers={"Content-Type": "application/octet-stream"})
+        try:
+            with urllib.request.urlopen(req, timeout=600) as r:
+                info = json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise BridgeError("the file is over ComfyUI's upload limit and the node's upload route is missing: restart ComfyUI after updating the node") from None
+            raise BridgeError(f"upload failed ({e.code})") from None
+        except urllib.error.URLError as e:
+            raise BridgeError(f"upload failed: {e}") from None
+        return {"filename": info.get("name") or name, "subfolder": info.get("subfolder") or subfolder, "type": info.get("type") or "input"}
+    boundary = "----InpaintCanvas" + uuid.uuid4().hex
     parts = [
         f"--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"{name}\"\r\nContent-Type: {mime}\r\n\r\n".encode() + content + b"\r\n",
         f"--{boundary}\r\nContent-Disposition: form-data; name=\"subfolder\"\r\n\r\n{subfolder}\r\n".encode(),
