@@ -10,7 +10,7 @@ same node, where it lands as a new layer. Select the next spot, generate again.
 **Video tutorial** (3 min): swapping the wheels on a BMW 635 CSi with a
 reference image, prompt upsampling and a film grain finish.
 
-[![Inpaint Canvas tutorial on YouTube](https://img.youtube.com/vi/n3obFaFfn_0/maxresdefault.jpg)](https://www.youtube.com/watch?v=n3obFaFfn_0)
+[![Inpaint Canvas tutorial on YouTube](https://img.youtube.com/vi/n3obFaFfn_0/maxresdefault.jpg)](https://www.youtube.com/watch?v=Lz7AT8SByx8&t=4s)
 
 Highlights
 
