@@ -130,6 +130,74 @@ function applyLook(px, look, strength) {
     }
 }
 
+const GRAIN_TILE = 1024;        // cells; the field repeats every GRAIN_TILE * cell size pixels
+const grainTiles = new Map();   // speckle / colour share / seed -> one tile of cells
+
+/**
+ * One tile of grain cells, values around 128, cached per speckle, colour share and seed.
+ *
+ * Real grain plates measure skewed and heavy-tailed (bright specks on a darker ground:
+ * skew 0.5-0.9, kurtosis 3.2-5.4 on fotokorn's scans, black-and-white stocks the most).
+ * A standardised lognormal reproduces that: sigma 0.3 gives skew ~0.95 / kurtosis ~4.6,
+ * sigma 0.12 stays close to gaussian. Samples come from a 64k table so the per-cell work
+ * is one random number and a lookup.
+ */
+function grainTileCanvas(sigma, chroma, seed) {
+    const key = JSON.stringify([sigma, chroma, String(seed || "grain")]);
+    const hit = grainTiles.get(key);
+    if (hit) return hit;
+    const N = GRAIN_TILE;
+    const noise = makeCanvas(N, N);
+    const nctx = noise.getContext("2d");
+    const nd = nctx.createImageData(N, N);
+    const d = nd.data;
+    const rand = rng(hashString(String(seed || "grain")));
+    const e1 = Math.exp(sigma * sigma / 2), norm = Math.sqrt((Math.exp(sigma * sigma) - 1) * Math.exp(sigma * sigma)) || 1;
+    const gauss = () => { const u = Math.max(1e-12, rand()), v = rand(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+    const TN = 65536;
+    const table = new Float32Array(TN);
+    for (let i = 0; i < TN; i++) table[i] = (sigma > 0.005 ? (Math.exp(sigma * gauss()) - e1) / norm : gauss()) * 40;
+    const sample = () => table[(rand() * TN) | 0];
+    for (let i = 0; i < d.length; i += 4) {
+        const g = sample();
+        if (chroma <= 0) { d[i] = d[i + 1] = d[i + 2] = 128 + g; }
+        else {
+            // luminance grain shared by all channels plus a per-channel part (colour negative films)
+            d[i] = 128 + g * (1 - chroma) + sample() * chroma;
+            d[i + 1] = 128 + g * (1 - chroma) + sample() * chroma;
+            d[i + 2] = 128 + g * (1 - chroma) + sample() * chroma;
+        }
+        d[i + 3] = 255;
+    }
+    nctx.putImageData(nd, 0, 0);
+    if (grainTiles.size > 8) grainTiles.clear();
+    grainTiles.set(key, noise);
+    return noise;
+}
+
+/**
+ * The grain field for a W x H input: the cell tile (or a real grain plate) repeated at
+ * cell size `gs`, anchored at `origin` (the input's top-left in its own pixels, measured
+ * from the image origin) so the grain sits still while the view pans and the preview size
+ * changes. The GPU path uses the same function, so both paths see the same field.
+ */
+export function grainNoiseCanvas(W, H, { gs = 1, sigma = 0, chroma = 0, seed = "grain", plate = null, plateScale = 1, origin = null } = {}) {
+    const big = makeCanvas(W, H);
+    const bctx = big.getContext("2d");
+    const tile = plate || grainTileCanvas(sigma, chroma, seed);
+    const s = Math.max(0.01, plate ? plateScale : gs);
+    const px = Math.max(1, tile.width * s), py = Math.max(1, tile.height * s);
+    const ox = Math.round((origin && origin[0]) || 0), oy = Math.round((origin && origin[1]) || 0);
+    const pat = bctx.createPattern(tile, "repeat");
+    try {
+        pat.setTransform(new DOMMatrix().translate(-(((ox % px) + px) % px), -(((oy % py) + py) % py)).scale(s));
+    } catch (_) { /* old browsers: no anchor, no scale */ }
+    bctx.imageSmoothingEnabled = s > 1;
+    bctx.fillStyle = pat;
+    bctx.fillRect(0, 0, W, H);
+    return big;
+}
+
 function applyGrain(src, p, info) {
     const W = src.width, H = src.height;
     const amount = (p.amount ?? 25) / 100;
@@ -154,57 +222,20 @@ function applyGrain(src, p, info) {
     const usePlate = !!(info.plate && info.plate.width);
     const sigma = Math.max(0, Math.min(0.5, (p.speckle ?? 25) / 100 * 0.5));
     const sc = Math.max(0.1, (p.plate_scale ?? 1) * (info.scale || 1));
-    const noiseKey = JSON.stringify(usePlate ? ["plate", info.plateKey || "", sc, W, H] : ["synth", size, sigma, chroma, String(info.seed || "grain"), W, H]);
+    const org = info.origin || [0, 0];
+    const noiseKey = JSON.stringify(usePlate ? ["plate", info.plateKey || "", sc, W, H, org] : ["synth", size, sigma, chroma, String(info.seed || "grain"), W, H, org]);
     let nz, center = 128, gain = 1.3;
     if (usePlate) { center = info.plateMean ?? 128; gain = 40 / Math.max(8, info.plateStd ?? 40); }   // plates come with their own contrast
     if (cache.noiseKey === noiseKey && cache.noise) {
         nz = cache.noise;
     } else {
-        const big = makeCanvas(W, H);
-        const bctx = big.getContext("2d");
-        if (usePlate) {
-            // a real grain plate (scan of a uniformly exposed film) replaces the synthetic noise,
-            // tiled at plate_scale (1 = plate pixels 1:1) and centred on its mean
-            const pat = bctx.createPattern(info.plate, "repeat");
-            try { pat.setTransform(new DOMMatrix().scale(sc, sc)); } catch (_) { /* old browsers */ }
-            bctx.fillStyle = pat;
-            bctx.fillRect(0, 0, W, H);
-        } else {
-            // noise at grain resolution (never finer than a pixel), scaled up with smoothing: soft, film-like clumps
-            const gs = Math.max(1, size);
-            const nw = Math.max(1, Math.round(W / gs)), nh = Math.max(1, Math.round(H / gs));
-            const noise = makeCanvas(nw, nh);
-            const nctx = noise.getContext("2d");
-            const nd = nctx.createImageData(nw, nh);
-            const d = nd.data;
-            const rand = rng(hashString(String(info.seed || "grain")));
-            // Real grain plates measure skewed and heavy-tailed (bright specks on a darker
-            // ground: skew 0.5-0.9, kurtosis 3.2-5.4 on fotokorn's scans, black-and-white
-            // stocks the most). A standardised lognormal reproduces that: sigma 0.3 gives
-            // skew ~0.95 / kurtosis ~4.6, sigma 0.12 stays close to gaussian. Samples come
-            // from a 64k table so the per-pixel work is one random number and a lookup.
-            const e1 = Math.exp(sigma * sigma / 2), norm = Math.sqrt((Math.exp(sigma * sigma) - 1) * Math.exp(sigma * sigma)) || 1;
-            const gauss = () => { const u = Math.max(1e-12, rand()), v = rand(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
-            const TN = 65536;
-            const table = new Float32Array(TN);
-            for (let i = 0; i < TN; i++) table[i] = (sigma > 0.005 ? (Math.exp(sigma * gauss()) - e1) / norm : gauss()) * 40;
-            const sample = () => table[(rand() * TN) | 0];
-            for (let i = 0; i < d.length; i += 4) {
-                const g = sample();
-                if (chroma <= 0) { d[i] = d[i + 1] = d[i + 2] = 128 + g; }
-                else {
-                    // luminance grain shared by all channels plus a per-channel part (colour negative films)
-                    d[i] = 128 + g * (1 - chroma) + sample() * chroma;
-                    d[i + 1] = 128 + g * (1 - chroma) + sample() * chroma;
-                    d[i + 2] = 128 + g * (1 - chroma) + sample() * chroma;
-                }
-                d[i + 3] = 255;
-            }
-            nctx.putImageData(nd, 0, 0);
-            bctx.imageSmoothingEnabled = gs > 1;
-            bctx.drawImage(noise, 0, 0, W, H);
-        }
-        nz = bctx.getImageData(0, 0, W, H).data;
+        // a real grain plate (scan of a uniformly exposed film) replaces the synthetic
+        // cells, tiled at plate_scale (1 = plate pixels 1:1) and centred on its mean
+        const big = grainNoiseCanvas(W, H, {
+            gs: Math.max(1, size), sigma, chroma, seed: info.seed,
+            plate: usePlate ? info.plate : null, plateScale: sc, origin: org,
+        });
+        nz = big.getContext("2d").getImageData(0, 0, W, H).data;
         cache.noiseKey = noiseKey;
         cache.noise = nz;
     }
@@ -224,6 +255,32 @@ function applyGrain(src, p, info) {
 }
 
 /** Mean and high-pass standard deviation of a grain plate, from a 512 px sample (for centring and gain). */
+/**
+ * A layer's pixels with their colour statistics shifted towards what is below them:
+ * per channel (value - meanT) * scale + meanS, mixed in by `strength` (0..1). `stats`
+ * comes from the editor's matchStats() (256 px thumbnails, ratio already clamped).
+ * Fully transparent pixels are left alone. The app overrides this with a shader pass.
+ */
+export function matchCanvas(src, stats, strength) {
+    const W = src.width, H = src.height;
+    const out = makeCanvas(W, H);
+    const ctx = out.getContext("2d");
+    ctx.drawImage(src, 0, 0);
+    const img = ctx.getImageData(0, 0, W, H);
+    const d = img.data;
+    const { meanS, meanT, scale } = stats;
+    const k = Math.max(0, Math.min(1, strength));
+    for (let i = 0; i < d.length; i += 4) {
+        if (!d[i + 3]) continue;
+        for (let ch = 0; ch < 3; ch++) {
+            const v = (d[i + ch] - meanT[ch]) * scale[ch] + meanS[ch];
+            d[i + ch] = Math.max(0, Math.min(255, d[i + ch] + (v - d[i + ch]) * k));
+        }
+    }
+    ctx.putImageData(img, 0, 0);
+    return out;
+}
+
 export function plateStats(img) {
     const w = Math.min(512, img.naturalWidth || img.width), h = Math.min(512, img.naturalHeight || img.height);
     const c = makeCanvas(w, h);

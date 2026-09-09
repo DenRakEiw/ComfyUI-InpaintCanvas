@@ -14,7 +14,7 @@
 
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
-import { FILTERS, FILTER_IDS, filterDefaults, applyFilter, lutFromCube, lutToCanvas, lutFromImage, plateStats } from "./inpaint_filters.js";
+import { FILTERS, FILTER_IDS, filterDefaults, applyFilter, matchCanvas, lutFromCube, lutToCanvas, lutFromImage, plateStats } from "./inpaint_filters.js";
 import { TEXT_DEFAULTS, FONT_CATEGORIES, loadFontList, fontList, addUserFont, renderText } from "./inpaint_text.js";
 import { installBridge } from "./inpaint_bridge.js";
 import { floodMask, maskToColorCanvas, clipMaskToSelection, rgbToHex } from "./inpaint_raster.js";
@@ -3438,13 +3438,15 @@ class InpaintEditor {
                 this.markSelectionChanged(this.boundsAfter(p.mode, [lx0, ly0, lx1, ly1]));
             }
         } else if (p.kind === "selpaint") {
-            if (this.fillEnclosed) this.closeStrokeLoop(p.path, !!p.subtract);
-            this.markSelectionChanged();
+            const filled = this.fillEnclosed && this.closeStrokeLoop(p.path, !!p.subtract);
+            // the dabs kept the levels up to date; a closed loop filled its whole box
+            this.markSelectionChanged(undefined, filled ? undefined : p.bounds);
         } else if (p.kind === "object") {
             if (!p.moved) this.toggleObjectAt(...this.toImage(e), p);
         } else if (p.kind === "layerpaint") {
+            const box = this.strokeRect(p, p.layer.canvas);
             this.commitStroke(p);
-            this.markLayerChanged(p.layer);
+            this.markLayerChanged(p.layer, box);
             if (!p.grad) this.lastStrokeEnd = { layerId: p.layer.id, x: p.last[0], y: p.last[1], mask: false };
         } else if (p.kind === "smudge") {
             this.markLayerChanged(p.layer);
@@ -3496,7 +3498,10 @@ class InpaintEditor {
     }
 
     selectionDab(x0, y0, x1, y1) {
-        this.touchSource(this.selection);
+        const r = this.brushSize / 2 + 2;
+        const p = this.pointer;
+        if (p && p.kind === "selpaint") this.strokeBounds(p, x0, y0, x1, y1, r);
+        this.touchSourceRect(this.selection, Math.min(x0, x1) - r, Math.min(y0, y1) - r, Math.max(x0, x1) + r, Math.max(y0, y1) + r);
         const sctx = this.selection.getContext("2d");
         const subtract = this.pointer && this.pointer.kind === "selpaint" ? !!this.pointer.subtract : this.tool === "deselect";
         sctx.globalCompositeOperation = subtract ? "destination-out" : "source-over";
@@ -4615,16 +4620,21 @@ class InpaintEditor {
         p.bounds = b ? [Math.min(b[0], nx0), Math.min(b[1], ny0), Math.max(b[2], nx1), Math.max(b[3], ny1)] : [nx0, ny0, nx1, ny1];
     }
 
+    /** The box a gesture painted over, in the target canvas's own pixels, or null for all of it. */
+    strokeRect(p, target) {
+        if (!target || !p.bounds) return null;
+        const layer = p.layer;
+        const sx = target.width / layer.w, sy = target.height / layer.h;
+        const [x0, y0, x1, y1] = p.bounds;
+        return [(x0 - layer.x) * sx, (y0 - layer.y) * sy, (x1 - layer.x) * sx, (y1 - layer.y) * sy];
+    }
+
     /** The undo step for a finished stroke: the touched rectangle, or the whole layer. */
     strokeUndo(p, target) {
         const layer = p.layer;
         if (!target) return null;
-        const sx = target.width / layer.w, sy = target.height / layer.h;
-        let rect = { x: 0, y: 0, w: target.width, h: target.height };
-        if (p.bounds) {
-            const [x0, y0, x1, y1] = p.bounds;
-            rect = { x: (x0 - layer.x) * sx, y: (y0 - layer.y) * sy, w: (x1 - x0) * sx, h: (y1 - y0) * sy };
-        }
+        const box = this.strokeRect(p, target);
+        const rect = box ? { x: box[0], y: box[1], w: box[2] - box[0], h: box[3] - box[1] } : { x: 0, y: 0, w: target.width, h: target.height };
         return this.snapshotRect(layer, rect, p.kind === "maskpaint");
     }
 
@@ -4842,7 +4852,7 @@ class InpaintEditor {
      * ([x0, y0, x1, y1] or null for an empty selection); left out it is scanned for on
      * the next getBounds().
      */
-    markSelectionChanged(bounds) {
+    markSelectionChanged(bounds, rect) {
         if (bounds === undefined) {
             this.selectionDirty = true;
         } else {
@@ -4851,14 +4861,15 @@ class InpaintEditor {
         }
         this.selectionSeq++;
         this.selectionEncoded = false;
-        this.touchSource(this.selection);
+        if (rect) this.touchSourceRect(this.selection, rect[0], rect[1], rect[2], rect[3]);
+        else this.touchSource(this.selection);
         this.uploaded.maskHash = null;
         this.renderInfo();
         this.drawThumb();
         this.notifyChanged();
     }
 
-    markLayerChanged(layer) {
+    markLayerChanged(layer, rect) {
         layer.dirty = true;
         layer._maskedValid = false;
         layer._mcache = null;
@@ -4866,7 +4877,9 @@ class InpaintEditor {
         layer._mstats = null;
         layer._mstatsView = null;
         layer.exportRef = null;
-        this.touchSource(layer.canvas);
+        // `rect` (in the layer canvas's own pixels) keeps the cached levels and refreshes them there
+        if (rect) this.touchSourceRect(layer.canvas, rect[0], rect[1], rect[2], rect[3]);
+        else this.touchSource(layer.canvas);
         this.touchSource(layer._masked);
         this.uploaded.baseHash = null;
         this.uploaded.controlHash = null;
@@ -5004,7 +5017,10 @@ class InpaintEditor {
         let canvas = null;
         const fxSlot = vp ? "_fxCacheView" : "_fxCache";
         if (!layer[fxSlot]) layer[fxSlot] = {};
-        try { canvas = applyFilter(layer.filter, input, layer.params, { scale, seed: layer.id, lut: layer._lutData, plate: layer._plateImg || null, plateKey: layer.plate && layer.plate.ref && layer.plate.ref.filename, plateMean: layer.plate && layer.plate.mean, plateStd: layer.plate && layer.plate.std, cache: layer[fxSlot] }); }
+        // where the input sits in the image, in its own pixels: filters with a field of
+        // their own (grain) anchor it there instead of at the corner of the preview
+        const origin = vp ? [vp.x * vp.sx, vp.y * vp.sy] : [0, 0];
+        try { canvas = applyFilter(layer.filter, input, layer.params, { scale, origin, seed: layer.id, lut: layer._lutData, plate: layer._plateImg || null, plateKey: layer.plate && layer.plate.ref && layer.plate.ref.filename, plateMean: layer.plate && layer.plate.mean, plateStd: layer.plate && layer.plate.std, cache: layer[fxSlot] }); }
         catch (err) { console.error(err); }
         layer[slot] = { version: this.compositeVersion, key, canvas };
         return canvas;
@@ -5768,11 +5784,12 @@ class InpaintEditor {
         }
     }
 
-    selectionBounds() {
-        if (!this.selection) return null;
-        const W = this.width, H = this.height;
+    /** Exact bounding box of the selected pixels inside a box, or null when it holds none. */
+    scanBounds(bx0, by0, bx1, by1) {
+        const W = bx1 - bx0, H = by1 - by0;
+        if (W <= 0 || H <= 0) return null;
         // one 32-bit word per pixel; alpha is the high byte, so "selected" is one bit test
-        const d = new Uint32Array(this.selection.getContext("2d").getImageData(0, 0, W, H).data.buffer);
+        const d = new Uint32Array(this.selection.getContext("2d").getImageData(bx0, by0, W, H).data.buffer);
         let x0 = W, y0 = H, x1 = -1, y1 = -1;
         for (let y = 0; y < H; y++) {
             const row = y * W;
@@ -5787,7 +5804,41 @@ class InpaintEditor {
             y1 = y;
         }
         if (x1 < 0) return null;
-        return [x0, y0, x1 + 1, y1 + 1];
+        return [bx0 + x0, by0 + y0, bx0 + x1 + 1, by0 + y1 + 1];
+    }
+
+    /**
+     * The selection's bounding box. On a large selection canvas the exact scan reads back
+     * hundreds of megabytes, so a display level is scanned first (any covered cell keeps
+     * some alpha) and the exact scan then runs inside that box only.
+     */
+    selectionBounds() {
+        if (!this.selection) return null;
+        const W = this.width, H = this.height;
+        if (W * H <= PYRAMID_MIN_PX) return this.scanBounds(0, 0, W, H);
+        const budget = this._pyramidBudget;
+        this._pyramidBudget = Infinity;
+        const lvl = this.displaySource(this.selection, 1 / 16);
+        this._pyramidBudget = budget;
+        if (lvl === this.selection) return this.scanBounds(0, 0, W, H);
+        const lw = lvl.width, lh = lvl.height;
+        const d = new Uint32Array(lvl.getContext("2d").getImageData(0, 0, lw, lh).data.buffer);
+        let cx0 = lw, cy0 = lh, cx1 = -1, cy1 = -1;
+        for (let y = 0; y < lh; y++) {
+            const row = y * lw;
+            for (let x = 0; x < lw; x++) {
+                if (!(d[row + x] & 0xff000000)) continue;   // any alpha at all, the level is smoothed
+                if (x < cx0) cx0 = x;
+                if (x > cx1) cx1 = x;
+                if (y < cy0) cy0 = y;
+                cy1 = y;
+            }
+        }
+        if (cx1 < 0) return null;
+        const fx = W / lw, fy = H / lh;
+        return this.scanBounds(
+            Math.max(0, Math.floor(cx0 * fx) - 2), Math.max(0, Math.floor(cy0 * fy) - 2),
+            Math.min(W, Math.ceil((cx1 + 1) * fx) + 2), Math.min(H, Math.ceil((cy1 + 1) * fy) + 2));
     }
 
     /**
@@ -6582,6 +6633,42 @@ Size as width x height:` : "Size as width x height:",
     }
 
     /**
+     * Pixels of `src` changed inside a rectangle (source pixels): refresh the cached levels
+     * there instead of dropping them. A brush dab would otherwise cost a full rebuild of
+     * the pyramid, which is 200 ms on a 96 MP source.
+     */
+    touchSourceRect(src, x0, y0, x1, y1) {
+        this.pixelVersion++;
+        if (!src) return;
+        const entry = this.pyramids.get(src);
+        if (!entry || entry.version !== (src._dispVer || 0) || !entry.levels.length) return;
+        const rx0 = Math.max(0, Math.floor(x0) - 1), ry0 = Math.max(0, Math.floor(y0) - 1);
+        const rx1 = Math.min(src.width, Math.ceil(x1) + 1), ry1 = Math.min(src.height, Math.ceil(y1) + 1);
+        if (rx1 <= rx0 || ry1 <= ry0) return;
+        let prev = src, px0 = rx0, py0 = ry0, px1 = rx1, py1 = ry1;
+        for (let i = 0; i < entry.levels.length; i++) {
+            const lvl = entry.levels[i];
+            if (!lvl) break;
+            // the same chain as a full build: level i is drawn from level i - 1
+            const f = lvl.width / prev.width, g = lvl.height / prev.height;
+            const lx0 = Math.max(0, Math.floor(px0 * f) - 1), ly0 = Math.max(0, Math.floor(py0 * g) - 1);
+            const lx1 = Math.min(lvl.width, Math.ceil(px1 * f) + 1), ly1 = Math.min(lvl.height, Math.ceil(py1 * g) + 1);
+            if (lx1 <= lx0 || ly1 <= ly0) break;
+            const cx = lvl.getContext("2d");
+            cx.save();
+            cx.setTransform(1, 0, 0, 1, 0, 0);
+            cx.globalAlpha = 1;
+            cx.globalCompositeOperation = "copy";   // replace the rectangle, alpha included
+            cx.imageSmoothingEnabled = true;
+            cx.imageSmoothingQuality = "medium";
+            cx.drawImage(prev, lx0 / f, ly0 / g, (lx1 - lx0) / f, (ly1 - ly0) / g, lx0, ly0, lx1 - lx0, ly1 - ly0);
+            cx.restore();
+            prev = lvl;
+            px0 = lx0; py0 = ly0; px1 = lx1; py1 = ly1;
+        }
+    }
+
+    /**
      * A cached downscaled copy of a source canvas for drawing at `scale` (destination
      * pixels per source pixel). Levels are successive halvings, so a 12k image is drawn
      * from a 1.5k copy at fit zoom instead of being resampled in full every frame.
@@ -6796,24 +6883,7 @@ Size as width x height:` : "Size as width x height:",
         const c = layer[slot];
         if (c && c.version === this.compositeVersion && c.key === key) return c.canvas;
         const st = this.matchStats(layer, below, vp, out0);
-        let out = out0;
-        if (st && strength > 0) {
-            const W = out0.width, H = out0.height;
-            const oc = makeCanvas(W, H);
-            const octx = oc.getContext("2d");
-            octx.drawImage(out0, 0, 0);
-            const img = octx.getImageData(0, 0, W, H);
-            const d = img.data;
-            for (let i = 0; i < d.length; i += 4) {
-                if (!d[i + 3]) continue;
-                for (let ch = 0; ch < 3; ch++) {
-                    const v = (d[i + ch] - st.meanT[ch]) * st.scale[ch] + st.meanS[ch];
-                    d[i + ch] = Math.max(0, Math.min(255, d[i + ch] + (v - d[i + ch]) * strength));
-                }
-            }
-            octx.putImageData(img, 0, 0);
-            out = oc;
-        }
+        const out = st && strength > 0 ? matchCanvas(out0, st, strength) : out0;
         layer[slot] = { version: this.compositeVersion, key, canvas: out };
         return out;
     }

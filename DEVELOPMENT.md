@@ -1153,3 +1153,26 @@ phase 1 is in the editor here and is what the app syncs. In short:
   version) instead of flattening the document on every press.
 
 Benchmark: `python tools/perf_test.py` in the app repo (it drives the app over DevTools).
+
+### 21b. Colour match and the grain field (2026-09-10, phase 2)
+
+- **The colour match is a filter-module function now.** `matchCanvas(src, stats, strength)`
+  in `inpaint_filters.js` holds the pixel loop; `layerMatchedPixels` computes the statistics
+  (`matchStats`, 256 px thumbnails, cached per composite version) and calls it. The app
+  patches `matchCanvas` to try a shader pass first (`applyMatchGL`, mode 6). Keep the CPU
+  loop the reference: the node has no WebGL path.
+- **The grain noise field is a cached tile.** `grainNoiseCanvas(W, H, {gs, sigma, chroma,
+  seed, plate, plateScale, origin})` repeats one 1024 x 1024 tile of cells
+  (`grainTileCanvas`, cached per speckle / colour share / seed) at the cell size, anchored
+  at `origin`. It used to be generated cell by cell for the exact canvas size, so every
+  preview size change re-rolled millions of cells (100-190 ms per zoom step). The app's GPU
+  module imports this very function, so both paths always see the same field - do not write
+  a second implementation.
+- **`info.origin`** is where the filter's input sits in the image, in the input's own
+  pixels (the editor passes the region of the viewport pass). Filters with a field of their
+  own use it so the field does not crawl while panning.
+- **`touchSourceRect(src, x0, y0, x1, y1)`** refreshes the cached display levels inside a
+  rectangle instead of dropping them: selection dabs, a finished brush stroke
+  (`markLayerChanged(layer, rect)`) and a selection stroke pass the box they touched.
+- **`selectionBounds()`** scans a display level first and makes the box exact only inside
+  the region the level marked, which keeps a 96 MP selection under 100 ms.
