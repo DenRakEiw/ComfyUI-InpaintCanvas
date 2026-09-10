@@ -6361,32 +6361,7 @@ class InpaintEditor {
             modeRow.appendChild(roleLab);
             row.appendChild(modeRow);
 
-            // transparency mask: cutout (RMBG), from selection, edit, apply, remove
-            const maskRow = el("div", "ipc-maskrow");
-            const busy = !!(this.cutoutPending && this.cutoutPending.layer === layer);
-            const cut = miniButton("scissors", busy ? "Removing the background ..." : "Cutout: remove the background with the model on the right (RMBG). The result is a transparency mask you can edit.", () => this.cutoutLayer(layer));
-            cut.disabled = busy || isFx || !availableCutoutBackends().length;
-            maskRow.appendChild(cut);
-            if (layer.id === this.activeLayerId && !isFx) {
-                const sel = selectInput(["auto"], "auto", "Background removal model");
-                this.cutoutSel = sel;
-                this.refreshCutoutBackends();
-                sel.addEventListener("change", () => { this.cutoutSettings.backend = sel.value; this.notifyChanged(); });
-                maskRow.appendChild(sel);
-            }
-            maskRow.appendChild(miniButton("mask", "Mask from selection: only the selected part of the layer stays visible", () => this.maskFromSelection(layer)));
-            maskRow.appendChild(el("span", "ipc-grow"));
-            maskRow.appendChild(el("span", null, layer.mask ? (layer.maskEdit ? "mask ✎" : "mask") : "no mask"));
-            const editBtn = miniButton("maskEdit", "Edit the mask with the paint (reveal) and erase (hide) tools", () => this.toggleMaskEdit(layer), layer.maskEdit ? "ipc-on" : "");
-            editBtn.disabled = !layer.mask;
-            maskRow.appendChild(editBtn);
-            const applyBtn = miniButton("check", "Apply the mask to the pixels", () => this.applyMask(layer));
-            applyBtn.disabled = !layer.mask;
-            maskRow.appendChild(applyBtn);
-            const delMask = miniButton("trash", "Remove the mask (the pixels stay)", () => this.removeMask(layer), "ipc-del");
-            delMask.disabled = !layer.mask;
-            maskRow.appendChild(delMask);
-            row.appendChild(maskRow);
+            row.appendChild(this.buildMaskRow(layer));
             list.appendChild(row);
         }
         const row = el("div", "ipc-layer" + (this.activeLayerId === null ? " ipc-selected" : ""));
@@ -6402,6 +6377,37 @@ class InpaintEditor {
         row.appendChild(top);
         list.appendChild(row);
         this.renderReferences();
+    }
+
+    /** Transparency mask row of a layer: cutout (RMBG), from selection, edit, apply, remove. */
+    buildMaskRow(layer) {
+        const isFx = layer.kind === "filter";
+        const maskRow = el("div", "ipc-maskrow");
+        const busy = !!(this.cutoutPending && this.cutoutPending.layer === layer);
+        const cut = miniButton("scissors", busy ? "Removing the background ..." : "Cutout: remove the background with the model on the right (RMBG). The result is a transparency mask you can edit.", () => this.cutoutLayer(layer));
+        cut.disabled = busy || isFx || !availableCutoutBackends().length;
+        maskRow.appendChild(cut);
+        if (!isFx) {
+            const sel = selectInput(["auto"], "auto", "Background removal model");
+            this.cutoutSel = sel;
+            this.refreshCutoutBackends();
+            sel.addEventListener("click", (e) => e.stopPropagation());
+            sel.addEventListener("change", () => { this.cutoutSettings.backend = sel.value; this.notifyChanged(); });
+            maskRow.appendChild(sel);
+        }
+        maskRow.appendChild(miniButton("mask", "Mask from selection: only the selected part of the layer stays visible", () => this.maskFromSelection(layer)));
+        maskRow.appendChild(el("span", "ipc-grow"));
+        maskRow.appendChild(el("span", null, layer.mask ? (layer.maskEdit ? "mask ✎" : "mask") : "no mask"));
+        const editBtn = miniButton("maskEdit", "Edit the mask with the paint (reveal) and erase (hide) tools", () => this.toggleMaskEdit(layer), layer.maskEdit ? "ipc-on" : "");
+        editBtn.disabled = !layer.mask;
+        maskRow.appendChild(editBtn);
+        const applyBtn = miniButton("check", "Apply the mask to the pixels", () => this.applyMask(layer));
+        applyBtn.disabled = !layer.mask;
+        maskRow.appendChild(applyBtn);
+        const delMask = miniButton("trash", "Remove the mask (the pixels stay)", () => this.removeMask(layer), "ipc-del");
+        delMask.disabled = !layer.mask;
+        maskRow.appendChild(delMask);
+        return maskRow;
     }
 
     /** The reference list: batch order top first, thumbnail, name, eye, order, back to image, delete. */
@@ -6448,6 +6454,9 @@ class InpaintEditor {
             }));
             top.appendChild(miniButton("trash", "Remove the reference", () => this.removeLayer(layer.id), "ipc-del"));
             row.appendChild(top);
+            // a reference keeps the transparency mask row: cutting the subject out (RMBG) is
+            // what a reference image is usually for, and the mask travels into the upload
+            if (layer.id === this.activeLayerId) row.appendChild(this.buildMaskRow(layer));
             list.appendChild(row);
         }
     }
@@ -6756,8 +6765,15 @@ Size as width x height:` : "Size as width x height:",
     touchSourceRect(src, x0, y0, x1, y1) {
         this.pixelVersion++;
         if (!src) return;
+        // The GPU compositor keeps one texture per source and version, so pixels that changed
+        // have to raise the version even when the cached levels are kept: without this a brush
+        // stroke or an erase sits in the canvas and never reaches the screen.
         const entry = this.pyramids.get(src);
-        if (!entry || entry.version !== (src._dispVer || 0) || !entry.levels.length) return;
+        const keep = !!(entry && entry.version === (src._dispVer || 0));
+        src._dispVer = (src._dispVer || 0) + 1;
+        if (!keep) return;
+        entry.version = src._dispVer;   // the levels are refreshed below, so they stay valid
+        if (!entry.levels.length) return;
         const rx0 = Math.max(0, Math.floor(x0) - 1), ry0 = Math.max(0, Math.floor(y0) - 1);
         const rx1 = Math.min(src.width, Math.ceil(x1) + 1), ry1 = Math.min(src.height, Math.ceil(y1) + 1);
         if (rx1 <= rx0 || ry1 <= ry0) return;
@@ -6779,6 +6795,7 @@ Size as width x height:` : "Size as width x height:",
             cx.imageSmoothingQuality = "medium";
             cx.drawImage(prev, lx0 / f, ly0 / g, (lx1 - lx0) / f, (ly1 - ly0) / g, lx0, ly0, lx1 - lx0, ly1 - ly0);
             cx.restore();
+            lvl._dispVer = (lvl._dispVer || 0) + 1;   // this level's pixels changed too
             prev = lvl;
             px0 = lx0; py0 = ly0; px1 = lx1; py1 = ly1;
         }
@@ -6905,23 +6922,29 @@ Size as width x height:` : "Size as width x height:",
             layers.push({ source: lvl, version: this.sourceVersion(lvl), x: 0, y: 0, w: this.width, h: this.height, opacity: 1, blend: "normal" });
         }
         const vp = { x: region.x, y: region.y, w: region.w, h: region.h, sx, sy: vh / region.h };
-        for (const layer of this.layers) {
-            if (!layer.visible || !layer.canvas) continue;
-            if (this.isControl(layer) && opts.forRun) continue;
-            const matched = this.matchActive(layer) ? this.layerMatchedPixels(layer, this.viewCanvas, vp) : null;
-            const px = matched || this.layerPixels(layer);
-            if (!px || px._livePreview) return null;
-            const lvl = this.displaySource(px, (layer.w * sx) / px.width);
-            layers.push({
-                source: lvl, version: this.sourceVersion(lvl),
-                x: layer.x, y: layer.y, w: layer.w, h: layer.h,
-                opacity: layer.opacity == null ? 1 : layer.opacity,
-                blend: layer.blend || "normal",
-            });
-        }
         try {
+            for (const layer of this.layers) {
+                if (!layer.visible || !layer.canvas) continue;
+                if (this.isControl(layer) && opts.forRun) continue;
+                // Canvas 2D takes the colour match's backdrop off the target it has drawn into
+                // so far; in a GPU pass nothing is drawn yet, so the stack below the layer is
+                // composited on its own (only when the statistics are not cached).
+                const matched = this.matchActive(layer)
+                    ? this.layerMatchedPixels(layer, () => this.glMatchBackdrop(comp, vw, vh, region, layers), vp)
+                    : null;
+                const px = matched || this.layerPixels(layer);
+                if (!px || px._livePreview) return null;
+                const lvl = this.displaySource(px, (layer.w * sx) / px.width);
+                layers.push({
+                    source: lvl, version: this.sourceVersion(lvl),
+                    x: layer.x, y: layer.y, w: layer.w, h: layer.h,
+                    opacity: layer.opacity == null ? 1 : layer.opacity,
+                    blend: layer.blend || "normal",
+                });
+            }
             return comp.composite({ width: vw, height: vh, region, layers });
         } catch (err) {
+            if (err && err.glBail) return null;   // no backdrop for a colour match: Canvas 2D draws this frame
             console.warn("Inpaint Canvas: the GPU compositor failed, staying on Canvas 2D:", (err && err.message) || err);
             this.compositorOff = true;
             return null;
@@ -6929,9 +6952,29 @@ Size as width x height:` : "Size as width x height:",
     }
 
     /**
-     * A version for a source canvas that only changes when its pixels do. Pyramid levels
-     * are rebuilt as new canvases, so their identity already carries the version; the
-     * counter is what `touchSource` bumps on the original.
+     * What is under a colour-matched layer in a GPU pass: the layers stacked so far,
+     * composited into a canvas of their own. The compositor draws into one canvas, so its
+     * result has to be copied before the frame itself is composited over it.
+     */
+    glMatchBackdrop(comp, vw, vh, region, layers) {
+        const c = comp.composite({ width: vw, height: vh, region, layers });
+        if (!c) { const err = new Error("the compositor could not build the colour match's backdrop"); err.glBail = true; throw err; }
+        if (!this.matchBackdrop) this.matchBackdrop = makeCanvas(vw, vh);
+        const out = this.matchBackdrop;
+        if (out.width !== vw || out.height !== vh) { out.width = vw; out.height = vh; }
+        const x = out.getContext("2d");
+        x.setTransform(1, 0, 0, 1, 0, 0);
+        x.globalAlpha = 1;
+        x.globalCompositeOperation = "copy";
+        x.drawImage(c, 0, 0);
+        return out;
+    }
+
+    /**
+     * A version for a source canvas that only changes when its pixels do: what
+     * `touchSource` and `touchSourceRect` bump, on the original and on every pyramid level
+     * they rewrite. A level rebuilt from scratch is a new canvas and starts at 0, which is
+     * a fresh key in the compositor's texture cache anyway.
      */
     sourceVersion(src) {
         return src ? (src._dispVer || 0) : 0;
@@ -7112,6 +7155,8 @@ Size as width x height:` : "Size as width x height:",
         const slot = vp ? "_mstatsView" : "_mstats";
         const cached = layer[slot];
         if (cached && cached.version === this.compositeVersion && cached.key === key) return cached.stats;
+        // `below` may be a thunk: building it costs a composite, and only a miss needs it
+        below = typeof below === "function" ? below() : below;
         const px = out0;
         const W = px.width, H = px.height;
         const s = Math.min(1, 256 / Math.max(layer.w, layer.h));
@@ -8049,6 +8094,7 @@ Size as width x height:` : "Size as width x height:",
 
     destroy() {
         if (this._compositor) { try { this._compositor.dispose(); } catch (_) { /* context gone */ } this._compositor = null; }
+        this.matchBackdrop = null;
         this.close();
         try { this.resizeObserver.disconnect(); } catch (_) { /* ignore */ }
         try { this.thumbObserver.disconnect(); } catch (_) { /* ignore */ }

@@ -1257,6 +1257,22 @@ Rules when you touch this:
   premultiplied when you check this.
 - **The texture cache is bounded** (`TEXTURE_CACHE`, least recently used evicted): pyramid
   levels are new canvases after every change, so an unbounded map would grow all session.
+- **Every pixel change has to raise `_dispVer`**, or the compositor draws the texture it
+  uploaded before. `touchSourceRect` refreshes the cached levels in place instead of
+  dropping them, and for a while it left the version alone for exactly that reason: the
+  result was that a brush stroke or an erase stayed in the layer canvas (and in every
+  export) but never reached the screen. It now raises the version, moves the pyramid entry
+  to it, and raises the version of every level it redrew.
+- **A colour match needs a backdrop of its own here.** Canvas 2D reads the statistics off
+  the target it has drawn into so far; the compositor's target is empty until the pass runs,
+  which left `matchStats` with no samples and the slider without an effect. `glViewComposite`
+  passes `layerMatchedPixels` a thunk (`glMatchBackdrop`) that composites the stack below the
+  layer into a canvas of its own, and `matchStats` resolves it only when the statistics are
+  not cached, so panning pays nothing.
 - The gate is `python tools/composite_test.py`, which draws the same view through both paths
   in one run and compares. Keep it deterministic: grain seeds its noise from the layer id
   (the test pins it) and marching ants walk with the clock (the test uses the tint overlay).
+  Watch what the two paths share: the test agreed on colour match for a while only because
+  the second shot re-used the first one's cached match canvas. It drops the match statistics
+  before each shot now, and erases into a layer through a rectangle touch first, which is
+  what catches both bugs above.
