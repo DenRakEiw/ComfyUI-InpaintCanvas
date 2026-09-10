@@ -533,7 +533,19 @@ function segmentTermInstruction(promptText) {
     return `Step 1: translate this request to English: "${promptText}". Step 2: name the one object in the picture that the request is about, as it looks now, in English, 1 to 3 words, plain nouns only (examples: swimsuit, hair, wooden chair, background). Output only the words of step 2, nothing else.`;
 }
 
+/**
+ * The instruction the language model gets. The host may hand out its own text (Scumble's
+ * prompt templates); when it does not, the built-in rules below are used.
+ */
 function upsampleInstruction(useCase, text, region, hint) {
+    if (host.upsampleInstruction) {
+        const own = host.upsampleInstruction({ useCase, prompt: text, region, hint });
+        if (own) return own;
+    }
+    return builtInUpsampleInstruction(useCase, text, region, hint);
+}
+
+function builtInUpsampleInstruction(useCase, text, region, hint) {
     // Kept short and with the request repeated at the end: small VLMs (Qwen3-VL 2B)
     // drop the request when it is buried in a long preamble.
     const req = text ? `"${text}"` : "(no request given: infer the most plausible content from the picture)";
