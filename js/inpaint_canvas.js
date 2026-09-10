@@ -705,6 +705,7 @@ const ICONS = {
     flatten: '<path d="M12 4l8 4-8 4-8-4z"/><path d="M4 12l8 4 8-4"/><path d="M4 16l8 4 8-4"/>',
     load: '<path d="M4 17v3h16v-3"/><path d="M12 4v11"/><path d="M7 9l5-5 5 5"/>',
     play: '<path d="M7 4l12 8-12 8z" fill="currentColor" stroke="none"/>',
+    sparkle: '<path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z" fill="currentColor" stroke="none"/><path d="M18 15l.8 2.2L21 18l-2.2.8L18 21l-.8-2.2L15 18l2.2-.8z" fill="currentColor" stroke="none"/>',
     close: '<path d="M6 6l12 12"/><path d="M18 6L6 18"/>',
     eye: '<path d="M2 12s4-6 10-6 10 6 10 6-4 6-10 6S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
     eyeOff: '<path d="M4 4l16 16"/><path d="M10 6.3A10 10 0 0112 6c6 0 10 6 10 6a17 17 0 01-3.2 3.4"/><path d="M6.6 8.6C4 10.4 2 12 2 12s4 6 10 6a10 10 0 003-.5"/>',
@@ -1165,6 +1166,9 @@ class InpaintEditor {
         });
         top.appendChild(this.fileInput);
         top.appendChild(iconButton("newfile", "New: an empty white canvas. Everything in this editor (layers, results, selection, history) is discarded; you are asked first.", () => this.newCanvas(), "New"));
+        if (host.generateNewAvailable && host.generateNewAvailable()) {
+            top.appendChild(iconButton("sparkle", "Generate new: make the base image from the prompt alone, no image needed. Model, size and seed are in the dialog.", () => host.openGenerateNew(this), "Generate new"));
+        }
         top.appendChild(iconButton("load", "Load an image as the base layer (Ctrl+drop replaces the image; a plain drop adds a layer)", () => this.fileInput.click(), "Load"));
         top.appendChild(iconButton("save", "Save the finished image (Ctrl+S): all visible layers with their filters, without control and reference layers, into ComfyUI's output folder. Name and format in the Canvas section.", () => this.exportImage(), "Save"));
 
@@ -6762,6 +6766,31 @@ class InpaintEditor {
         this.drawThumb();
         this.notifyChanged();
         this.setStatus(layer ? `Showing only ${h.name}.` : `${h.name} is discarded; restore it first.`);
+    }
+
+    /**
+     * Replace the base image with these pixels. Used by "Generate new" (the model's answer
+     * becomes the image) and by anything that turns a result into the new base.
+     */
+    async setBaseFromCanvas(canvas, { keepLayers = false } = {}) {
+        if (this.pending) this.cancelPending();
+        if (this.textEdit) this.endTextEdit(false);
+        const { ref } = await uploadCanvas(canvas, `n${this.node.id}_base`);
+        const img = await loadImageEl(viewUrl(ref));
+        if (!keepLayers) {
+            this.layers = [];
+            this.activeLayerId = null;
+            this.history = [];
+            this.savedSelections = [];
+            this.guides = { x: [], y: [] };
+            this.compare = null;
+            this.selection = null;
+        }
+        await this.setBase(ref, img, { keepLayers });
+        this.undo = []; this.redo = [];
+        this.renderHistory();
+        this.renderSelectionList();
+        return { width: this.width, height: this.height };
     }
 
     /** A fresh white canvas after a confirmation; the size is asked for in the same dialog. */
