@@ -1276,3 +1276,47 @@ Rules when you touch this:
   the second shot re-used the first one's cached match canvas. It drops the match statistics
   before each shot now, and erases into a layer through a rectangle touch first, which is
   what catches both bugs above.
+
+### 21f. What a long session costs, and giving it back (2026-09-10, phase 6)
+
+The symptom the phase started from: after several large documents had been built and closed
+in one page, a `levels` slider tick cost 45 ms instead of 8 and a pan frame 47 ms instead of
+4. The app repo's `tools/mem_test.py` measures it - it builds a 96 MP document per round,
+benchmarks it, closes it, forces a collection and reports the private bytes of the renderer
+and of the GPU process next to a census of every canvas the page ever made.
+
+**The cause was not the drawing code.** Four closed 96 MP documents were still reachable
+from one strong reference each, and through them 19 GB of canvas backing store. A heap
+snapshot found the retaining path in one hop: an event listener registered while a panel was
+being built, closing over that panel's document. Nothing in the editor was at fault, and
+none of the mechanisms the plan suspected first (undo tiles, the object map, the texture
+cache, the surface pool) contributed more than a few hundred MB. **Take the heap snapshot
+before rewriting anything**: it is one CDP call and it answers the question the census only
+poses.
+
+Rules that came out of it:
+
+- **Whoever keeps a per-editor map has to empty it when the editor goes.** `host.emit(
+  "removed", { editor })` fires from `removeEditor`, before the shell calls `destroy()`, so
+  the editor is still usable in that handler. The app's plugin host is the example: panels
+  and tool buttons are Maps keyed by the editor, and the listeners a panel registers belong
+  to that panel instance.
+- **A closed editor's WebGL context has to be lost, not just emptied.** `dispose()` deletes
+  the textures, zeroes its canvas and calls `WEBGL_lose_context`; a context is otherwise only
+  dropped when its canvas is collected, and Chromium keeps at most 16 per page.
+- **The compositor's texture cache is bounded in bytes** (`TEXTURE_BUDGET`, 1 GB), with a
+  count cap behind it. A count says nothing here: one level-0 texture of a 96 MP source is
+  384 MB and 48 small ones are 12. `_evict` never drops a texture the current frame used.
+- **`releaseCaches({ deep })`** gives the caches back - the filtered and matched copies, the
+  masked layers, the scratch canvases, the display pyramids, the compositor's textures, and
+  through the `releaseGpu` hook the host may set, the GPU-side pool as well. It returns the
+  bytes it dropped and **does not draw**: a background tab that redrew there would rebuild
+  every cache it just gave up. Free VRAM calls it and draws itself.
+- **Measuring GPU memory needs patience.** The shared image behind a collected canvas is
+  released asynchronously, and a document that was just closed keeps its layers until the
+  upload `close()` started has read them: closing four 96 MP tabs at once held 19 GB for a
+  few seconds. Read the number until it stops falling, never after a fixed wait.
+- **What is left is not ours.** With the leak gone, four 96 MP documents opened and closed
+  in a row leave 5 to 7 canvases (about 30 MB) alive and the benchmark within a few percent
+  of the first round. Four of them *open at the same time* still cost 40 ms a frame, because
+  19 GB of layer pixels really are live; that is what the host app's memory watch is for.

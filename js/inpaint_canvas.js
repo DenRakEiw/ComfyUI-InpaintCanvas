@@ -7786,13 +7786,63 @@ Size as width x height:` : "Size as width x height:",
     }
 
     /** Drop the helper models from VRAM: ComfyUI's /free resets the executor, which releases the node instances holding them. */
+    /**
+     * Give the caches back: the filtered and matched copies, the masked layers, the
+     * scratch canvases, the display pyramids and the compositor's textures. Everything
+     * here is rebuilt on demand, so the only cost is the next frame; the pyramid comes
+     * back one level per frame by design. `deep` also drops the GPU-side pool through
+     * the hook the app sets (`releaseGpu`). Returns the bytes it let go of.
+     */
+    releaseCaches({ deep = false } = {}) {
+        const px = (c) => (c && c.width ? c.width * c.height * 4 : 0);
+        let freed = 0;
+        const sources = [];
+        for (const l of this.layers) {
+            for (const slot of ["_fcache", "_fcacheView", "_mcache", "_mcacheView"]) {
+                if (l[slot]) { freed += px(l[slot].canvas); l[slot] = null; }
+            }
+            l._fxCache = null;
+            l._fxCacheView = null;
+            l._mstats = null;
+            l._mstatsView = null;
+            if (l._masked) { freed += px(l._masked); sources.push(l._masked); l._masked = null; l._maskedValid = false; }
+            for (const c of [l.canvas, l.mask]) if (c) sources.push(c);
+        }
+        for (const name of ["sceneCanvas", "viewCanvas", "matchBackdrop", "flatCanvas", "filterMaskCanvas", "strokePreview", "maskedPreview", "antsCanvas", "clipScratch"]) {
+            if (this[name]) { freed += px(this[name]); this[name] = null; }
+        }
+        if (this.flatCache) { freed += px(this.flatCache.canvas); this.flatCache = null; }
+        this.sceneSig = null;
+        // the pyramids: their levels are exclusively theirs, the sources stay
+        for (const src of [...sources, this._baseCanvas, this.selection]) {
+            if (!src) continue;
+            const entry = this.pyramids.get(src);
+            if (!entry) continue;
+            for (const lvl of entry.levels) freed += px(lvl);
+            this.pyramids.delete(src);
+        }
+        if (this._compositor) {
+            const st = this._compositor.stats ? this._compositor.stats() : null;
+            if (st) freed += st.bytes;
+            this._compositor.clear();
+        }
+        if (deep && typeof this.releaseGpu === "function") { try { freed += this.releaseGpu() || 0; } catch (_) { /* no GPU path */ } }
+        // deliberately no draw: a background tab that redrew here would build every cache
+        // straight back. The next draw (a gesture, or the tab coming forward) rebuilds
+        // exactly what it needs; the caller redraws when the tab is the one in front.
+        return freed;
+    }
+
     async freeHelperModels() {
+        const freed = this.releaseCaches({ deep: true });
+        const mb = Math.round(freed / 1048576);
+        this.drawSoon();
         try {
-            this.setStatus("Freeing helper models (SAM, Qwen-VL) from VRAM ...");
+            this.setStatus(`Freed ${mb} MB of caches. Freeing helper models (SAM, Qwen-VL) from VRAM ...`);
             const r = await api.fetchApi("/free", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ unload_models: true, free_memory: true }) });
             if (r.status !== 200) throw new Error("/free answered " + r.status);
             this.helperUsed = false;
-            this.setStatus("Helper models freed.");
+            this.setStatus(`Freed ${mb} MB of caches; the helper models are out of VRAM too.`);
         } catch (err) {
             console.warn("Inpaint Canvas: could not free models", err);
             this.setStatus("Could not free the helper models: " + (err.message || err));
@@ -8090,6 +8140,93 @@ Size as width x height:` : "Size as width x height:",
             references,
             refs: this.refSettings,
         });
+    }
+
+    /**
+     * What this editor holds in pixels, as plain data (bytes are w * h * 4, the backing
+     * store of a canvas). Nothing here allocates or frees; it is the input of
+     * tools/mem_test.py and of the memory work in the app's docs/PERFORMANCE.md.
+     * The GPU filter chain is app-only and is asked separately (glPoolStats()).
+     */
+    memoryReport() {
+        const px = (c) => (c && c.width ? c.width * c.height * 4 : 0);
+        const seen = new Set();          // one canvas counted once, however many slots hold it
+        const add = (into, name, c) => {
+            if (!c || !c.width) return;
+            const bytes = px(c);
+            into.push({ name, w: c.width, h: c.height, bytes, shared: seen.has(c) });
+            seen.add(c);
+        };
+        const sum = (list) => list.reduce((a, e) => a + (e.shared ? 0 : e.bytes), 0);
+
+        // layers, and the sources whose pyramids we can find again
+        const sources = [];
+        const layers = [];
+        for (const l of this.layers) {
+            const own = [];
+            add(own, "canvas", l.canvas);
+            add(own, "mask", l.mask);
+            add(own, "_masked", l._masked);
+            for (const slot of ["_fcache", "_fcacheView", "_mcache", "_mcacheView"]) {
+                const c = l[slot] && l[slot].canvas;
+                add(own, slot, c);
+            }
+            for (const c of [l.canvas, l.mask, l._masked, l._mcache && l._mcache.canvas, l._mcacheView && l._mcacheView.canvas]) if (c) sources.push(c);
+            layers.push({ id: l.id, name: l.name, kind: l.kind, w: l.w, h: l.h, bytes: sum(own), slots: own });
+        }
+        for (const c of [this._baseCanvas, this.selection]) if (c) sources.push(c);
+
+        // pyramids: a WeakMap cannot be walked, so ask it for every source we know of
+        const pyramid = [];
+        for (const src of sources) {
+            const entry = this.pyramids.get(src);
+            if (!entry || !entry.levels.length) continue;
+            let bytes = 0, levels = 0;
+            for (const lvl of entry.levels) if (lvl && lvl.width) { bytes += px(lvl); levels++; }
+            pyramid.push({ w: src.width, h: src.height, levels, bytes });
+        }
+
+        // undo / redo: the rect copies plus the canvases the "layers" / "canvas" snapshots hold
+        const live = new Set();
+        for (const l of this.layers) { if (l.canvas) live.add(l.canvas); if (l.mask) live.add(l.mask); }
+        const undoSeen = new Set();
+        const walkSteps = (list) => {
+            const kinds = {};
+            let bytes = 0, held = 0;
+            for (const s of list) {
+                if (!s) continue;
+                kinds[s.kind] = (kinds[s.kind] || 0) + 1;
+                if (s.canvas && s.canvas.width && !undoSeen.has(s.canvas)) { undoSeen.add(s.canvas); bytes += px(s.canvas); }
+                for (const l of s.layers || []) {
+                    for (const c of [l.canvas, l.mask, l._masked]) {
+                        if (!c || !c.width || live.has(c) || undoSeen.has(c)) continue;
+                        undoSeen.add(c);
+                        held += px(c);
+                    }
+                }
+            }
+            return { steps: list.length, kinds, rectBytes: bytes, heldLayerBytes: held };
+        };
+        const undo = { budget: this.undoBytes, undo: walkSteps(this.undo), redo: walkSteps(this.redo) };
+
+        // scratch canvases the editor keeps between frames
+        const scratch = [];
+        add(scratch, "_baseCanvas", this._baseCanvas);
+        add(scratch, "selection", this.selection);
+        for (const name of ["sceneCanvas", "viewCanvas", "matchBackdrop", "flatCanvas", "strokePreview", "maskedPreview", "antsCanvas", "clipScratch", "filterMaskCanvas"]) add(scratch, name, this[name]);
+        add(scratch, "flatCache", this.flatCache && this.flatCache.canvas);
+
+        const comp = this._compositor && this._compositor.stats ? this._compositor.stats() : null;
+        return {
+            id: this.node && this.node.id,
+            size: [this.width, this.height],
+            layers: { count: layers.length, bytes: layers.reduce((a, l) => a + l.bytes, 0), list: layers },
+            pyramid: { sources: pyramid.length, levels: pyramid.reduce((a, p) => a + p.levels, 0), bytes: pyramid.reduce((a, p) => a + p.bytes, 0), list: pyramid },
+            undo,
+            compositor: comp,
+            objects: this.objects && this.objects.ids ? { w: this.objects.w, h: this.objects.h, bytes: this.objects.ids.byteLength } : null,
+            scratch: { bytes: sum(scratch), list: scratch },
+        };
     }
 
     destroy() {

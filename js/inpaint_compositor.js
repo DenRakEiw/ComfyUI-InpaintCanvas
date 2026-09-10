@@ -125,9 +125,12 @@ function link(gl, vsSrc, fsSrc) {
     return p;
 }
 
-// How many source textures to keep. A stack of ten layers needs ten, plus the levels a
-// zoom step leaves behind; beyond that they are uploads nobody asked for again.
-const TEXTURE_CACHE = 48;
+// What the source textures may cost. A stack of ten layers needs ten, plus the levels a
+// zoom step leaves behind; beyond that they are uploads nobody asked for again. The
+// budget is in bytes because the count says nothing: one level-0 texture of a 96 MP
+// source is 384 MB and 48 small ones are 12.
+const TEXTURE_BUDGET = 1024 * 1024 * 1024;
+const TEXTURE_CACHE = 64;   // and a plain count, so a stack of tiny sources cannot grow forever
 
 let SUPPORTED = null;
 
@@ -233,14 +236,31 @@ export class GLCompositor {
         return entry.tex;
     }
 
-    /** Drop the textures that no recent frame asked for. */
+    /** Drop the textures that no recent frame asked for, oldest first, never this frame's. */
     _evict() {
-        if (this.textures.size <= TEXTURE_CACHE) return;
+        let bytes = 0;
+        for (const e of this.textures.values()) bytes += (e.w || 0) * (e.h || 0) * 4;
+        if (bytes <= TEXTURE_BUDGET && this.textures.size <= TEXTURE_CACHE) return;
         const entries = [...this.textures.entries()].sort((a, b) => (a[1].used || 0) - (b[1].used || 0));
-        for (let i = 0; i < entries.length - TEXTURE_CACHE; i++) {
-            try { this.gl.deleteTexture(entries[i][1].tex); } catch (_) { /* context gone */ }
-            this.textures.delete(entries[i][0]);
+        for (const [src, e] of entries) {
+            if (bytes <= TEXTURE_BUDGET && this.textures.size <= TEXTURE_CACHE) break;
+            if (e.used === this.frame) continue;   // the stack being drawn right now
+            try { this.gl.deleteTexture(e.tex); } catch (_) { /* context gone */ }
+            this.textures.delete(src);
+            bytes -= (e.w || 0) * (e.h || 0) * 4;
         }
+    }
+
+    /**
+     * What the cache holds, for the memory report: entries, the bytes of the source
+     * textures (RGBA8, so w * h * 4) and the bytes of the two ping-pong targets.
+     */
+    stats() {
+        let bytes = 0;
+        for (const e of this.textures.values()) bytes += (e.w || 0) * (e.h || 0) * 4;
+        let targetBytes = 0;
+        for (const t of this.targets) if (t) targetBytes += (t.w || 0) * (t.h || 0) * 4;
+        return { entries: this.textures.size, bytes, targetBytes, budget: TEXTURE_BUDGET, limit: TEXTURE_CACHE, lost: this.lost };
     }
 
     /** Drop the texture of a source the editor threw away. */
@@ -362,6 +382,14 @@ export class GLCompositor {
         return this.canvas;
     }
 
+    /** Drop every cached source texture, keep the context (the next frame uploads again). */
+    clear() {
+        try {
+            for (const e of this.textures.values()) this.gl.deleteTexture(e.tex);
+        } catch (_) { /* context gone */ }
+        this.textures.clear();
+    }
+
     dispose() {
         const gl = this.gl;
         try {
@@ -372,6 +400,12 @@ export class GLCompositor {
             gl.deleteProgram(this.prog);
             gl.deleteProgram(this.copy);
             gl.deleteBuffer(this.quad);
+            // A context is only dropped when its canvas is collected, and Chromium keeps
+            // at most 16 per page: a closed editor would hold one until a major GC.
+            this.canvas.width = this.canvas.height = 0;
+            const ext = gl.getExtension("WEBGL_lose_context");
+            if (ext) ext.loseContext();
         } catch (_) { /* context already gone */ }
+        this.lost = true;
     }
 }
