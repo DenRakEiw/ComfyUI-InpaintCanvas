@@ -815,6 +815,10 @@ const STYLE = `
 .ipc-askbox .ipc-askmsg { color:#aaa; white-space:pre-line; }
 .ipc-askbox .ipc-askinput { background:#1b1b1b; color:#eee; border:1px solid #4a4a4a; border-radius:6px; padding:7px 9px; font:inherit; }
 .ipc-askbox .ipc-askrow { display:flex; gap:8px; align-items:center; }
+.ipc-askbox .ipc-askfields { display:flex; gap:10px; }
+.ipc-askbox .ipc-askfield { display:flex; flex-direction:column; gap:4px; flex:1 1 0; font-size:12px; color:#aaa; }
+.ipc-askbox .ipc-askfield input { width:100%; box-sizing:border-box; }
+.ipc-askbox .ipc-asklink { display:flex; gap:6px; align-items:center; color:#aaa; font-size:12px; }
 .ipc-flyout { position:absolute; z-index:6; display:flex; flex-direction:column; gap:3px; padding:5px; background:#262626; border:1px solid #444; border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.55); min-width:170px; }
 .ipc-flyout .ipc-ib { justify-content:flex-start; padding:5px 10px; width:auto; height:auto; text-align:left; white-space:nowrap; }
 .ipc-flyout .ipc-key { margin-left:auto; padding-left:14px; color:#8a8a8a; font-size:11px; }
@@ -969,7 +973,15 @@ function injectStyle() {
 // the editor
 // ---------------------------------------------------------------------------
 
+// Copy in one tab, paste in another: the clipboard belongs to the module, not to an editor.
+let CLIPBOARD = null;
+
 class InpaintEditor {
+
+    get clipboard() { return CLIPBOARD; }
+
+    set clipboard(v) { CLIPBOARD = v; }
+
     constructor(node) {
         this.node = node;
         this.width = 0;
@@ -2160,6 +2172,7 @@ class InpaintEditor {
         root.addEventListener("contextmenu", (e) => e.preventDefault());
         root.addEventListener("click", (e) => {
             const t = e.target;
+            if (this.askOpen) return;   // the dialog just focused its input; do not pull the focus back to the canvas
             if (t && t.closest && t.closest("button") && !t.closest("input, select, textarea")) this.root.focus({ preventScroll: true });
         });
         root.addEventListener("wheel", (e) => {
@@ -2211,14 +2224,49 @@ class InpaintEditor {
      * Resolves with the entered text, with true for a plain confirm, or with null
      * when the question was cancelled.
      */
-    ask({ title = "", message = "", value = null, ok = "OK", cancel = "Cancel", danger = false } = {}) {
+    ask({ title = "", message = "", value = null, fields = null, linked = false, ok = "OK", cancel = "Cancel", danger = false } = {}) {
         return new Promise((resolve) => {
             const wrap = el("div", "ipc-ask");
             const box = el("div", "ipc-askbox");
             if (title) box.appendChild(el("div", "ipc-asktitle", title));
             if (message) box.appendChild(el("div", "ipc-askmsg", message));
             let input = null;
-            if (value != null) {
+            const nums = [];
+            if (fields && fields.length) {
+                // one labelled number box per field; two of them can be tied by their ratio
+                const grid = el("div", "ipc-askfields");
+                const ratio = fields.length === 2 && +fields[0].value > 0 ? +fields[1].value / +fields[0].value : 1;
+                for (const f of fields) {
+                    const cell = el("div", "ipc-askfield");
+                    cell.appendChild(el("span", null, f.label || f.key));
+                    const inp = document.createElement("input");
+                    inp.type = "number";
+                    inp.className = "ipc-askinput";
+                    inp.value = String(f.value != null ? f.value : "");
+                    if (f.min != null) inp.min = String(f.min);
+                    if (f.max != null) inp.max = String(f.max);
+                    inp.dataset.key = f.key;
+                    cell.appendChild(inp);
+                    grid.appendChild(cell);
+                    nums.push(inp);
+                }
+                box.appendChild(grid);
+                if (nums.length === 2 && linked) {
+                    const lab = el("label", "ipc-asklink");
+                    const link = document.createElement("input");
+                    link.type = "checkbox";
+                    lab.appendChild(link);
+                    lab.appendChild(el("span", null, "Keep the ratio"));
+                    box.appendChild(lab);
+                    const tie = (from, to, factor) => () => {
+                        if (!link.checked) return;
+                        const v = +from.value;
+                        if (v > 0) to.value = String(Math.max(1, Math.round(v * factor)));
+                    };
+                    nums[0].addEventListener("input", tie(nums[0], nums[1], ratio));
+                    nums[1].addEventListener("input", tie(nums[1], nums[0], ratio ? 1 / ratio : 1));
+                }
+            } else if (value != null) {
                 input = document.createElement("input");
                 input.type = "text";
                 input.className = "ipc-askinput";
@@ -2235,6 +2283,13 @@ class InpaintEditor {
             row.appendChild(okBtn);
             box.appendChild(row);
             wrap.appendChild(box);
+            // the answer: an object of numbers for fields, the string for a text input, true otherwise
+            const answer = () => {
+                if (!nums.length) return input ? input.value : true;
+                const out = {};
+                for (const inp of nums) out[inp.dataset.key] = +inp.value;
+                return out;
+            };
             const finish = (val) => {
                 if (this.askOpen !== wrap) return;
                 this.askOpen = null;
@@ -2245,15 +2300,17 @@ class InpaintEditor {
             };
             const onKey = (e) => {
                 if (e.key === "Escape") { e.preventDefault(); e.stopImmediatePropagation(); finish(null); }
-                else if (e.key === "Enter") { e.preventDefault(); e.stopImmediatePropagation(); finish(input ? input.value : true); }
+                else if (e.key === "Enter") { e.preventDefault(); e.stopImmediatePropagation(); finish(answer()); }
             };
             cancelBtn.addEventListener("click", () => finish(null));
-            okBtn.addEventListener("click", () => finish(input ? input.value : true));
+            okBtn.addEventListener("click", () => finish(answer()));
             wrap.addEventListener("pointerdown", (e) => { if (e.target === wrap) finish(null); });
             this.askOpen = wrap;
             window.addEventListener("keydown", onKey, true);
             this.root.appendChild(wrap);
-            if (input) { input.focus(); input.select(); } else okBtn.focus();
+            if (nums.length) { nums[0].focus(); nums[0].select(); }
+            else if (input) { input.focus(); input.select(); }
+            else okBtn.focus();
         });
     }
 
@@ -2331,7 +2388,7 @@ class InpaintEditor {
         if ((e.ctrlKey || e.metaKey) && k === "u") { e.preventDefault(); this.upsamplePrompt(); return; }
         if ((e.ctrlKey || e.metaKey) && k === "c") { e.preventDefault(); this.copySelection({ merged: e.shiftKey }); return; }
         if ((e.ctrlKey || e.metaKey) && k === "x") { e.preventDefault(); this.copySelection({ cut: true }); return; }
-        if ((e.ctrlKey || e.metaKey) && k === "v" && this.clipboard) { e.preventDefault(); this.pasteClipboard(); return; }
+        if ((e.ctrlKey || e.metaKey) && k === "v") { e.preventDefault(); this.pasteClipboard(); return; }
         if ((e.ctrlKey || e.metaKey) && k === "i") { e.preventDefault(); this.invertSelection(); return; }
         if ((e.ctrlKey || e.metaKey) && k === "s") { e.preventDefault(); this.exportImage(); return; }
         if (e.ctrlKey || e.metaKey || e.altKey) return;
@@ -3378,6 +3435,7 @@ class InpaintEditor {
         } else if (p.kind === "selmove") {
             const sctx = this.selection.getContext("2d");
             const mx = Math.round(ix - p.start[0]), my = Math.round(iy - p.start[1]);
+            if (mx || my) p.moved = true;
             sctx.globalCompositeOperation = "source-over";
             sctx.clearRect(0, 0, this.width, this.height);
             sctx.drawImage(p.orig, mx, my);
@@ -3478,11 +3536,14 @@ class InpaintEditor {
             sctx.globalCompositeOperation = "source-over";
             this.markSelectionChanged(this.boundsAfter(p.mode, [Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1)]));
         } else if (p.kind === "selmove") {
+            // a click without a drag deselects, the way the marquee tools do in Photoshop and Krita
+            if (!p.moved) { this.clearSelection(); return; }
             this.markSelectionChanged(this.selectionDirty ? undefined : this.cachedBounds);
             this.setStatus("Selection outline moved.");
         } else if (p.kind === "lasso") {
             const pts = this.lassoPoints;
             this.lassoPoints = null;
+            if ((!pts || pts.length <= 2) && p.mode === "replace") { this.clearSelection(); return; }   // a click deselects
             if (pts && pts.length > 2) {
                 const sctx = this.selection.getContext("2d");
                 if (p.mode === "replace") { sctx.globalCompositeOperation = "source-over"; sctx.clearRect(0, 0, this.width, this.height); this.selectionLabel = ""; }
@@ -4140,9 +4201,13 @@ class InpaintEditor {
         this.draw();
     }
 
-    /** Copy the selected pixels (of the active layer, or of everything visible with merged) into the editor's clipboard; cut clears them afterwards. */
+    /**
+     * Into the clipboard: the selected pixels of the active layer (of everything visible
+     * with merged), or the whole layer when nothing is selected, which is what Krita does.
+     * Cut clears the pixels afterwards. Every tab shares the clipboard.
+     */
     copySelection({ merged = false, cut = false } = {}) {
-        if (!this.selection || !this.getBounds()) { this.setStatus("Nothing selected to copy."); return null; }
+        if (!this.selection || !this.getBounds()) return this.copyLayer({ merged, cut });
         const [x0, y0, x1, y1] = this.getBounds();
         const w = x1 - x0, h = y1 - y0;
         const layer = this.activeLayer();
@@ -4163,15 +4228,40 @@ class InpaintEditor {
         return this.clipboard;
     }
 
-    /** Paste the editor's clipboard as a new layer at the place it was copied from. */
+    /** The whole active layer into the clipboard: Ctrl+C with nothing selected, Ctrl+X cuts it out. */
+    copyLayer({ merged = false, cut = false, layer = null } = {}) {
+        if (!this.width) { this.setStatus("Load an image first."); return null; }
+        const l = layer || this.activeLayer();
+        const useMerged = merged || !l || l.kind === "filter";
+        if (!useMerged && l.locked && cut) { this.setStatus(`${l.name} is locked.`); return null; }
+        let c, x, y, name;
+        if (useMerged) {
+            c = makeCanvas(this.width, this.height);
+            c.getContext("2d").drawImage(this.flattenToCanvas({ forRun: true }), 0, 0);
+            x = 0; y = 0;
+            name = l && l.kind === "filter" ? "the visible image (a filter layer has no pixels of its own)" : "the visible image";
+        } else {
+            c = makeCanvas(l.w, l.h);
+            c.getContext("2d").drawImage(this.layerPixels(l), 0, 0);
+            x = l.x; y = l.y; name = l.name;
+        }
+        this.clipboard = { canvas: c, x, y, source: name };
+        if (cut && l && !useMerged) this.removeLayer(l.id);
+        this.setStatus(`${cut ? "Cut" : "Copied"} ${c.width} \u00d7 ${c.height} px from ${name}. Ctrl+V pastes it as a layer, here or in another tab.`);
+        return this.clipboard;
+    }
+
+    /** Paste the clipboard as a new layer at the place it was copied from. */
     pasteClipboard() {
-        if (!this.clipboard) { this.setStatus("Nothing copied yet (Ctrl+C with a selection)."); return null; }
+        if (!this.clipboard) { this.setStatus("Nothing copied yet: Ctrl+C copies the selection, or the whole layer when nothing is selected."); return null; }
         if (!this.width) { this.setStatus("Load an image first."); return null; }
         this.pasteCounter = (this.pasteCounter || 0) + 1;
         const { canvas, x, y } = this.clipboard;
         const copy = makeCanvas(canvas.width, canvas.height);
         copy.getContext("2d").drawImage(canvas, 0, 0);
-        const layer = this.addLayer({ name: `Paste ${this.pasteCounter}`, kind: "image", ref: null, canvas: copy, x, y, w: canvas.width, h: canvas.height, dirty: true });
+        const src = this.clipboard.source || "";
+        const name = src && !/^the visible image/.test(src) ? `${src} copy` : `Paste ${this.pasteCounter}`;
+        const layer = this.addLayer({ name, kind: "image", ref: null, canvas: copy, x, y, w: canvas.width, h: canvas.height, dirty: true });
         this.setStatus(`${layer.name} added (${canvas.width} × ${canvas.height} at ${x}, ${y}). Move it with T.`);
         return layer;
     }
@@ -6288,6 +6378,7 @@ class InpaintEditor {
                     this.renderLayers(); this.notifyChanged();
                 }, layer.alphaLock ? "ipc-on" : "ipc-dim"));
             }
+            top.appendChild(miniButton("duplicate", "Duplicate layer (Ctrl+J). Ctrl+C copies it, Ctrl+V pastes it here or in another tab", () => this.duplicateLayer(layer)));
             top.appendChild(miniButton("trash", "Delete layer (Delete). Drag the row to reorder, Ctrl+] / Ctrl+[ move it up / down, Ctrl+J duplicates, Ctrl+E merges down", () => this.removeLayer(layer.id), "ipc-del"));
             row.appendChild(top);
 
@@ -6675,21 +6766,28 @@ class InpaintEditor {
 
     /** A fresh white canvas after a confirmation; the size is asked for in the same dialog. */
     async newCanvas(size = null) {
-        const cur = this.width ? `${this.width}x${this.height}` : "1024x1024";
+        const curW = this.width || 1024, curH = this.height || 1024;
         const what = this.base ? `This discards the current image, ${this.layers.length} layer${this.layers.length === 1 ? "" : "s"}, the selection and ${this.history.length} history entr${this.history.length === 1 ? "y" : "ies"} in this editor.` : "";
-        const answer = size != null ? String(size) : await this.ask({
-            title: "New empty canvas",
-            message: what ? `${what}
-
-Size as width x height:` : "Size as width x height:",
-            value: cur,
-            ok: "Create",
-            danger: !!this.base,
-        });
-        if (answer == null) { this.setStatus("New canvas cancelled."); return; }
-        const m = /^\s*(\d{2,5})\s*[x×*,\s]\s*(\d{2,5})\s*$/i.exec(answer);
-        if (!m) { this.setStatus("Size not understood. Use width x height, e.g. 1024x1024."); return; }
-        const w = Math.min(16384, +m[1]), h = Math.min(16384, +m[2]);
+        let w, h;
+        if (size != null) {
+            const m = /^\s*(\d{2,5})\s*[x*,\s\u00d7]\s*(\d{2,5})\s*$/i.exec(String(size));
+            if (!m) { this.setStatus("Size not understood. Use width x height, e.g. 1024x1024."); return; }
+            w = +m[1]; h = +m[2];
+        } else {
+            const answer = await this.ask({
+                title: "New empty canvas",
+                message: what,
+                fields: [{ key: "width", label: "Width", value: curW, min: 16, max: 16384 },
+                    { key: "height", label: "Height", value: curH, min: 16, max: 16384 }],
+                linked: true,
+                ok: "Create",
+                danger: !!this.base,
+            });
+            if (answer == null) { this.setStatus("New canvas cancelled."); return; }
+            w = answer.width; h = answer.height;
+        }
+        if (!(w >= 16) || !(h >= 16)) { this.setStatus("Width and height must be at least 16 pixels."); return; }
+        w = Math.min(16384, Math.round(w)); h = Math.min(16384, Math.round(h));
         try {
             this.setStatus(`Creating a ${w} × ${h} canvas ...`);
             if (this.pending) this.cancelPending();
@@ -7281,6 +7379,21 @@ Size as width x height:` : "Size as width x height:",
         requestAnimationFrame(() => { this._drawQueued = false; this.draw(); });
     }
 
+    /**
+     * An outline that is still being dragged, drawn the way marching ants are: a solid
+     * black line first, the dashed white one over it. A single white line is invisible on
+     * a white image, which is why Photoshop and Krita never draw one.
+     */
+    antsStroke(ctx, path, s) {
+        ctx.lineWidth = 1 / s;
+        ctx.setLineDash([]);
+        ctx.strokeStyle = "#000";
+        path();
+        ctx.setLineDash([4 / s, 3 / s]);
+        ctx.strokeStyle = "#fff";
+        path();
+    }
+
     /** Selection as a marching-ants outline: the mask shifted by a screen pixel in eight directions minus the mask, filled with a moving stripe pattern. */
     drawMarchingAnts(ctx) {
         const W = this.canvas.width, H = this.canvas.height;
@@ -7583,39 +7696,37 @@ Size as width x height:` : "Size as width x height:",
         const p = this.pointer;
         if (p && p.kind === "rect") {
             ctx.save();
-            ctx.lineWidth = 1 / s;
-            ctx.strokeStyle = "#fff";
-            ctx.setLineDash([4 / s, 3 / s]);
-            if (p.ellipse) {
-                ctx.beginPath();
-                ctx.ellipse((p.start[0] + p.cur[0]) / 2, (p.start[1] + p.cur[1]) / 2, Math.abs(p.cur[0] - p.start[0]) / 2, Math.abs(p.cur[1] - p.start[1]) / 2, 0, 0, Math.PI * 2);
-                ctx.stroke();
-            } else {
-                ctx.strokeRect(p.start[0], p.start[1], p.cur[0] - p.start[0], p.cur[1] - p.start[1]);
-            }
+            this.antsStroke(ctx, () => {
+                if (p.ellipse) {
+                    ctx.beginPath();
+                    ctx.ellipse((p.start[0] + p.cur[0]) / 2, (p.start[1] + p.cur[1]) / 2, Math.abs(p.cur[0] - p.start[0]) / 2, Math.abs(p.cur[1] - p.start[1]) / 2, 0, 0, Math.PI * 2);
+                    ctx.stroke();
+                } else {
+                    ctx.strokeRect(p.start[0], p.start[1], p.cur[0] - p.start[0], p.cur[1] - p.start[1]);
+                }
+            }, s);
             ctx.restore();
         }
         if (this.lassoPoints && this.lassoPoints.length > 1) {
             ctx.save();
-            ctx.lineWidth = 1 / s;
-            ctx.strokeStyle = "#fff";
-            ctx.beginPath();
-            ctx.moveTo(this.lassoPoints[0][0], this.lassoPoints[0][1]);
-            for (const [x, y] of this.lassoPoints) ctx.lineTo(x, y);
-            ctx.stroke();
+            this.antsStroke(ctx, () => {
+                ctx.beginPath();
+                ctx.moveTo(this.lassoPoints[0][0], this.lassoPoints[0][1]);
+                for (const [x, y] of this.lassoPoints) ctx.lineTo(x, y);
+                ctx.stroke();
+            }, s);
             ctx.restore();
         }
         if (this.polyPoints && this.polyPoints.length) {
             const pts = this.polyPoints;
             ctx.save();
-            ctx.lineWidth = 1 / s;
-            ctx.strokeStyle = "#fff";
-            ctx.setLineDash([4 / s, 3 / s]);
-            ctx.beginPath();
-            ctx.moveTo(pts[0][0], pts[0][1]);
-            for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
-            if (this.hover) ctx.lineTo(this.hover[0], this.hover[1]);
-            ctx.stroke();
+            this.antsStroke(ctx, () => {
+                ctx.beginPath();
+                ctx.moveTo(pts[0][0], pts[0][1]);
+                for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+                if (this.hover) ctx.lineTo(this.hover[0], this.hover[1]);
+                ctx.stroke();
+            }, s);
             ctx.setLineDash([]);
             const r = 4 / s;
             ctx.fillStyle = "#fff";
