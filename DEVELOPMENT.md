@@ -1229,3 +1229,34 @@ over the whole image (one to four seconds at 96 MP). They are worker jobs now:
   into the selection's new box with `boundsAfter`.
 - Undo still works because `pushUndo({kind: "selection"})` runs before the worker call and
   `canvas.toBlob` snapshots the canvas at that moment.
+
+### 21e. The WebGL2 compositor (2026-09-10, phase 5 step 1)
+
+`js/inpaint_compositor.js` stacks the visible region on the GPU: one shader pass per layer
+into a viewport-sized framebuffer, sources cached as textures by `_dispVer`, the version
+`touchSource` already bumps. `InpaintEditor.drawViewComposite` uses it when
+`glCompositeUsable()` says the stack allows it and falls back to Canvas 2D otherwise, so
+nothing depends on WebGL2 being there.
+
+Rules when you touch this:
+
+- **It stacks prepared pixels and nothing else.** The editor hands over what it would have
+  drawn (`layerPixels`, or `layerMatchedPixels` for a colour-matched layer), so masks, the
+  stroke preview and colour match keep working without the compositor knowing about them.
+  Filter layers, a running stroke, a pending transform, the compare split, peek, exports and
+  runs stay on Canvas 2D.
+- **Two orientation and alpha traps**, both found by comparing against Canvas 2D:
+  a canvas texture's first row is the image's top while a framebuffer texture's is its
+  bottom, so the layer pass samples `1.0 - v`; and textures are uploaded with
+  `UNPACK_PREMULTIPLY_ALPHA_WEBGL = true` (then un-premultiplied in the shader) so scaling
+  interpolates across transparent edges the way Canvas 2D does. Without the second one,
+  scaled layers were up to 45 levels off along the edges of transparent areas.
+- **The blend modes follow the W3C compositing spec** and agree with Canvas 2D to 2.3 levels
+  in premultiplied values. Straight-alpha differences reach 85 levels at alpha 1/255, which
+  is 8-bit rounding amplified by the division, not a different picture. Compare
+  premultiplied when you check this.
+- **The texture cache is bounded** (`TEXTURE_CACHE`, least recently used evicted): pyramid
+  levels are new canvases after every change, so an unbounded map would grow all session.
+- The gate is `python tools/composite_test.py`, which draws the same view through both paths
+  in one run and compares. Keep it deterministic: grain seeds its noise from the layer id
+  (the test pins it) and marching ants walk with the clock (the test uses the tint overlay).

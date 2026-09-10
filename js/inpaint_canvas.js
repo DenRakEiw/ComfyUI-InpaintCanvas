@@ -19,6 +19,7 @@ import { TEXT_DEFAULTS, FONT_CATEGORIES, loadFontList, fontList, addUserFont, re
 import { installBridge } from "./inpaint_bridge.js";
 import { floodMask, maskToColorCanvas, clipMaskToSelection, rgbToHex, growMask, invertMask, maskBounds } from "./inpaint_raster.js";
 import { buildPsd, buildOra } from "./inpaint_export.js";
+import { GLCompositor } from "./inpaint_compositor.js";
 
 const NODE_CLASS = "InpaintCanvas";
 const STITCH_CLASS = "InpaintCanvasStitch";
@@ -6856,6 +6857,87 @@ Size as width x height:` : "Size as width x height:",
     }
 
     /**
+     * The WebGL2 compositor, once per editor and only if this host has WebGL2. Null means
+     * the Canvas 2D path does the work, which is also what happens after a failure.
+     */
+    compositor() {
+        if (this._compositor !== undefined) return this._compositor;
+        this._compositor = null;
+        try {
+            if (GLCompositor.available()) this._compositor = new GLCompositor();
+        } catch (err) {
+            console.warn("Inpaint Canvas: no GPU compositor, staying on Canvas 2D:", (err && err.message) || err);
+        }
+        return this._compositor;
+    }
+
+    /**
+     * Can the GPU composite this stack? It stacks prepared layer pixels and nothing else,
+     * so anything that needs Canvas 2D's own machinery stays on Canvas 2D. None of these
+     * is a per-frame cost: painting and transforming are already a fraction of a
+     * millisecond after phases 1 and 2, and filter layers keep their chain.
+     */
+    glCompositeUsable(opts) {
+        if (this.compositorOff || opts.forRun || opts.controlOnly) return false;
+        if (this.compareShow || this.peekBase) return false;
+        if (this.pending) return false;                       // a transform draws with a mesh
+        if (this.pointer && this.pointer.layer) return false;  // a live stroke preview changes every frame
+        for (const l of this.layers) {
+            if (!l.visible) continue;
+            if (l.kind === "filter") return false;             // the filter chain is step 2
+            if (l.maskEdit) return false;
+        }
+        return !!this.compositor();
+    }
+
+    /**
+     * The visible region composited on the GPU. Returns the compositor's canvas, or null
+     * when it could not do it (a source over MAX_TEXTURE_SIZE, a lost context).
+     */
+    glViewComposite(region, vw, vh, opts) {
+        const comp = this.compositor();
+        if (!comp) return null;
+        const sx = vw / region.w;
+        const layers = [];
+        const base = this.baseSource();
+        if (base) {
+            const lvl = this.displaySource(base, sx);
+            layers.push({ source: lvl, version: this.sourceVersion(lvl), x: 0, y: 0, w: this.width, h: this.height, opacity: 1, blend: "normal" });
+        }
+        const vp = { x: region.x, y: region.y, w: region.w, h: region.h, sx, sy: vh / region.h };
+        for (const layer of this.layers) {
+            if (!layer.visible || !layer.canvas) continue;
+            if (this.isControl(layer) && opts.forRun) continue;
+            const matched = this.matchActive(layer) ? this.layerMatchedPixels(layer, this.viewCanvas, vp) : null;
+            const px = matched || this.layerPixels(layer);
+            if (!px || px._livePreview) return null;
+            const lvl = this.displaySource(px, (layer.w * sx) / px.width);
+            layers.push({
+                source: lvl, version: this.sourceVersion(lvl),
+                x: layer.x, y: layer.y, w: layer.w, h: layer.h,
+                opacity: layer.opacity == null ? 1 : layer.opacity,
+                blend: layer.blend || "normal",
+            });
+        }
+        try {
+            return comp.composite({ width: vw, height: vh, region, layers });
+        } catch (err) {
+            console.warn("Inpaint Canvas: the GPU compositor failed, staying on Canvas 2D:", (err && err.message) || err);
+            this.compositorOff = true;
+            return null;
+        }
+    }
+
+    /**
+     * A version for a source canvas that only changes when its pixels do. Pyramid levels
+     * are rebuilt as new canvases, so their identity already carries the version; the
+     * counter is what `touchSource` bumps on the original.
+     */
+    sourceVersion(src) {
+        return src ? (src._dispVer || 0) : 0;
+    }
+
+    /**
      * Composite only what the view shows, at screen resolution, and blit that (Krita's
      * prescaled projection). Layers come from their pyramid level, filters and colour
      * match run on the small input; exports, runs and the thumbnail keep their own paths.
@@ -6873,13 +6955,29 @@ Size as width x height:` : "Size as width x height:",
         v.globalCompositeOperation = "source-over";
         v.clearRect(0, 0, vw, vh);
         v.imageSmoothingEnabled = true;
-        v.setTransform(sx, 0, 0, sy, -region.x * sx, -region.y * sy);
-        const prev = this.viewPass;
-        this.viewPass = { x: region.x, y: region.y, w: region.w, h: region.h, sx, sy };
-        try {
-            this.drawComposite(v, {});
-        } finally {
-            this.viewPass = prev;
+        let gl = null;
+        if (this.glCompositeUsable({})) {
+            const prevVp = this.viewPass;
+            this.viewPass = { x: region.x, y: region.y, w: region.w, h: region.h, sx, sy };
+            try {
+                gl = this.glViewComposite(region, vw, vh, {});
+            } finally {
+                this.viewPass = prevVp;
+            }
+            if (gl) {
+                v.setTransform(1, 0, 0, 1, 0, 0);
+                v.drawImage(gl, 0, 0);
+            }
+        }
+        if (!gl) {
+            v.setTransform(sx, 0, 0, sy, -region.x * sx, -region.y * sy);
+            const prev = this.viewPass;
+            this.viewPass = { x: region.x, y: region.y, w: region.w, h: region.h, sx, sy };
+            try {
+                this.drawComposite(v, {});
+            } finally {
+                this.viewPass = prev;
+            }
         }
         ctx.save();
         ctx.globalAlpha = 1;
@@ -7950,6 +8048,7 @@ Size as width x height:` : "Size as width x height:",
     }
 
     destroy() {
+        if (this._compositor) { try { this._compositor.dispose(); } catch (_) { /* context gone */ } this._compositor = null; }
         this.close();
         try { this.resizeObserver.disconnect(); } catch (_) { /* ignore */ }
         try { this.thumbObserver.disconnect(); } catch (_) { /* ignore */ }
