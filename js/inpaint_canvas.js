@@ -17,6 +17,7 @@ import { api } from "../../scripts/api.js";
 import { FILTERS, FILTER_IDS, filterDefaults, applyFilter, matchCanvas, lutFromCube, lutToCanvas, lutFromImage, plateStats } from "./inpaint_filters.js";
 import { TEXT_DEFAULTS, FONT_CATEGORIES, loadFontList, fontList, addUserFont, renderText } from "./inpaint_text.js";
 import { installBridge } from "./inpaint_bridge.js";
+import { readAbr, tipCanvas } from "./inpaint_brushes.js";
 import { floodMask, maskToColorCanvas, clipMaskToSelection, rgbToHex, growMask, invertMask, maskBounds } from "./inpaint_raster.js";
 import { buildPsd, buildOra } from "./inpaint_export.js";
 import { GLCompositor } from "./inpaint_compositor.js";
@@ -1015,6 +1016,10 @@ class InpaintEditor {
         this.gridSize = gridSize;
         this.tool = "select";
         this.brushSize = 40;
+        this.brushTips = [];        // imported tips: { id, name, canvas, spacing }
+        this.brushTipId = "";       // "" = the built-in round tip
+        this.brushTipSpacing = 0.25;
+        this.onBrushTips = null;    // the host may set this to persist imported tips
         this.hardness = 1;
         this.eraseHardness = 0.5;       // the eraser is soft by default, like Krita's Eraser Soft
         try {
@@ -1215,6 +1220,21 @@ class InpaintEditor {
         this.colorInput.addEventListener("input", () => { this.color = this.colorInput.value; });
         colorLabel.appendChild(this.colorInput);
         top.appendChild(colorLabel);
+
+        // brush tip: the built-in round dab, or a stamp imported from a .abr or an image
+        const tipLabel = el("label", null, "Tip");
+        this.tipSel = selectInput(["Round"], "Round", "The brush tip. Round is the built-in soft dab; the others were imported from a .abr or an image file.");
+        this.tipSel.addEventListener("change", () => this.setBrushTip(this.tipSel.value === "Round" ? "" : this.tipSel.value));
+        tipLabel.appendChild(this.tipSel);
+        this.tipFile = document.createElement("input");
+        this.tipFile.type = "file";
+        this.tipFile.accept = ".abr,.png,.jpg,.jpeg,.webp";
+        this.tipFile.multiple = true;
+        this.tipFile.style.display = "none";
+        this.tipFile.addEventListener("change", () => { const f = Array.from(this.tipFile.files || []); this.tipFile.value = ""; this.importBrushFiles(f); });
+        tipLabel.appendChild(this.tipFile);
+        tipLabel.appendChild(iconButton("upload", "Import brush tips from a Photoshop .abr file or from images. A .abr may hold dozens of tips; all of them are added.", () => this.tipFile.click(), "Import"));
+        top.appendChild(tipLabel);
         // view toggles
         const viewBox = el("span", "ipc-viewbox");
         this.rulersBtn = iconButton("ruler", "Rulers (Ctrl+Shift+R). Drag a guide out of a ruler; drag it back to remove it; double-click a ruler clears all guides. Layers snap to guides.", () => this.toggleRulers());
@@ -3792,6 +3812,8 @@ class InpaintEditor {
         const color = p.white ? "#ffffff" : (p.erase ? "#000000" : this.color);
         ctx.globalCompositeOperation = "source-over";
         const hardness = p.erase ? this.eraseHardness : this.hardness;
+        const tip = this.brushTip();
+        if (tip) { this.stampDab(ctx, tip, lx0, ly0, lx1, ly1, radius, color); return; }
         if (hardness >= 0.98) {
             ctx.strokeStyle = color;
             ctx.lineCap = "round";
@@ -4008,6 +4030,141 @@ class InpaintEditor {
         if (this.quickMask && !["paint", "erase", "bucket"].includes(this.tool)) this.setTool("paint");
         this.draw();
         this.setStatus(this.quickMask ? "Quick mask on: paint selects, erase deselects, the bucket selects similar colours. Q switches back." : "Quick mask off.");
+    }
+
+    // ---- brush tips (Photoshop .abr and images) ---------------------------------------------
+
+    /** The selected imported tip, or null for the built-in round dab. */
+    brushTip() {
+        if (!this.brushTipId) return null;
+        return this.brushTips.find((t) => t.id === this.brushTipId) || null;
+    }
+
+    setBrushTip(id) {
+        this.brushTipId = this.brushTips.some((t) => t.id === id) ? id : "";
+        this._tipStamp = null;
+        if (this.tipSel) this.tipSel.value = this.brushTipId || "Round";
+        const t = this.brushTip();
+        this.setStatus(t ? `Brush tip: ${t.name} (${t.canvas.width} \u00d7 ${t.canvas.height}).` : "Brush tip: the built-in round dab.");
+    }
+
+    /** Rebuild the tip select from this.brushTips, keeping the current choice if it survives. */
+    renderBrushTips() {
+        if (!this.tipSel) return;
+        const keep = this.brushTipId;
+        this.tipSel.innerHTML = "";
+        for (const [value, label] of [["Round", "Round"], ...this.brushTips.map((t) => [t.id, t.name])]) {
+            const o = document.createElement("option");
+            o.value = value; o.textContent = label;
+            this.tipSel.appendChild(o);
+        }
+        this.tipSel.value = this.brushTips.some((t) => t.id === keep) ? keep : "Round";
+        this.brushTipId = this.tipSel.value === "Round" ? "" : this.tipSel.value;
+    }
+
+    /**
+     * Add tips from the files the user picked: a Photoshop .abr, which may hold dozens, or
+     * plain images, whose alpha is the coverage when they have one and whose darkness is
+     * when they do not, so a black-on-white brush scan works as well as a cut-out PNG.
+     */
+    async importBrushFiles(files) {
+        if (!files || !files.length) return [];
+        const added = [];
+        for (const f of files) {
+            try {
+                const tips = /\.abr$/i.test(f.name) ? await this.tipsFromAbr(f) : [await this.tipFromImage(f)];
+                for (const tip of tips) { this.brushTips.push(tip); added.push(tip); }
+            } catch (err) {
+                console.warn("brush import", f.name, err);
+                this.setStatus(`${f.name}: ${err.message || err}`);
+            }
+        }
+        if (!added.length) return added;
+        this.renderBrushTips();
+        this.setBrushTip(added[0].id);
+        if (this.onBrushTips) { try { this.onBrushTips(this.brushTips); } catch (err) { console.warn("brush tips not saved", err); } }
+        this.setStatus(`${added.length} brush tip${added.length === 1 ? "" : "s"} imported. Pick one under Tip.`);
+        return added;
+    }
+
+    async tipsFromAbr(file) {
+        const { brushes } = readAbr(await file.arrayBuffer());
+        const stem = file.name.replace(/\.abr$/i, "");
+        return brushes.map((b, i) => this.makeTip(`${stem} ${i + 1}`, tipCanvas(b, makeCanvas), b.spacing ? b.spacing / 100 : 0));
+    }
+
+    async tipFromImage(file) {
+        const url = URL.createObjectURL(file);
+        try {
+            const img = await new Promise((resolve, reject) => {
+                const im = new Image();
+                im.onload = () => resolve(im);
+                im.onerror = () => reject(new Error("this file is not an image the browser can read"));
+                im.src = url;
+            });
+            const w = img.naturalWidth, h = img.naturalHeight;
+            if (!w || !h) throw new Error("the image is empty");
+            const c = makeCanvas(w, h);
+            const ctx = c.getContext("2d");
+            ctx.drawImage(img, 0, 0);
+            const d = ctx.getImageData(0, 0, w, h);
+            let opaque = 0;
+            for (let j = 3; j < d.data.length; j += 4) if (d.data[j] > 250) opaque++;
+            if (opaque > w * h * 0.98) {
+                // no alpha to speak of: read it as a scan, where dark pixels paint
+                for (let i = 0, j = 0; i < w * h; i++, j += 4) {
+                    const lum = d.data[j] * 0.299 + d.data[j + 1] * 0.587 + d.data[j + 2] * 0.114;
+                    d.data[j] = 0; d.data[j + 1] = 0; d.data[j + 2] = 0; d.data[j + 3] = 255 - Math.round(lum);
+                }
+            } else {
+                for (let i = 0, j = 0; i < w * h; i++, j += 4) { d.data[j] = 0; d.data[j + 1] = 0; d.data[j + 2] = 0; }
+            }
+            ctx.putImageData(d, 0, 0);
+            return this.makeTip(file.name.replace(/\.[^.]+$/, ""), c, 0);
+        } finally {
+            URL.revokeObjectURL(url);
+        }
+    }
+
+    makeTip(name, canvas, spacing) {
+        return { id: `tip${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`, name, canvas, spacing: spacing > 0.01 ? spacing : 0 };
+    }
+
+    /** The tip tinted and scaled so its long side is `size`, cached for the running stroke. */
+    tipStamp(tip, size, color) {
+        const s = Math.max(1, Math.round(size));
+        const key = `${tip.id}|${s}|${color}`;
+        if (this._tipStamp && this._tipStamp.key === key) return this._tipStamp.c;
+        const src = tip.canvas;
+        const k = s / Math.max(src.width, src.height);
+        const w = Math.max(1, Math.round(src.width * k)), h = Math.max(1, Math.round(src.height * k));
+        const c = makeCanvas(w, h);
+        const ctx = c.getContext("2d");
+        ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = "high";
+        ctx.drawImage(src, 0, 0, w, h);
+        ctx.globalCompositeOperation = "source-in";
+        ctx.fillStyle = color;
+        ctx.fillRect(0, 0, w, h);
+        this._tipStamp = { key, c };
+        return c;
+    }
+
+    /**
+     * One stroke segment stamped with the imported tip instead of the round dab. The step
+     * follows the tip's own spacing when the file carried one, otherwise a quarter of the
+     * stamp, which is close to what the round dab uses.
+     */
+    stampDab(ctx, tip, lx0, ly0, lx1, ly1, radius, color) {
+        const stamp = this.tipStamp(tip, radius * 2, color);
+        const w = stamp.width, h = stamp.height;
+        const step = Math.max(1, Math.max(w, h) * (tip.spacing || this.brushTipSpacing));
+        const dist = Math.hypot(lx1 - lx0, ly1 - ly0);
+        const steps = Math.max(1, Math.ceil(dist / step));
+        for (let i = 0; i <= steps; i++) {
+            const t = steps === 0 ? 0 : i / steps;
+            const x = lx0 + (lx1 - lx0) * t, y = ly0 + (ly1 - ly0) * t;
+            ctx.drawImage(stamp, x - w / 2, y - h / 2);
+        }
     }
 
     /** A soft round alpha mask of radius r (canvas 2r × 2r), cached per size and hardness. */
@@ -7667,6 +7824,31 @@ class InpaintEditor {
      * black line first, the dashed white one over it. A single white line is invisible on
      * a white image, which is why Photoshop and Krita never draw one.
      */
+    /**
+     * The brush outline under the cursor. The coloured ring sits on a dark halo, because on
+     * its own a one pixel line in the paint colour disappears over its own paint: a brush
+     * wider than the layer then looks like a tool that fills rectangles instead of a brush
+     * that is simply bigger than what is being painted on.
+     */
+    drawBrushRing(ctx, s) {
+        const brushTools = ["select", "deselect", "paint", "erase", "smudge", "clone", "heal"];
+        if (!this.hover || !brushTools.includes(this.tool)) return;
+        ctx.save();
+        const colour = this.tool === "paint" ? this.color : (this.tool === "erase" || this.tool === "deselect" ? "#ffd166" : "#fff");
+        const ring = (r, dash) => {
+            ctx.setLineDash(dash ? [3 / s, 3 / s] : []);
+            ctx.lineWidth = 3 / s;
+            ctx.strokeStyle = "rgba(0,0,0,0.8)";
+            ctx.beginPath(); ctx.arc(this.hover[0], this.hover[1], r, 0, Math.PI * 2); ctx.stroke();
+            ctx.lineWidth = 1 / s;
+            ctx.strokeStyle = colour;
+            ctx.beginPath(); ctx.arc(this.hover[0], this.hover[1], r, 0, Math.PI * 2); ctx.stroke();
+        };
+        ring(this.brushSize / 2, false);
+        if ((this.tool === "paint" || this.tool === "erase") && this.activeHardness() < 0.98) ring((this.brushSize / 2) * this.activeHardness(), true);
+        ctx.restore();
+    }
+
     antsStroke(ctx, path, s) {
         ctx.lineWidth = 1 / s;
         ctx.setLineDash([]);
@@ -8061,22 +8243,7 @@ class InpaintEditor {
             ctx.beginPath(); ctx.moveTo(q[0] - k, q[1]); ctx.lineTo(q[0] + k, q[1]); ctx.moveTo(q[0], q[1] - k); ctx.lineTo(q[0], q[1] + k); ctx.stroke();
             ctx.restore();
         }
-        const brushTools = ["select", "deselect", "paint", "erase", "smudge", "clone", "heal"];
-        if (this.hover && brushTools.includes(this.tool) && !(p && p.kind === "pan") && !this.spaceDown) {
-            ctx.save();
-            ctx.lineWidth = 1 / s;
-            ctx.strokeStyle = this.tool === "paint" ? this.color : (this.tool === "erase" || this.tool === "deselect" ? "#ffd166" : "#fff");
-            ctx.beginPath();
-            ctx.arc(this.hover[0], this.hover[1], this.brushSize / 2, 0, Math.PI * 2);
-            ctx.stroke();
-            if ((this.tool === "paint" || this.tool === "erase") && this.activeHardness() < 0.98) {
-                ctx.setLineDash([3 / s, 3 / s]);
-                ctx.beginPath();
-                ctx.arc(this.hover[0], this.hover[1], (this.brushSize / 2) * this.activeHardness(), 0, Math.PI * 2);
-                ctx.stroke();
-            }
-            ctx.restore();
-        }
+        if (!(p && p.kind === "pan") && !this.spaceDown) this.drawBrushRing(ctx, s);
     }
 
     // ---- queue -------------------------------------------------------------
