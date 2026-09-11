@@ -7328,7 +7328,14 @@ class InpaintEditor {
             cx.save();
             cx.setTransform(1, 0, 0, 1, 0, 0);
             cx.globalAlpha = 1;
-            cx.globalCompositeOperation = "copy";   // replace the rectangle, alpha included
+            // Replace the rectangle, alpha included: clear it and draw over the hole. This used
+            // to be one drawImage with globalCompositeOperation "copy", and "copy" applies to
+            // the whole canvas in Chromium: everything outside the rectangle was cleared too,
+            // so after one erase stroke the display level of the layer held nothing but the
+            // strip around the stroke, and a result layer vanished from the screen (not from
+            // its pixels) while the eraser was nowhere near its content.
+            cx.globalCompositeOperation = "source-over";
+            cx.clearRect(lx0, ly0, lx1 - lx0, ly1 - ly0);
             cx.imageSmoothingEnabled = true;
             cx.imageSmoothingQuality = "medium";
             cx.drawImage(prev, lx0 / f, ly0 / g, (lx1 - lx0) / f, (ly1 - ly0) / g, lx0, ly0, lx1 - lx0, ly1 - ly0);

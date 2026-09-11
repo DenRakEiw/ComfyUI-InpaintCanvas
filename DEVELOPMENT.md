@@ -1263,6 +1263,14 @@ Rules when you touch this:
   result was that a brush stroke or an erase stayed in the layer canvas (and in every
   export) but never reached the screen. It now raises the version, moves the pyramid entry
   to it, and raises the version of every level it redrew.
+- **Never redraw part of a canvas with `globalCompositeOperation = "copy"`.** Chromium applies
+  `copy` (and `source-in`, `source-out`, `destination-in`, `destination-atop`) to the whole
+  canvas, not to the drawn shape: everything outside the drawn rectangle is cleared too.
+  `touchSourceRect` did that to refresh a stroke's rectangle in each pyramid level, and one
+  erase stroke left the level holding only the strip around the stroke, so a zoomed-out view
+  lost the whole layer while its pixels were intact (2026-09-11). Replace a rectangle with
+  `clearRect` followed by a `source-over` draw; `copy` is only right when the draw covers the
+  whole canvas.
 - **A colour match needs a backdrop of its own here.** Canvas 2D reads the statistics off
   the target it has drawn into so far; the compositor's target is empty until the pass runs,
   which left `matchStats` with no samples and the slider without an effect. `glViewComposite`
