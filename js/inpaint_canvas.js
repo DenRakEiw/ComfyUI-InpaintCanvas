@@ -1288,7 +1288,7 @@ class InpaintEditor {
             { tool: "select", label: "Selection brush", key: "B", title: "Paint selection (B): adds to the selection, Alt subtracts" },
             { tool: "deselect", label: "Deselect brush", key: "D", title: "Erase from selection (D)" },
         ], [
-            { icon: "loop", label: "Close loops", title: "Close loops (Photoshop-style): end a brush stroke where it started and the inside is filled too. Also for the subtract brush.", toggle: () => this.fillEnclosed, onClick: () => { this.fillEnclosed = !this.fillEnclosed; this.setStatus(this.fillEnclosed ? "Close loops on: end a stroke where it started to fill the inside." : "Close loops off."); } },
+            { icon: "loop", label: "Close loops", title: "Close loops: end a brush stroke where it started and the inside is filled too. Also for the subtract brush.", toggle: () => this.fillEnclosed, onClick: () => { this.fillEnclosed = !this.fillEnclosed; this.setStatus(this.fillEnclosed ? "Close loops on: end a stroke where it started to fill the inside." : "Close loops off."); } },
         ]);
         addGroup([
             { tool: "rect", label: "Rectangle", key: "R", title: "Rectangle selection (R): replaces the selection, Shift adds, Alt subtracts, Ctrl keeps it square. Drag inside an existing selection to move its outline." },
@@ -1594,7 +1594,7 @@ class InpaintEditor {
             this.saveNameInput.spellcheck = false;
             this.saveNameInput.addEventListener("keydown", (e) => { e.stopPropagation(); if (e.key === "Enter") this.exportImage(); });
             exp.appendChild(this.saveNameInput);
-            this.saveFormatSel = selectInput(["png", "jpg", "webp", "psd", "ora"], "png", "PNG keeps the workflow inside the file (drop it onto ComfyUI to load it again), JPEG and WebP are smaller. PSD (Photoshop) and ORA (OpenRaster, for Krita / GIMP) keep the layers: name, position, opacity, visibility, blend mode; filter layers are baked into the merged image only.");
+            this.saveFormatSel = selectInput(["png", "jpg", "webp", "psd", "ora"], "png", "PNG keeps the workflow inside the file (drop it onto ComfyUI to load it again), JPEG and WebP are smaller. PSD and ORA (OpenRaster, for GIMP and others) keep the layers: name, position, opacity, visibility, blend mode; filter layers are baked into the merged image only.");
             exp.appendChild(this.saveFormatSel);
             const dl = iconButton("download", "Save and also download the file in the browser", () => this.exportImage({ download: true }), "Download");
             dl.classList.add("ipc-small");
