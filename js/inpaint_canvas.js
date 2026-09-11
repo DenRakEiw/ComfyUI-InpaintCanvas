@@ -688,6 +688,7 @@ const ICONS = {
     heal: '<rect x="2" y="9" width="20" height="6" rx="3" transform="rotate(-45 12 12)"/><path d="M10 10l4 4"/><path d="M14 10l-4 4"/>',
     eyedropper: '<path d="M4 20l1-4 9-9 3 3-9 9z"/><path d="M14 7l3-3 3 3-3 3"/>',
     bucket: '<path d="M4 11l7-7 8 8-7 7z"/><path d="M4 11h11"/><path d="M19 14c0 2 1.5 3 1.5 4.5a1.5 1.5 0 01-3 0C17.5 17 19 16 19 14z" fill="currentColor" stroke="none"/>',
+    shape: '<rect x="3" y="8" width="11" height="11" rx="1.5"/><circle cx="16" cy="9" r="5"/>',
     gradient: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M8 4v16" stroke-dasharray="1 2"/><path d="M12 4v16" stroke-dasharray="2 2"/><path d="M16 4v16" stroke-dasharray="3 1"/>',
     lock: '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/>',
     alphaLock: '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/><path d="M8 14h3v3H8zM13 17h3v3h-3z" fill="currentColor" stroke="none"/>',
@@ -1062,6 +1063,8 @@ class InpaintEditor {
         this.pointer = null;
         this.lassoPoints = null;
         this.polyPoints = null;         // polygon selection in progress: [[x, y], ...]
+        this.shapePoints = null;        // polygon / polyline / bezier shape in progress: [{x, y, hx, hy}, ...]
+        this.shapeDrag = null;          // the bezier handle being pulled right now
         this.polyMode = "replace";
         this.hover = null;
         this.objects = null;            // {hash, w, h, ids: Uint16Array, count, layerId}
@@ -1314,6 +1317,11 @@ class InpaintEditor {
         ], [
             { icon: "fill", label: "Fill selection", key: "Shift+F", title: "Fill the selection with the colour on the active layer (Shift+F)", onClick: () => this.fillSelection() },
         ]);
+        addTool("shape", "Shape (Y): draw a filled or outlined shape on the active layer, limited to the selection. "
+            + "Rectangle and ellipse are dragged out (Shift keeps them square, Alt draws from the centre); polygon, polyline and Bezier are "
+            + "clicked point by point (click the first point or press Enter to finish, Backspace takes one back, Esc cancels; on a Bezier "
+            + "point, drag while clicking to curve the line); freehand follows the cursor. Kind, fill, outline and corner radius are in the "
+            + "bar above the canvas.");
         addTool("eyedropper", "Eyedropper (I): click to pick the colour under the cursor from the visible image. Alt+click with the brush does the same.");
         addTool("transform", "Move / scale / rotate the active layer (T). Drag inside to move, corners scale (Shift: free aspect), edges scale one axis, drag just outside a corner to rotate (Shift snaps to 15°). Rotation is applied with Enter.");
         addTool("text", "Text (Shift+T): click on the canvas to add a text layer, click a text layer to select it, drag to move it, double-click to edit it on the canvas.");
@@ -1863,7 +1871,8 @@ class InpaintEditor {
         moveCtl(this.sizeCtl && this.sizeCtl.input.parentElement, "select deselect paint erase smudge clone heal");
         moveCtl(this.hardCtl && this.hardCtl.input.parentElement, "paint erase smudge clone heal");
         moveCtl(this.opacCtl && this.opacCtl.input.parentElement, "paint erase clone heal bucket gradient");
-        moveCtl(this.colorLabel, "paint bucket gradient");
+        moveCtl(this.opacCtl && this.opacCtl.input.parentElement, "shape");
+        moveCtl(this.colorLabel, "paint bucket gradient shape");
         const row = (cls, ...nodes) => { const lab = el("label", null); lab.dataset.for = cls; for (const n of nodes) lab.appendChild(typeof n === "string" ? el("span", null, n) : n); bar.appendChild(lab); return lab; };
         const tol = document.createElement("input");
         tol.type = "range"; tol.min = 0; tol.max = 255; tol.value = this.fillOpts.tolerance; tol.title = "Tolerance: how different a colour may be to count as the same area (0..255 per channel)";
@@ -1883,6 +1892,33 @@ class InpaintEditor {
         const gto = selectInput(["transparent", "white", "black"], "transparent", "What the colour fades to");
         gto.addEventListener("change", () => { this.gradientOpts.to = gto.value; });
         row("gradient", "To", gto);
+        this.shapeOpts = { kind: "rectangle", fill: true, stroke: false, width: 4, radius: 0, color: "#000000" };
+        const skind = selectInput(["rectangle", "ellipse", "polygon", "polyline", "bezier", "freehand"], "rectangle",
+            "What the shape tool draws. Rectangle, ellipse and freehand are dragged; polygon, polyline and Bezier are clicked point by point.");
+        skind.addEventListener("change", () => { this.cancelShape(); this.shapeOpts.kind = skind.value; this.updateOptsBar(); this.draw(); });
+        row("shape", "Kind", skind);
+        const sfill = document.createElement("input");
+        sfill.type = "checkbox"; sfill.checked = true; sfill.title = "Fill the shape with the paint colour";
+        sfill.addEventListener("change", () => { this.shapeOpts.fill = sfill.checked; });
+        this.shapeFillRow = row("shape", sfill, "Fill");
+        const sstroke = document.createElement("input");
+        sstroke.type = "checkbox"; sstroke.title = "Draw the outline as well, in its own colour";
+        sstroke.addEventListener("change", () => { this.shapeOpts.stroke = sstroke.checked; this.updateOptsBar(); });
+        this.shapeStrokeRow = row("shape", sstroke, "Outline");
+        const swidth = document.createElement("input");
+        swidth.type = "number"; swidth.className = "ipc-num"; swidth.min = 1; swidth.max = 500; swidth.value = this.shapeOpts.width;
+        swidth.style.width = "56px"; swidth.title = "Outline width in image pixels";
+        swidth.addEventListener("change", () => { this.shapeOpts.width = Math.max(1, Math.min(500, +swidth.value || 1)); swidth.value = this.shapeOpts.width; });
+        this.shapeWidthRow = row("shape", "Width", swidth);
+        const scolor = document.createElement("input");
+        scolor.type = "color"; scolor.value = this.shapeOpts.color; scolor.title = "Outline colour (the fill uses the paint colour)";
+        scolor.addEventListener("input", () => { this.shapeOpts.color = scolor.value; });
+        this.shapeColorRow = row("shape", scolor);
+        const sradius = document.createElement("input");
+        sradius.type = "number"; sradius.className = "ipc-num"; sradius.min = 0; sradius.max = 4096; sradius.value = 0;
+        sradius.style.width = "56px"; sradius.title = "Corner radius of the rectangle, in image pixels";
+        sradius.addEventListener("change", () => { this.shapeOpts.radius = Math.max(0, +sradius.value || 0); sradius.value = this.shapeOpts.radius; });
+        this.shapeRadiusRow = row("shape", "Radius", sradius);
         this.smudgeOpts = { strength: 60 };
         this.cloneOpts = { sample: "image", aligned: true };
         const str = document.createElement("input");
@@ -1906,11 +1942,27 @@ class InpaintEditor {
     updateOptsBar() {
         if (!this.optsBar) return;
         const tool = this.tool;
-        const on = ["select", "deselect", "paint", "erase", "bucket", "gradient", "eyedropper", "smudge", "clone", "heal", "wand"].includes(tool);
+        const on = ["select", "deselect", "paint", "erase", "bucket", "gradient", "eyedropper", "smudge", "clone", "heal", "wand", "shape"].includes(tool);
         this.optsBar.hidden = !on;
         if (!on) return;
         for (const lab of this.optsBar.querySelectorAll("label")) lab.hidden = !(lab.dataset.for || "").split(" ").includes(tool);
-        const hints = { select: "Paint to select, Alt subtracts", deselect: "Paint to deselect", paint: "Alt+click picks a colour, Shift+click draws a line", erase: "Shift+click draws a line", wand: "Click to select the similar area; Shift adds, Alt subtracts", bucket: "Click to fill; Shift+F fills the whole selection", gradient: "Drag from the colour to where it should have faded", eyedropper: "Click to pick a colour", smudge: "Drag across an edge to soften it", clone: this.cloneSource ? "Paint to copy from the source (Alt+click moves it)" : "Alt+click sets the source point", heal: this.cloneSource ? "Paint to repair with the source's texture (Alt+click moves it)" : "Alt+click sets the source point" };
+        if (tool === "shape") {
+            const o = this.shapeOpts, open = o.kind === "polyline";
+            this.shapeFillRow.hidden = open;                       // an open line has nothing to fill
+            this.shapeStrokeRow.hidden = open;
+            this.shapeWidthRow.hidden = !(o.stroke || open);
+            this.shapeColorRow.hidden = !(o.stroke || open);
+            this.shapeRadiusRow.hidden = o.kind !== "rectangle";
+        }
+        const shapeHints = {
+            rectangle: "Drag a rectangle; Shift keeps it square, Alt draws from the centre",
+            ellipse: "Drag an ellipse; Shift keeps it a circle, Alt draws from the centre",
+            polygon: "Click the corners, click the first point or press Enter to close",
+            polyline: "Click the corners, press Enter to finish the line",
+            bezier: "Click a point, or drag while clicking to curve the line; Enter finishes",
+            freehand: "Draw with the cursor held down",
+        };
+        const hints = { shape: shapeHints[this.shapeOpts.kind] || "", select: "Paint to select, Alt subtracts", deselect: "Paint to deselect", paint: "Alt+click picks a colour, Shift+click draws a line", erase: "Shift+click draws a line", wand: "Click to select the similar area; Shift adds, Alt subtracts", bucket: "Click to fill; Shift+F fills the whole selection", gradient: "Drag from the colour to where it should have faded", eyedropper: "Click to pick a colour", smudge: "Drag across an edge to soften it", clone: this.cloneSource ? "Paint to copy from the source (Alt+click moves it)" : "Alt+click sets the source point", heal: this.cloneSource ? "Paint to repair with the source's texture (Alt+click moves it)" : "Alt+click sets the source point" };
         this.optsHint.textContent = hints[tool] || "";
     }
 
@@ -2126,6 +2178,7 @@ class InpaintEditor {
                 e.stopImmediatePropagation(); e.preventDefault();
                 if (this.pending) this.cancelPending();
                 else if (this.polyPoints) { this.polyPoints = null; this.draw(); this.setStatus("Polygon cancelled."); }
+                else if (this.shapePoints) { this.cancelShape(); this.draw(); this.setStatus("Shape cancelled."); }
                 else if (this.tool === "canvas" && this.extendPending()) { this.resetExtend(); this.setStatus("Canvas extension reset."); }
                 else if (this.flyout) this.closeFlyout();
                 else if (this.textEdit) this.endTextEdit(false);
@@ -2344,6 +2397,7 @@ class InpaintEditor {
     setTool(tool) {
         if (this.pending && tool !== "transform") this.cancelPending();
         if (this.polyPoints && tool !== "polygon") this.polyPoints = null;
+        if (this.shapePoints && tool !== "shape") this.cancelShape();
         this.tool = tool;
         if (this.hardCtl) {
             const v = Math.round(this.activeHardness() * 100);
@@ -2377,8 +2431,10 @@ class InpaintEditor {
         if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); this.generate(); return; }
         if (e.key === "Enter" && this.pending) { e.preventDefault(); this.applyPending(); return; }
         if (e.key === "Enter" && this.polyPoints) { e.preventDefault(); this.closePolygon(); this.draw(); return; }
+        if (e.key === "Enter" && this.shapePoints) { e.preventDefault(); this.finishShape(); return; }
         if (e.key === "Enter" && this.tool === "canvas") { e.preventDefault(); if (this.extendPending()) this.applyCanvasFrame(); else this.setStatus("Drag the frame first: outward extends, inward crops."); return; }
         if ((e.key === "Backspace" || e.key === "Delete") && this.polyPoints) { e.preventDefault(); this.polyPoints.pop(); if (!this.polyPoints.length) this.polyPoints = null; this.draw(); return; }
+        if ((e.key === "Backspace" || e.key === "Delete") && this.shapePoints) { e.preventDefault(); this.shapePoints.pop(); if (!this.shapePoints.length) this.shapePoints = null; this.draw(); return; }
         if (this.tool === "transform" && !this.pending && e.key.startsWith("Arrow")) {
             const l = this.activeLayer();
             if (l) {
@@ -2430,6 +2486,7 @@ class InpaintEditor {
             case "c": this.setTool("canvas"); break;
             case "i": this.setTool("eyedropper"); break;
             case "w": this.setTool("wand"); break;
+            case "y": this.setTool("shape"); break;
             case "q": this.toggleQuickMask(); break;
             case "s": this.setTool(e.shiftKey ? "smudge" : "clone"); break;
             case "j": this.setTool("heal"); break;
@@ -3336,6 +3393,8 @@ class InpaintEditor {
             if (!layer) layer = this.addPaintLayer();
             const stroke = makeCanvas(layer.canvas.width, layer.canvas.height);
             this.pointer = { kind: "layerpaint", grad: true, layer, stroke, clip: this.strokeClip(layer, layer.canvas), erase: false, start: [ix, iy], last: [ix, iy] };
+        } else if (this.tool === "shape") {
+            this.shapePointerDown(ix, iy, e, isDouble);
         } else if ((this.tool === "paint" || this.tool === "erase") && this.quickMask) {
             // quick mask: the brushes edit the selection
             this.pushUndo({ kind: "selection" });
@@ -3434,10 +3493,17 @@ class InpaintEditor {
             p.path.push([ix, iy]);
         } else if (p.kind === "layerpaint" || p.kind === "maskpaint") {
             if (e.pointerType === "pen" && e.pressure > 0) p.pressure = e.pressure;
-            if (p.grad) this.gradientDab(p, ix, iy);
+            if (p.shape) this.shapeDab(p, ix, iy, e);
+            else if (p.grad) this.gradientDab(p, ix, iy);
             else if (p.clone) this.cloneDab(p, p.last[0], p.last[1], ix, iy);
             else this.layerDab(p, p.last[0], p.last[1], ix, iy);
             p.last = [ix, iy];
+        } else if (p.kind === "shapepoint") {
+            // a Bezier point curves the line by dragging its handle out of the click
+            if (this.shapeDrag && this.shapePoints) {
+                const q = this.shapePoints[this.shapeDrag.index];
+                if (q) { q.hx = ix - q.x; q.hy = iy - q.y; }
+            }
         } else if (p.kind === "smudge") {
             if (e.pointerType === "pen" && e.pressure > 0) p.pressure = e.pressure;
             this.smudgeDab(p, p.last[0], p.last[1], ix, iy);
@@ -3586,6 +3652,8 @@ class InpaintEditor {
             this.commitStroke(p);
             this.markLayerChanged(p.layer, box);
             if (!p.grad) this.lastStrokeEnd = { layerId: p.layer.id, x: p.last[0], y: p.last[1], mask: false };
+        } else if (p.kind === "shapepoint") {
+            this.shapeDrag = null;
         } else if (p.kind === "smudge") {
             this.markLayerChanged(p.layer);
         } else if (p.kind === "maskpaint") {
@@ -4059,6 +4127,163 @@ class InpaintEditor {
         g.addColorStop(1, o.to === "white" ? "rgba(255,255,255,1)" : o.to === "black" ? "rgba(0,0,0,1)" : `rgba(${rgb},0)`);
         ctx.fillStyle = g;
         ctx.fillRect(0, 0, c.width, c.height);
+    }
+
+    // ---- shape tool ---------------------------------------------------------------------
+    //
+    // Rectangle, ellipse and freehand are one drag: the gesture is an ordinary `layerpaint`
+    // pointer whose stroke buffer is redrawn on every move, so the live preview, the clip to
+    // the selection, the brush opacity and the undo step all come from the paint machinery.
+    // Polygon, polyline and Bezier are clicked point by point instead, held in `shapePoints`
+    // and drawn as an overlay until Enter, a double click or the first point finishes them.
+
+    /** The layer a shape goes on: the active one, or a new paint layer over the base. */
+    shapeTarget() {
+        let layer = this.activeLayer();
+        if (layer && layer.locked) { this.setStatus(`${layer.name} is locked.`); return null; }
+        if (layer && layer.kind === "filter") { this.setStatus("Filter layers have no pixels. Select a paint or image layer."); return null; }
+        if (layer && layer.kind === "text") { this.setStatus("Text layers hold text, not pixels. Select a paint or image layer."); return null; }
+        if (!layer) layer = this.addPaintLayer();
+        return layer;
+    }
+
+    shapePointerDown(ix, iy, e, isDouble) {
+        const kind = this.shapeOpts.kind;
+        if (kind === "rectangle" || kind === "ellipse" || kind === "freehand") {
+            const layer = this.shapeTarget();
+            if (!layer) return;
+            const stroke = makeCanvas(layer.canvas.width, layer.canvas.height);
+            this.pointer = { kind: "layerpaint", shape: kind, layer, stroke, clip: this.strokeClip(layer, layer.canvas),
+                erase: false, start: [ix, iy], cur: [ix, iy], path: [[ix, iy]], last: [ix, iy] };
+            return;
+        }
+        // clicked point by point
+        if (!this.shapePoints) {
+            if (!this.shapeTarget()) return;      // says why, and makes the paint layer early
+            this.shapePoints = [{ x: ix, y: iy, hx: 0, hy: 0 }];
+        } else {
+            const first = this.shapePoints[0];
+            const near = Math.hypot(ix - first.x, iy - first.y) <= 8 / this.view.scale;
+            if ((near && this.shapePoints.length >= 2) || e.detail >= 2 || isDouble) { this.finishShape(near && this.shapePoints.length >= 2); return; }
+            this.shapePoints.push({ x: ix, y: iy, hx: 0, hy: 0 });
+        }
+        // a Bezier point takes its handle from the drag that follows the click
+        if (this.shapeOpts.kind === "bezier") this.shapeDrag = { index: this.shapePoints.length - 1 };
+        this.pointer = { kind: "shapepoint" };
+        this.draw();
+    }
+
+    /** Redraw the dragged shape into its stroke buffer (called on every pointer move). */
+    shapeDab(p, ix, iy, e) {
+        const o = this.shapeOpts;
+        if (p.shape === "freehand") {
+            const [lx, ly] = p.path[p.path.length - 1];
+            if (Math.hypot(ix - lx, iy - ly) >= 1) p.path.push([ix, iy]);
+        } else if (e && (e.shiftKey || e.ctrlKey)) {
+            const dx = ix - p.start[0], dy = iy - p.start[1], m = Math.max(Math.abs(dx), Math.abs(dy));
+            p.cur = [p.start[0] + Math.sign(dx || 1) * m, p.start[1] + Math.sign(dy || 1) * m];
+        } else {
+            p.cur = [ix, iy];
+        }
+        p.fromCenter = !!(e && e.altKey);
+        const ctx = p.stroke.getContext("2d");
+        this.touchSource(p.stroke);   // no bounds: the shape may move anywhere in the layer
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.globalCompositeOperation = "source-over";
+        ctx.clearRect(0, 0, p.stroke.width, p.stroke.height);
+        this.paintShape(ctx, p.layer, (c) => this.shapePath(c, p), p.shape !== "freehand" || o.fill);
+    }
+
+    /** The path of a dragged shape, in image coordinates. */
+    shapePath(ctx, p) {
+        const o = this.shapeOpts;
+        if (p.shape === "freehand") {
+            const pts = p.path;
+            ctx.moveTo(pts[0][0], pts[0][1]);
+            for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+            return;
+        }
+        let x0 = p.start[0], y0 = p.start[1], x1 = p.cur[0], y1 = p.cur[1];
+        if (p.fromCenter) { x0 = p.start[0] - (x1 - p.start[0]); y0 = p.start[1] - (y1 - p.start[1]); }
+        const x = Math.min(x0, x1), y = Math.min(y0, y1), w = Math.abs(x1 - x0), h = Math.abs(y1 - y0);
+        if (p.shape === "ellipse") {
+            ctx.ellipse(x + w / 2, y + h / 2, w / 2, h / 2, 0, 0, Math.PI * 2);
+        } else if (o.radius > 0) {
+            const r = Math.min(o.radius, w / 2, h / 2);
+            ctx.moveTo(x + r, y);
+            ctx.arcTo(x + w, y, x + w, y + h, r);
+            ctx.arcTo(x + w, y + h, x, y + h, r);
+            ctx.arcTo(x, y + h, x, y, r);
+            ctx.arcTo(x, y, x + w, y, r);
+        } else {
+            ctx.rect(x, y, w, h);
+        }
+    }
+
+    /** The path of the clicked points, straight for polygon / polyline, curved for Bezier. */
+    shapePointPath(ctx, pts, closed, toCursor) {
+        const bez = this.shapeOpts.kind === "bezier";
+        const all = toCursor ? [...pts, { x: toCursor[0], y: toCursor[1], hx: 0, hy: 0 }] : pts;
+        ctx.moveTo(all[0].x, all[0].y);
+        for (let i = 1; i < all.length; i++) {
+            const a = all[i - 1], b = all[i];
+            if (bez && (a.hx || a.hy || b.hx || b.hy)) ctx.bezierCurveTo(a.x + a.hx, a.y + a.hy, b.x - b.hx, b.y - b.hy, b.x, b.y);
+            else ctx.lineTo(b.x, b.y);
+        }
+        if (closed && all.length > 2) {
+            const a = all[all.length - 1], b = all[0];
+            if (bez && (a.hx || a.hy || b.hx || b.hy)) ctx.bezierCurveTo(a.x + a.hx, a.y + a.hy, b.x - b.hx, b.y - b.hy, b.x, b.y);
+            else ctx.closePath();
+        }
+    }
+
+    /**
+     * Fill and outline a path on a stroke buffer sized like the layer. `build` draws the path
+     * in image coordinates; the transform maps them onto the layer, so the outline width is in
+     * image pixels whatever the layer's own resolution is.
+     */
+    paintShape(ctx, layer, build, closed) {
+        const o = this.shapeOpts;
+        const sx = layer.canvas.width / layer.w, sy = layer.canvas.height / layer.h;
+        ctx.save();
+        ctx.setTransform(sx, 0, 0, sy, -layer.x * sx, -layer.y * sy);
+        ctx.beginPath();
+        build(ctx);
+        if (closed) {
+            ctx.closePath();
+            if (o.fill) { ctx.fillStyle = this.color; ctx.fill(); }
+            if (o.stroke) { ctx.strokeStyle = o.color; ctx.lineWidth = o.width; ctx.lineJoin = "round"; ctx.lineCap = "round"; ctx.stroke(); }
+        } else {
+            ctx.strokeStyle = o.stroke ? o.color : this.color;
+            ctx.lineWidth = o.width; ctx.lineJoin = "round"; ctx.lineCap = "round";
+            ctx.stroke();
+        }
+        ctx.restore();
+    }
+
+    /** Draw the clicked shape onto the layer and end the gesture. */
+    finishShape(close) {
+        const pts = this.shapePoints;
+        this.shapePoints = null;
+        this.shapeDrag = null;
+        const kind = this.shapeOpts.kind;
+        const closed = kind !== "polyline" && (close !== false);
+        if (!pts || pts.length < (closed ? 3 : 2)) { this.setStatus(`A ${kind} needs at least ${closed ? "three" : "two"} points.`); this.draw(); return; }
+        const layer = this.shapeTarget();
+        if (!layer) { this.draw(); return; }
+        if (closed && !this.shapeOpts.fill && !this.shapeOpts.stroke) { this.setStatus("Neither fill nor outline is on: nothing to draw."); this.draw(); return; }
+        const stroke = makeCanvas(layer.canvas.width, layer.canvas.height);
+        this.paintShape(stroke.getContext("2d"), layer, (c) => this.shapePointPath(c, pts, closed, null), closed);
+        const p = { kind: "layerpaint", layer, stroke, clip: this.strokeClip(layer, layer.canvas), erase: false };
+        this.commitStroke(p);
+        this.markLayerChanged(layer);
+        this.draw();
+        this.setStatus(`${kind[0].toUpperCase() + kind.slice(1)} with ${pts.length} points drawn on ${layer.name}.`);
+    }
+
+    cancelShape() {
+        this.shapePoints = null;
+        this.shapeDrag = null;
     }
 
     /** Image-sized canvas the bucket and eyedropper look at: the visible image or the active layer alone. */
@@ -7776,6 +8001,36 @@ class InpaintEditor {
             const closeNear = this.hover && pts.length >= 3 && Math.hypot(this.hover[0] - pts[0][0], this.hover[1] - pts[0][1]) <= 8 / s;
             ctx.strokeStyle = closeNear ? "#7cc7ff" : "#fff";
             ctx.beginPath(); ctx.arc(pts[0][0], pts[0][1], (closeNear ? 8 : 5) / s, 0, Math.PI * 2); ctx.stroke();
+            ctx.restore();
+        }
+        if (this.shapePoints && this.shapePoints.length) {
+            const pts = this.shapePoints;
+            const closed = this.shapeOpts.kind !== "polyline";
+            ctx.save();
+            this.antsStroke(ctx, () => {
+                ctx.beginPath();
+                this.shapePointPath(ctx, pts, false, this.hover && !this.shapeDrag ? this.hover : null);
+                ctx.stroke();
+            }, s);
+            ctx.setLineDash([]);
+            const r = 4 / s;
+            ctx.fillStyle = "#fff";
+            for (const q of pts) ctx.fillRect(q.x - r / 2, q.y - r / 2, r, r);
+            if (this.shapeOpts.kind === "bezier") {
+                ctx.strokeStyle = "#7cc7ff";
+                ctx.lineWidth = 1 / s;
+                for (const q of pts) {
+                    if (!q.hx && !q.hy) continue;
+                    ctx.beginPath();
+                    ctx.moveTo(q.x - q.hx, q.y - q.hy); ctx.lineTo(q.x + q.hx, q.y + q.hy);
+                    ctx.stroke();
+                }
+            }
+            // the first point closes the shape: a ring, larger when the cursor is within reach
+            const closeNear = closed && this.hover && pts.length >= 2 && Math.hypot(this.hover[0] - pts[0].x, this.hover[1] - pts[0].y) <= 8 / s;
+            ctx.strokeStyle = closeNear ? "#7cc7ff" : "#fff";
+            ctx.lineWidth = 1 / s;
+            ctx.beginPath(); ctx.arc(pts[0].x, pts[0].y, (closeNear ? 8 : 5) / s, 0, Math.PI * 2); ctx.stroke();
             ctx.restore();
         }
         if ((this.tool === "clone" || this.tool === "heal") && this.cloneSource) {
