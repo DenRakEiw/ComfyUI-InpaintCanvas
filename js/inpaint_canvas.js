@@ -3331,7 +3331,7 @@ class InpaintEditor {
                 orig.getContext("2d").drawImage(this.selection, 0, 0);
                 this.pointer = { kind: "selmove", start: [ix, iy], orig, origBounds: this.getBounds() };
             } else {
-                this.pointer = { kind: "rect", ellipse: this.tool === "ellipse", square: e.ctrlKey, start: [ix, iy], cur: [ix, iy], mode: selMode };
+                this.pointer = { kind: "rect", ellipse: this.tool === "ellipse", square: e.ctrlKey, start: [ix, iy], cur: [ix, iy], startPx: this.toCanvasPx(e), mode: selMode };
             }
         } else if (this.tool === "lasso") {
             this.pushUndo({ kind: "selection" });
@@ -3509,6 +3509,12 @@ class InpaintEditor {
             this.smudgeDab(p, p.last[0], p.last[1], ix, iy);
             p.last = [ix, iy];
         } else if (p.kind === "rect") {
+            if (p.startPx) {
+                // in screen pixels, so it is the same gesture at every zoom: on a large image
+                // one screen pixel is many image pixels
+                const [cx, cy] = this.toCanvasPx(e);
+                if (Math.hypot(cx - p.startPx[0], cy - p.startPx[1]) > 3) p.moved = true;
+            }
             if (p.square || e.ctrlKey) {
                 const dx = ix - p.start[0], dy = iy - p.start[1], m = Math.max(Math.abs(dx), Math.abs(dy));
                 p.cur = [p.start[0] + Math.sign(dx || 1) * m, p.start[1] + Math.sign(dy || 1) * m];
@@ -3602,6 +3608,17 @@ class InpaintEditor {
         this.viewEl.classList.remove("ipc-panning");
         try { this.canvas.releasePointerCapture(e.pointerId); } catch (_) { /* ignore */ }
         if (p.kind === "rect") {
+            if (p.startPx && !p.moved) {
+                // a click without a drag deselects, like the lasso below. Without the screen
+                // pixel threshold a hand that wobbles by one pixel left a small selection
+                // right under the cursor, which on a 15k image is a dozen image pixels wide.
+                if (p.mode !== "replace") return;
+                this.selectionLabel = "";
+                this.selection.getContext("2d").clearRect(0, 0, this.width, this.height);
+                this.markSelectionChanged(null);   // the undo step was pushed on pointer down
+                this.draw();
+                return;
+            }
             const [x0, y0] = p.start;
             const [x1, y1] = p.cur;
             const sctx = this.selection.getContext("2d");
