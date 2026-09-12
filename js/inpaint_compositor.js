@@ -132,6 +132,13 @@ function link(gl, vsSrc, fsSrc) {
 const TEXTURE_BUDGET = 1024 * 1024 * 1024;
 const TEXTURE_CACHE = 64;   // and a plain count, so a stack of tiny sources cannot grow forever
 
+// A source above this many pixels is not uploaded whole: the compositor keeps a window of it,
+// the part the view shows plus a margin of half the view on each side (phase A item 4 of
+// docs/PLAN_TILES.md). At 1:1 on a 15k document the whole source is a 600 MB upload that held
+// the first frame after a zoom for 58 to 320 ms and then sat in VRAM per layer; the window is
+// a few tens of MB and survives a pan inside its margin.
+const WINDOW_PX = 16 * 1024 * 1024;
+
 let SUPPORTED = null;
 
 export class GLCompositor {
@@ -236,6 +243,61 @@ export class GLCompositor {
         return entry.tex;
     }
 
+    /**
+     * The texture of a source for this frame, with the source rectangle it covers: the whole
+     * source below WINDOW_PX, else a window around the part of it the view shows. `need` is
+     * that part in source pixels ({ x, y, w, h }); a cached window is reused while it still
+     * holds it and the version is unchanged. Null when the source cannot be uploaded.
+     */
+    _source(source, version, need) {
+        const gl = this.gl;
+        const sw = source.width, sh = source.height;
+        if (sw * sh <= WINDOW_PX) {
+            const tex = this._texture(source, version);
+            return tex ? { tex, x: 0, y: 0, w: sw, h: sh } : null;
+        }
+        let entry = this.textures.get(source);
+        if (!entry) {
+            entry = { tex: gl.createTexture(), version: null, w: 0, h: 0, x: 0, y: 0, window: true };
+            this.textures.set(source, entry);
+        }
+        // the needed rectangle, clamped to the source; nothing to draw when the layer is off screen
+        const nx0 = Math.max(0, Math.floor(need.x)), ny0 = Math.max(0, Math.floor(need.y));
+        const nx1 = Math.min(sw, Math.ceil(need.x + need.w)), ny1 = Math.min(sh, Math.ceil(need.y + need.h));
+        if (nx1 <= nx0 || ny1 <= ny0) return { tex: null, x: 0, y: 0, w: 0, h: 0 };
+        const inside = entry.version === version && entry.window && nx0 >= entry.x && ny0 >= entry.y && nx1 <= entry.x + entry.w && ny1 <= entry.y + entry.h;
+        if (!inside) {
+            const mx = Math.ceil((nx1 - nx0) / 2), my = Math.ceil((ny1 - ny0) / 2);
+            let x = Math.max(0, nx0 - mx), y = Math.max(0, ny0 - my);
+            let w = Math.min(sw, nx1 + mx) - x, h = Math.min(sh, ny1 + my) - y;
+            w = Math.min(w, this.maxTexture); h = Math.min(h, this.maxTexture);
+            if (w <= 0 || h <= 0) return null;
+            if (!this.scratch) this.scratch = document.createElement("canvas");
+            const sc = this.scratch;
+            if (sc.width !== w || sc.height !== h) { sc.width = w; sc.height = h; }
+            const cx = sc.getContext("2d");
+            cx.setTransform(1, 0, 0, 1, 0, 0);
+            cx.globalAlpha = 1;
+            cx.globalCompositeOperation = "source-over";
+            cx.clearRect(0, 0, w, h);
+            cx.drawImage(source, x, y, w, h, 0, 0, w, h);
+            gl.bindTexture(gl.TEXTURE_2D, entry.tex);
+            gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+            gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, sc);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            entry.version = version;
+            entry.x = x; entry.y = y; entry.w = w; entry.h = h;
+            entry.window = true;
+            this.windowUploads = (this.windowUploads || 0) + 1;
+        }
+        entry.used = this.frame;
+        return { tex: entry.tex, x: entry.x, y: entry.y, w: entry.w, h: entry.h };
+    }
+
     /** Drop the textures that no recent frame asked for, oldest first, never this frame's. */
     _evict() {
         let bytes = 0;
@@ -256,11 +318,16 @@ export class GLCompositor {
      * textures (RGBA8, so w * h * 4) and the bytes of the two ping-pong targets.
      */
     stats() {
-        let bytes = 0;
-        for (const e of this.textures.values()) bytes += (e.w || 0) * (e.h || 0) * 4;
+        let bytes = 0, windows = 0, windowBytes = 0;
+        for (const e of this.textures.values()) {
+            const b = (e.w || 0) * (e.h || 0) * 4;
+            bytes += b;
+            if (e.window) { windows++; windowBytes += b; }
+        }
         let targetBytes = 0;
         for (const t of this.targets) if (t) targetBytes += (t.w || 0) * (t.h || 0) * 4;
-        return { entries: this.textures.size, bytes, targetBytes, budget: TEXTURE_BUDGET, limit: TEXTURE_CACHE, lost: this.lost };
+        const scratchBytes = this.scratch ? this.scratch.width * this.scratch.height * 4 : 0;
+        return { entries: this.textures.size, bytes, targetBytes, windows, windowBytes, scratchBytes, windowUploads: this.windowUploads || 0, budget: TEXTURE_BUDGET, limit: TEXTURE_CACHE, lost: this.lost };
     }
 
     /** Drop the texture of a source the editor threw away. */
@@ -292,13 +359,19 @@ export class GLCompositor {
         const region = spec.region;
         const layers = spec.layers || [];
         // every source has to fit a texture before anything is drawn: a fallback halfway
-        // through would leave the caller with a half-composited picture
+        // through would leave the caller with a half-composited picture. A large source is
+        // uploaded as a window around what the view shows; the layer's rectangle is then the
+        // window's, mapped back into image coordinates.
         const prepared = [];
         for (const l of layers) {
             if (!l || !l.source) continue;
-            const tex = this._texture(l.source, l.version);
-            if (!tex) return null;
-            prepared.push({ ...l, tex });
+            const sw = l.source.width, sh = l.source.height;
+            const fx = l.w / sw, fy = l.h / sh;   // image pixels per source pixel
+            const need = { x: (region.x - l.x) / fx, y: (region.y - l.y) / fy, w: region.w / fx, h: region.h / fy };
+            const s = this._source(l.source, l.version, need);
+            if (!s) return null;
+            if (!s.tex) continue;   // off screen
+            prepared.push({ ...l, tex: s.tex, x: l.x + s.x * fx, y: l.y + s.y * fy, w: s.w * fx, h: s.h * fy });
         }
         if (this.canvas.width !== W || this.canvas.height !== H) {
             this.canvas.width = W;
@@ -388,6 +461,7 @@ export class GLCompositor {
             for (const e of this.textures.values()) this.gl.deleteTexture(e.tex);
         } catch (_) { /* context gone */ }
         this.textures.clear();
+        if (this.scratch) { this.scratch.width = this.scratch.height = 1; }
     }
 
     dispose() {
@@ -397,6 +471,7 @@ export class GLCompositor {
             this.textures.clear();
             for (const t of this.targets) { if (t) { gl.deleteFramebuffer(t.fb); gl.deleteTexture(t.tex); } }
             this.targets = [];
+            if (this.scratch) { this.scratch.width = this.scratch.height = 0; this.scratch = null; }
             gl.deleteProgram(this.prog);
             gl.deleteProgram(this.copy);
             gl.deleteBuffer(this.quad);
