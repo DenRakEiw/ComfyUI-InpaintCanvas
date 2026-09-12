@@ -2192,6 +2192,7 @@ class InpaintEditor {
             if (!this.isOpen) return;
             const t = e.target;
             if (this.askOpen) return;   // the question dialog has its own keys
+            if (t && t.closest && t.closest("dialog[open]")) return;   // a key inside an open <dialog> (a host settings dialog, a plugin's) stays with the dialog: Escape has to reach its native close
             const inField = t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT");
             if (e.key === "Escape") {
                 if (t === this.promptInput) return;
