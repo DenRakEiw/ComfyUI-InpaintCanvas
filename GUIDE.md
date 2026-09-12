@@ -39,6 +39,7 @@ Minimal local chain: `crop_image` and `crop_mask` into VAE Encode (for Inpaintin
 ## Painting and retouch
 
 - **Paint** (P) and **erase** (E): size, hardness and opacity in the bar above the canvas, Alt+click picks a colour, Shift+click draws a straight line from the last stroke's end, a pen's pressure scales the size. On the base a paint layer is created for you. With a selection present, strokes stay inside it.
+- **Brush tips**: *Tip* in the bar picks the built-in round dab or an imported tip; *Import* takes Photoshop `.abr` files (every sampled tip in the pack, with its name and spacing; the parametric round tips are skipped and counted) and plain images (a cut-out PNG's alpha, or the darkness of a black-on-white scan). A tip brings a *Spacing* slider and *Follow stroke*, which turns the tip with the direction of travel; the cursor shows the tip's box, the eraser stamps a tip too, and the trash button removes one. The node keeps imported tips for the session; Scumble stores them.
 - **Eyedropper** (I), **bucket** (G) with tolerance and contiguous, **gradient** (Shift+G) linear or radial, colour to transparent, white or black.
 - **Smudge** (Shift+S) drags pixels along the stroke, with a strength slider: the tool of choice for a hard seam after inpainting. On the base it first makes a copy layer.
 - **Clone stamp** (S) and **healing brush** (J): Alt+click sets the source, then paint. The healing brush shifts the copied texture to the colour and brightness of where it lands. *Aligned* keeps the offset between strokes.

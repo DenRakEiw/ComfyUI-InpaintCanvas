@@ -928,6 +928,7 @@ const STYLE = `
 .ipc-list { overflow:auto; flex:none; min-height:90px; max-height:56vh; }
 .ipc-list.ipc-reflist { min-height:0; max-height:30vh; }
 .ipc-list.ipc-reflist:empty::after { content:"No references. Drop images here or use the button above."; display:block; padding:8px 10px; color:#666; font-size:11px; }
+.ipc-tipthumb { width:48px; height:24px; vertical-align:middle; background:#1a1a1a; border:1px solid #444; border-radius:3px; margin-right:4px; }
 .ipc-refcount { color:#7cc7ff; font-size:10px; margin-left:6px; text-transform:none; letter-spacing:0; }
 .ipc-side h4 .ipc-sel.ipc-narrow { max-width:80px; font-size:11px; padding:1px 4px; }
 .ipc-layer { display:flex; flex-direction:column; gap:4px; padding:6px 8px; border-bottom:1px solid #161616; cursor:pointer; }
@@ -1271,6 +1272,13 @@ class InpaintEditor {
 
         // brush tip: the built-in round dab, or a stamp imported from a .abr or an image
         const tipLabel = el("label", null, "Tip");
+        this.tipLabel = tipLabel;
+        this.tipThumb = document.createElement("canvas");
+        this.tipThumb.width = 48; this.tipThumb.height = 24;
+        this.tipThumb.className = "ipc-tipthumb";
+        this.tipThumb.style.width = "48px"; this.tipThumb.style.height = "24px"; this.tipThumb.style.position = "static";   // .ipc-view canvas is absolute and 100 %
+        this.tipThumb.title = "The tip that will land on the canvas";
+        tipLabel.appendChild(this.tipThumb);
         this.tipSel = selectInput(["Round"], "Round", "The brush tip. Round is the built-in soft dab; the others were imported from a .abr or an image file.");
         this.tipSel.addEventListener("change", () => this.setBrushTip(this.tipSel.value === "Round" ? "" : this.tipSel.value));
         tipLabel.appendChild(this.tipSel);
@@ -1282,7 +1290,28 @@ class InpaintEditor {
         this.tipFile.addEventListener("change", () => { const f = Array.from(this.tipFile.files || []); this.tipFile.value = ""; this.importBrushFiles(f); });
         tipLabel.appendChild(this.tipFile);
         tipLabel.appendChild(iconButton("upload", "Import brush tips from a Photoshop .abr file or from images. A .abr may hold dozens of tips; all of them are added.", () => this.tipFile.click(), "Import"));
-        top.appendChild(tipLabel);
+        this.tipRemoveBtn = iconButton("trash", "Remove this tip from the list", () => this.removeBrushTip(this.brushTipId));
+        tipLabel.appendChild(this.tipRemoveBtn);
+        // the tip's own settings, shown while an imported tip is active (the round dab has hardness instead)
+        const spacingLabel = el("label", null, "Spacing");
+        this.spacingCtl = document.createElement("input");
+        this.spacingCtl.type = "range"; this.spacingCtl.min = 1; this.spacingCtl.max = 200; this.spacingCtl.value = 25;
+        this.spacingCtl.title = "Distance between stamps as a share of the tip's size; a .abr brings its own value";
+        const spacingVal = el("span", null, "25%");
+        this.spacingCtl.addEventListener("input", () => { spacingVal.textContent = this.spacingCtl.value + "%"; const t = this.brushTip(); if (t) { t.spacing = +this.spacingCtl.value / 100; this._tipStamp = null; } });
+        this.spacingCtl.addEventListener("change", () => this.brushTipsChanged());
+        this.spacingVal = spacingVal;
+        spacingLabel.appendChild(this.spacingCtl); spacingLabel.appendChild(spacingVal);
+        const rotateLabel = el("label", null);
+        this.tipRotateCb = document.createElement("input");
+        this.tipRotateCb.type = "checkbox";
+        this.tipRotateCb.title = "Rotate the tip to follow the stroke direction, the way a flat brush turns in the hand";
+        this.tipRotateCb.addEventListener("change", () => { this.tipRotate = this.tipRotateCb.checked; try { localStorage.setItem("ipc.tipRotate", this.tipRotate ? "1" : "0"); } catch (_) { /* ignore */ } });
+        try { this.tipRotate = localStorage.getItem("ipc.tipRotate") === "1"; } catch (_) { this.tipRotate = false; }
+        this.tipRotateCb.checked = !!this.tipRotate;
+        rotateLabel.appendChild(this.tipRotateCb); rotateLabel.appendChild(el("span", null, "Follow stroke"));
+        this.tipOnlyEls = [spacingLabel, rotateLabel];
+        top.appendChild(tipLabel); top.appendChild(spacingLabel); top.appendChild(rotateLabel);
         // view toggles
         const viewBox = el("span", "ipc-viewbox");
         this.rulersBtn = iconButton("ruler", "Rulers (Ctrl+Shift+R). Drag a guide out of a ruler; drag it back to remove it; double-click a ruler clears all guides. Layers snap to guides.", () => this.toggleRulers());
@@ -1941,6 +1970,9 @@ class InpaintEditor {
         moveCtl(this.opacCtl && this.opacCtl.input.parentElement, "paint erase clone heal bucket gradient");
         moveCtl(this.opacCtl && this.opacCtl.input.parentElement, "shape");
         moveCtl(this.colorLabel, "paint bucket gradient shape");
+        moveCtl(this.tipLabel, "paint erase");
+        for (const e of this.tipOnlyEls || []) moveCtl(e, "paint erase");
+        this.syncTipControls();
         const row = (cls, ...nodes) => { const lab = el("label", null); lab.dataset.for = cls; for (const n of nodes) lab.appendChild(typeof n === "string" ? el("span", null, n) : n); bar.appendChild(lab); return lab; };
         const tol = document.createElement("input");
         tol.type = "range"; tol.min = 0; tol.max = 255; tol.value = this.fillOpts.tolerance; tol.title = "Tolerance: how different a colour may be to count as the same area (0..255 per channel)";
@@ -4095,7 +4127,50 @@ class InpaintEditor {
         this._tipStamp = null;
         if (this.tipSel) this.tipSel.value = this.brushTipId || "Round";
         const t = this.brushTip();
-        this.setStatus(t ? `Brush tip: ${t.name} (${t.canvas.width} \u00d7 ${t.canvas.height}).` : "Brush tip: the built-in round dab.");
+        this.syncTipControls();
+        this.draw();
+        this.setStatus(t ? `Brush tip: ${t.name} (${t.canvas.width} \u00d7 ${t.canvas.height}${t.spacing ? `, spacing ${Math.round(t.spacing * 100)} %` : ""}).` : "Brush tip: the built-in round dab.");
+    }
+
+    /** The thumbnail, the Remove button and the tip-only rows follow the active tip. */
+    syncTipControls() {
+        const t = this.brushTip();
+        if (this.tipThumb) {
+            const ctx = this.tipThumb.getContext("2d");
+            ctx.clearRect(0, 0, this.tipThumb.width, this.tipThumb.height);
+            const src = t ? t.canvas : this.dabMask(11, this.hardness);
+            const k = Math.min((this.tipThumb.width - 2) / src.width, (this.tipThumb.height - 2) / src.height, 1.5);
+            const w = src.width * k, h = src.height * k;
+            ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = "high";
+            ctx.drawImage(src, (this.tipThumb.width - w) / 2, (this.tipThumb.height - h) / 2, w, h);
+            // the tip is black on transparent: draw it as white so it reads on the dark bar
+            ctx.globalCompositeOperation = "source-in";
+            ctx.fillStyle = "#e8e8e8";
+            ctx.fillRect(0, 0, this.tipThumb.width, this.tipThumb.height);
+            ctx.globalCompositeOperation = "source-over";
+        }
+        if (this.tipRemoveBtn) this.tipRemoveBtn.style.display = t ? "" : "none";
+        for (const e of this.tipOnlyEls || []) e.style.display = t ? "" : "none";
+        if (t && this.spacingCtl) { const v = Math.round((t.spacing || this.brushTipSpacing) * 100); this.spacingCtl.value = v; this.spacingVal.textContent = v + "%"; }
+    }
+
+    /** Drop a tip from the list (the round dab takes over when it was active) and tell the host. */
+    removeBrushTip(id) {
+        const t = this.brushTips.find((x) => x.id === id);
+        if (!t) return false;
+        this.brushTips.splice(this.brushTips.indexOf(t), 1);
+        if (this.brushTipId === id) this.brushTipId = "";
+        this._tipStamp = null;
+        this.renderBrushTips();
+        this.syncTipControls();
+        this.brushTipsChanged();
+        this.setStatus(`Brush tip ${t.name} removed.`);
+        return true;
+    }
+
+    /** The list changed (import, remove, spacing): the host may persist it. */
+    brushTipsChanged() {
+        if (this.onBrushTips) { try { this.onBrushTips(this.brushTips); } catch (err) { console.warn("brush tips not saved", err); } }
     }
 
     /** Rebuild the tip select from this.brushTips, keeping the current choice if it survives. */
@@ -4132,15 +4207,20 @@ class InpaintEditor {
         if (!added.length) return added;
         this.renderBrushTips();
         this.setBrushTip(added[0].id);
-        if (this.onBrushTips) { try { this.onBrushTips(this.brushTips); } catch (err) { console.warn("brush tips not saved", err); } }
-        this.setStatus(`${added.length} brush tip${added.length === 1 ? "" : "s"} imported. Pick one under Tip.`);
+        this.brushTipsChanged();
+        const skipped = this._tipsSkipped || 0;
+        this._tipsSkipped = 0;
+        this.setStatus(`${added.length} brush tip${added.length === 1 ? "" : "s"} imported${skipped ? `, ${skipped} computed (round) tip${skipped === 1 ? "" : "s"} skipped` : ""}. Pick one under Tip.`);
         return added;
     }
 
+    /** Every sampled tip of a .abr, named as the file names it (an unnamed one after the file and its index). */
     async tipsFromAbr(file) {
-        const { brushes } = readAbr(await file.arrayBuffer());
+        const { brushes, computed, warnings } = readAbr(await file.arrayBuffer());
+        this._tipsSkipped = (this._tipsSkipped || 0) + (computed || 0);
+        for (const w of warnings || []) console.info("brush import", file.name, w);
         const stem = file.name.replace(/\.abr$/i, "");
-        return brushes.map((b, i) => this.makeTip(`${stem} ${i + 1}`, tipCanvas(b, makeCanvas), b.spacing ? b.spacing / 100 : 0));
+        return brushes.map((b, i) => this.makeTip(b.name || `${stem} ${i + 1}`, tipCanvas(b, makeCanvas), b.spacing || 0, file.name));
     }
 
     async tipFromImage(file) {
@@ -4176,8 +4256,8 @@ class InpaintEditor {
         }
     }
 
-    makeTip(name, canvas, spacing) {
-        return { id: `tip${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`, name, canvas, spacing: spacing > 0.01 ? spacing : 0 };
+    makeTip(name, canvas, spacing, source = "") {
+        return { id: `tip${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`, name, canvas, spacing: spacing > 0.01 ? Math.min(2, spacing) : 0, source };
     }
 
     /** The tip tinted and scaled so its long side is `size`, cached for the running stroke. */
@@ -4210,10 +4290,22 @@ class InpaintEditor {
         const step = Math.max(1, Math.max(w, h) * (tip.spacing || this.brushTipSpacing));
         const dist = Math.hypot(lx1 - lx0, ly1 - ly0);
         const steps = Math.max(1, Math.ceil(dist / step));
+        // "Follow stroke": the tip turns with the direction of travel; a stationary dab keeps the last angle
+        const rotate = !!this.tipRotate;
+        if (rotate && dist > 0.5) this._tipAngle = Math.atan2(ly1 - ly0, lx1 - lx0);
+        const angle = rotate ? (this._tipAngle || 0) : 0;
         for (let i = 0; i <= steps; i++) {
             const t = steps === 0 ? 0 : i / steps;
             const x = lx0 + (lx1 - lx0) * t, y = ly0 + (ly1 - ly0) * t;
-            ctx.drawImage(stamp, x - w / 2, y - h / 2);
+            if (angle) {
+                ctx.save();
+                ctx.translate(x, y);
+                ctx.rotate(angle);
+                ctx.drawImage(stamp, -w / 2, -h / 2);
+                ctx.restore();
+            } else {
+                ctx.drawImage(stamp, x - w / 2, y - h / 2);
+            }
         }
     }
 
@@ -7941,6 +8033,21 @@ class InpaintEditor {
             ctx.strokeStyle = colour;
             ctx.beginPath(); ctx.arc(this.hover[0], this.hover[1], r, 0, Math.PI * 2); ctx.stroke();
         };
+        const tip = (this.tool === "paint" || this.tool === "erase") ? this.brushTip() : null;
+        if (tip) {
+            // the box the stamp will cover, long side = the brush size, turned with the stroke when following it
+            const k = this.brushSize / Math.max(tip.canvas.width, tip.canvas.height);
+            const w = tip.canvas.width * k, h = tip.canvas.height * k;
+            ctx.translate(this.hover[0], this.hover[1]);
+            if (this.tipRotate && this._tipAngle) ctx.rotate(this._tipAngle);
+            ctx.setLineDash([]);
+            ctx.lineWidth = 3 / s; ctx.strokeStyle = "rgba(0,0,0,0.8)";
+            ctx.strokeRect(-w / 2, -h / 2, w, h);
+            ctx.lineWidth = 1 / s; ctx.strokeStyle = colour;
+            ctx.strokeRect(-w / 2, -h / 2, w, h);
+            ctx.restore();
+            return;
+        }
         ring(this.brushSize / 2, false);
         if ((this.tool === "paint" || this.tool === "erase") && this.activeHardness() < 0.98) ring((this.brushSize / 2) * this.activeHardness(), true);
         ctx.restore();

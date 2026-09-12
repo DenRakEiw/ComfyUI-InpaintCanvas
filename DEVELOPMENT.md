@@ -1328,3 +1328,35 @@ Rules that came out of it:
   in a row leave 5 to 7 canvases (about 30 MB) alive and the benchmark within a few percent
   of the first round. Four of them *open at the same time* still cost 40 ms a frame, because
   19 GB of layer pixels really are live; that is what the host app's memory watch is for.
+
+## 22. Brush tips from Photoshop .abr files (2026-09-11, verified 2026-09-12)
+
+`js/inpaint_brushes.js` reads the format after GIMP's `gimpbrush-load.c` and scurest/abrupng
+(both GPL-3.0). Versions 1 and 2 are a flat list; 6 and 10 are `8BIM` blocks, padded to four
+bytes: `samp` holds the sampled bitmaps (each entry starts with the brush's UUID as a Pascal
+string, then a 10 or 264 byte header by subversion, the bounds, the depth and PackBits rows),
+`desc` an Action Descriptor (the PSD "Descriptor structure": Objc / VlLs / UntF / TEXT / enum /
+long / bool / type / alis / tdta / obj / ObAr) whose `Brsh` list holds one preset per entry,
+and `patt` the patterns. Neither reference reads `desc`; this reader does, because it is the
+only place the names and spacings live: a preset's `Brsh.sampledData` is the UUID of its
+bitmap, `Nm  ` its name (`$$$/Presets/Brushes/X=Name`), `Spcn` the spacing in percent of the
+diameter, `Dmtr` the preset's diameter (not the bitmap's size), `Angl` / `Rndn` / `flipX` /
+`flipY` the tip transform, which is not applied. Several presets may share one bitmap (the
+first one names it); a `dualBrush` inside a preset holds a second `Brsh`, named
+"<preset> (dual)". A preset without `sampledData` is a computed round tip: counted, skipped.
+
+Verified on Photoshop 2026's own packs (Default Brushes 6.2: 18 bitmaps, 28 presets; Legacy
+Brushes 10.2: 214 / 471; Converted Legacy Tool Presets 10.2: 36 / 144) and a 377 MB
+third-party 6.2 pack (109 / 187): every bitmap is referenced by a preset, the descriptor
+parser consumes the `desc` block to its last byte, and the mean coverage of the tips is
+0.03 to 0.7 (an inverted polarity would read 0.3 to 0.97). The stored value is the alpha.
+
+In the editor: `importBrushFiles` -> `tipsFromAbr` / `tipFromImage` -> `makeTip` (id, name,
+canvas, spacing as a fraction of the tip's size, source file); `stampDab` stamps the tinted
+tip (`tipStamp`, cached per size and colour) every `spacing * size` pixels and rotates it by
+the segment angle when `tipRotate` is on; `drawBrushRing` draws the tip's box instead of the
+circle; the eraser goes through the same `layerDab`, so a tip erases too. `onBrushTips` is
+the host hook, called after an import, a removal and a spacing change with the whole list;
+Scumble persists it, the node keeps the list in memory. Scumble's `tools/brush_test.js`
+writes synthetic files of every version (nothing copyrighted is stored) and checks the reader,
+`tools/brush_test.py` the editor path.
