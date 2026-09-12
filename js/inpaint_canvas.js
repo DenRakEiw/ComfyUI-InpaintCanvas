@@ -3144,6 +3144,32 @@ class InpaintEditor {
         this.renderLayers(); this.draw(); this.drawThumb(); this.notifyChanged();
     }
 
+    /**
+     * Snap the edges a scale gesture drags to the canvas edges, its centre and the guides
+     * (within 8 screen px), like a magnet: the pointer is shifted by the snap and the scale
+     * re-applied, so a kept aspect ratio stays consistent and "drag to the full picture" lands
+     * exactly. Rotated layers are not snapped (their edges are not axis-aligned).
+     */
+    snapScale(p, ix, iy) {
+        const l = p.layer, h = p.handle;
+        const th = 8 / this.view.scale;
+        const tx = [0, this.width / 2, this.width, ...((this.guides && this.guides.x) || [])];
+        const ty = [0, this.height / 2, this.height, ...((this.guides && this.guides.y) || [])];
+        const nearest = (edge, targets) => { let best = null; for (const t of targets) { const d = Math.abs(edge - t); if (d <= th && (!best || d < best[0])) best = [d, t - edge, t]; } return best; };
+        const edgeX = () => (h.includes("e") ? l.x + l.w : h.includes("w") ? l.x : null);
+        const edgeY = () => (h.includes("s") ? l.y + l.h : h.includes("n") ? l.y : null);
+        const ex = edgeX(), ey = edgeY();
+        const sx = ex == null ? null : nearest(ex, tx), sy = ey == null ? null : nearest(ey, ty);
+        if (!sx && !sy) return;
+        this.applyScale(p, ix + (sx ? sx[1] : 0), iy + (sy ? sy[1] : 0));
+        // with a kept aspect only the dominant axis lands exactly: show the lines for the edges that did
+        const gx = [], gy = [];
+        const ex2 = edgeX(), ey2 = edgeY();
+        if (sx && ex2 != null && Math.abs(ex2 - sx[2]) <= 1) gx.push(sx[2]);
+        if (sy && ey2 != null && Math.abs(ey2 - sy[2]) <= 1) gy.push(sy[2]);
+        this.snapGuides = gx.length || gy.length ? { x: gx, y: gy } : null;
+    }
+
     /** Snap a moving layer's edges and centre to the canvas edges and centre (within 8 screen px). */
     snapLayer(l) {
         const th = 8 / this.view.scale;
@@ -3658,6 +3684,8 @@ class InpaintEditor {
                 l.y = Math.round(l.y + (s * dx + c * dy) - dy);
             } else {
                 this.applyScale(p, ix, iy);
+                this.snapGuides = null;
+                if (!e.altKey) this.snapScale(p, ix, iy);
             }
         } else if (p.kind === "guide") {
             p.pos = Math.round(p.axis === "x" ? ix : iy);
@@ -8352,7 +8380,7 @@ class InpaintEditor {
             ctx.restore();
         }
 
-        if (this.snapGuides && this.pointer && this.pointer.kind === "move") {
+        if (this.snapGuides && this.pointer && (this.pointer.kind === "move" || this.pointer.kind === "scale")) {
             ctx.save();
             ctx.strokeStyle = "#ff66cc";
             ctx.lineWidth = 1 / s;

@@ -51,7 +51,7 @@ Minimal local chain: `crop_image` and `crop_mask` into VAE Encode (for Inpaintin
 
 ## Transform and canvas
 
-- **Transform** (T): drag inside to move, corners scale (Shift: free aspect), edges scale one axis, drag just outside a corner to rotate (Shift snaps to 15°). Rotate, distort (four corners) and warp (grid) preview live and are baked with Enter. The bar also has numeric X / Y / W / H, flip, rotate 90° and centre. While moving, the layer snaps to the canvas edges, centre and guides (Alt: free).
+- **Transform** (T): drag inside to move, corners scale (Shift: free aspect), edges scale one axis, drag just outside a corner to rotate (Shift snaps to 15°). Rotate, distort (four corners) and warp (grid) preview live and are baked with Enter. The bar also has numeric X / Y / W / H, flip, rotate 90° and centre. While moving or scaling, the layer's edges snap to the canvas edges, centre and guides like a magnet, so a layer dragged to the full picture lands exactly (Alt: free).
 - **Canvas tool** (C): the canvas as a frame. Drag its edges outward to extend (outpainting), inward to crop; it applies when you release, Ctrl+Z takes it back. Extending bakes the visible image into a new base and selects the new border; the Border fill decides what the model sees there. The Canvas section does the same with numbers and can resize the whole image.
 
 ## Filter layers
