@@ -1360,3 +1360,71 @@ the host hook, called after an import, a removal and a spacing change with the w
 Scumble persists it, the node keeps the list in memory. Scumble's `tools/brush_test.js`
 writes synthetic files of every version (nothing copyrighted is stored) and checks the reader,
 `tools/brush_test.py` the editor path.
+
+## 23. Large documents without tiles: the quick wins (2026-09-13, Scumble phase A)
+
+Scumble's `docs/PLAN_TILES.md` is the plan for a tile engine; its phase A is what could be
+done inside the current model, and it landed here first. Everything was measured on a
+synthetic 15,000 × 10,000 document (base, three full-size paint layers, a colour-matched
+result layer, a film look) on an RTX 5090 shared with ComfyUI. The rules that came out of it:
+
+- **The selection's undo step is a copy of its extent** (`snapshotSelection`): the 1/16
+  display level says where any alpha lies (`selectionExtent`, one cell of padding so a
+  feathered tail is inside), the copy is a canvas up to `SNAP_CANVAS_PX` (16 MP) and a PNG
+  of the extent above that, an empty selection is `{ empty: true }`. The restore clears the
+  canvas, draws the copy at its offset and refreshes the levels inside the union of the old
+  extent and the copy's rectangle (`markSelectionChanged(bounds, rect)`). Never encode a
+  whole-canvas PNG per selection step again.
+- **The bounding box is never a readback of the whole canvas.** `scanBoundsIn(box)` reads
+  64 px strips from the edges of a box known to hold the selection (rows from the top and
+  the bottom, then columns within those rows); the box is the extent, or after a subtract
+  the old box carried as a superset (`markSelectionChanged({ within })`, `selectionLoose`).
+  Wherever `selectionDirty = true` is set by hand, `selectionLoose = false` goes with it, or a
+  stale superset would be trusted. On a GPU canvas the cost of a readback is mostly waiting
+  for the work queued before it, so fewer and smaller readbacks matter more than fast loops.
+- **A rect undo keeps the display levels** (`applySnapshot` layerrect passes the rectangle
+  to `markLayerChanged` / `markMaskChanged`) and redraws only that layer's row thumbnail
+  (`refreshLayerThumb`); a full touch of a 600 MB layer cost the next frame 400 ms.
+- **A change keeps the colour-match statistics of the layers it cannot have touched**
+  (`bumpComposite`): matched layers below the changed one, and those whose rectangle plus
+  the statistics' 8 % padding lies clear of the changed box. `matchStats` is a readback and
+  waits for the GPU.
+- **Stroke buffers cover the gesture, not the layer** (`StrokeBuffer`): `ensure(box)` grows
+  the buffer with 32 px of padding and a quarter of headroom on the sides that grew, and
+  returns a context translated to the buffer's origin, so the dab code keeps drawing in
+  target pixels; `all()` is the whole target (a gradient). The selection clip is drawn for
+  the buffer's box on demand (`clipCanvasFor`, cached per buffer canvas in `p.clipCanvas`);
+  `clippedStroke(p)` is a canvas of the buffer's size placed at `p.stroke.x, p.stroke.y`.
+  `paintShape` takes the buffer's origin; `shapeBox` / `finishShape` set `p.bounds` from the
+  shape so the undo copy is the shape's box. A gesture's live previews (`strokePreview`,
+  `maskPreview`, `maskedPreview`) are refreshed inside the dab's rectangle
+  (`strokeDirty` / `takeDirty` / `refreshStrokePreview`, one dirty box per preview) and the
+  big ones are given back on pointer up (`releaseStrokeScratch`, above
+  `STROKE_SCRATCH_KEEP_PX`). A small buffer starts as a software canvas and grows onto the
+  GPU: Skia's CPU and GPU blending of twenty overlapping soft dabs round a few levels apart,
+  which is why Scumble's gate compares premultiplied values with a tolerance of 8.
+- **`destination-in`, `source-in`, `destination-atop` and `copy` apply to the whole canvas**,
+  not to the drawn rectangle (§21e met `copy`). A regional one needs `clip()` first, which is
+  how the masked live preview refreshes its box.
+- **The wand and the bucket flood a region** (`floodRegion`): a coarse flood on a composite
+  of at most `FLOOD_COARSE_PX` (2048) on the long side finds the box, the fine flood runs
+  inside it at full resolution and widens the box on every edge the region touches (the
+  worker reports `touches`) until it does not; a box above `FLOOD_WHOLE_SHARE` (40 %) of the
+  picture goes the old one-pass way; a non-contiguous select always does. `sampleRegion
+  (source, box, scale, opts)` composites a box at a scale through the same region pass the
+  screen uses, and marks its `viewPass` with `sample: true` so the filter and match caches
+  it fills are its own (`_fcacheSample`, `_fxCacheSample`, `_mcacheSample`) and the screen's
+  survive. The eyedropper composites one pixel. `applyShapeToSelection(shape, mode, box,
+  at)` places the shape at `at`. The bucket's undo step is a rect copy of the box.
+- **The compositor uploads a window of a large source** (`_source` in
+  `inpaint_compositor.js`, above `WINDOW_PX` = 16 MP): the part the view shows plus half the
+  view on each side, drawn into a scratch canvas; the cached window is reused while the view
+  stays inside it and the version is unchanged, and the quad is the window's rectangle
+  mapped back to image coordinates. Windows count in `stats()`. The compositor and Canvas
+  2D resample a level differently at a fractional zoom-out (up to 50 levels on a hard edge
+  at fit); that is the same with and without the windows and is not a window bug.
+- **Measured and not changed.** A `willReadFrequently` selection canvas lands in the GPU
+  process just the same in Chromium 152 and fills slower; `imageSmoothingQuality: "low"` on
+  the 2:1 pyramid levels gives the same pixels and is often faster, but the timings are
+  drowned in GPU queue waits on a shared card, so "medium" stays until a quiet measurement
+  says otherwise.
