@@ -516,6 +516,73 @@ function copyCanvas(src) {
 const LR = 0.299, LG = 0.587, LB = 0.114;
 
 // ---------------------------------------------------------------------------
+// normalise: the layer's colours pulled towards its own mean, or its levels stretched
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-channel mean and 1 % / 99 % levels of a canvas (0..255), alpha-weighted, sampled at
+ * up to 256 px on the long side, which is plenty for statistics. The GPU path uses the
+ * same numbers, so both paths agree.
+ */
+export function colourStats(src) {
+    const k = Math.min(1, 256 / Math.max(src.width, src.height));
+    const w = Math.max(1, Math.round(src.width * k)), h = Math.max(1, Math.round(src.height * k));
+    const c = makeCanvas(w, h);
+    const ctx = c.getContext("2d");
+    ctx.drawImage(src, 0, 0, w, h);
+    const px = ctx.getImageData(0, 0, w, h).data;
+    const hist = [new Float64Array(256), new Float64Array(256), new Float64Array(256)];
+    const sum = [0, 0, 0];
+    let wsum = 0;
+    for (let i = 0; i < px.length; i += 4) {
+        const a = px[i + 3] / 255;
+        if (!a) continue;
+        wsum += a;
+        for (let ch = 0; ch < 3; ch++) { const v = px[i + ch]; sum[ch] += v * a; hist[ch][v] += a; }
+    }
+    if (!wsum) return { mean: [128, 128, 128], lo: [0, 0, 0], hi: [255, 255, 255] };
+    const mean = sum.map((v) => v / wsum);
+    const level = (ch, frac) => { let acc = 0; for (let v = 0; v < 256; v++) { acc += hist[ch][v]; if (acc >= wsum * frac) return v; } return 255; };
+    const lo = [0, 1, 2].map((ch) => level(ch, 0.01)), hi = [0, 1, 2].map((ch) => Math.max(level(ch, 0.99), 0));
+    return { mean, lo, hi: hi.map((v, i) => Math.max(v, lo[i] + 1)) };
+}
+
+/**
+ * mode "colour": each pixel's chroma (its distance from its own luma) moves towards the mean
+ * colour's chroma, so the tint evens out while the light stays; "all": every value moves
+ * towards the mean; "levels": each channel stretched from its 1 % to its 99 % level.
+ * `amount` mixes the result in.
+ */
+function applyNormalize(src, p) {
+    const k = Math.max(0, Math.min(1, (p.amount ?? 50) / 100));
+    if (!k) return copyCanvas(src);
+    const st = colourStats(src);
+    const mode = p.mode || "colour";
+    const { out, octx, img, px } = openPixels(src);
+    const ym = LR * st.mean[0] + LG * st.mean[1] + LB * st.mean[2];
+    const mc = [st.mean[0] - ym, st.mean[1] - ym, st.mean[2] - ym];
+    const cl = (v) => (v < 0 ? 0 : v > 255 ? 255 : v);
+    for (let i = 0; i < px.length; i += 4) {
+        const r = px[i], g = px[i + 1], b = px[i + 2];
+        let nr, ng, nb;
+        if (mode === "levels") {
+            nr = (r - st.lo[0]) * 255 / (st.hi[0] - st.lo[0]); ng = (g - st.lo[1]) * 255 / (st.hi[1] - st.lo[1]); nb = (b - st.lo[2]) * 255 / (st.hi[2] - st.lo[2]);
+            nr = cl(nr); ng = cl(ng); nb = cl(nb);
+        } else if (mode === "all") {
+            nr = st.mean[0]; ng = st.mean[1]; nb = st.mean[2];
+        } else {
+            const y = LR * r + LG * g + LB * b;
+            nr = y + mc[0]; ng = y + mc[1]; nb = y + mc[2];
+        }
+        px[i] = Math.round(cl(r + (nr - r) * k));
+        px[i + 1] = Math.round(cl(g + (ng - g) * k));
+        px[i + 2] = Math.round(cl(b + (nb - b) * k));
+    }
+    octx.putImageData(img, 0, 0);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // hue / saturation / lightness
 // ---------------------------------------------------------------------------
 
@@ -854,6 +921,15 @@ export const FILTERS = {
         label: "Invert",
         params: [],
         apply: applyInvert,
+    },
+    normalize: {
+        label: "Normalise",
+        params: [
+            { key: "mode", label: "Mode", type: "select", default: "colour", title: "Colours: the tint evens out towards the mean colour, the light stays. All: every value moves towards the mean. Levels: each channel stretched to the full range.",
+                options: [{ id: "colour", label: "Colours towards the mean" }, { id: "all", label: "Everything towards the mean" }, { id: "levels", label: "Stretch levels" }] },
+            { key: "amount", label: "Amount", min: 0, max: 100, step: 1, default: 50, unit: "%" },
+        ],
+        apply: applyNormalize,
     },
     lut: {
         label: "LUT (.cube)",

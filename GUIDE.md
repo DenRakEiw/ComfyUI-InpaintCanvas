@@ -56,7 +56,7 @@ Minimal local chain: `crop_image` and `crop_mask` into VAE Encode (for Inpaintin
 
 ## Filter layers
 
-The fx button in the Layers header adds a filter layer. It filters everything below it, non-destructively, with a mask to limit where it applies: film grain with 46 stock presets (Portra, Kodachrome, Tri-X, Cinestill, ...) and real grain plates, sharpen, gaussian blur, levels, curves, brightness / contrast, hue / saturation, colour balance, black & white, invert, LUT (.cube) and vignette. Filters are part of what your chain sees, of flatten and of the saved image.
+The fx button in the Layers header adds a filter layer. It filters everything below it, non-destructively, with a mask to limit where it applies: film grain with 46 stock presets (Portra, Kodachrome, Tri-X, Cinestill, ...) and real grain plates, sharpen, gaussian blur, levels, curves, brightness / contrast, hue / saturation, colour balance, black & white, invert, normalise (the colours pulled towards the layer's mean with a slider, or its levels stretched), LUT (.cube) and vignette. Filters are part of what your chain sees, of flatten and of the saved image.
 
 ## Prompt and upsampling
 
