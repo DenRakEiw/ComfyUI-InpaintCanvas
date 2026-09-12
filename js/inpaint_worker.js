@@ -66,7 +66,11 @@ async function selection(msg) {
     return { bitmap: out.transferToImageBitmap(), bounds: maskBounds(img.data, W, H) };
 }
 
-/** The magic wand's and the bucket's region, as a shape in the requested colour. */
+/**
+ * The magic wand's and the bucket's region, as a shape in the requested colour. The bitmap
+ * may be a box cut out of the image: `touches` says on which of its edges the region
+ * arrives, so the editor can widen the box and ask again.
+ */
 async function flood(msg) {
     const src = canvasOf(msg.bitmap);
     const W = src.width, H = src.height;
@@ -86,7 +90,8 @@ async function flood(msg) {
         }
     }
     const shape = maskToColorCanvas(mask, W, H, msg.color || "#ff0000");
-    return { bitmap: shape.transferToImageBitmap(), count, bounds: x1 < 0 ? null : [x0, y0, x1 + 1, y1 + 1] };
+    const touches = x1 < 0 ? null : { l: x0 === 0, t: y0 === 0, r: x1 === W - 1, b: y1 === H - 1 };
+    return { bitmap: shape.transferToImageBitmap(), count, bounds: x1 < 0 ? null : [x0, y0, x1 + 1, y1 + 1], touches };
 }
 
 async function run(msg) {

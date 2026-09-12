@@ -29,6 +29,8 @@ const MAX_UNDO = 30;
 const MAX_UNDO_BYTES = 384 * 1024 * 1024;   // rect undo copies: older steps are dropped past this
 const PYRAMID_MIN_PX = 1 << 20;             // sources below 1 MP are drawn straight, no levels
 const PYRAMID_LEVELS = 8;
+const FLOOD_COARSE_PX = 2048;               // the wand's and the bucket's first pass runs on a composite this large
+const FLOOD_WHOLE_SHARE = 0.4;              // a region box above this share of the image is flooded in one pass over the whole image
 const SNAP_CANVAS_PX = 16 * 1024 * 1024;   // a selection undo step up to this many pixels is a canvas copy, above it a PNG
 const SYNC_ENCODE_PX = 16 * 1024 * 1024;    // above this the selection PNG for getValue is encoded off the main thread
 const WORKER_TIMEOUT = 180000;              // a worker job that never answers falls back to the main thread
@@ -3977,19 +3979,23 @@ class InpaintEditor {
     }
 
     /**
-     * The same with the region already drawn (a canvas or an ImageBitmap from the worker).
-     * `box` is the region's bounding box when the caller knows it, so the new selection's
-     * bounds do not have to be scanned for.
+     * The same with the region already drawn (a canvas or an ImageBitmap from the worker),
+     * placed with its top left corner at `at` (image coordinates; the shape may be a box
+     * of the image rather than all of it). `box` is the region's bounding box in image
+     * coordinates when the caller knows it, so the new selection's bounds do not have to
+     * be scanned for.
      */
-    applyShapeToSelection(shape, mode = "replace", box = null) {
+    applyShapeToSelection(shape, mode = "replace", box = null, at = [0, 0]) {
         const hint = box ? this.boundsAfter(mode, box) : undefined;
         this.pushUndo({ kind: "selection" });
         const sctx = this.selection.getContext("2d");
         if (mode === "replace") { sctx.globalCompositeOperation = "source-over"; sctx.clearRect(0, 0, this.width, this.height); this.selectionLabel = ""; }
         sctx.globalCompositeOperation = mode === "subtract" ? "destination-out" : "source-over";
-        sctx.drawImage(shape, 0, 0);
+        sctx.drawImage(shape, at[0], at[1]);
         sctx.globalCompositeOperation = "source-over";
-        this.markSelectionChanged(hint);
+        // a replace clears the whole canvas, so its levels are refreshed whole; add and subtract touch the shape's box
+        const rect = mode === "replace" ? undefined : [at[0], at[1], at[0] + shape.width, at[1] + shape.height];
+        this.markSelectionChanged(hint, rect);
         this.draw();
     }
 
@@ -4020,36 +4026,125 @@ class InpaintEditor {
     }
 
     /**
-     * The region of similar pixels around (x, y) of `src`, as a shape in `color`
-     * (a canvas or an ImageBitmap) plus the number of pixels it covers. Runs in the
-     * worker when there is one; `clip` limits it to the selection.
+     * The region of similar pixels around (x, y) of `src` (a canvas of any size: the whole
+     * image, or a box of it whose top left corner sits at `at` in image coordinates), as a
+     * shape in `color` (a canvas or an ImageBitmap) plus the number of pixels it covers, its
+     * bounds in `src`'s own pixels and on which edges of `src` it arrives. Runs in the worker
+     * when there is one; `clip` limits it to the selection.
      */
-    async floodShape(src, x, y, { tolerance = 32, contiguous = true, color = "#ff0000", clip = false } = {}) {
+    async floodShape(src, x, y, { tolerance = 32, contiguous = true, color = "#ff0000", clip = false, at = [0, 0] } = {}) {
+        const W = src.width, H = src.height;
+        const clipping = clip && this.getBounds();
         if (editorWorker()) {
             const transfer = [];
             try {
                 const bitmap = await createImageBitmap(src);
                 transfer.push(bitmap);
                 const args = { bitmap, x, y, tolerance, contiguous, color };
-                if (clip && this.getBounds()) {
-                    const selBitmap = await createImageBitmap(this.selection);
+                if (clipping) {
+                    // only the box of the selection: a crop, not a copy of the whole canvas
+                    const selBitmap = await createImageBitmap(this.selection, at[0], at[1], W, H);
                     transfer.push(selBitmap);
                     args.selBitmap = selBitmap;
                 }
                 const r = await workerCall("flood", args, transfer);
-                if (r.bitmap) return { shape: r.bitmap, count: r.count, bounds: r.bounds, close: true };
+                if (r.bitmap) return { shape: r.bitmap, count: r.count, bounds: r.bounds, touches: r.touches, close: true };
             } catch (err) {
                 console.warn("Inpaint Canvas: the region in the worker failed, using the main thread:", (err && err.message) || err);
                 for (const b of transfer) { try { b.close(); } catch (_) { /* already transferred */ } }
             }
         }
-        const data = src.getContext("2d").getImageData(0, 0, this.width, this.height).data;
-        const mask = floodMask(data, this.width, this.height, x, y, tolerance, contiguous);
-        if (clip && this.getBounds()) clipMaskToSelection(mask, this.selection);
+        const data = src.getContext("2d").getImageData(0, 0, W, H).data;
+        const mask = floodMask(data, W, H, x, y, tolerance, contiguous);
+        if (clipping) {
+            let sel = this.selection;
+            if (at[0] || at[1] || W !== this.width || H !== this.height) { sel = makeCanvas(W, H); sel.getContext("2d").drawImage(this.selection, -at[0], -at[1]); }
+            clipMaskToSelection(mask, sel);
+        }
         let count = 0;
         for (let i = 0; i < mask.length; i++) count += mask[i];
-        const shape = maskToColorCanvas(mask, this.width, this.height, color);
-        return { shape, count, bounds: maskBounds(shape.getContext("2d").getImageData(0, 0, this.width, this.height).data, this.width, this.height), close: false };
+        const shape = maskToColorCanvas(mask, W, H, color);
+        const bounds = maskBounds(shape.getContext("2d").getImageData(0, 0, W, H).data, W, H);
+        const touches = bounds ? { l: bounds[0] === 0, t: bounds[1] === 0, r: bounds[2] === W, b: bounds[3] === H } : null;
+        return { shape, count, bounds, touches, close: false };
+    }
+
+    /**
+     * The region of similar pixels around (x, y) in image coordinates, found without a
+     * full-resolution composite of the whole image (phase A item 3 of the app's
+     * docs/PLAN_TILES.md; on a 15k document that composite alone was 0.6 s, the flood over
+     * 150 million pixels two more). Two passes: a coarse flood on a composite of at most
+     * FLOOD_COARSE_PX on the long side finds the region's box; the fine flood then runs
+     * inside that box, composited at full resolution for the box only, and widens the box
+     * where the region arrives at its edge (a thin bridge the coarse pass could not see)
+     * until it does not, or the box is the image. The answer carries the box's origin
+     * (`x`, `y`) and size, the bounds in image coordinates, and the shape at box size.
+     * A non-contiguous select (every similar pixel of the image) has to read it all and
+     * takes the old path.
+     */
+    async floodRegion(x, y, o) {
+        const W = this.width, H = this.height;
+        const whole = async () => {
+            const r = await this.floodShape(this.sampleCanvas(o.sample), x, y, { tolerance: o.tolerance, contiguous: o.contiguous, color: o.color, clip: o.clip });
+            return { ...r, x: 0, y: 0, w: W, h: H, rounds: 0 };
+        };
+        if (!o.contiguous || Math.max(W, H) <= FLOOD_COARSE_PX) return whole();
+        const s = FLOOD_COARSE_PX / Math.max(W, H);
+        const coarse = this.sampleRegion(o.sample, [0, 0, W, H], s);
+        const cr = await this.floodShape(coarse, Math.floor(x * s), Math.floor(y * s), { tolerance: o.tolerance, contiguous: true, clip: false });
+        if (cr.close) cr.shape.close();
+        const pad = Math.ceil(2 / s) + 8;
+        let box = cr.bounds
+            ? [cr.bounds[0] / s - pad, cr.bounds[1] / s - pad, cr.bounds[2] / s + pad, cr.bounds[3] / s + pad]
+            : [x - pad, y - pad, x + pad, y + pad];
+        for (let round = 1; ; round++) {
+            box = [Math.max(0, Math.floor(box[0])), Math.max(0, Math.floor(box[1])), Math.min(W, Math.ceil(box[2])), Math.min(H, Math.ceil(box[3]))];
+            const [bx, by, bx1, by1] = box, bw = bx1 - bx, bh = by1 - by;
+            // a region that covers most of the picture is cheaper in one pass than box by box
+            if (bw <= 0 || bh <= 0 || bw * bh > W * H * FLOOD_WHOLE_SHARE) return whole();
+            const fine = this.sampleRegion(o.sample, box, 1);
+            const r = await this.floodShape(fine, x - bx, y - by, { tolerance: o.tolerance, contiguous: true, color: o.color, clip: o.clip, at: [bx, by] });
+            const t = r.touches || {};
+            const l = t.l && bx > 0, tp = t.t && by > 0, rt = t.r && bx1 < W, b = t.b && by1 < H;
+            if (!(l || tp || rt || b) || round >= 8) {
+                return { ...r, x: bx, y: by, w: bw, h: bh, rounds: round, bounds: r.bounds ? [r.bounds[0] + bx, r.bounds[1] + by, r.bounds[2] + bx, r.bounds[3] + by] : null };
+            }
+            if (r.close) r.shape.close();
+            // widen by half the box on every side the region reached
+            box = [l ? bx - bw / 2 : bx, tp ? by - bh / 2 : by, rt ? bx1 + bw / 2 : bx1, b ? by1 + bh / 2 : by1];
+        }
+    }
+
+    /**
+     * A canvas of the region `box` ([x0, y0, x1, y1] in image coordinates) of what the
+     * bucket, wand and eyedropper look at, at `scale` pixels per image pixel: the visible
+     * image composited for that box only (the same region pass the screen uses), or the
+     * active layer alone. `opts` are drawComposite's (`forRun` leaves the helper layers out).
+     */
+    sampleRegion(source, box, scale, opts = {}) {
+        const [x0, y0, x1, y1] = box;
+        const w = Math.max(1, Math.round((x1 - x0) * scale)), h = Math.max(1, Math.round((y1 - y0) * scale));
+        const c = makeCanvas(w, h);
+        const ctx = c.getContext("2d");
+        ctx.setTransform(scale, 0, 0, scale, -x0 * scale, -y0 * scale);
+        if (source === "layer") {
+            const l = this.activeLayer();
+            if (l && l.kind !== "filter" && l.canvas) {
+                const px = this.layerPixels(l);
+                ctx.imageSmoothingEnabled = true;
+                ctx.drawImage(this.displaySource(px, (l.w * scale) / px.width), l.x, l.y, l.w, l.h);
+                return c;
+            }
+        }
+        const prev = this.viewPass;
+        // `sample`: this pass keeps its own filter and match caches, the screen's stay
+        this.viewPass = { x: x0, y: y0, w: x1 - x0, h: y1 - y0, sx: scale, sy: scale, sample: true };
+        try {
+            this.drawComposite(ctx, opts);
+        } finally {
+            this.viewPass = prev;
+        }
+        return c;
     }
 
     /** Magic wand: the area of similar colour under (ix, iy) becomes the selection. */
@@ -4059,10 +4154,10 @@ class InpaintEditor {
         if (x < 0 || y < 0 || x >= this.width || y >= this.height) return;
         const o = this.fillOpts || { tolerance: 32, contiguous: true, sample: "image" };
         const t0 = performance.now();
-        const { shape, count, bounds, close } = await this.floodShape(this.sampleCanvas(o.sample), x, y, { tolerance: o.tolerance, contiguous: o.contiguous });
-        this.applyShapeToSelection(shape, mode, bounds);
-        if (close) shape.close();
-        this.setStatus(`${count.toLocaleString()} px ${mode === "replace" ? "selected" : mode === "add" ? "added" : "subtracted"} (${Math.round(performance.now() - t0)} ms).`);
+        const r = await this.floodRegion(x, y, { tolerance: o.tolerance, contiguous: o.contiguous, sample: o.sample });
+        this.applyShapeToSelection(r.shape, mode, r.bounds, [r.x, r.y]);
+        if (r.close) r.shape.close();
+        this.setStatus(`${r.count.toLocaleString()} px ${mode === "replace" ? "selected" : mode === "add" ? "added" : "subtracted"} (${Math.round(performance.now() - t0)} ms).`);
     }
 
     /** Soften the selection edge: gaussian blur of the mask. */
@@ -4398,7 +4493,7 @@ class InpaintEditor {
         }
         layer._maskedValid = false;
         layer._mcache = null;
-        layer._mcacheView = null;
+        layer._mcacheView = null; layer._mcacheSample = null;
         this.touchSource(c);
     }
 
@@ -4653,7 +4748,8 @@ class InpaintEditor {
     pickColor(ix, iy) {
         if (!this.width) return;
         const x = Math.max(0, Math.min(this.width - 1, Math.floor(ix))), y = Math.max(0, Math.min(this.height - 1, Math.floor(iy)));
-        const d = this.sampleCanvas(this.fillOpts && this.fillOpts.sample).getContext("2d").getImageData(x, y, 1, 1).data;
+        // one pixel composited, not the whole image (0.6 s on a 15k document)
+        const d = this.sampleRegion(this.fillOpts && this.fillOpts.sample, [x, y, x + 1, y + 1], 1).getContext("2d").getImageData(0, 0, 1, 1).data;
         if (d[3] === 0) { this.setStatus("Transparent here, nothing to pick."); return; }
         const hex = rgbToHex(d[0], d[1], d[2]);
         this.color = hex;
@@ -4671,19 +4767,23 @@ class InpaintEditor {
         if (x < 0 || y < 0 || x >= this.width || y >= this.height) return;
         const o = this.fillOpts || { tolerance: 32, contiguous: true, sample: "image" };
         const t0 = performance.now();
-        const { shape: fill, count: n, close } = await this.floodShape(this.sampleCanvas(o.sample), x, y, { tolerance: o.tolerance, contiguous: o.contiguous, color: this.color, clip: true });
-        if (!n) { if (close) fill.close(); this.setStatus("Nothing to fill here (outside the selection?)."); return; }
+        const r = await this.floodRegion(x, y, { tolerance: o.tolerance, contiguous: o.contiguous, sample: o.sample, color: this.color, clip: true });
+        const fill = r.shape, n = r.count;
+        if (!n) { if (r.close) fill.close(); this.setStatus("Nothing to fill here (outside the selection?)."); return; }
         if (!layer) layer = this.addPaintLayer();
-        this.pushUndo({ kind: "layer", id: layer.id });
+        // the undo step is a copy of the box the fill can touch, in the layer's own pixels
+        const sx = layer.canvas.width / layer.w, sy = layer.canvas.height / layer.h;
+        const lx = (r.x - layer.x) * sx, ly = (r.y - layer.y) * sy, lw = r.w * sx, lh = r.h * sy;
+        this.pushUndoSnapshot(this.snapshotRect(layer, { x: lx, y: ly, w: lw, h: lh }));
         const ctx = layer.canvas.getContext("2d");
         ctx.save();
         ctx.globalAlpha = this.brushOpacity;
         ctx.globalCompositeOperation = layer.alphaLock ? "source-atop" : "source-over";
-        ctx.setTransform(layer.canvas.width / layer.w, 0, 0, layer.canvas.height / layer.h, 0, 0);
-        ctx.drawImage(fill, -layer.x, -layer.y);
+        ctx.setTransform(sx, 0, 0, sy, 0, 0);
+        ctx.drawImage(fill, r.x - layer.x, r.y - layer.y);
         ctx.restore();
-        if (close) fill.close();
-        this.markLayerChanged(layer);
+        if (r.close) fill.close();
+        this.markLayerChanged(layer, [Math.floor(lx), Math.floor(ly), Math.ceil(lx + lw), Math.ceil(ly + lh)]);
         this.draw();
         this.setStatus(`Filled ${n.toLocaleString()} px on ${layer.name} (${Math.round(performance.now() - t0)} ms).`);
     }
@@ -5706,7 +5806,7 @@ class InpaintEditor {
         layer.dirty = true;
         layer._maskedValid = false;
         layer._mcache = null;
-        layer._mcacheView = null;
+        layer._mcacheView = null; layer._mcacheSample = null;
         layer._mstats = null;
         layer._mstatsView = null;
         layer.exportRef = null;
@@ -5806,7 +5906,7 @@ class InpaintEditor {
 
     markFilterChanged(layer, { soon = false } = {}) {
         layer._fcache = null;
-        layer._fcacheView = null;
+        layer._fcacheView = null; layer._fcacheSample = null; layer._fxCacheSample = null;
         this.uploaded.baseHash = null;
         if (soon) { this.drawSoon(); return; }   // slider drag: one draw per frame, thumbnail and save on release
         this.draw();
@@ -5868,7 +5968,7 @@ class InpaintEditor {
     filteredCanvas(layer, below, forRun, preview) {
         const vp = this.viewPass;
         const key = JSON.stringify([layer.filter, layer.params, layer.lut && layer.lut.ref && layer.lut.ref.filename, layer.plate && layer.plate.ref && layer.plate.ref.filename, !!forRun, !!preview, below.width, below.height, vp ? [vp.x, vp.y] : 0]);
-        const slot = vp ? "_fcacheView" : "_fcache";
+        const slot = vp ? (vp.sample ? "_fcacheSample" : "_fcacheView") : "_fcache";
         const c = layer[slot];
         if (c && c.version === this.compositeVersion && c.key === key) return c.canvas;
         let input = below, scale = vp ? vp.sx : 1;
@@ -5883,7 +5983,7 @@ class InpaintEditor {
             }
         }
         let canvas = null;
-        const fxSlot = vp ? "_fxCacheView" : "_fxCache";
+        const fxSlot = vp ? (vp.sample ? "_fxCacheSample" : "_fxCacheView") : "_fxCache";
         if (!layer[fxSlot]) layer[fxSlot] = {};
         // where the input sits in the image, in its own pixels: filters with a field of
         // their own (grain) anchor it there instead of at the corner of the preview
@@ -5942,7 +6042,7 @@ class InpaintEditor {
         if (!layer.mask) layer.maskRef = null;
         layer._maskedValid = false;
         layer._mcache = null;
-        layer._mcacheView = null;
+        layer._mcacheView = null; layer._mcacheSample = null;
         // `rect` (in the mask's own pixels) keeps the cached levels and refreshes them there
         if (rect && layer.mask) this.touchSourceRect(layer.mask, rect[0], rect[1], rect[2], rect[3]);
         else this.touchSource(layer.mask);
@@ -8017,7 +8117,7 @@ class InpaintEditor {
 
     markMatchChanged(layer) {
         layer._mcache = null;
-        layer._mcacheView = null;
+        layer._mcacheView = null; layer._mcacheSample = null;
         layer._mstats = null;
         layer._mstatsView = null;
         this.uploaded.baseHash = null;
@@ -8038,7 +8138,7 @@ class InpaintEditor {
         // in a region pass the match is applied to the pyramid level that is actually drawn
         const out0 = vp ? this.displaySource(px, (layer.w * vp.sx) / px.width) : px;
         const key = JSON.stringify([m.strength, m.source, layer.x, layer.y, layer.w, layer.h, out0.width, out0.height]);
-        const slot = vp ? "_mcacheView" : "_mcache";
+        const slot = vp ? (vp.sample ? "_mcacheSample" : "_mcacheView") : "_mcache";
         const c = layer[slot];
         if (c && c.version === this.compositeVersion && c.key === key) return c.canvas;
         const st = this.matchStats(layer, below, vp, out0);
@@ -8769,11 +8869,12 @@ class InpaintEditor {
         let freed = 0;
         const sources = [];
         for (const l of this.layers) {
-            for (const slot of ["_fcache", "_fcacheView", "_mcache", "_mcacheView"]) {
+            for (const slot of ["_fcache", "_fcacheView", "_fcacheSample", "_mcache", "_mcacheView", "_mcacheSample"]) {
                 if (l[slot]) { freed += px(l[slot].canvas); l[slot] = null; }
             }
             l._fxCache = null;
             l._fxCacheView = null;
+            l._fxCacheSample = null;
             l._mstats = null;
             l._mstatsView = null;
             if (l._masked) { freed += px(l._masked); sources.push(l._masked); l._masked = null; l._maskedValid = false; }
@@ -9138,11 +9239,11 @@ class InpaintEditor {
             add(own, "canvas", l.canvas);
             add(own, "mask", l.mask);
             add(own, "_masked", l._masked);
-            for (const slot of ["_fcache", "_fcacheView", "_mcache", "_mcacheView"]) {
+            for (const slot of ["_fcache", "_fcacheView", "_fcacheSample", "_mcache", "_mcacheView", "_mcacheSample"]) {
                 const c = l[slot] && l[slot].canvas;
                 add(own, slot, c);
             }
-            for (const c of [l.canvas, l.mask, l._masked, l._mcache && l._mcache.canvas, l._mcacheView && l._mcacheView.canvas]) if (c) sources.push(c);
+            for (const c of [l.canvas, l.mask, l._masked, l._mcache && l._mcache.canvas, l._mcacheView && l._mcacheView.canvas, l._mcacheSample && l._mcacheSample.canvas]) if (c) sources.push(c);
             layers.push({ id: l.id, name: l.name, kind: l.kind, w: l.w, h: l.h, bytes: sum(own), slots: own });
         }
         for (const c of [this._baseCanvas, this.selection]) if (c) sources.push(c);
