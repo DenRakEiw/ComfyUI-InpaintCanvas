@@ -29,6 +29,7 @@ const MAX_UNDO = 30;
 const MAX_UNDO_BYTES = 384 * 1024 * 1024;   // rect undo copies: older steps are dropped past this
 const PYRAMID_MIN_PX = 1 << 20;             // sources below 1 MP are drawn straight, no levels
 const PYRAMID_LEVELS = 8;
+const SNAP_CANVAS_PX = 16 * 1024 * 1024;   // a selection undo step up to this many pixels is a canvas copy, above it a PNG
 const SYNC_ENCODE_PX = 16 * 1024 * 1024;    // above this the selection PNG for getValue is encoded off the main thread
 const WORKER_TIMEOUT = 180000;              // a worker job that never answers falls back to the main thread
 const HANDLE_PX = 9;
@@ -1093,6 +1094,7 @@ class InpaintEditor {
         this.undo = [];
         this.redo = [];
         this.selectionDirty = true;
+        this.selectionLoose = false;   // cachedBounds is a superset of the selection, made exact on the next getBounds()
         this.selectionDataUrl = null;
         this.cachedBounds = null;
         this.compositeVersion = 0;      // bumped whenever the composite changes (filter caches key on it)
@@ -3309,7 +3311,7 @@ class InpaintEditor {
             this.width = nw; this.height = nh;
             this.pushUndoSnapshot(before);
             this.uploaded = this.makeUploaded();
-            this.selectionDirty = true;
+            this.selectionDirty = true; this.selectionLoose = false;
             this.selectionDataUrl = null;
             this.renderLayers(); this.renderInfo(); this.fitView(); this.drawThumb(); this.notifyChanged();
             this.setStatus(`Canvas cropped to ${nw} × ${nh}; the layers keep their pixels (Ctrl+Z takes it back).`);
@@ -3355,7 +3357,7 @@ class InpaintEditor {
             this.width = nw; this.height = nh;
             this.pushUndoSnapshot(before);
             this.uploaded = this.makeUploaded();
-            this.selectionDirty = true;
+            this.selectionDirty = true; this.selectionLoose = false;
             this.selectionDataUrl = null;
             this.renderLayers(); this.renderInfo(); this.fitView(); this.drawThumb(); this.notifyChanged();
             this.setStatus(`Image resized to ${nw} × ${nh} (Ctrl+Z takes it back). Layers keep their own resolution.`);
@@ -3663,7 +3665,7 @@ class InpaintEditor {
                 this.cachedBounds = (nb[2] > nb[0] && nb[3] > nb[1]) ? nb : null;
                 this.selectionDirty = false;
             } else {
-                this.selectionDirty = true;
+                this.selectionDirty = true; this.selectionLoose = false;
             }
         } else if (p.kind === "lasso") {
             this.lassoPoints.push([ix, iy]);
@@ -3790,8 +3792,9 @@ class InpaintEditor {
             }
         } else if (p.kind === "selpaint") {
             const filled = this.fillEnclosed && this.closeStrokeLoop(p.path, !!p.subtract);
-            // the dabs kept the levels up to date; a closed loop filled its whole box
-            this.markSelectionChanged(undefined, filled ? undefined : p.bounds);
+            // the dabs kept the levels up to date and a closed loop fills inside the path, which
+            // lies within the dabs' box; that box is the new bounds (an add) or their superset (a subtract)
+            this.markSelectionChanged(p.bounds ? this.boundsAfter(p.subtract ? "subtract" : "add", p.bounds) : undefined, p.bounds);
         } else if (p.kind === "object") {
             if (!p.moved) this.toggleObjectAt(...this.toImage(e), p);
         } else if (p.kind === "layerpaint") {
@@ -5364,7 +5367,7 @@ class InpaintEditor {
             sctx.clearRect(left, top, W, H);
             this.pushUndoSnapshot(before);
             this.uploaded = this.makeUploaded();
-            this.selectionDirty = true;
+            this.selectionDirty = true; this.selectionLoose = false;
             this.selectionDataUrl = null;
             for (const k of Object.keys(this.extendInputs)) this.extendInputs[k].value = 0;
             this.renderLayers();
@@ -5402,6 +5405,27 @@ class InpaintEditor {
         const c = makeCanvas(w, h);
         c.getContext("2d").drawImage(target, x, y, w, h, 0, 0, w, h);
         return { kind: "layerrect", id: layer.id, mask, x, y, w, h, canvas: c, bytes: w * h * 4 };
+    }
+
+    /**
+     * The undo step of a selection change: a copy of the selection inside its extent, the
+     * way a brush stroke's step is a copy of the touched rectangle. A whole-canvas PNG
+     * used to be encoded per step, which on a 15k document is 150 million pixels through
+     * the worker for a marquee that covers a corner. Up to SNAP_CANVAS_PX the copy is a
+     * canvas (a GPU blit, counted against MAX_UNDO_BYTES); above it the extent is encoded
+     * as a PNG off the main thread, like the old whole-canvas step. An empty selection is
+     * a step without pixels.
+     */
+    snapshotSelection() {
+        const ext = this.selectionExtent();
+        const bounds = this.selectionDirty ? undefined : this.cachedBounds;
+        if (!ext) return { kind: "selection", empty: true, bytes: 0, bounds: null };
+        const [x, y, x1, y1] = ext;
+        const w = x1 - x, h = y1 - y;
+        const c = makeCanvas(w, h);
+        c.getContext("2d").drawImage(this.selection, x, y, w, h, 0, 0, w, h);
+        if (w * h > SNAP_CANVAS_PX) return { kind: "selection", x, y, w, h, url: this.snapUrl(c), bytes: 0, bounds };
+        return { kind: "selection", x, y, w, h, canvas: c, bytes: w * h * 4, bounds };
     }
 
     /** Widen the box a gesture has painted over (image coordinates). */
@@ -5448,7 +5472,7 @@ class InpaintEditor {
             const l = this.layers.find((x) => x.id === step.id);
             return l ? this.snapshotRect(l, step, step.mask) : null;
         }
-        if (step.kind === "selection") return { kind: "selection", url: this.snapUrl(this.selection) };
+        if (step.kind === "selection") return this.snapshotSelection();
         if (step.kind === "layers") return { kind: "layers", layers: this.layers.map((l) => ({ ...l })), activeLayerId: this.activeLayerId };
         if (step.kind === "canvas") {
             // base, size, selection and the layer list (shallow copies: the canvases themselves are never mutated by extend / crop, only replaced)
@@ -5501,7 +5525,7 @@ class InpaintEditor {
             this.selection = makeCanvas(this.width, this.height);
             try { this.selection.getContext("2d").drawImage(await snapImage(snap.selection), 0, 0); } catch (_) { /* empty selection */ }
             this.uploaded = this.makeUploaded();
-            this.selectionDirty = true;
+            this.selectionDirty = true; this.selectionLoose = false;
             this.selectionDataUrl = null;
             if (this.extendInputs) for (const k of Object.keys(this.extendInputs)) this.extendInputs[k].value = 0;
             this.renderLayers();
@@ -5513,12 +5537,22 @@ class InpaintEditor {
             return;
         }
         if (snap.kind === "selection") {
-            const img = await snapImage(snap.url);
+            // the copy goes back where it was taken from; what was selected outside it since is
+            // cleared. The display levels are refreshed inside the union of both rectangles, so
+            // an undo costs the selection's extent and not a rebuild of the levels of a 15k canvas.
+            const old = this.selectionExtent();
+            const img = snap.empty ? null : (snap.canvas || await snapImage(snap.url));
             const sctx = this.selection.getContext("2d");
+            sctx.save();
+            sctx.setTransform(1, 0, 0, 1, 0, 0);
+            sctx.globalAlpha = 1;
             sctx.globalCompositeOperation = "source-over";
             sctx.clearRect(0, 0, this.width, this.height);
-            sctx.drawImage(img, 0, 0);
-            this.markSelectionChanged();
+            if (img) sctx.drawImage(img, snap.x, snap.y);
+            sctx.restore();
+            const now = snap.empty ? null : [snap.x, snap.y, snap.x + snap.w, snap.y + snap.h];
+            const rect = old && now ? [Math.min(old[0], now[0]), Math.min(old[1], now[1]), Math.max(old[2], now[2]), Math.max(old[3], now[3])] : (old || now || [0, 0, 1, 1]);
+            this.markSelectionChanged(snap.bounds, rect);
         } else {
             const layer = this.layers.find((l) => l.id === snap.id);
             if (!layer) return;
@@ -5575,8 +5609,11 @@ class InpaintEditor {
                     ctx.drawImage(snap.canvas, snap.x, snap.y);
                     ctx.restore();
                 }
-                if (snap.mask) this.markMaskChanged(layer); else this.markLayerChanged(layer);
-                this.renderLayers();
+                // the touched rectangle is known: the display levels are refreshed there instead
+                // of being rebuilt, which on a 15k layer cost the next frame 400 ms
+                const rect = [snap.x, snap.y, snap.x + snap.w, snap.y + snap.h];
+                if (snap.mask) this.markMaskChanged(layer, rect); else this.markLayerChanged(layer, rect);
+                this.refreshLayerThumb(layer);   // nothing else in the list changed
             } else if (snap.kind === "layerfull") {
                 const img = await snapImage(snap.url);
                 layer.canvas = imageToCanvas(img, snap.cw, snap.ch);
@@ -5640,15 +5677,20 @@ class InpaintEditor {
 
     /**
      * The selection changed. `bounds` is its new bounding box when the caller knows it
-     * ([x0, y0, x1, y1] or null for an empty selection); left out it is scanned for on
-     * the next getBounds().
+     * ([x0, y0, x1, y1] or null for an empty selection), `{ within: box }` when only a
+     * rectangle holding it is known (a subtract: the old box), left out it is scanned for
+     * on the next getBounds(). `rect` is the rectangle the pixels changed in (image
+     * coordinates): the display levels are refreshed there instead of being rebuilt.
      */
     markSelectionChanged(bounds, rect) {
         if (bounds === undefined) {
-            this.selectionDirty = true;
+            this.selectionDirty = true; this.selectionLoose = false;
+        } else if (bounds && bounds.within) {
+            this.cachedBounds = bounds.within;
+            this.selectionDirty = true; this.selectionLoose = true;
         } else {
             this.cachedBounds = bounds;
-            this.selectionDirty = false;
+            this.selectionDirty = false; this.selectionLoose = false;
         }
         this.selectionSeq++;
         this.selectionEncoded = false;
@@ -5672,11 +5714,46 @@ class InpaintEditor {
         if (rect) this.touchSourceRect(layer.canvas, rect[0], rect[1], rect[2], rect[3]);
         else this.touchSource(layer.canvas);
         this.touchSource(layer._masked);
-        this.uploaded.baseHash = null;
+        this.bumpComposite(layer, rect ? this.layerRectToImage(layer, layer.canvas, rect) : null);
         this.uploaded.controlHash = null;
         this.drawThumb();
         this.notifyChanged();
         this.scheduleAutosave();
+    }
+
+    /** A rectangle in a layer target's own pixels ([x0, y0, x1, y1]) in image coordinates. */
+    layerRectToImage(layer, target, rect) {
+        const sx = layer.w / target.width, sy = layer.h / target.height;
+        return [layer.x + rect[0] * sx, layer.y + rect[1] * sy, layer.x + rect[2] * sx, layer.y + rect[3] * sy];
+    }
+
+    /**
+     * The composite changed because `layer`'s pixels changed inside `box` (image coordinates,
+     * null for the whole layer). The colour-match statistics of every other layer are keyed
+     * on the composite version and would be scanned for again on the next frame, which is a
+     * readback that waits for the GPU (40 to 380 ms on a 15k document); those that the change
+     * cannot have touched keep their statistics: a matched layer below the changed one (its
+     * backdrop is untouched), and one whose sampling rectangle (its own rectangle plus the
+     * statistics' padding) lies clear of the box.
+     */
+    bumpComposite(layer, box) {
+        const v0 = this.compositeVersion;
+        this.uploaded.baseHash = null;   // bumps compositeVersion
+        const v1 = this.compositeVersion;
+        if (v1 === v0) return;
+        const i = this.layers.indexOf(layer);
+        const b = box || [layer.x, layer.y, layer.x + layer.w, layer.y + layer.h];
+        for (let j = 0; j < this.layers.length; j++) {
+            const l = this.layers[j];
+            if (l === layer || !this.matchActive(l)) continue;
+            let keep = j < i;   // below the change: its backdrop did not change
+            if (!keep) {
+                const pad = Math.max(8, Math.max(l.w, l.h) * 0.1);   // matchStats samples 8 % around the layer
+                keep = b[2] <= l.x - pad || b[0] >= l.x + l.w + pad || b[3] <= l.y - pad || b[1] >= l.y + l.h + pad;
+            }
+            if (!keep) continue;
+            for (const slot of ["_mstats", "_mstatsView"]) if (l[slot] && l[slot].version === v0) l[slot].version = v1;
+        }
     }
 
     /** Upload edited layers 15 s after the last change, so a crash loses at most that much. */
@@ -5859,17 +5936,19 @@ class InpaintEditor {
         ctx.globalCompositeOperation = "source-over";
     }
 
-    markMaskChanged(layer) {
+    markMaskChanged(layer, rect) {
         this.scheduleAutosave();
         layer.maskDirty = !!layer.mask;
         if (!layer.mask) layer.maskRef = null;
         layer._maskedValid = false;
         layer._mcache = null;
         layer._mcacheView = null;
-        this.touchSource(layer.mask);
+        // `rect` (in the mask's own pixels) keeps the cached levels and refreshes them there
+        if (rect && layer.mask) this.touchSourceRect(layer.mask, rect[0], rect[1], rect[2], rect[3]);
+        else this.touchSource(layer.mask);
         this.touchSource(layer._masked);
         layer.exportRef = null;
-        this.uploaded.baseHash = null;
+        this.bumpComposite(layer, rect && layer.mask ? this.layerRectToImage(layer, layer.mask, rect) : null);
         this.uploaded.controlHash = null;
         this.drawThumb();
         this.notifyChanged();
@@ -6096,6 +6175,14 @@ class InpaintEditor {
         ctx.imageSmoothingEnabled = true;
         ctx.imageSmoothingQuality = "medium";
         ctx.drawImage(this.displaySource(px, s), (canvas.width - w) / 2, (canvas.height - h) / 2, w, h);
+    }
+
+    /** Redraw one row's thumbnail in place; the whole list when the row is not there. */
+    refreshLayerThumb(layer) {
+        if (!this.layerList) return;
+        const th = this.layerList.querySelector(`.ipc-layer[data-layer="${layer.id}"] canvas.ipc-lthumb`);
+        if (!th) { this.renderLayers(); return; }
+        this.drawLayerThumb(th, layer);
     }
 
     /** Swap the name span for an input; Enter or blur commits, Esc cancels. */
@@ -6605,19 +6692,65 @@ class InpaintEditor {
     }
 
     /**
-     * The selection's bounding box. On a large selection canvas the exact scan reads back
-     * hundreds of megabytes, so a display level is scanned first (any covered cell keeps
-     * some alpha) and the exact scan then runs inside that box only.
+     * Exact bounding box of the selected pixels inside `box`, a rectangle known to hold
+     * them all, read in 64 px strips from each edge inwards: rows from the top until the
+     * first selected pixel, rows from the bottom, then columns within those rows. A
+     * marquee on a 15k canvas costs four strips of a few MB instead of the box (hundreds
+     * of MB and half a second of readback). A selection whose alpha never reaches 128
+     * still reads the whole box, strip by strip. Null when the box holds none.
      */
-    selectionBounds() {
+    scanBoundsIn(box) {
+        const [bx0, by0, bx1, by1] = box;
+        const W = bx1 - bx0, H = by1 - by0;
+        if (W <= 0 || H <= 0) return null;
+        const ctx = this.selection.getContext("2d");
+        const STRIP = 64;
+        const rows = (y, h) => {   // first and last row of the strip with a selected pixel, or null
+            const d = new Uint32Array(ctx.getImageData(bx0, y, W, h).data.buffer);
+            let first = -1, last = -1;
+            for (let r = 0; r < h; r++) {
+                const row = r * W;
+                for (let x = 0; x < W; x++) if (d[row + x] & 0x80000000) { if (first < 0) first = r; last = r; break; }
+            }
+            return first < 0 ? null : [first, last];
+        };
+        let y0 = -1, y1 = -1;
+        for (let y = by0; y < by1 && y0 < 0; y += STRIP) { const hit = rows(y, Math.min(STRIP, by1 - y)); if (hit) y0 = y + hit[0]; }
+        if (y0 < 0) return null;
+        for (let y = by1; y > y0 && y1 < 0; y -= STRIP) { const yy = Math.max(y0, y - STRIP); const hit = rows(yy, y - yy); if (hit) y1 = yy + hit[1] + 1; }
+        if (y1 < 0) y1 = y0 + 1;
+        const cols = (x, w) => {   // first and last column of the strip with a selected pixel, or null
+            const h = y1 - y0;
+            const d = new Uint32Array(ctx.getImageData(x, y0, w, h).data.buffer);
+            let first = -1, last = -1;
+            for (let c = 0; c < w; c++) {
+                for (let r = 0; r < h; r++) if (d[r * w + c] & 0x80000000) { if (first < 0) first = c; last = c; break; }
+            }
+            return first < 0 ? null : [first, last];
+        };
+        let x0 = -1, x1 = -1;
+        for (let x = bx0; x < bx1 && x0 < 0; x += STRIP) { const hit = cols(x, Math.min(STRIP, bx1 - x)); if (hit) x0 = x + hit[0]; }
+        if (x0 < 0) return null;
+        for (let x = bx1; x > x0 && x1 < 0; x -= STRIP) { const xx = Math.max(x0, x - STRIP); const hit = cols(xx, x - xx); if (hit) x1 = xx + hit[1] + 1; }
+        if (x1 < 0) x1 = x0 + 1;
+        return [x0, y0, x1, y1];
+    }
+
+    /**
+     * A rectangle holding every pixel of the selection with any alpha at all (the bounds
+     * count only alpha >= 128; a feathered tail lies outside them), from the 1/16 display
+     * level padded by one cell, so nothing full-size is read back. What an undo step has
+     * to copy and what a restore has to refresh. Null when the selection is empty.
+     */
+    selectionExtent() {
         if (!this.selection) return null;
         const W = this.width, H = this.height;
-        if (W * H <= PYRAMID_MIN_PX) return this.scanBounds(0, 0, W, H);
+        if (W * H <= PYRAMID_MIN_PX) return [0, 0, W, H];
         const budget = this._pyramidBudget;
         this._pyramidBudget = Infinity;
         const lvl = this.displaySource(this.selection, 1 / 16);
         this._pyramidBudget = budget;
-        if (lvl === this.selection) return this.scanBounds(0, 0, W, H);
+        if (lvl === this.selection) return [0, 0, W, H];
         const lw = lvl.width, lh = lvl.height;
         const d = new Uint32Array(lvl.getContext("2d").getImageData(0, 0, lw, lh).data.buffer);
         let cx0 = lw, cy0 = lh, cx1 = -1, cy1 = -1;
@@ -6633,9 +6766,17 @@ class InpaintEditor {
         }
         if (cx1 < 0) return null;
         const fx = W / lw, fy = H / lh;
-        return this.scanBounds(
-            Math.max(0, Math.floor(cx0 * fx) - 2), Math.max(0, Math.floor(cy0 * fy) - 2),
-            Math.min(W, Math.ceil((cx1 + 1) * fx) + 2), Math.min(H, Math.ceil((cy1 + 1) * fy) + 2));
+        return [Math.max(0, Math.floor((cx0 - 1) * fx) - 2), Math.max(0, Math.floor((cy0 - 1) * fy) - 2),
+            Math.min(W, Math.ceil((cx1 + 2) * fx) + 2), Math.min(H, Math.ceil((cy1 + 2) * fy) + 2)];
+    }
+
+    /**
+     * The selection's bounding box, scanned for: the extent from the 1/16 level, then the
+     * exact box by strips inside it. Never a readback of the whole canvas.
+     */
+    selectionBounds() {
+        const ext = this.selectionExtent();
+        return ext ? this.scanBoundsIn(ext) : null;
     }
 
     /**
@@ -6643,22 +6784,29 @@ class InpaintEditor {
      * image coordinates), or undefined when it has to be scanned for (every subtract).
      */
     boundsAfter(mode, box) {
-        if (mode === "subtract") return undefined;
+        // the known box, exact or a superset ({ within }), or undefined when nothing is known
+        const known = this.selectionDirty && !this.selectionLoose ? undefined : this.cachedBounds;
+        if (mode === "subtract") {
+            // a subtract only removes: the old box still holds everything, as a superset
+            if (known === undefined) return undefined;
+            return known ? { within: known } : null;
+        }
         const b = [Math.max(0, Math.floor(box[0])), Math.max(0, Math.floor(box[1])),
             Math.min(this.width, Math.ceil(box[2])), Math.min(this.height, Math.ceil(box[3]))];
         const empty = b[2] <= b[0] || b[3] <= b[1];
         if (mode === "replace") return empty ? null : b;
-        if (this.selectionDirty) return undefined;
-        const old = this.cachedBounds;
-        if (empty) return old;
-        if (!old) return b;
-        return [Math.min(old[0], b[0]), Math.min(old[1], b[1]), Math.max(old[2], b[2]), Math.max(old[3], b[3])];
+        if (known === undefined) return undefined;
+        const old = known;
+        const u = empty ? old : (!old ? b : [Math.min(old[0], b[0]), Math.min(old[1], b[1]), Math.max(old[2], b[2]), Math.max(old[3], b[3])]);
+        return this.selectionLoose && u ? { within: u } : u;
     }
 
     getBounds() {
         if (this.selectionDirty) {
-            this.cachedBounds = this.selectionBounds();
+            // a superset is made exact by strips from its edges; otherwise the extent is scanned for
+            this.cachedBounds = this.selectionLoose && this.cachedBounds ? this.scanBoundsIn(this.cachedBounds) : this.selectionBounds();
             this.selectionDirty = false;
+            this.selectionLoose = false;
         }
         return this.cachedBounds;
     }
@@ -6755,7 +6903,7 @@ class InpaintEditor {
         this.uploaded.baseRef = null;
         this.uploaded.controlHash = null;
         this.dropHint.style.display = "none";
-        this.selectionDirty = true;
+        this.selectionDirty = true; this.selectionLoose = false;
         this.selectionDataUrl = null;
         this.selectionEncoded = false;
         this._baseCanvas = null;
@@ -8886,7 +9034,7 @@ class InpaintEditor {
                 const sel = await loadImageEl(state.selection);
                 if (stale()) return;
                 this.selection.getContext("2d").drawImage(sel, 0, 0);
-                this.selectionDirty = true;
+                this.selectionDirty = true; this.selectionLoose = false;
             }
             this.renderLayers();
             this.renderHistory();
