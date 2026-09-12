@@ -72,6 +72,54 @@ function loadImageEl(src) {
     });
 }
 
+// ---- SVG: a vector drawing has no pixel size of its own, so it is rasterised on the way in -----
+// The upload, the mirror and the server only ever see the PNG; a reload finds pixels, not a
+// file that needs a size again. An <img> would render a sizeless SVG at 300 x 150.
+const SVG_RE = /\.svg$/i;
+function isSvgFile(file) { return !!file && (file.type === "image/svg+xml" || SVG_RE.test(file.name || "")); }
+
+/** The size an SVG declares: width / height attributes (px, pt, mm, cm, in, pc at 96 dpi), else the viewBox. */
+function svgSize(text) {
+    const doc = new DOMParser().parseFromString(text, "image/svg+xml");
+    const svg = doc.documentElement;
+    if (!svg || svg.nodeName.toLowerCase() !== "svg") throw new Error("not an SVG file");
+    const len = (v) => {
+        const m = /^\s*([\d.]+)\s*(px|pt|mm|cm|in|pc)?\s*$/i.exec(v || "");
+        if (!m) return 0;   // percentages and em are not a pixel size
+        return +m[1] * ({ px: 1, pt: 96 / 72, mm: 96 / 25.4, cm: 96 / 2.54, in: 96, pc: 16 }[(m[2] || "px").toLowerCase()]);
+    };
+    let w = len(svg.getAttribute("width")), h = len(svg.getAttribute("height"));
+    const vb = (svg.getAttribute("viewBox") || "").trim().split(/[\s,]+/).map(Number);
+    const vbw = vb.length === 4 && vb[2] > 0 ? vb[2] : 0, vbh = vb.length === 4 && vb[3] > 0 ? vb[3] : 0;
+    const declared = w > 0 && h > 0;
+    if (!(w > 0) && !(h > 0)) { w = vbw; h = vbh; }
+    else if (!(w > 0)) w = vbh > 0 ? h * vbw / vbh : h;
+    else if (!(h > 0)) h = vbw > 0 ? w * vbh / vbw : w;
+    if (!(w > 0) || !(h > 0)) { w = 300; h = 150; }
+    return { width: w, height: h, declared, viewBox: vbw > 0 && vbh > 0, doc };
+}
+
+/** Rasterise an SVG file into a PNG File of exactly width x height (the caller keeps the aspect). */
+async function rasterizeSvg(file, { width, height }) {
+    const text = await file.text();
+    const info = svgSize(text);
+    const svg = info.doc.documentElement;
+    // without a viewBox the user units are pixels and a new width / height would crop instead of scale
+    if (!info.viewBox) svg.setAttribute("viewBox", `0 0 ${info.width} ${info.height}`);
+    svg.setAttribute("width", String(width));
+    svg.setAttribute("height", String(height));
+    const url = URL.createObjectURL(new Blob([new XMLSerializer().serializeToString(svg)], { type: "image/svg+xml" }));
+    try {
+        const img = await loadImageEl(url);
+        const c = makeCanvas(width, height);
+        c.getContext("2d").drawImage(img, 0, 0, width, height);
+        const png = await new Promise((resolve, reject) => c.toBlob((b) => (b ? resolve(b) : reject(new Error("could not encode the rasterised SVG"))), "image/png"));
+        return new File([png], (file.name || "image.svg").replace(SVG_RE, "") + ".png", { type: "image/png" });
+    } finally {
+        URL.revokeObjectURL(url);
+    }
+}
+
 // ---- the worker: PNG encoding, upload hashes and the layered export writers ----------
 // canvas.toBlob keeps the main thread busy for 755 ms on a 96 MP canvas (measured), and
 // the PSD writer for 3 s. Both move into js/inpaint_worker.js; the editor only pays for
@@ -2345,6 +2393,7 @@ class InpaintEditor {
                     const lab = el("label", "ipc-asklink");
                     const link = document.createElement("input");
                     link.type = "checkbox";
+                    link.checked = linked === "on";   // true only offers the tie; "on" starts with it
                     lab.appendChild(link);
                     lab.appendChild(el("span", null, "Keep the ratio"));
                     box.appendChild(lab);
@@ -5865,8 +5914,14 @@ class InpaintEditor {
         }
         let n = this.layers.filter((l) => this.isReference(l)).length;
         let last = null;
-        for (const file of files) {
+        for (let file of files) {
             try {
+                if (isSvgFile(file)) {
+                    // rasterised to fit the document, so the layer is sharp at 1:1 and the transform tool only ever scales it down
+                    const target = await this.svgTarget(file, { ask: false, fit: [this.width, this.height] });
+                    this.setStatus(`Rasterising ${file.name || "the SVG"} at ${target.width} × ${target.height} ...`);
+                    file = await rasterizeSvg(file, target);
+                }
                 this.setStatus(`Uploading ${file.name || "image"} ...`);
                 const ext = ((file.name || "").match(/\.[a-z0-9]+$/i) || [".png"])[0];
                 const stem = (file.name || "image").replace(/\.[a-z0-9]+$/i, "").replace(/[^a-z0-9._-]/gi, "_") || "image";
@@ -6595,9 +6650,15 @@ class InpaintEditor {
         this.notifyChanged();
     }
 
-    async loadFile(file) {
+    async loadFile(file, { size = null, ask = true } = {}) {
         if (!file) return;
         try {
+            if (isSvgFile(file)) {
+                const target = await this.svgTarget(file, { size, ask });
+                if (!target) { this.setStatus("Import cancelled."); return; }
+                this.setStatus(`Rasterising ${file.name || "the SVG"} at ${target.width} × ${target.height} ...`);
+                file = await rasterizeSvg(file, target);
+            }
             this.setStatus("Uploading " + (file.name || "image") + " ...");
             const ext = ((file.name || "").match(/\.[a-z0-9]+$/i) || [".png"])[0];
             const stem = (file.name || "pasted").replace(/\.[a-z0-9]+$/i, "").replace(/[^a-z0-9._-]/gi, "_") || "image";
@@ -6608,6 +6669,34 @@ class InpaintEditor {
             console.error(err);
             this.setStatus(String(err.message || err));
         }
+    }
+
+    /** The pixel size an SVG is rasterised at: the caller's `size` ([w, h], one of them may be 0 for
+     *  "keep the aspect"), else fitted into `fit` (a document), else the file's own size when it declares
+     *  one and 2048 on the long side when it only has a viewBox; the size dialog confirms it when `ask`. */
+    async svgTarget(file, { size = null, ask = true, fit = null } = {}) {
+        const info = svgSize(await file.text());
+        const ratio = info.width / info.height;
+        let w, h;
+        if (size && size[0] > 0 && size[1] > 0) { w = size[0]; h = size[1]; }
+        else if (size && size[0] > 0) { w = size[0]; h = w / ratio; }
+        else if (size && size[1] > 0) { h = size[1]; w = h * ratio; }
+        else if (fit && fit[0] > 0 && fit[1] > 0) { const k = Math.min(fit[0] / info.width, fit[1] / info.height); w = info.width * k; h = info.height * k; }
+        else if (info.declared && info.width <= 16384 && info.height <= 16384) { w = info.width; h = info.height; }
+        else { const k = 2048 / Math.max(info.width, info.height); w = info.width * k; h = info.height * k; }
+        w = Math.min(16384, Math.max(1, Math.round(w))); h = Math.min(16384, Math.max(1, Math.round(h)));
+        if (ask && !size && !fit) {
+            const answer = await this.ask({
+                title: "Import SVG",
+                message: `${file.name || "The file"} is a vector drawing and has no pixel size of its own. Rasterise it at:`,
+                fields: [{ key: "width", label: "Width", value: w, min: 1, max: 16384 }, { key: "height", label: "Height", value: h, min: 1, max: 16384 }],
+                linked: "on",
+                ok: "Import",
+            });
+            if (answer == null) return null;
+            w = Math.min(16384, Math.max(1, Math.round(answer.width))); h = Math.min(16384, Math.max(1, Math.round(answer.height)));
+        }
+        return { width: w, height: h };
     }
 
     addLayer(layer, { activate = true } = {}) {

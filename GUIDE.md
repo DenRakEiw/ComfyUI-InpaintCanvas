@@ -33,6 +33,7 @@ Minimal local chain: `crop_image` and `crop_mask` into VAE Encode (for Inpaintin
 - Each row: thumbnail, eye (Alt+click: solo), name (double-click renames), lock, alpha lock (paint lands only on existing pixels), opacity, blend mode, colour match against the image below, and the mask row: cutout with the installed RMBG models, mask from selection, edit, apply, remove.
 - The badge on a row switches a layer between *image* (part of the picture) and *reference* (not in the picture, sent along with `crop_image` as an extra batch image for Flux.2 / Kontext multi-reference editing). The Role select turns a layer into a control image (scribble, lineart, depth, pose, canny) that comes out of `control_image`.
 - Drop an image on the canvas to add it as a layer (Shift: reference, Ctrl: replace the base). An image pasted from the clipboard becomes a layer too.
+- An SVG file has no pixel size of its own: loaded as the image it asks for the size to rasterise at (its own when it declares one, else 2048 px on the long side, ratio kept); dropped as a layer it is rasterised to fit the image. The editor keeps pixels, so shapes in an SVG are not editable objects afterwards.
 - Flatten bakes all visible layers into the base.
 
 ## Painting and retouch
