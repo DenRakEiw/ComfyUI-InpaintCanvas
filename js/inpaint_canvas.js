@@ -1043,6 +1043,55 @@ function injectStyle() {
 // Copy in one tab, paste in another: the clipboard belongs to the module, not to an editor.
 let CLIPBOARD = null;
 
+// A live preview canvas above this many pixels is given back after the gesture (a 15k
+// layer's is 600 MB); smaller ones are kept for the next stroke.
+const STROKE_SCRATCH_KEEP_PX = 16 * 1024 * 1024;
+
+/**
+ * A stroke's pixels while the button is down: a canvas that covers what the gesture has
+ * touched so far, grown as it goes, with its origin in the target's own pixels. It used to
+ * be a canvas the size of the layer per gesture (600 MB on a 15k layer, and as much again
+ * for the selection clip). `ensure(x0, y0, x1, y1)` makes the buffer hold that box and
+ * hands back its context translated so callers keep drawing in target pixels; `all()` is
+ * the whole target (a gradient). `canvas` is null until the first dab.
+ */
+class StrokeBuffer {
+    constructor(target) {
+        this.tw = target.width;
+        this.th = target.height;
+        this.canvas = null;
+        this.x = 0; this.y = 0; this.w = 0; this.h = 0;
+    }
+
+    ensure(x0, y0, x1, y1) {
+        const PAD = 32;
+        x0 = Math.max(0, Math.floor(x0) - PAD); y0 = Math.max(0, Math.floor(y0) - PAD);
+        x1 = Math.min(this.tw, Math.ceil(x1) + PAD); y1 = Math.min(this.th, Math.ceil(y1) + PAD);
+        if (x1 <= x0) x1 = Math.min(this.tw, x0 + 1);
+        if (y1 <= y0) y1 = Math.min(this.th, y0 + 1);
+        if (!this.canvas) {
+            this.x = x0; this.y = y0; this.w = Math.max(1, x1 - x0); this.h = Math.max(1, y1 - y0);
+            this.canvas = makeCanvas(this.w, this.h);
+        } else if (x0 < this.x || y0 < this.y || x1 > this.x + this.w || y1 > this.y + this.h) {
+            // grow to the union, with headroom of a quarter on the sides that grew, so a
+            // stroke that keeps going does not reallocate on every dab
+            const ux0 = Math.min(this.x, x0), uy0 = Math.min(this.y, y0), ux1 = Math.max(this.x + this.w, x1), uy1 = Math.max(this.y + this.h, y1);
+            const gx = Math.ceil((ux1 - ux0) / 4), gy = Math.ceil((uy1 - uy0) / 4);
+            const nx0 = x0 < this.x ? Math.max(0, ux0 - gx) : ux0, ny0 = y0 < this.y ? Math.max(0, uy0 - gy) : uy0;
+            const nx1 = x1 > this.x + this.w ? Math.min(this.tw, ux1 + gx) : ux1, ny1 = y1 > this.y + this.h ? Math.min(this.th, uy1 + gy) : uy1;
+            const c = makeCanvas(nx1 - nx0, ny1 - ny0);
+            c.getContext("2d").drawImage(this.canvas, this.x - nx0, this.y - ny0);
+            this.canvas = c;
+            this.x = nx0; this.y = ny0; this.w = nx1 - nx0; this.h = ny1 - ny0;
+        }
+        const ctx = this.canvas.getContext("2d");
+        ctx.setTransform(1, 0, 0, 1, -this.x, -this.y);
+        return ctx;
+    }
+
+    all() { return this.ensure(0, 0, this.tw, this.th); }
+}
+
 class InpaintEditor {
 
     get clipboard() { return CLIPBOARD; }
@@ -2765,12 +2814,34 @@ class InpaintEditor {
         const mask = this.maskWithStroke(layer);
         let out;
         if (live) {
-            if (!this.maskedPreview || this.maskedPreview.width !== base.width || this.maskedPreview.height !== base.height) { this.maskedPreview = makeCanvas(base.width, base.height); this.maskedPreview._livePreview = true; }
+            // the live copy is rebuilt inside the dab's rectangle only; destination-in would
+            // clear everything outside the drawn part, so the box is a clip region
+            let fresh = false;
+            if (!this.maskedPreview || this.maskedPreview.width !== base.width || this.maskedPreview.height !== base.height) { this.maskedPreview = makeCanvas(base.width, base.height); this.maskedPreview._livePreview = true; fresh = true; }
+            if (p.maskedOf !== this.maskedPreview) { p.maskedOf = this.maskedPreview; fresh = true; }
             out = this.maskedPreview;
-        } else {
-            if (!layer._masked || layer._masked.width !== base.width || layer._masked.height !== base.height) layer._masked = makeCanvas(base.width, base.height);
-            out = layer._masked;
+            const box = fresh ? null : this.takeDirty(p, "dirtyMasked", layer, base);
+            if (fresh) p.dirtyMasked = null;
+            if (fresh || box) {
+                const [x, y, w, h] = box ? [box[0], box[1], box[2] - box[0], box[3] - box[1]] : [0, 0, out.width, out.height];
+                const ctx = out.getContext("2d");
+                ctx.save();
+                ctx.setTransform(1, 0, 0, 1, 0, 0);
+                ctx.beginPath();
+                ctx.rect(x, y, w, h);
+                ctx.clip();
+                ctx.globalCompositeOperation = "source-over";
+                ctx.globalAlpha = 1;
+                ctx.clearRect(x, y, w, h);
+                ctx.drawImage(base, x, y, w, h, x, y, w, h);
+                ctx.globalCompositeOperation = "destination-in";
+                ctx.drawImage(mask, 0, 0, out.width, out.height);
+                ctx.restore();
+            }
+            return out;
         }
+        if (!layer._masked || layer._masked.width !== base.width || layer._masked.height !== base.height) layer._masked = makeCanvas(base.width, base.height);
+        out = layer._masked;
         const ctx = out.getContext("2d");
         ctx.globalCompositeOperation = "source-over";
         ctx.globalAlpha = 1;
@@ -2779,7 +2850,8 @@ class InpaintEditor {
         ctx.globalCompositeOperation = "destination-in";
         ctx.drawImage(mask, 0, 0, out.width, out.height);
         ctx.globalCompositeOperation = "source-over";
-        if (!live) { layer._maskedValid = true; this.touchSource(out); }
+        layer._maskedValid = true;
+        this.touchSource(out);
         return out;
     }
 
@@ -2787,17 +2859,17 @@ class InpaintEditor {
     maskWithStroke(layer) {
         const p = this.pointer;
         if (!p || p.kind !== "maskpaint" || p.layer !== layer) return layer.mask;
-        if (!this.maskPreview || this.maskPreview.width !== layer.mask.width || this.maskPreview.height !== layer.mask.height) { this.maskPreview = makeCanvas(layer.mask.width, layer.mask.height); this.maskPreview._livePreview = true; }
-        const ctx = this.maskPreview.getContext("2d");
-        ctx.globalCompositeOperation = "source-over";
-        ctx.globalAlpha = 1;
-        ctx.clearRect(0, 0, this.maskPreview.width, this.maskPreview.height);
-        ctx.drawImage(layer.mask, 0, 0);
-        ctx.globalAlpha = this.brushOpacity;
-        ctx.globalCompositeOperation = p.erase ? "destination-out" : "source-over";
-        ctx.drawImage(this.clippedStroke(p), 0, 0);
-        ctx.globalAlpha = 1;
-        ctx.globalCompositeOperation = "source-over";
+        const target = layer.mask;
+        let fresh = false;
+        if (!this.maskPreview || this.maskPreview.width !== target.width || this.maskPreview.height !== target.height) {
+            this.maskPreview = makeCanvas(target.width, target.height);
+            this.maskPreview._livePreview = true;
+            fresh = true;
+        }
+        if (p.maskPreviewOf !== this.maskPreview) { p.maskPreviewOf = this.maskPreview; fresh = true; }
+        const box = fresh ? null : this.takeDirty(p, "dirtyMask", layer, target);
+        if (fresh) p.dirtyMask = null;
+        if (fresh || box) this.refreshStrokePreview(this.maskPreview, target, p, box, p.erase ? "destination-out" : "source-over");
         return this.maskPreview;
     }
 
@@ -3514,7 +3586,7 @@ class InpaintEditor {
             if (!o.aligned || !this.cloneOffset) this.cloneOffset = { x: this.cloneSource.x - ix, y: this.cloneSource.y - iy };
             const sample = this.sampleCanvas(o.sample);
             const heal = this.tool === "heal";
-            const stroke = makeCanvas(layer.canvas.width, layer.canvas.height);
+            const stroke = new StrokeBuffer(layer.canvas);
             this.pointer = { kind: "layerpaint", layer, stroke, clip: this.strokeClip(layer, layer.canvas), erase: false, last: [ix, iy], pressure: e.pointerType === "pen" && e.pressure > 0 ? e.pressure : 1,
                 clone: { sample, dest: heal ? (o.sample === "image" ? sample : this.compositeCanvas()) : null, off: this.cloneOffset, heal } };
             this.cloneDab(this.pointer, ix, iy, ix, iy);
@@ -3523,7 +3595,7 @@ class InpaintEditor {
             if (layer && layer.locked) { this.setStatus(`${layer.name} is locked.`); return; }
             if (layer && layer.kind === "filter") { this.setStatus("Filter layers have no pixels. Select a paint or image layer."); return; }
             if (!layer) layer = this.addPaintLayer();
-            const stroke = makeCanvas(layer.canvas.width, layer.canvas.height);
+            const stroke = new StrokeBuffer(layer.canvas);
             this.pointer = { kind: "layerpaint", grad: true, layer, stroke, clip: this.strokeClip(layer, layer.canvas), erase: false, start: [ix, iy], last: [ix, iy] };
         } else if (this.tool === "shape") {
             this.shapePointerDown(ix, iy, e, isDouble);
@@ -3542,7 +3614,7 @@ class InpaintEditor {
             if (layer && layer.alphaLock && this.tool === "erase" && !(layer.mask && layer.maskEdit)) { this.setStatus(`${layer.name} has its alpha locked: nothing to erase. Unlock alpha first.`); return; }
             if (layer && layer.mask && layer.maskEdit) {
                 // Painting on the transparency mask: paint reveals, erase hides.
-                const stroke = makeCanvas(layer.mask.width, layer.mask.height);
+                const stroke = new StrokeBuffer(layer.mask);
                 this.pointer = { kind: "maskpaint", layer, stroke, clip: this.strokeClip(layer, layer.mask), erase: this.tool === "erase", white: true, last: [ix, iy], pressure };
                 if (lineFrom && prev.mask) this.layerDab(this.pointer, lineFrom[0], lineFrom[1], ix, iy); else this.layerDab(this.pointer, ix, iy, ix, iy);
                 this.draw();
@@ -3553,7 +3625,7 @@ class InpaintEditor {
                 if (this.tool === "erase") { this.setStatus("The base layer cannot be erased. Select a layer or add a paint layer."); return; }
                 layer = this.addPaintLayer();
             }
-            const stroke = makeCanvas(layer.canvas.width, layer.canvas.height);
+            const stroke = new StrokeBuffer(layer.canvas);
             this.pointer = { kind: "layerpaint", layer, stroke, clip: this.strokeClip(layer, layer.canvas), erase: this.tool === "erase", last: [ix, iy], pressure };
             if (lineFrom && !prev.mask) this.layerDab(this.pointer, lineFrom[0], lineFrom[1], ix, iy); else this.layerDab(this.pointer, ix, iy, ix, iy);
         } else if (this.tool === "transform") {
@@ -3803,14 +3875,17 @@ class InpaintEditor {
             const box = this.strokeRect(p, p.layer.canvas);
             this.commitStroke(p);
             this.markLayerChanged(p.layer, box);
+            this.releaseStrokeScratch();
             if (!p.grad) this.lastStrokeEnd = { layerId: p.layer.id, x: p.last[0], y: p.last[1], mask: false };
         } else if (p.kind === "shapepoint") {
             this.shapeDrag = null;
         } else if (p.kind === "smudge") {
             this.markLayerChanged(p.layer);
         } else if (p.kind === "maskpaint") {
+            const box = this.strokeRect(p, p.layer.mask);
             this.commitStroke(p);
-            this.markMaskChanged(p.layer);
+            this.markMaskChanged(p.layer, box);
+            this.releaseStrokeScratch();
             this.lastStrokeEnd = { layerId: p.layer.id, x: p.last[0], y: p.last[1], mask: true };
         } else if (p.kind === "move" || p.kind === "scale") {
             this.snapGuides = null;
@@ -3916,14 +3991,17 @@ class InpaintEditor {
     layerDab(p, x0, y0, x1, y1) {
         const layer = p.layer;
         const c = p.stroke;
-        const sx = c.width / layer.w, sy = c.height / layer.h;
-        const ctx = c.getContext("2d");
+        const sx = c.tw / layer.w, sy = c.th / layer.h;
         const lx0 = (x0 - layer.x) * sx, ly0 = (y0 - layer.y) * sy;
         const lx1 = (x1 - layer.x) * sx, ly1 = (y1 - layer.y) * sy;
         this.strokeBounds(p, x0, y0, x1, y1, this.brushSize / 2 + 2);
-        this.touchSource(c);
+        this.strokeDirty(p, x0, y0, x1, y1, this.brushSize / 2 + 2);
         // a pen's pressure scales the size (Krita's default "size by pressure"); the mouse paints at full size
         const radius = this.brushSize * (sx + sy) / 4 * (p.pressure == null ? 1 : Math.max(0.05, Math.min(1, p.pressure)));
+        // the buffer holds the segment plus the dab (a tip may be wider than round, and turned)
+        const R = radius * 1.5 + 2;
+        const ctx = c.ensure(Math.min(lx0, lx1) - R, Math.min(ly0, ly1) - R, Math.max(lx0, lx1) + R, Math.max(ly0, ly1) + R);
+        this.touchSource(c.canvas);
         const color = p.white ? "#ffffff" : (p.erase ? "#000000" : this.color);
         ctx.globalCompositeOperation = "source-over";
         const hardness = p.erase ? this.eraseHardness : this.hardness;
@@ -4483,7 +4561,7 @@ class InpaintEditor {
             dctx.drawImage(c, px - r, py - r, size, size, 0, 0, size, size);
             dctx.globalCompositeOperation = "destination-in";
             dctx.drawImage(mask, 0, 0);
-            if (p.clip) dctx.drawImage(p.clip, -(x - r), -(y - r));
+            if (p.clip) { this._smudgeClip = this.clipCanvasFor(layer, c, x - r, y - r, size, size, this._smudgeClip); dctx.drawImage(this._smudgeClip, 0, 0); }
             ctx.save();
             ctx.globalAlpha = strength;
             ctx.globalCompositeOperation = layer.alphaLock ? "source-atop" : "source-over";
@@ -4512,16 +4590,17 @@ class InpaintEditor {
     /** Clone / heal: copy the source patch (offset by the stroke's offset) into the stroke buffer; heal shifts its colour to the destination's. */
     cloneDab(p, x0, y0, x1, y1) {
         const layer = p.layer, s = p.stroke, cl = p.clone;
-        const sx = s.width / layer.w, sy = s.height / layer.h;
+        const sx = s.tw / layer.w, sy = s.th / layer.h;
         const R = Math.max(0.5, this.brushSize / 2 * Math.max(0.05, Math.min(1, p.pressure || 1)));   // image px
         const r = Math.max(1, R * (sx + sy) / 2);                                                       // layer px
         const size = Math.ceil(r * 2);
         this.strokeBounds(p, x0, y0, x1, y1, R + 2);
-        this.touchSource(s);
+        this.strokeDirty(p, x0, y0, x1, y1, R + 2);
         if (!this._cloneDab || this._cloneDab.width !== size) this._cloneDab = makeCanvas(size, size);
         const d = this._cloneDab, dctx = d.getContext("2d");
         const mask = this.dabMask(r, this.hardness);
-        const sctx = s.getContext("2d");
+        const sctx = s.ensure((Math.min(x0, x1) - layer.x) * sx - r - 1, (Math.min(y0, y1) - layer.y) * sy - r - 1, (Math.max(x0, x1) - layer.x) * sx + r + 1, (Math.max(y0, y1) - layer.y) * sy + r + 1);
+        this.touchSource(s.canvas);
         const dist = Math.hypot(x1 - x0, y1 - y0);
         const steps = Math.max(1, Math.ceil(dist / Math.max(1, R * 0.25)));
         for (let i = 0; i <= steps; i++) {
@@ -4553,13 +4632,14 @@ class InpaintEditor {
     /** Gradient tool: rebuild the stroke buffer as a gradient from the drag start to (ix, iy). */
     gradientDab(p, ix, iy) {
         const layer = p.layer, c = p.stroke;
-        const sx = c.width / layer.w, sy = c.height / layer.h;
+        const sx = c.tw / layer.w, sy = c.th / layer.h;
         const x0 = (p.start[0] - layer.x) * sx, y0 = (p.start[1] - layer.y) * sy;
         const x1 = (ix - layer.x) * sx, y1 = (iy - layer.y) * sy;
-        const ctx = c.getContext("2d");
-        this.touchSource(c);   // no bounds: a gradient covers the whole layer
+        const ctx = c.all();   // no bounds: a gradient covers the whole layer
+        this.touchSource(c.canvas);
+        this.strokeDirty(p, layer.x, layer.y, layer.x + layer.w, layer.y + layer.h, 0);
         ctx.globalCompositeOperation = "source-over";
-        ctx.clearRect(0, 0, c.width, c.height);
+        ctx.clearRect(0, 0, c.tw, c.th);
         const dist = Math.hypot(x1 - x0, y1 - y0);
         if (dist < 0.5) return;
         const o = this.gradientOpts || { type: "linear", to: "transparent" };
@@ -4568,7 +4648,7 @@ class InpaintEditor {
         g.addColorStop(0, `rgba(${rgb},1)`);
         g.addColorStop(1, o.to === "white" ? "rgba(255,255,255,1)" : o.to === "black" ? "rgba(0,0,0,1)" : `rgba(${rgb},0)`);
         ctx.fillStyle = g;
-        ctx.fillRect(0, 0, c.width, c.height);
+        ctx.fillRect(0, 0, c.tw, c.th);
     }
 
     // ---- shape tool ---------------------------------------------------------------------
@@ -4594,7 +4674,7 @@ class InpaintEditor {
         if (kind === "rectangle" || kind === "ellipse" || kind === "freehand") {
             const layer = this.shapeTarget();
             if (!layer) return;
-            const stroke = makeCanvas(layer.canvas.width, layer.canvas.height);
+            const stroke = new StrokeBuffer(layer.canvas);
             this.pointer = { kind: "layerpaint", shape: kind, layer, stroke, clip: this.strokeClip(layer, layer.canvas),
                 erase: false, start: [ix, iy], cur: [ix, iy], path: [[ix, iy]], last: [ix, iy] };
             return;
@@ -4628,12 +4708,39 @@ class InpaintEditor {
             p.cur = [ix, iy];
         }
         p.fromCenter = !!(e && e.altKey);
-        const ctx = p.stroke.getContext("2d");
-        this.touchSource(p.stroke);   // no bounds: the shape may move anywhere in the layer
-        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        // the shape's box, outline included (image coordinates): the buffer covers it, the
+        // preview refreshes it together with the box before (the shape moves), and the undo
+        // step copies the final one
+        const box = this.shapeBox(p);
+        const prev = p.shapeBox;
+        p.shapeBox = box;
+        p.bounds = null;
+        this.strokeBounds(p, box[0], box[1], box[2], box[3], 0);
+        const dirty = prev ? [Math.min(prev[0], box[0]), Math.min(prev[1], box[1]), Math.max(prev[2], box[2]), Math.max(prev[3], box[3])] : box;
+        this.strokeDirty(p, dirty[0], dirty[1], dirty[2], dirty[3], 0);
+        const sb = p.stroke, layer = p.layer;
+        const sx = sb.tw / layer.w, sy = sb.th / layer.h;
+        const ctx = sb.ensure((box[0] - layer.x) * sx, (box[1] - layer.y) * sy, (box[2] - layer.x) * sx, (box[3] - layer.y) * sy);
+        this.touchSource(sb.canvas);
         ctx.globalCompositeOperation = "source-over";
-        ctx.clearRect(0, 0, p.stroke.width, p.stroke.height);
-        this.paintShape(ctx, p.layer, (c) => this.shapePath(c, p), p.shape !== "freehand" || o.fill);
+        ctx.clearRect(sb.x, sb.y, sb.w, sb.h);
+        this.paintShape(ctx, layer, (c) => this.shapePath(c, p), p.shape !== "freehand" || o.fill, [sb.x, sb.y]);
+    }
+
+    /** The box a dragged shape covers, outline included (image coordinates). */
+    shapeBox(p) {
+        const pad = (this.shapeOpts.width || 0) / 2 + 2;
+        let x0, y0, x1, y1;
+        if (p.shape === "freehand") {
+            x0 = Infinity; y0 = Infinity; x1 = -Infinity; y1 = -Infinity;
+            for (const [px, py] of p.path) { if (px < x0) x0 = px; if (px > x1) x1 = px; if (py < y0) y0 = py; if (py > y1) y1 = py; }
+        } else {
+            let ax = p.start[0], ay = p.start[1];
+            const bx = p.cur[0], by = p.cur[1];
+            if (p.fromCenter) { ax = p.start[0] - (bx - p.start[0]); ay = p.start[1] - (by - p.start[1]); }
+            x0 = Math.min(ax, bx); y0 = Math.min(ay, by); x1 = Math.max(ax, bx); y1 = Math.max(ay, by);
+        }
+        return [x0 - pad, y0 - pad, x1 + pad, y1 + pad];
     }
 
     /** The path of a dragged shape, in image coordinates. */
@@ -4684,11 +4791,12 @@ class InpaintEditor {
      * in image coordinates; the transform maps them onto the layer, so the outline width is in
      * image pixels whatever the layer's own resolution is.
      */
-    paintShape(ctx, layer, build, closed) {
+    paintShape(ctx, layer, build, closed, origin = [0, 0]) {
         const o = this.shapeOpts;
         const sx = layer.canvas.width / layer.w, sy = layer.canvas.height / layer.h;
         ctx.save();
-        ctx.setTransform(sx, 0, 0, sy, -layer.x * sx, -layer.y * sy);
+        // image coordinates to the layer's pixels, less the stroke buffer's origin
+        ctx.setTransform(sx, 0, 0, sy, -layer.x * sx - origin[0], -layer.y * sy - origin[1]);
         ctx.beginPath();
         build(ctx);
         if (closed) {
@@ -4714,11 +4822,26 @@ class InpaintEditor {
         const layer = this.shapeTarget();
         if (!layer) { this.draw(); return; }
         if (closed && !this.shapeOpts.fill && !this.shapeOpts.stroke) { this.setStatus("Neither fill nor outline is on: nothing to draw."); this.draw(); return; }
-        const stroke = makeCanvas(layer.canvas.width, layer.canvas.height);
-        this.paintShape(stroke.getContext("2d"), layer, (c) => this.shapePointPath(c, pts, closed, null), closed);
+        const stroke = new StrokeBuffer(layer.canvas);
+        // the box of the points and their handles, outline included: the buffer and the undo
+        // step cover that, not the layer
+        const pad = (this.shapeOpts.width || 0) / 2 + 2;
+        let bx0 = Infinity, by0 = Infinity, bx1 = -Infinity, by1 = -Infinity;
+        for (const q of pts) {
+            for (const [x, y] of [[q.x, q.y], [q.x + (q.hx || 0), q.y + (q.hy || 0)], [q.x - (q.hx || 0), q.y - (q.hy || 0)]]) {
+                if (x < bx0) bx0 = x; if (x > bx1) bx1 = x; if (y < by0) by0 = y; if (y > by1) by1 = y;
+            }
+        }
+        const box = [bx0 - pad, by0 - pad, bx1 + pad, by1 + pad];
+        const sx = layer.canvas.width / layer.w, sy = layer.canvas.height / layer.h;
+        const ctx = stroke.ensure((box[0] - layer.x) * sx, (box[1] - layer.y) * sy, (box[2] - layer.x) * sx, (box[3] - layer.y) * sy);
+        this.paintShape(ctx, layer, (c) => this.shapePointPath(c, pts, closed, null), closed, [stroke.x, stroke.y]);
         const p = { kind: "layerpaint", layer, stroke, clip: this.strokeClip(layer, layer.canvas), erase: false };
+        this.strokeBounds(p, box[0], box[1], box[2], box[3], 0);
+        const rect = this.strokeRect(p, layer.canvas);
         this.commitStroke(p);
-        this.markLayerChanged(layer);
+        this.markLayerChanged(layer, rect);
+        this.releaseStrokeScratch();
         this.draw();
         this.setStatus(`${kind[0].toUpperCase() + kind.slice(1)} with ${pts.length} points drawn on ${layer.name}.`);
     }
@@ -4789,30 +4912,59 @@ class InpaintEditor {
     }
 
     /**
-     * The selection mapped into a layer's pixel space (alpha = selected), or null
-     * without a selection. Brush and eraser strokes are clipped to it, like in
-     * Krita and Photoshop; Ctrl+D clears the selection to paint freely.
+     * Whether strokes on this layer are clipped to the selection, like in Krita and
+     * Photoshop (Ctrl+D clears the selection to paint freely). The clip itself is drawn on
+     * demand for the part of the layer a gesture touches (clipCanvasFor); it used to be a
+     * canvas the size of the layer per gesture.
      */
     strokeClip(layer, target) {
-        if (!this.selection || !this.getBounds()) return null;
-        const c = makeCanvas(target.width, target.height);
+        return !!(this.selection && this.getBounds()) || null;
+    }
+
+    /** A stroke buffer for `target` (a layer canvas or a mask); tests build gestures with it. */
+    newStrokeBuffer(target) { return new StrokeBuffer(target); }
+
+    /**
+     * The selection mapped into `target`'s pixels (alpha = selected) inside the box
+     * (x, y, w, h in target pixels), as a canvas of that size; `into` is reused when it fits.
+     */
+    clipCanvasFor(layer, target, x, y, w, h, into = null) {
+        const c = into && into.width === w && into.height === h ? into : makeCanvas(w, h);
         const ctx = c.getContext("2d");
-        ctx.setTransform(target.width / layer.w, 0, 0, target.height / layer.h, 0, 0);
+        ctx.save();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.globalCompositeOperation = "source-over";
+        ctx.globalAlpha = 1;
+        ctx.clearRect(0, 0, w, h);
+        ctx.setTransform(target.width / layer.w, 0, 0, target.height / layer.h, -x, -y);
         ctx.drawImage(this.selection, -layer.x, -layer.y);
+        ctx.restore();
         return c;
     }
 
-    /** The stroke buffer, limited to the selection when the gesture has a clip. */
+    /**
+     * The stroke buffer's pixels, limited to the selection when the gesture has a clip: a
+     * canvas of the buffer's size (placed at p.stroke.x, p.stroke.y in the target), or null
+     * before the first dab.
+     */
     clippedStroke(p) {
-        if (!p.clip) return p.stroke;
-        if (!this.clipScratch || this.clipScratch.width !== p.stroke.width || this.clipScratch.height !== p.stroke.height) { this.clipScratch = makeCanvas(p.stroke.width, p.stroke.height); this.clipScratch._livePreview = true; }
+        const sb = p.stroke;
+        if (!sb || !sb.canvas) return null;
+        if (!p.clip) return sb.canvas;
+        // the clip for this buffer, drawn again only when the buffer grew (a new canvas)
+        if (!p.clipCanvas || p.clipOf !== sb.canvas) {
+            p.clipCanvas = this.clipCanvasFor(p.layer, p.kind === "maskpaint" ? p.layer.mask : p.layer.canvas, sb.x, sb.y, sb.w, sb.h, p.clipCanvas);
+            p.clipOf = sb.canvas;
+        }
+        if (!this.clipScratch || this.clipScratch.width !== sb.w || this.clipScratch.height !== sb.h) { this.clipScratch = makeCanvas(sb.w, sb.h); this.clipScratch._livePreview = true; }
         const ctx = this.clipScratch.getContext("2d");
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
         ctx.globalCompositeOperation = "source-over";
         ctx.globalAlpha = 1;
-        ctx.clearRect(0, 0, this.clipScratch.width, this.clipScratch.height);
-        ctx.drawImage(p.stroke, 0, 0);
+        ctx.clearRect(0, 0, sb.w, sb.h);
+        ctx.drawImage(sb.canvas, 0, 0);
         ctx.globalCompositeOperation = "destination-in";
-        ctx.drawImage(p.clip, 0, 0);
+        ctx.drawImage(p.clipCanvas, 0, 0);
         ctx.globalCompositeOperation = "source-over";
         return this.clipScratch;
     }
@@ -4822,32 +4974,92 @@ class InpaintEditor {
         const target = p.kind === "maskpaint" ? p.layer.mask : p.layer.canvas;
         // the undo step is a copy of what the stroke touched, taken before it is applied
         if (!p.noUndo) this.pushUndoSnapshot(this.strokeUndo(p, target));
+        const cs = this.clippedStroke(p);
+        if (!cs) return;
         const ctx = target.getContext("2d");
         ctx.save();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
         ctx.globalAlpha = this.brushOpacity;
         ctx.globalCompositeOperation = p.erase ? "destination-out" : (p.kind === "layerpaint" && p.layer.alphaLock ? "source-atop" : "source-over");
-        ctx.drawImage(this.clippedStroke(p), 0, 0);
+        ctx.drawImage(cs, p.stroke.x, p.stroke.y);
         ctx.restore();
+    }
+
+    /**
+     * Add the box a dab changed (image coordinates, padded) to the gesture's dirty
+     * rectangles, one per live preview: each preview refreshes its own and takes it.
+     */
+    strokeDirty(p, x0, y0, x1, y1, pad) {
+        const b = [Math.min(x0, x1) - pad, Math.min(y0, y1) - pad, Math.max(x0, x1) + pad, Math.max(y0, y1) + pad];
+        for (const k of ["dirtyLayer", "dirtyMask", "dirtyMasked"]) {
+            const d = p[k];
+            p[k] = d ? [Math.min(d[0], b[0]), Math.min(d[1], b[1]), Math.max(d[2], b[2]), Math.max(d[3], b[3])] : b;
+        }
+    }
+
+    /** A live preview's dirty rectangle in `target`'s pixels (clamped), taken; null when nothing changed. */
+    takeDirty(p, key, layer, target) {
+        const d = p[key];
+        if (!d) return null;
+        p[key] = null;
+        const sx = target.width / layer.w, sy = target.height / layer.h;
+        const x0 = Math.max(0, Math.floor((d[0] - layer.x) * sx) - 1), y0 = Math.max(0, Math.floor((d[1] - layer.y) * sy) - 1);
+        const x1 = Math.min(target.width, Math.ceil((d[2] - layer.x) * sx) + 1), y1 = Math.min(target.height, Math.ceil((d[3] - layer.y) * sy) + 1);
+        return x1 > x0 && y1 > y0 ? [x0, y0, x1, y1] : null;
+    }
+
+    /**
+     * Bring a live preview up to date inside `box` (target pixels; null for all of it, once
+     * per gesture): the target's own pixels there, then the stroke over them with the brush
+     * opacity and operation. A preview used to be rebuilt whole on every frame, three
+     * full-size blits per dab on a 15k layer.
+     */
+    refreshStrokePreview(preview, target, p, box, op) {
+        const [x, y, w, h] = box ? [box[0], box[1], box[2] - box[0], box[3] - box[1]] : [0, 0, target.width, target.height];
+        if (w <= 0 || h <= 0) return;
+        const ctx = preview.getContext("2d");
+        ctx.save();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.globalCompositeOperation = "source-over";
+        ctx.globalAlpha = 1;
+        ctx.clearRect(x, y, w, h);
+        ctx.drawImage(target, x, y, w, h, x, y, w, h);
+        const cs = this.clippedStroke(p);
+        if (cs) {
+            const sb = p.stroke;
+            const ix0 = Math.max(x, sb.x), iy0 = Math.max(y, sb.y), ix1 = Math.min(x + w, sb.x + sb.w), iy1 = Math.min(y + h, sb.y + sb.h);
+            if (ix1 > ix0 && iy1 > iy0) {
+                ctx.globalAlpha = this.brushOpacity;
+                ctx.globalCompositeOperation = op;
+                ctx.drawImage(cs, ix0 - sb.x, iy0 - sb.y, ix1 - ix0, iy1 - iy0, ix0, iy0, ix1 - ix0, iy1 - iy0);
+            }
+        }
+        ctx.restore();
+    }
+
+    /** After a gesture: the live preview canvases of a large layer are given back, small ones are kept for the next stroke. */
+    releaseStrokeScratch() {
+        for (const k of ["strokePreview", "maskPreview", "maskedPreview", "clipScratch"]) {
+            const c = this[k];
+            if (c && c.width * c.height > STROKE_SCRATCH_KEEP_PX) this[k] = null;
+        }
     }
 
     /** Layer pixels with the in-progress stroke applied, for live preview. */
     layerWithStroke(layer) {
         const p = this.pointer;
         if (!p || p.kind !== "layerpaint" || p.layer !== layer) return layer.canvas;
-        if (!this.strokePreview || this.strokePreview.width !== layer.canvas.width || this.strokePreview.height !== layer.canvas.height) {
-            this.strokePreview = makeCanvas(layer.canvas.width, layer.canvas.height);
+        const target = layer.canvas;
+        let fresh = false;
+        if (!this.strokePreview || this.strokePreview.width !== target.width || this.strokePreview.height !== target.height) {
+            this.strokePreview = makeCanvas(target.width, target.height);
             this.strokePreview._livePreview = true;
+            fresh = true;
         }
-        const ctx = this.strokePreview.getContext("2d");
-        ctx.globalCompositeOperation = "source-over";
-        ctx.globalAlpha = 1;
-        ctx.clearRect(0, 0, this.strokePreview.width, this.strokePreview.height);
-        ctx.drawImage(layer.canvas, 0, 0);
-        ctx.globalAlpha = this.brushOpacity;
-        ctx.globalCompositeOperation = p.erase ? "destination-out" : (layer.alphaLock ? "source-atop" : "source-over");
-        ctx.drawImage(this.clippedStroke(p), 0, 0);
-        ctx.globalAlpha = 1;
-        ctx.globalCompositeOperation = "source-over";
+        if (p.previewOf !== this.strokePreview) { p.previewOf = this.strokePreview; fresh = true; }   // a new gesture: the layer is copied once
+        const box = fresh ? null : this.takeDirty(p, "dirtyLayer", layer, target);
+        if (fresh) p.dirtyLayer = null;
+        if (fresh || box) this.refreshStrokePreview(this.strokePreview, target, p, box, p.erase ? "destination-out" : (layer.alphaLock ? "source-atop" : "source-over"));
         return this.strokePreview;
     }
 
@@ -8880,7 +9092,7 @@ class InpaintEditor {
             if (l._masked) { freed += px(l._masked); sources.push(l._masked); l._masked = null; l._maskedValid = false; }
             for (const c of [l.canvas, l.mask]) if (c) sources.push(c);
         }
-        for (const name of ["sceneCanvas", "viewCanvas", "matchBackdrop", "flatCanvas", "filterMaskCanvas", "strokePreview", "maskedPreview", "antsCanvas", "clipScratch"]) {
+        for (const name of ["sceneCanvas", "viewCanvas", "matchBackdrop", "flatCanvas", "filterMaskCanvas", "strokePreview", "maskPreview", "maskedPreview", "antsCanvas", "clipScratch"]) {
             if (this[name]) { freed += px(this[name]); this[name] = null; }
         }
         if (this.flatCache) { freed += px(this.flatCache.canvas); this.flatCache = null; }
@@ -9285,7 +9497,7 @@ class InpaintEditor {
         const scratch = [];
         add(scratch, "_baseCanvas", this._baseCanvas);
         add(scratch, "selection", this.selection);
-        for (const name of ["sceneCanvas", "viewCanvas", "matchBackdrop", "flatCanvas", "strokePreview", "maskedPreview", "antsCanvas", "clipScratch", "filterMaskCanvas"]) add(scratch, name, this[name]);
+        for (const name of ["sceneCanvas", "viewCanvas", "matchBackdrop", "flatCanvas", "strokePreview", "maskPreview", "maskedPreview", "antsCanvas", "clipScratch", "filterMaskCanvas"]) add(scratch, name, this[name]);
         add(scratch, "flatCache", this.flatCache && this.flatCache.canvas);
 
         const comp = this._compositor && this._compositor.stats ? this._compositor.stats() : null;
