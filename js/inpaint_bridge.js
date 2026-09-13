@@ -34,7 +34,7 @@ export function installBridge({ api, app, viewUrl, loadImageEl, makeCanvas, FILT
     function layerSummary(ed, l) {
         const out = {
             id: l.id, name: l.name, kind: l.kind, role: l.role || "none", visible: !!l.visible, opacity: Math.round((l.opacity == null ? 1 : l.opacity) * 100) / 100,
-            blend: l.blend || "normal", x: l.x, y: l.y, w: l.w, h: l.h, locked: !!l.locked, alpha_lock: !!l.alphaLock, mask: !!l.mask,
+            blend: l.blend || "normal", x: l.x, y: l.y, w: l.w, h: l.h, locked: !!l.locked, alpha_lock: !!l.alphaLock, mask: !!l.maskPx,
             active: l.id === ed.activeLayerId,
         };
         if (l.match && l.match.strength > 0) out.match = { strength: l.match.strength, source: l.match.source };
@@ -409,13 +409,15 @@ export function installBridge({ api, app, viewUrl, loadImageEl, makeCanvas, FILT
         async screenshot(ed, a) {
             requireImage(ed);
             const max = clampInt(a.max_size, 64, 4096, 1024);
-            const src = a.what === "layer" ? (() => { const l = findLayer(ed, a.layer); return { canvas: l.canvas, w: l.canvas.width, h: l.canvas.height }; })() : { canvas: ed.flattenToCanvas({ forRun: a.what !== "editor" }), w: ed.width, h: ed.height };
+            // a layer alone is its own pixels (unmasked, at their resolution); the picture is a composite canvas
+            const src = a.what === "layer" ? (() => { const l = findLayer(ed, a.layer); return { px: l.px, w: l.px.width, h: l.px.height }; })() : { canvas: ed.flattenToCanvas({ forRun: a.what !== "editor" }), w: ed.width, h: ed.height };
             const s = Math.min(1, max / Math.max(src.w, src.h));
             const w = Math.max(1, Math.round(src.w * s)), h = Math.max(1, Math.round(src.h * s));
             const c = makeCanvas(w, h);
             const ctx = c.getContext("2d");
             ctx.fillStyle = "#202020"; ctx.fillRect(0, 0, w, h);
-            ctx.drawImage(src.canvas, 0, 0, w, h);
+            if (src.px) src.px.drawTo(ctx, 0, 0, w, h);
+            else ctx.drawImage(src.canvas, 0, 0, w, h);
             const b = bounds(ed);
             if (a.show_selection !== false && b && ed.sel && a.what !== "layer") {
                 ctx.globalAlpha = 0.35; ed.sel.drawTo(ctx, 0, 0, w, h); ctx.globalAlpha = 1;
