@@ -417,8 +417,8 @@ export function installBridge({ api, app, viewUrl, loadImageEl, makeCanvas, FILT
             ctx.fillStyle = "#202020"; ctx.fillRect(0, 0, w, h);
             ctx.drawImage(src.canvas, 0, 0, w, h);
             const b = bounds(ed);
-            if (a.show_selection !== false && b && ed.selection && a.what !== "layer") {
-                ctx.globalAlpha = 0.35; ctx.drawImage(ed.selection, 0, 0, w, h); ctx.globalAlpha = 1;
+            if (a.show_selection !== false && b && ed.sel && a.what !== "layer") {
+                ctx.globalAlpha = 0.35; ed.sel.drawTo(ctx, 0, 0, w, h); ctx.globalAlpha = 1;
                 ctx.strokeStyle = "#ff40ff"; ctx.lineWidth = 2; ctx.strokeRect(b.x * s, b.y * s, b.w * s, b.h * s);
             }
             if (a.show_layers && a.what !== "layer") {

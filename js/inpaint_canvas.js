@@ -21,7 +21,7 @@ import { readAbr, tipCanvas } from "./inpaint_brushes.js";
 import { floodMask, maskToColorCanvas, clipMaskToSelection, rgbToHex, growMask, invertMask, maskBounds } from "./inpaint_raster.js";
 import { buildPsd, buildOra } from "./inpaint_export.js";
 import { GLCompositor } from "./inpaint_compositor.js";
-import { LayerPixels, MaskPixels, canvasOf, installLayerAliases } from "./inpaint_pixels.js";
+import { LayerPixels, MaskPixels, canvasOf, installLayerAliases, deprecatedPixels } from "./inpaint_pixels.js";
 
 /**
  * Two hosts run this editor: Scumble (renderer/editor/host.js, the editor is the window) and
@@ -1111,6 +1111,17 @@ class InpaintEditor {
 
     set clipboard(v) { CLIPBOARD = v; }
 
+    /** The selection's canvas under its old name, for one release: use `sel` (MaskPixels). */
+    get selection() {
+        deprecatedPixels("editor.selection", "editor.sel");
+        return this.sel ? this.sel.toCanvas() : null;
+    }
+
+    set selection(canvas) {
+        deprecatedPixels("editor.selection", "editor.sel");
+        this.sel = canvas ? MaskPixels.fromCanvas(canvas) : null;
+    }
+
     constructor(node) {
         this.node = node;
         this.width = 0;
@@ -1119,7 +1130,7 @@ class InpaintEditor {
         this.layers = [];            // { id, name, kind, role, blend, ref, px (LayerPixels), x, y, w, h, opacity, visible, dirty,
                                      //   maskPx (MaskPixels, alpha = visible) | null, maskRef, maskDirty, maskEdit }
         this.activeLayerId = null;   // null = base
-        this.selection = null;       // canvas WxH, red pixels where selected
+        this.sel = null;             // MaskPixels WxH (red, alpha = selected); null before an image is loaded
         this.history = [];           // { key, ref, x, y, w, h, prompt, layerId, thumb }
         this.view = { scale: 1, x: 0, y: 0, angle: 0 };
         this.guides = { x: [], y: [] };
@@ -1273,9 +1284,9 @@ class InpaintEditor {
         } finally {
             this.viewPass = prev;
         }
-        if (this.selection) {
+        if (this.sel) {
             ctx.globalAlpha = 0.45;
-            ctx.drawImage(this.displaySource(this.selection, w / this.width), 0, 0, this.width, this.height);
+            ctx.drawImage(this.displaySource(this.sel, w / this.width), 0, 0, this.width, this.height);
             ctx.globalAlpha = 1;
         }
     }
@@ -3403,9 +3414,8 @@ class InpaintEditor {
                     l.x -= left; l.y -= top;
                 }
             }
-            const sel = makeCanvas(nw, nh);
-            sel.getContext("2d").drawImage(this.selection, -left, -top);
-            this.selection = sel;
+            // a new object (the canvas undo step holds the old one): the old selection placed at -left, -top
+            this.sel = this.sel.resized(nw, nh, { x: -left, y: -top });
             this.base = { ref, img };
             this.width = nw; this.height = nh;
             this.pushUndoSnapshot(before);
@@ -3455,8 +3465,8 @@ class InpaintEditor {
             const sel = makeCanvas(nw, nh);
             const sc = sel.getContext("2d");
             sc.imageSmoothingEnabled = true;
-            sc.drawImage(this.selection, 0, 0, nw, nh);
-            this.selection = sel;
+            this.sel.drawTo(sc, 0, 0, nw, nh);
+            this.sel = MaskPixels.fromCanvas(sel);
             this.base = { ref, img };
             this.width = nw; this.height = nh;
             this.pushUndoSnapshot(before);
@@ -3562,8 +3572,7 @@ class InpaintEditor {
             this.pushUndo({ kind: "selection" });
             if (selMode === "replace" && !e.ctrlKey && this.selectedAt(ix, iy)) {
                 // dragging inside the selection moves its outline (Photoshop's marquee tools)
-                const orig = makeCanvas(this.width, this.height);
-                orig.getContext("2d").drawImage(this.selection, 0, 0);
+                const orig = this.sel.clone();   // the outline as it was, drawn back offset while dragging
                 this.pointer = { kind: "selmove", start: [ix, iy], orig, origBounds: this.getBounds() };
             } else {
                 this.pointer = { kind: "rect", ellipse: this.tool === "ellipse", square: e.ctrlKey, start: [ix, iy], cur: [ix, iy], startPx: this.toCanvasPx(e), mode: selMode };
@@ -3757,13 +3766,14 @@ class InpaintEditor {
             } else p.cur = [ix, iy];
             p.mode = e.altKey ? "subtract" : (e.shiftKey ? "add" : p.mode === "replace" && !e.shiftKey ? "replace" : "add");
         } else if (p.kind === "selmove") {
-            const sctx = this.selection.getContext("2d");
             const mx = Math.round(ix - p.start[0]), my = Math.round(iy - p.start[1]);
             if (mx || my) p.moved = true;
-            sctx.globalCompositeOperation = "source-over";
-            sctx.clearRect(0, 0, this.width, this.height);
-            sctx.drawImage(p.orig, mx, my);
-            this.touchSource(this.selection);
+            const W = this.width, H = this.height, orig = p.orig;
+            this.sel.drawInto(null, (ctx) => {
+                ctx.clearRect(0, 0, W, H);
+                orig.drawTo(ctx, mx, my);
+            });
+            this.touchSource(this.sel);
             if (p.origBounds) {
                 // the outline only moves: shift the known box instead of scanning the selection
                 const nb = [Math.max(0, p.origBounds[0] + mx), Math.max(0, p.origBounds[1] + my),
@@ -3853,25 +3863,29 @@ class InpaintEditor {
                 // right under the cursor, which on a 15k image is a dozen image pixels wide.
                 if (p.mode !== "replace") return;
                 this.selectionLabel = "";
-                this.selection.getContext("2d").clearRect(0, 0, this.width, this.height);
+                this.sel.clear();
                 this.markSelectionChanged(null);   // the undo step was pushed on pointer down
                 this.draw();
                 return;
             }
             const [x0, y0] = p.start;
             const [x1, y1] = p.cur;
-            const sctx = this.selection.getContext("2d");
-            if (p.mode === "replace") { sctx.globalCompositeOperation = "source-over"; sctx.clearRect(0, 0, this.width, this.height); this.selectionLabel = ""; }
-            sctx.globalCompositeOperation = p.mode === "subtract" ? "destination-out" : "source-over";
-            sctx.fillStyle = "#ff0000";
-            if (p.ellipse) {
-                sctx.beginPath();
-                sctx.ellipse((x0 + x1) / 2, (y0 + y1) / 2, Math.abs(x1 - x0) / 2, Math.abs(y1 - y0) / 2, 0, 0, Math.PI * 2);
-                sctx.fill();
-            } else {
-                sctx.fillRect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0));
-            }
-            sctx.globalCompositeOperation = "source-over";
+            const mode = p.mode, ellipse = p.ellipse, W = this.width, H = this.height;
+            if (mode === "replace") this.selectionLabel = "";
+            // a replace clears everything (null); add and subtract stay inside the shape's box
+            const box = mode === "replace" ? null : [Math.min(x0, x1) - 1, Math.min(y0, y1) - 1, Math.max(x0, x1) + 1, Math.max(y0, y1) + 1];
+            this.sel.drawInto(box, (sctx) => {
+                if (mode === "replace") sctx.clearRect(0, 0, W, H);
+                sctx.globalCompositeOperation = mode === "subtract" ? "destination-out" : "source-over";
+                sctx.fillStyle = "#ff0000";
+                if (ellipse) {
+                    sctx.beginPath();
+                    sctx.ellipse((x0 + x1) / 2, (y0 + y1) / 2, Math.abs(x1 - x0) / 2, Math.abs(y1 - y0) / 2, 0, 0, Math.PI * 2);
+                    sctx.fill();
+                } else {
+                    sctx.fillRect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0));
+                }
+            });
             this.markSelectionChanged(this.boundsAfter(p.mode, [Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1)]));
         } else if (p.kind === "selmove") {
             // a click without a drag deselects, the way the marquee tools do in Photoshop and Krita
@@ -3883,18 +3897,21 @@ class InpaintEditor {
             this.lassoPoints = null;
             if ((!pts || pts.length <= 2) && p.mode === "replace") { this.clearSelection(); return; }   // a click deselects
             if (pts && pts.length > 2) {
-                const sctx = this.selection.getContext("2d");
-                if (p.mode === "replace") { sctx.globalCompositeOperation = "source-over"; sctx.clearRect(0, 0, this.width, this.height); this.selectionLabel = ""; }
-                sctx.globalCompositeOperation = p.mode === "subtract" ? "destination-out" : "source-over";
-                sctx.fillStyle = "#ff0000";
-                sctx.beginPath();
-                sctx.moveTo(pts[0][0], pts[0][1]);
-                for (let i = 1; i < pts.length; i++) sctx.lineTo(pts[i][0], pts[i][1]);
-                sctx.closePath();
-                sctx.fill();
-                sctx.globalCompositeOperation = "source-over";
                 let lx0 = pts[0][0], ly0 = pts[0][1], lx1 = lx0, ly1 = ly0;
                 for (const [px, py] of pts) { if (px < lx0) lx0 = px; if (px > lx1) lx1 = px; if (py < ly0) ly0 = py; if (py > ly1) ly1 = py; }
+                const mode = p.mode, W = this.width, H = this.height;
+                if (mode === "replace") this.selectionLabel = "";
+                // a replace clears everything (null); add and subtract stay inside the points' box
+                this.sel.drawInto(mode === "replace" ? null : [lx0 - 1, ly0 - 1, lx1 + 1, ly1 + 1], (sctx) => {
+                    if (mode === "replace") sctx.clearRect(0, 0, W, H);
+                    sctx.globalCompositeOperation = mode === "subtract" ? "destination-out" : "source-over";
+                    sctx.fillStyle = "#ff0000";
+                    sctx.beginPath();
+                    sctx.moveTo(pts[0][0], pts[0][1]);
+                    for (let i = 1; i < pts.length; i++) sctx.lineTo(pts[i][0], pts[i][1]);
+                    sctx.closePath();
+                    sctx.fill();
+                });
                 this.markSelectionChanged(this.boundsAfter(p.mode, [lx0, ly0, lx1, ly1]));
             }
         } else if (p.kind === "selpaint") {
@@ -3949,16 +3966,21 @@ class InpaintEditor {
         this.polyPoints = null;
         if (!pts || pts.length < 3) { this.setStatus("A polygon needs at least three points."); return; }
         this.pushUndo({ kind: "selection" });
-        const sctx = this.selection.getContext("2d");
-        if (this.polyMode === "replace") { sctx.globalCompositeOperation = "source-over"; sctx.clearRect(0, 0, this.width, this.height); this.selectionLabel = ""; }
-        sctx.globalCompositeOperation = this.polyMode === "subtract" ? "destination-out" : "source-over";
-        sctx.fillStyle = "#ff0000";
-        sctx.beginPath();
-        sctx.moveTo(pts[0][0], pts[0][1]);
-        for (let i = 1; i < pts.length; i++) sctx.lineTo(pts[i][0], pts[i][1]);
-        sctx.closePath();
-        sctx.fill();
-        sctx.globalCompositeOperation = "source-over";
+        const mode = this.polyMode, W = this.width, H = this.height;
+        if (mode === "replace") this.selectionLabel = "";
+        let bx0 = pts[0][0], by0 = pts[0][1], bx1 = bx0, by1 = by0;
+        for (const [px, py] of pts) { if (px < bx0) bx0 = px; if (px > bx1) bx1 = px; if (py < by0) by0 = py; if (py > by1) by1 = py; }
+        // a replace clears everything (null); add and subtract stay inside the points' box
+        this.sel.drawInto(mode === "replace" ? null : [bx0 - 1, by0 - 1, bx1 + 1, by1 + 1], (sctx) => {
+            if (mode === "replace") sctx.clearRect(0, 0, W, H);
+            sctx.globalCompositeOperation = mode === "subtract" ? "destination-out" : "source-over";
+            sctx.fillStyle = "#ff0000";
+            sctx.beginPath();
+            sctx.moveTo(pts[0][0], pts[0][1]);
+            for (let i = 1; i < pts.length; i++) sctx.lineTo(pts[i][0], pts[i][1]);
+            sctx.closePath();
+            sctx.fill();
+        });
         this.markSelectionChanged();
         this.setStatus(`Polygon with ${pts.length} points ${this.polyMode === "replace" ? "selected" : this.polyMode === "add" ? "added" : "subtracted"}.`);
     }
@@ -3967,19 +3989,25 @@ class InpaintEditor {
         const r = this.brushSize / 2 + 2;
         const p = this.pointer;
         if (p && p.kind === "selpaint") this.strokeBounds(p, x0, y0, x1, y1, r);
-        this.touchSourceRect(this.selection, Math.min(x0, x1) - r, Math.min(y0, y1) - r, Math.max(x0, x1) + r, Math.max(y0, y1) + r);
-        const sctx = this.selection.getContext("2d");
+        this.touchSourceRect(this.sel, Math.min(x0, x1) - r, Math.min(y0, y1) - r, Math.max(x0, x1) + r, Math.max(y0, y1) + r);
         const subtract = this.pointer && this.pointer.kind === "selpaint" ? !!this.pointer.subtract : this.tool === "deselect";
-        sctx.globalCompositeOperation = subtract ? "destination-out" : "source-over";
-        sctx.strokeStyle = "#ff0000";
-        sctx.lineCap = "round";
-        sctx.lineJoin = "round";
-        sctx.lineWidth = this.brushSize;
-        sctx.beginPath();
-        sctx.moveTo(x0, y0);
-        sctx.lineTo(x1 + 0.01, y1 + 0.01);
-        sctx.stroke();
-        sctx.globalCompositeOperation = "source-over";
+        const size = this.brushSize;
+        // The round line reaches half the brush past its ends, but the clip must hold Skia's
+        // conservative bounds of the stroke too (about 0.71 of the width past the ends): a clip
+        // inside those changes how a GPU canvas antialiases the stroke, measured up to 255 levels
+        // on the edge pixels with a pad of half the brush + 16 at 150 px. The full width + 4 holds them.
+        const pad = size + 4;
+        this.sel.drawInto([Math.min(x0, x1) - pad, Math.min(y0, y1) - pad, Math.max(x0, x1) + pad, Math.max(y0, y1) + pad], (sctx) => {
+            sctx.globalCompositeOperation = subtract ? "destination-out" : "source-over";
+            sctx.strokeStyle = "#ff0000";
+            sctx.lineCap = "round";
+            sctx.lineJoin = "round";
+            sctx.lineWidth = size;
+            sctx.beginPath();
+            sctx.moveTo(x0, y0);
+            sctx.lineTo(x1 + 0.01, y1 + 0.01);
+            sctx.stroke();
+        });
     }
 
     /**
@@ -4003,16 +4031,16 @@ class InpaintEditor {
         let minX = x0, maxX = x0, minY = y0, maxY = y0;
         for (const [x, y] of path) { if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y; }
         if (Math.max(maxX - minX, maxY - minY) < this.brushSize * 1.5) return false;
-        const sctx = this.selection.getContext("2d");
-        sctx.save();
-        sctx.globalCompositeOperation = subtract ? "destination-out" : "source-over";
-        sctx.fillStyle = "#ff0000";
-        sctx.beginPath();
-        sctx.moveTo(x0, y0);
-        for (let i = 1; i < path.length; i++) sctx.lineTo(path[i][0], path[i][1]);
-        sctx.closePath();
-        sctx.fill("nonzero");
-        sctx.restore();
+        // the closed path lies inside the box of its points
+        this.sel.drawInto([minX - 1, minY - 1, maxX + 1, maxY + 1], (sctx) => {
+            sctx.globalCompositeOperation = subtract ? "destination-out" : "source-over";
+            sctx.fillStyle = "#ff0000";
+            sctx.beginPath();
+            sctx.moveTo(x0, y0);
+            for (let i = 1; i < path.length; i++) sctx.lineTo(path[i][0], path[i][1]);
+            sctx.closePath();
+            sctx.fill("nonzero");
+        });
         return true;
     }
 
@@ -4081,7 +4109,7 @@ class InpaintEditor {
     selectedAt(ix, iy) {
         const x = Math.floor(ix), y = Math.floor(iy);
         if (x < 0 || y < 0 || x >= this.width || y >= this.height || !this.getBounds()) return false;
-        return this.selection.getContext("2d").getImageData(x, y, 1, 1).data[3] > 127;
+        return this.sel.readRect(x, y, 1, 1).data[3] > 127;
     }
 
     /** Combine a W×H region mask (1 = inside) with the selection: replace, add or subtract. */
@@ -4099,13 +4127,15 @@ class InpaintEditor {
     applyShapeToSelection(shape, mode = "replace", box = null, at = [0, 0]) {
         const hint = box ? this.boundsAfter(mode, box) : undefined;
         this.pushUndo({ kind: "selection" });
-        const sctx = this.selection.getContext("2d");
-        if (mode === "replace") { sctx.globalCompositeOperation = "source-over"; sctx.clearRect(0, 0, this.width, this.height); this.selectionLabel = ""; }
-        sctx.globalCompositeOperation = mode === "subtract" ? "destination-out" : "source-over";
-        sctx.drawImage(shape, at[0], at[1]);
-        sctx.globalCompositeOperation = "source-over";
+        const W = this.width, H = this.height;
+        if (mode === "replace") this.selectionLabel = "";
         // a replace clears the whole canvas, so its levels are refreshed whole; add and subtract touch the shape's box
         const rect = mode === "replace" ? undefined : [at[0], at[1], at[0] + shape.width, at[1] + shape.height];
+        this.sel.drawInto(rect || null, (sctx) => {
+            if (mode === "replace") sctx.clearRect(0, 0, W, H);
+            sctx.globalCompositeOperation = mode === "subtract" ? "destination-out" : "source-over";
+            sctx.drawImage(shape, at[0], at[1]);
+        });
         this.markSelectionChanged(hint, rect);
         this.draw();
     }
@@ -4116,18 +4146,16 @@ class InpaintEditor {
      * failed and the caller has to do the work itself.
      */
     async selectionInWorker(kind, args) {
-        if (!this.selection || !editorWorker()) return null;
+        if (!this.sel || !editorWorker()) return null;
         try {
-            const bitmap = await createImageBitmap(this.selection);
+            const bitmap = await createImageBitmap(this.sel.toCanvas());
             const r = await workerCall("selection", { kind, bitmap, ...args }, [bitmap]);
             if (!r.bitmap) return null;
-            const sctx = this.selection.getContext("2d");
-            sctx.save();
-            sctx.setTransform(1, 0, 0, 1, 0, 0);
-            sctx.globalAlpha = 1;
-            sctx.globalCompositeOperation = "copy";
-            sctx.drawImage(r.bitmap, 0, 0);
-            sctx.restore();
+            // the answer is the whole selection: "copy" replaces all of it, which is the whole rect (null)
+            this.sel.drawInto(null, (sctx) => {
+                sctx.globalCompositeOperation = "copy";
+                sctx.drawImage(r.bitmap, 0, 0);
+            });
             r.bitmap.close();
             return { bounds: r.bounds === undefined ? undefined : r.bounds };
         } catch (err) {
@@ -4154,7 +4182,7 @@ class InpaintEditor {
                 const args = { bitmap, x, y, tolerance, contiguous, color };
                 if (clipping) {
                     // only the box of the selection: a crop, not a copy of the whole canvas
-                    const selBitmap = await createImageBitmap(this.selection, at[0], at[1], W, H);
+                    const selBitmap = await createImageBitmap(this.sel.toCanvas(), at[0], at[1], W, H);
                     transfer.push(selBitmap);
                     args.selBitmap = selBitmap;
                 }
@@ -4168,8 +4196,9 @@ class InpaintEditor {
         const data = src.getContext("2d").getImageData(0, 0, W, H).data;
         const mask = floodMask(data, W, H, x, y, tolerance, contiguous);
         if (clipping) {
-            let sel = this.selection;
-            if (at[0] || at[1] || W !== this.width || H !== this.height) { sel = makeCanvas(W, H); sel.getContext("2d").drawImage(this.selection, -at[0], -at[1]); }
+            let sel;
+            if (at[0] || at[1] || W !== this.width || H !== this.height) { sel = makeCanvas(W, H); this.sel.drawTo(sel.getContext("2d"), -at[0], -at[1]); }
+            else sel = this.sel.toCanvas();
             clipMaskToSelection(mask, sel);
         }
         let count = 0;
@@ -4281,12 +4310,13 @@ class InpaintEditor {
             const tmp = makeCanvas(this.width, this.height);
             const tctx = tmp.getContext("2d");
             tctx.filter = `blur(${r}px)`;
-            tctx.drawImage(this.selection, 0, 0);
+            this.sel.drawTo(tctx, 0, 0);
             tctx.filter = "none";
-            const sctx = this.selection.getContext("2d");
-            sctx.globalCompositeOperation = "source-over";
-            sctx.clearRect(0, 0, this.width, this.height);
-            sctx.drawImage(tmp, 0, 0);
+            const W = this.width, H = this.height;
+            this.sel.drawInto(null, (sctx) => {
+                sctx.clearRect(0, 0, W, H);
+                sctx.drawImage(tmp, 0, 0);
+            });
         }
         this.markSelectionChanged(done ? done.bounds : undefined);
         this.draw();
@@ -4307,7 +4337,7 @@ class InpaintEditor {
         if (!this.getBounds()) { this.setStatus("Nothing selected to save."); return; }
         if (!this.savedSelections) this.savedSelections = [];
         const name = this.selectionLabel ? this.selectionLabel : `Selection ${this.savedSelections.length + 1}`;
-        this.savedSelections.push({ name, url: this.selection.toDataURL("image/png") });
+        this.savedSelections.push({ name, url: this.sel.toCanvas().toDataURL("image/png") });
         this.renderSelectionList();
         this.selectionsSel.selectedIndex = this.savedSelections.length - 1;
         this.notifyChanged();
@@ -4320,11 +4350,13 @@ class InpaintEditor {
         try {
             const img = await loadImageEl(s.url);
             this.pushUndo({ kind: "selection" });
-            const sctx = this.selection.getContext("2d");
-            if (mode === "replace") { sctx.globalCompositeOperation = "source-over"; sctx.clearRect(0, 0, this.width, this.height); }
-            sctx.globalCompositeOperation = mode === "subtract" ? "destination-out" : "source-over";
-            sctx.drawImage(img, 0, 0);
-            sctx.globalCompositeOperation = "source-over";
+            const W = this.width, H = this.height;
+            // the saved PNG is drawn unscaled at 0, 0 whatever its size: the whole rect (null)
+            this.sel.drawInto(null, (sctx) => {
+                if (mode === "replace") sctx.clearRect(0, 0, W, H);
+                sctx.globalCompositeOperation = mode === "subtract" ? "destination-out" : "source-over";
+                sctx.drawImage(img, 0, 0);
+            });
             this.selectionLabel = mode === "replace" ? s.name : this.selectionLabel;
             this.markSelectionChanged();
             this.draw();
@@ -4961,7 +4993,7 @@ class InpaintEditor {
      * canvas the size of the layer per gesture.
      */
     strokeClip(layer, target) {
-        return !!(this.selection && this.getBounds()) || null;
+        return !!(this.sel && this.getBounds()) || null;
     }
 
     /** A stroke buffer for `target` (a layer's `px` or a mask's `maskPx`; only the size is read); tests build gestures with it. */
@@ -4981,7 +5013,7 @@ class InpaintEditor {
         ctx.globalAlpha = 1;
         ctx.clearRect(0, 0, w, h);
         ctx.setTransform(target.width / layer.w, 0, 0, target.height / layer.h, -x, -y);
-        ctx.drawImage(this.selection, -layer.x, -layer.y);
+        this.sel.drawTo(ctx, -layer.x, -layer.y);
         ctx.restore();
         return c;
     }
@@ -5111,7 +5143,7 @@ class InpaintEditor {
     }
 
     fillSelection() {
-        if (!this.selection || !this.getBounds()) { this.setStatus("Nothing selected to fill."); return; }
+        if (!this.sel || !this.getBounds()) { this.setStatus("Nothing selected to fill."); return; }
         let layer = this.activeLayer();
         if (!layer) layer = this.addPaintLayer();
         if (layer.locked) { this.setStatus(`${layer.name} is locked.`); return; }
@@ -5120,7 +5152,7 @@ class InpaintEditor {
         this.pushUndo(onMask ? { kind: "mask", id: layer.id } : { kind: "layer", id: layer.id });
         const shape = makeCanvas(this.width, this.height);
         const sctx = shape.getContext("2d");
-        sctx.drawImage(this.selection, 0, 0);
+        this.sel.drawTo(sctx, 0, 0);
         sctx.globalCompositeOperation = "source-in";
         sctx.fillStyle = onMask ? "#ffffff" : this.color;
         sctx.fillRect(0, 0, this.width, this.height);
@@ -5148,7 +5180,7 @@ class InpaintEditor {
      * Cut clears the pixels afterwards. Every tab shares the clipboard.
      */
     copySelection({ merged = false, cut = false } = {}) {
-        if (!this.selection || !this.getBounds()) return this.copyLayer({ merged, cut });
+        if (!this.sel || !this.getBounds()) return this.copyLayer({ merged, cut });
         const [x0, y0, x1, y1] = this.getBounds();
         const w = x1 - x0, h = y1 - y0;
         const layer = this.activeLayer();
@@ -5161,7 +5193,7 @@ class InpaintEditor {
             ctx.drawImage(this.layerPixels(layer), layer.x - x0, layer.y - y0, layer.w, layer.h);
         }
         ctx.globalCompositeOperation = "destination-in";
-        ctx.drawImage(this.selection, -x0, -y0);
+        this.sel.drawTo(ctx, -x0, -y0);
         ctx.globalCompositeOperation = "source-over";
         this.clipboard = { canvas: c, x: x0, y: y0, source: useMerged ? "merged" : layer.name };
         if (cut && layer && !useMerged) this.clearSelectedPixels();
@@ -5209,7 +5241,7 @@ class InpaintEditor {
 
     /** Delete the selected pixels of the active layer (Krita "Clear"); on a mask in edit mode it hides them. */
     clearSelectedPixels() {
-        if (!this.selection || !this.getBounds()) { this.setStatus("Nothing selected. Make a selection first, invert it to keep only the selected part."); return; }
+        if (!this.sel || !this.getBounds()) { this.setStatus("Nothing selected. Make a selection first, invert it to keep only the selected part."); return; }
         const layer = this.activeLayer();
         if (!layer) { this.setStatus("The base layer cannot be erased. Select a layer, or paint on the base first to get a layer."); return; }
         if (layer.locked) { this.setStatus(`${layer.name} is locked.`); return; }
@@ -5217,11 +5249,11 @@ class InpaintEditor {
         if (layer.kind === "filter" && !onMask) { this.setStatus("Filter layers have no pixels. Use \"mask from selection\" to limit the filter instead."); return; }
         this.pushUndo(onMask ? { kind: "mask", id: layer.id } : { kind: "layer", id: layer.id });
         const target = onMask ? layer.maskPx : layer.px;
-        const selection = this.selection;   // the selection read stays on its canvas until step (d)
+        const sel = this.sel;
         target.drawInto(null, (ctx) => {
             ctx.globalCompositeOperation = "destination-out";
             ctx.setTransform(target.width / layer.w, 0, 0, target.height / layer.h, 0, 0);
-            ctx.drawImage(selection, -layer.x, -layer.y);
+            sel.drawTo(ctx, -layer.x, -layer.y);
         });
         if (onMask) this.markMaskChanged(layer); else this.markLayerChanged(layer);
         this.draw();
@@ -5231,16 +5263,15 @@ class InpaintEditor {
     // ---- selection: grow / shrink / from layer ------------------------------
 
     async growSelection(n) {
-        if (!this.selection || !n) return;
+        if (!this.sel || !n) return;
         const W = this.width, H = this.height;
         const grow = n > 0, r = Math.abs(n);
         this.pushUndo({ kind: "selection" });
         const done = await this.selectionInWorker("grow", { n });
         if (!done) {
-            const sctx = this.selection.getContext("2d");
-            const img = sctx.getImageData(0, 0, W, H);
+            const img = this.sel.readRect(0, 0, W, H);
             growMask(img.data, W, H, n);
-            sctx.putImageData(img, 0, 0);
+            this.sel.writeRect(img, 0, 0);
         }
         this.markSelectionChanged(done ? done.bounds : undefined);
         this.draw();
@@ -5254,13 +5285,12 @@ class InpaintEditor {
         const tmp = makeCanvas(this.width, this.height);
         tmp.getContext("2d").drawImage(this.layerPixels(layer), layer.x, layer.y, layer.w, layer.h);
         const src = tmp.getContext("2d").getImageData(0, 0, this.width, this.height).data;
-        const sctx = this.selection.getContext("2d");
-        const img = sctx.createImageData(this.width, this.height);
+        const img = new ImageData(this.width, this.height);
         const d = img.data;
         for (let i = 0; i < src.length; i += 4) {
             d[i] = 255; d[i + 1] = 0; d[i + 2] = 0; d[i + 3] = src[i + 3] > 127 ? 255 : 0;
         }
-        sctx.putImageData(img, 0, 0);
+        this.sel.writeRect(img, 0, 0);
         this.markSelectionChanged();
         this.draw();
         this.setStatus(`Selection taken from ${layer.name}.`);
@@ -5400,7 +5430,7 @@ class InpaintEditor {
                 // what the generator sees: the area solid green
                 const tmp = makeCanvas(c.width, c.height);
                 const t = tmp.getContext("2d");
-                t.drawImage(this.selection, x, y, w, h, 0, 0, c.width, c.height);
+                this.sel.drawTo(t, x, y, w, h, 0, 0, c.width, c.height);
                 t.globalCompositeOperation = "source-in";
                 t.fillStyle = "#00ff00";
                 t.fillRect(0, 0, c.width, c.height);
@@ -5411,9 +5441,9 @@ class InpaintEditor {
                 const ring = makeCanvas(c.width, c.height);
                 const r = ring.getContext("2d");
                 const px = Math.max(2, Math.round(c.width / 300));
-                for (let dx = -px; dx <= px; dx += px) for (let dy = -px; dy <= px; dy += px) r.drawImage(this.selection, x, y, w, h, dx, dy, c.width, c.height);
+                for (let dx = -px; dx <= px; dx += px) for (let dy = -px; dy <= px; dy += px) this.sel.drawTo(r, x, y, w, h, dx, dy, c.width, c.height);
                 r.globalCompositeOperation = "destination-out";
-                r.drawImage(this.selection, x, y, w, h, 0, 0, c.width, c.height);
+                this.sel.drawTo(r, x, y, w, h, 0, 0, c.width, c.height);
                 r.globalCompositeOperation = "source-in";
                 r.fillStyle = "#ff00ff";
                 r.fillRect(0, 0, c.width, c.height);
@@ -5603,13 +5633,14 @@ class InpaintEditor {
         const id = this.objectIdAt(ix, iy);
         if (!id) { if (host.objectsInApp()) { host.selectPoint(this, ix, iy, p); return; } this.setStatus("No object here. Use the brush or lasso for this spot."); return; }
         const x = Math.floor(ix), y = Math.floor(iy);
-        const already = this.selection.getContext("2d").getImageData(x, y, 1, 1).data[3] > 0;
+        const already = this.sel.readRect(x, y, 1, 1).data[3] > 0;
         const subtract = p.alt ? true : (p.shift ? false : already);
         this.pushUndo({ kind: "selection" });
-        const sctx = this.selection.getContext("2d");
-        sctx.globalCompositeOperation = subtract ? "destination-out" : "source-over";
-        sctx.drawImage(this.objectShape(id), 0, 0);
-        sctx.globalCompositeOperation = "source-over";
+        const shape = this.objectShape(id);   // image-sized: the whole rect (null)
+        this.sel.drawInto(null, (sctx) => {
+            sctx.globalCompositeOperation = subtract ? "destination-out" : "source-over";
+            sctx.drawImage(shape, 0, 0);
+        });
         this.markSelectionChanged();
         this.draw();
         this.setStatus(subtract ? "Object removed from the selection." : "Object added to the selection.");
@@ -5622,7 +5653,7 @@ class InpaintEditor {
         this.segBtn.disabled = false;
         try {
             const img = await loadImageEl(viewUrl({ filename: info.filename, subfolder: info.subfolder || SUBFOLDER, type: info.type || "temp" }));
-            if (!this.selection) return;
+            if (!this.sel) return;
             this.pushUndo({ kind: "selection" });
             const tmp = makeCanvas(this.width, this.height);
             const tctx = tmp.getContext("2d");
@@ -5640,11 +5671,12 @@ class InpaintEditor {
                 if (on) count++;
             }
             sh.putImageData(out, 0, 0);
-            const sctx = this.selection.getContext("2d");
-            if (pending.mode === "replace") sctx.clearRect(0, 0, this.width, this.height);
-            sctx.globalCompositeOperation = pending.mode === "subtract" ? "destination-out" : "source-over";
-            sctx.drawImage(shape, 0, 0);
-            sctx.globalCompositeOperation = "source-over";
+            const W = this.width, H = this.height;
+            this.sel.drawInto(null, (sctx) => {
+                if (pending.mode === "replace") sctx.clearRect(0, 0, W, H);
+                sctx.globalCompositeOperation = pending.mode === "subtract" ? "destination-out" : "source-over";
+                sctx.drawImage(shape, 0, 0);
+            });
             this.markSelectionChanged();
             this.draw();
             const pct = Math.round(100 * count / (this.width * this.height));
@@ -5726,11 +5758,10 @@ class InpaintEditor {
             this.activeLayerId = null;
             this.base = { ref, img };
             this.width = nw; this.height = nh;
-            this.selection = makeCanvas(nw, nh);
-            const sctx = this.selection.getContext("2d");
-            sctx.fillStyle = "#ff0000";
-            sctx.fillRect(0, 0, nw, nh);
-            sctx.clearRect(left, top, W, H);
+            // a new object (the canvas undo step holds the old one): the new border selected
+            this.sel = MaskPixels.empty(nw, nh);
+            this.sel.fill(null, "#ff0000");
+            this.sel.clear([left, top, left + W, top + H]);
             this.pushUndoSnapshot(before);
             this.uploaded = this.makeUploaded();
             this.selectionDirty = true; this.selectionLoose = false;
@@ -5789,7 +5820,7 @@ class InpaintEditor {
         const [x, y, x1, y1] = ext;
         const w = x1 - x, h = y1 - y;
         const c = makeCanvas(w, h);
-        c.getContext("2d").drawImage(this.selection, x, y, w, h, 0, 0, w, h);
+        this.sel.drawTo(c.getContext("2d"), x, y, w, h, 0, 0, w, h);
         if (w * h > SNAP_CANVAS_PX) return { kind: "selection", x, y, w, h, url: this.snapUrl(c), bytes: 0, bounds };
         return { kind: "selection", x, y, w, h, canvas: c, bytes: w * h * 4, bounds };
     }
@@ -5842,7 +5873,7 @@ class InpaintEditor {
         if (step.kind === "layers") return { kind: "layers", layers: this.layers.map((l) => ({ ...l })), activeLayerId: this.activeLayerId };
         if (step.kind === "canvas") {
             // base, size, selection and the layer list (shallow copies: the canvases themselves are never mutated by extend / crop, only replaced)
-            return { kind: "canvas", base: this.base, width: this.width, height: this.height, selection: this.snapUrl(this.selection), layers: this.layers.map((l) => ({ ...l })), activeLayerId: this.activeLayerId };
+            return { kind: "canvas", base: this.base, width: this.width, height: this.height, selection: this.snapUrl(this.sel.toCanvas()), layers: this.layers.map((l) => ({ ...l })), activeLayerId: this.activeLayerId };
         }
         const layer = this.layers.find((l) => l.id === step.id);
         if (!layer) return null;
@@ -5858,7 +5889,7 @@ class InpaintEditor {
     }
 
     pushUndo(step) {
-        if (!this.selection) return;
+        if (!this.sel) return;   // no image loaded yet: nothing to undo
         this.pushUndoSnapshot(this.snapshot(step));
     }
 
@@ -5889,8 +5920,11 @@ class InpaintEditor {
             this.height = snap.height;
             this.layers = snap.layers.map((l) => installLayerAliases({ ...l, dirty: true, exportRef: null, _maskedValid: false, _mcache: null, _fxCache: null, maskDirty: !!l.maskPx }));
             this.activeLayerId = snap.activeLayerId;
-            this.selection = makeCanvas(this.width, this.height);
-            try { this.selection.getContext("2d").drawImage(await snapImage(snap.selection), 0, 0); } catch (_) { /* empty selection */ }
+            const sel = this.sel = MaskPixels.empty(this.width, this.height);
+            try {
+                const img = await snapImage(snap.selection);
+                sel.drawInto(null, (ctx) => ctx.drawImage(img, 0, 0));
+            } catch (_) { /* empty selection */ }
             this.uploaded = this.makeUploaded();
             this.selectionDirty = true; this.selectionLoose = false;
             this.selectionDataUrl = null;
@@ -5909,14 +5943,11 @@ class InpaintEditor {
             // an undo costs the selection's extent and not a rebuild of the levels of a 15k canvas.
             const old = this.selectionExtent();
             const img = snap.empty ? null : (snap.canvas || await snapImage(snap.url));
-            const sctx = this.selection.getContext("2d");
-            sctx.save();
-            sctx.setTransform(1, 0, 0, 1, 0, 0);
-            sctx.globalAlpha = 1;
-            sctx.globalCompositeOperation = "source-over";
-            sctx.clearRect(0, 0, this.width, this.height);
-            if (img) sctx.drawImage(img, snap.x, snap.y);
-            sctx.restore();
+            const W = this.width, H = this.height;
+            this.sel.drawInto(null, (sctx) => {
+                sctx.clearRect(0, 0, W, H);
+                if (img) sctx.drawImage(img, snap.x, snap.y);
+            });
             const now = snap.empty ? null : [snap.x, snap.y, snap.x + snap.w, snap.y + snap.h];
             const rect = old && now ? [Math.min(old[0], now[0]), Math.min(old[1], now[1]), Math.max(old[2], now[2]), Math.max(old[3], now[3])] : (old || now || [0, 0, 1, 1]);
             this.markSelectionChanged(snap.bounds, rect);
@@ -6020,23 +6051,22 @@ class InpaintEditor {
     // ---- selection ops -----------------------------------------------------
 
     clearSelection() {
-        if (!this.selection) return;
+        if (!this.sel) return;
         this.selectionLabel = "";
         this.pushUndo({ kind: "selection" });
-        this.selection.getContext("2d").clearRect(0, 0, this.width, this.height);
+        this.sel.clear();
         this.markSelectionChanged(null);
         this.draw();
     }
 
     async invertSelection() {
-        if (!this.selection) return;
+        if (!this.sel) return;
         this.pushUndo({ kind: "selection" });
         const done = await this.selectionInWorker("invert", {});
         if (!done) {
-            const sctx = this.selection.getContext("2d");
-            const data = sctx.getImageData(0, 0, this.width, this.height);
+            const data = this.sel.readRect(0, 0, this.width, this.height);
             invertMask(data.data);
-            sctx.putImageData(data, 0, 0);
+            this.sel.writeRect(data, 0, 0);
         }
         this.markSelectionChanged(done ? done.bounds : undefined);
         this.draw();
@@ -6061,8 +6091,8 @@ class InpaintEditor {
         }
         this.selectionSeq++;
         this.selectionEncoded = false;
-        if (rect) this.touchSourceRect(this.selection, rect[0], rect[1], rect[2], rect[3]);
-        else this.touchSource(this.selection);
+        if (rect) this.touchSourceRect(this.sel, rect[0], rect[1], rect[2], rect[3]);
+        else this.touchSource(this.sel);
         this.uploaded.maskHash = null;
         this.renderInfo();
         this.drawThumb();
@@ -6480,13 +6510,13 @@ class InpaintEditor {
 
     /** Transparency mask from the selection (Krita: "add transparency mask" from selection). */
     maskFromSelection(layer) {
-        if (!layer || !this.selection) return;
+        if (!layer || !this.sel) return;
         if (!this.getBounds()) { this.setStatus("Select the area to keep first."); return; }
         this.pushUndo({ kind: "mask", id: layer.id });
         const m = makeCanvas(layer.canvas.width, layer.canvas.height);
         const ctx = m.getContext("2d");
         ctx.setTransform(m.width / layer.w, 0, 0, m.height / layer.h, 0, 0);
-        ctx.drawImage(this.selection, -layer.x, -layer.y);
+        this.sel.drawTo(ctx, -layer.x, -layer.y);
         ctx.setTransform(1, 0, 0, 1, 0, 0);
         ctx.globalCompositeOperation = "source-in";
         ctx.fillStyle = "#ffffff";
@@ -7103,7 +7133,7 @@ class InpaintEditor {
         const W = bx1 - bx0, H = by1 - by0;
         if (W <= 0 || H <= 0) return null;
         // one 32-bit word per pixel; alpha is the high byte, so "selected" is one bit test
-        const d = new Uint32Array(this.selection.getContext("2d").getImageData(bx0, by0, W, H).data.buffer);
+        const d = new Uint32Array(this.sel.readRect(bx0, by0, W, H).data.buffer);
         let x0 = W, y0 = H, x1 = -1, y1 = -1;
         for (let y = 0; y < H; y++) {
             const row = y * W;
@@ -7133,10 +7163,10 @@ class InpaintEditor {
         const [bx0, by0, bx1, by1] = box;
         const W = bx1 - bx0, H = by1 - by0;
         if (W <= 0 || H <= 0) return null;
-        const ctx = this.selection.getContext("2d");
+        const sel = this.sel;
         const STRIP = 64;
         const rows = (y, h) => {   // first and last row of the strip with a selected pixel, or null
-            const d = new Uint32Array(ctx.getImageData(bx0, y, W, h).data.buffer);
+            const d = new Uint32Array(sel.readRect(bx0, y, W, h).data.buffer);
             let first = -1, last = -1;
             for (let r = 0; r < h; r++) {
                 const row = r * W;
@@ -7151,7 +7181,7 @@ class InpaintEditor {
         if (y1 < 0) y1 = y0 + 1;
         const cols = (x, w) => {   // first and last column of the strip with a selected pixel, or null
             const h = y1 - y0;
-            const d = new Uint32Array(ctx.getImageData(x, y0, w, h).data.buffer);
+            const d = new Uint32Array(sel.readRect(x, y0, w, h).data.buffer);
             let first = -1, last = -1;
             for (let c = 0; c < w; c++) {
                 for (let r = 0; r < h; r++) if (d[r * w + c] & 0x80000000) { if (first < 0) first = c; last = c; break; }
@@ -7173,14 +7203,15 @@ class InpaintEditor {
      * to copy and what a restore has to refresh. Null when the selection is empty.
      */
     selectionExtent() {
-        if (!this.selection) return null;
+        if (!this.sel) return null;
         const W = this.width, H = this.height;
         if (W * H <= PYRAMID_MIN_PX) return [0, 0, W, H];
         const budget = this._pyramidBudget;
         this._pyramidBudget = Infinity;
-        const lvl = this.displaySource(this.selection, 1 / 16);
+        const lvl = this.displaySource(this.sel, 1 / 16);
         this._pyramidBudget = budget;
-        if (lvl === this.selection) return [0, 0, W, H];
+        // no level came back (displaySource hands back the source itself): read nothing, take it all
+        if (lvl === canvasOf(this.sel)) return [0, 0, W, H];
         const lw = lvl.width, lh = lvl.height;
         const d = new Uint32Array(lvl.getContext("2d").getImageData(0, 0, lw, lh).data.buffer);
         let cx0 = lw, cy0 = lh, cx1 = -1, cy1 = -1;
@@ -7323,8 +7354,8 @@ class InpaintEditor {
         this.width = img.naturalWidth;
         this.height = img.naturalHeight;
         if (!keepLayers || sizeChanged) { this.layers = []; this.activeLayerId = null; }
-        if (!this.selection || sizeChanged) {
-            this.selection = makeCanvas(this.width, this.height);
+        if (!this.sel || sizeChanged) {
+            this.sel = MaskPixels.empty(this.width, this.height);
             this.undo = [];
             this.redo = [];
         }
@@ -7339,7 +7370,7 @@ class InpaintEditor {
         this._basePxImg = null;
         this.flatCache = null;
         this.sceneSig = null;
-        this.touchSource(this.selection);
+        this.touchSource(this.sel);
         this.renderLayers();
         this.renderInfo();
         this.fitView();
@@ -7986,7 +8017,7 @@ class InpaintEditor {
             this.savedSelections = [];
             this.guides = { x: [], y: [] };
             this.compare = null;
-            this.selection = null;
+            this.sel = null;
         }
         await this.setBase(ref, img, { keepLayers });
         this.undo = []; this.redo = [];
@@ -8035,7 +8066,7 @@ class InpaintEditor {
             this.savedSelections = [];
             this.guides = { x: [], y: [] };
             this.compare = null;
-            this.selection = null;
+            this.sel = null;
             await this.setBase(ref, img, { keepLayers: false });
             this.undo = []; this.redo = [];
             this.renderHistory();
@@ -8574,7 +8605,7 @@ class InpaintEditor {
     maskToCanvas() {
         const c = makeCanvas(this.width, this.height);
         const ctx = c.getContext("2d");
-        const src = this.selection.getContext("2d").getImageData(0, 0, this.width, this.height).data;
+        const src = this.sel.readRect(0, 0, this.width, this.height).data;
         const out = ctx.createImageData(this.width, this.height);
         const d = out.data;
         for (let i = 0; i < src.length; i += 4) {
@@ -8699,7 +8730,7 @@ class InpaintEditor {
         a.clearRect(0, 0, W, H);
         a.imageSmoothingEnabled = s < 1;
         const r = 1.25;
-        const sel = this.displaySource(this.selection, s);   // nine draws of the selection: never at full size
+        const sel = this.displaySource(this.sel, s);   // nine draws of the selection: never at full size
         for (const [dx, dy] of [[r, 0], [-r, 0], [0, r], [0, -r], [r, r], [-r, -r], [r, -r], [-r, r]]) {
             this.applyViewTransform(a, dx, dy);
             a.drawImage(sel, 0, 0, this.width, this.height);
@@ -8835,7 +8866,7 @@ class InpaintEditor {
         const s = this.view.scale;
         if (this.selectionDisplay === "tint" || this.quickMask || !this.getBounds()) {
             ctx.globalAlpha = this.quickMask ? 0.5 : 0.4;
-            ctx.drawImage(this.displaySource(this.selection, s), 0, 0, this.width, this.height);
+            ctx.drawImage(this.displaySource(this.sel, s), 0, 0, this.width, this.height);
             ctx.globalAlpha = 1;
         } else {
             this.drawMarchingAnts(ctx);
@@ -9244,7 +9275,7 @@ class InpaintEditor {
         this.sceneSig = null;
         // the pyramids: their levels are exclusively theirs, the sources stay
         // the base's pixels only when they were built: asking basePx here would build them
-        for (const src of [...sources, canvasOf(this._basePx), this.selection]) {
+        for (const src of [...sources, canvasOf(this._basePx), canvasOf(this.sel)]) {
             if (!src) continue;
             const entry = this.pyramids.get(src);
             if (!entry) continue;
@@ -9313,8 +9344,8 @@ class InpaintEditor {
         if (this._selEncoding) return;
         this._selEncoding = true;
         const seq = this.selectionSeq;
-        const canvas = this.selection;
-        canvasToBlob(canvas)
+        const sel = this.sel;   // a replaced selection is a new object: its PNG is not stored
+        canvasToBlob(sel.toCanvas())
             .then((blob) => new Promise((res, rej) => {
                 const r = new FileReader();
                 r.onload = () => res(r.result);
@@ -9323,7 +9354,7 @@ class InpaintEditor {
             }))
             .then((url) => {
                 this._selEncoding = false;
-                if (canvas !== this.selection) return;
+                if (sel !== this.sel) return;
                 this.selectionDataUrl = url;
                 if (seq === this.selectionSeq) {
                     this.selectionEncoded = true;
@@ -9337,9 +9368,9 @@ class InpaintEditor {
 
     getValue() {
         if (!this.base) return this.lastValueString || "{}";
-        if (this.selection && (!this.selectionEncoded || !this.selectionDataUrl)) {
+        if (this.sel && (!this.selectionEncoded || !this.selectionDataUrl)) {
             if (this.width * this.height <= SYNC_ENCODE_PX) {
-                this.selectionDataUrl = this.selection.toDataURL("image/png");
+                this.selectionDataUrl = this.sel.toCanvas().toDataURL("image/png");
                 this.selectionEncoded = true;
             } else {
                 // a 100 MP toDataURL blocks the editor for seconds: encode in the background,
@@ -9485,7 +9516,8 @@ class InpaintEditor {
             if (state.selection) {
                 const sel = await loadImageEl(state.selection);
                 if (stale()) return;
-                this.selection.getContext("2d").drawImage(sel, 0, 0);
+                // over what setBase left (source-over, as always: a same-size restore keeps the old selection too)
+                this.sel.drawInto(null, (ctx) => ctx.drawImage(sel, 0, 0));
                 this.selectionDirty = true; this.selectionLoose = false;
             }
             this.renderLayers();
@@ -9600,7 +9632,7 @@ class InpaintEditor {
             layers.push({ id: l.id, name: l.name, kind: l.kind, w: l.w, h: l.h, bytes: sum(own), slots: own });
         }
         // the base's pixels only when they were built (basePx would build them)
-        for (const c of [canvasOf(this._basePx), this.selection]) if (c) sources.push(c);
+        for (const c of [canvasOf(this._basePx), canvasOf(this.sel)]) if (c) sources.push(c);
 
         // pyramids: a WeakMap cannot be walked, so ask it for every source we know of
         const pyramid = [];
@@ -9639,7 +9671,7 @@ class InpaintEditor {
         // scratch canvases the editor keeps between frames
         const scratch = [];
         add(scratch, "_baseCanvas", canvasOf(this._basePx));   // the name mem_test and the docs know
-        add(scratch, "selection", this.selection);
+        add(scratch, "selection", canvasOf(this.sel));
         for (const name of ["sceneCanvas", "viewCanvas", "matchBackdrop", "flatCanvas", "strokePreview", "maskPreview", "maskedPreview", "antsCanvas", "clipScratch", "filterMaskCanvas"]) add(scratch, name, this[name]);
         add(scratch, "flatCache", this.flatCache && this.flatCache.canvas);
 
