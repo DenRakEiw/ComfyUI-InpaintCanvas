@@ -41,7 +41,7 @@ const PYRAMID_MIN_PX = 1 << 20;             // sources below 1 MP are drawn stra
 const PYRAMID_LEVELS = 8;
 const FLOOD_COARSE_PX = 2048;               // the wand's and the bucket's first pass runs on a composite this large
 const FLOOD_WHOLE_SHARE = 0.4;              // a region box above this share of the image is flooded in one pass over the whole image
-const SNAP_CANVAS_PX = 16 * 1024 * 1024;   // a selection undo step up to this many pixels is a canvas copy, above it a PNG
+const SNAP_CANVAS_PX = 16 * 1024 * 1024;   // a selection undo step up to this many pixels is a pixels copy, above it a PNG
 const SYNC_ENCODE_PX = 16 * 1024 * 1024;    // above this the selection PNG for getValue is encoded off the main thread
 const WORKER_TIMEOUT = 180000;              // a worker job that never answers falls back to the main thread
 const HANDLE_PX = 9;
@@ -327,12 +327,6 @@ function makeCanvas(w, h) {
     const c = document.createElement("canvas");
     c.width = Math.max(1, w | 0);
     c.height = Math.max(1, h | 0);
-    return c;
-}
-
-function imageToCanvas(img, w, h) {
-    const c = makeCanvas(w || img.naturalWidth, h || img.naturalHeight);
-    c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
     return c;
 }
 
@@ -5793,29 +5787,29 @@ class InpaintEditor {
     }
 
     /**
-     * A copy of the pixels of `layer` inside `rect` (in the target canvas's own pixels):
-     * the undo step of a brush stroke, so a stroke on a 100 MP layer costs what it covered.
+     * A copy of the pixels of `layer` inside `rect` (in the target's own pixels): the undo
+     * step of a brush stroke, so a stroke on a 100 MP layer costs what it covered. The step
+     * holds the copy as pixels (`px`) and goes back with a "copy" blit.
      */
     snapshotRect(layer, rect, mask = false) {
-        const target = mask ? layer.mask : layer.canvas;
+        const target = mask ? layer.maskPx : layer.px;
         if (!target) return null;
         const x = Math.max(0, Math.floor(rect.x) - 2), y = Math.max(0, Math.floor(rect.y) - 2);
         const w = Math.min(target.width - x, Math.ceil(rect.w + (rect.x - x)) + 4);
         const h = Math.min(target.height - y, Math.ceil(rect.h + (rect.y - y)) + 4);
         if (w <= 0 || h <= 0) return null;
-        const c = makeCanvas(w, h);
-        c.getContext("2d").drawImage(target, x, y, w, h, 0, 0, w, h);
-        return { kind: "layerrect", id: layer.id, mask, x, y, w, h, canvas: c, bytes: w * h * 4 };
+        const copy = target.copyRect([x, y, x + w, y + h]);
+        return { kind: "layerrect", id: layer.id, mask, x, y, w, h, px: copy, bytes: w * h * 4 };
     }
 
     /**
      * The undo step of a selection change: a copy of the selection inside its extent, the
      * way a brush stroke's step is a copy of the touched rectangle. A whole-canvas PNG
      * used to be encoded per step, which on a 15k document is 150 million pixels through
-     * the worker for a marquee that covers a corner. Up to SNAP_CANVAS_PX the copy is a
-     * canvas (a GPU blit, counted against MAX_UNDO_BYTES); above it the extent is encoded
-     * as a PNG off the main thread, like the old whole-canvas step. An empty selection is
-     * a step without pixels.
+     * the worker for a marquee that covers a corner. Up to SNAP_CANVAS_PX the copy is
+     * pixels (`px`, a GPU blit, counted against MAX_UNDO_BYTES); above it the extent is
+     * encoded as a PNG off the main thread, like the old whole-canvas step. An empty
+     * selection is a step without pixels.
      */
     snapshotSelection() {
         const ext = this.selectionExtent();
@@ -5823,10 +5817,9 @@ class InpaintEditor {
         if (!ext) return { kind: "selection", empty: true, bytes: 0, bounds: null };
         const [x, y, x1, y1] = ext;
         const w = x1 - x, h = y1 - y;
-        const c = makeCanvas(w, h);
-        this.sel.drawTo(c.getContext("2d"), x, y, w, h, 0, 0, w, h);
-        if (w * h > SNAP_CANVAS_PX) return { kind: "selection", x, y, w, h, url: this.snapUrl(c), bytes: 0, bounds };
-        return { kind: "selection", x, y, w, h, canvas: c, bytes: w * h * 4, bounds };
+        const copy = this.sel.copyRect(ext);   // the extent is on whole pixels inside the selection
+        if (w * h > SNAP_CANVAS_PX) return { kind: "selection", x, y, w, h, url: this.snapUrl(copy.toCanvas()), bytes: 0, bounds };
+        return { kind: "selection", x, y, w, h, px: copy, bytes: w * h * 4, bounds };
     }
 
     /** Widen the box a gesture has painted over (image coordinates). */
@@ -5855,7 +5848,7 @@ class InpaintEditor {
         return this.snapshotRect(layer, rect, p.kind === "maskpaint");
     }
 
-    /** Free a discarded undo step: its blob URL and its share of the memory budget. */
+    /** Free a discarded undo step: its blob URLs, its pixels copy and its share of the memory budget. */
     releaseSnapshot(snap) {
         if (!snap) return;
         this.undoBytes -= snap.bytes || 0;
@@ -5865,7 +5858,7 @@ class InpaintEditor {
             if (typeof v.then === "function") v.then((u) => { if (typeof u === "string" && u.startsWith("blob:")) URL.revokeObjectURL(u); }).catch(() => {});
             else if (typeof v === "string" && v.startsWith("blob:")) URL.revokeObjectURL(v);
         }
-        snap.canvas = null;
+        snap.px = null;
     }
 
     snapshot(step) {
@@ -5881,14 +5874,15 @@ class InpaintEditor {
         }
         const layer = this.layers.find((l) => l.id === step.id);
         if (!layer) return null;
-        if (step.kind === "layer") return { kind: "layer", id: layer.id, url: this.snapUrl(layer.canvas) };
+        // the whole-layer steps stay a PNG per step (docs/PLAN_BCE.md C1 rule 7); C4 makes them tile refs
+        if (step.kind === "layer") return { kind: "layer", id: layer.id, url: this.snapUrl(layer.px.toCanvas()) };
         if (step.kind === "transform") return { kind: "transform", id: layer.id, x: layer.x, y: layer.y, w: layer.w, h: layer.h };
-        if (step.kind === "mask") return { kind: "mask", id: layer.id, url: layer.mask ? this.snapUrl(layer.mask) : null, mw: layer.mask ? layer.mask.width : 0, mh: layer.mask ? layer.mask.height : 0 };
+        if (step.kind === "mask") return { kind: "mask", id: layer.id, url: layer.maskPx ? this.snapUrl(layer.maskPx.toCanvas()) : null, mw: layer.maskPx ? layer.maskPx.width : 0, mh: layer.maskPx ? layer.maskPx.height : 0 };
         if (step.kind === "match") return { kind: "match", id: layer.id, match: { ...(layer.match || { strength: 0, source: "surroundings" }) } };
         if (step.kind === "filter") return { kind: "filter", id: layer.id, filter: layer.filter, params: { ...(layer.params || {}) }, lut: layer.lut ? { ...layer.lut } : null, lutData: layer._lutData || null, plate: layer.plate ? { ...layer.plate } : null, plateImg: layer._plateImg || null, name: layer.name };
-        if (step.kind === "text") return { kind: "text", id: layer.id, text: JSON.parse(JSON.stringify(layer.text || TEXT_DEFAULTS)), url: this.snapUrl(layer.canvas), cw: layer.canvas.width, ch: layer.canvas.height, x: layer.x, y: layer.y, w: layer.w, h: layer.h };
-        if (step.kind === "layerfull") return { kind: "layerfull", id: layer.id, url: this.snapUrl(layer.canvas), cw: layer.canvas.width, ch: layer.canvas.height, x: layer.x, y: layer.y, w: layer.w, h: layer.h,
-            mask: layer.mask ? this.snapUrl(layer.mask) : null, mw: layer.mask ? layer.mask.width : 0, mh: layer.mask ? layer.mask.height : 0 };
+        if (step.kind === "text") return { kind: "text", id: layer.id, text: JSON.parse(JSON.stringify(layer.text || TEXT_DEFAULTS)), url: this.snapUrl(layer.px.toCanvas()), cw: layer.px.width, ch: layer.px.height, x: layer.x, y: layer.y, w: layer.w, h: layer.h };
+        if (step.kind === "layerfull") return { kind: "layerfull", id: layer.id, url: this.snapUrl(layer.px.toCanvas()), cw: layer.px.width, ch: layer.px.height, x: layer.x, y: layer.y, w: layer.w, h: layer.h,
+            mask: layer.maskPx ? this.snapUrl(layer.maskPx.toCanvas()) : null, mw: layer.maskPx ? layer.maskPx.width : 0, mh: layer.maskPx ? layer.maskPx.height : 0 };
         return null;
     }
 
@@ -5946,12 +5940,17 @@ class InpaintEditor {
             // cleared. The display levels are refreshed inside the union of both rectangles, so
             // an undo costs the selection's extent and not a rebuild of the levels of a 15k canvas.
             const old = this.selectionExtent();
-            const img = snap.empty ? null : (snap.canvas || await snapImage(snap.url));
-            const W = this.width, H = this.height;
-            this.sel.drawInto(null, (sctx) => {
-                sctx.clearRect(0, 0, W, H);
-                if (img) sctx.drawImage(img, snap.x, snap.y);
-            });
+            if (snap.px) {
+                this.sel.clear();
+                this.sel.blit(snap.px, snap.x, snap.y, "copy");
+            } else {
+                const img = snap.empty ? null : await snapImage(snap.url);
+                const W = this.width, H = this.height;
+                this.sel.drawInto(null, (sctx) => {
+                    sctx.clearRect(0, 0, W, H);
+                    if (img) sctx.drawImage(img, snap.x, snap.y);
+                });
+            }
             const now = snap.empty ? null : [snap.x, snap.y, snap.x + snap.w, snap.y + snap.h];
             const rect = old && now ? [Math.min(old[0], now[0]), Math.min(old[1], now[1]), Math.max(old[2], now[2]), Math.max(old[3], now[3])] : (old || now || [0, 0, 1, 1]);
             this.markSelectionChanged(snap.bounds, rect);
@@ -5960,10 +5959,13 @@ class InpaintEditor {
             if (!layer) return;
             if (snap.kind === "layer") {
                 const img = await snapImage(snap.url);
-                const ctx = layer.canvas.getContext("2d");
-                ctx.globalCompositeOperation = "source-over";
-                ctx.clearRect(0, 0, layer.canvas.width, layer.canvas.height);
-                ctx.drawImage(img, 0, 0);
+                // in place, from a fresh context: 0.1.11 drew with whatever a flip, a turn or a merge
+                // had left on the layer's context, and put a flipped layer back mirrored (rule 11)
+                const pixels = layer.px, W = pixels.width, H = pixels.height;
+                pixels.drawInto(null, (ctx) => {
+                    ctx.clearRect(0, 0, W, H);
+                    ctx.drawImage(img, 0, 0);
+                });
                 this.markLayerChanged(layer);
             } else if (snap.kind === "transform") {
                 Object.assign(layer, { x: snap.x, y: snap.y, w: snap.w, h: snap.h });
@@ -5987,30 +5989,21 @@ class InpaintEditor {
                 this.markFilterChanged(layer);
                 this.renderLayers();
             } else if (snap.kind === "mask") {
-                layer.mask = snap.url ? imageToCanvas(await snapImage(snap.url), snap.mw, snap.mh) : null;
-                if (!layer.mask) layer.maskEdit = false;
+                layer.maskPx = snap.url ? MaskPixels.fromImage(await snapImage(snap.url), snap.mw, snap.mh) : null;
+                if (!layer.maskPx) layer.maskEdit = false;
                 this.markMaskChanged(layer);
                 this.renderLayers();
             } else if (snap.kind === "text") {
                 const img = await snapImage(snap.url);
-                layer.canvas = imageToCanvas(img, snap.cw, snap.ch);
+                layer.px = LayerPixels.fromImage(img, snap.cw, snap.ch);   // replaced: rule 2
                 Object.assign(layer, { x: snap.x, y: snap.y, w: snap.w, h: snap.h });
                 layer.text = JSON.parse(JSON.stringify(snap.text));
                 layer._maskedValid = false;
                 this.markLayerChanged(layer);
                 this.renderLayers();
             } else if (snap.kind === "layerrect") {
-                const target = snap.mask ? layer.mask : layer.canvas;
-                if (target && snap.canvas) {
-                    const ctx = target.getContext("2d");
-                    ctx.save();
-                    ctx.setTransform(1, 0, 0, 1, 0, 0);
-                    ctx.globalAlpha = 1;
-                    ctx.globalCompositeOperation = "source-over";
-                    ctx.clearRect(snap.x, snap.y, snap.w, snap.h);
-                    ctx.drawImage(snap.canvas, snap.x, snap.y);
-                    ctx.restore();
-                }
+                const target = snap.mask ? layer.maskPx : layer.px;
+                if (target && snap.px) target.blit(snap.px, snap.x, snap.y, "copy");
                 // the touched rectangle is known: the display levels are refreshed there instead
                 // of being rebuilt, which on a 15k layer cost the next frame 400 ms
                 const rect = [snap.x, snap.y, snap.x + snap.w, snap.y + snap.h];
@@ -6018,11 +6011,11 @@ class InpaintEditor {
                 this.refreshLayerThumb(layer);   // nothing else in the list changed
             } else if (snap.kind === "layerfull") {
                 const img = await snapImage(snap.url);
-                layer.canvas = imageToCanvas(img, snap.cw, snap.ch);
+                layer.px = LayerPixels.fromImage(img, snap.cw, snap.ch);   // replaced: rule 2
                 Object.assign(layer, { x: snap.x, y: snap.y, w: snap.w, h: snap.h });
-                layer.mask = snap.mask ? imageToCanvas(await snapImage(snap.mask), snap.mw, snap.mh) : null;
-                if (!layer.mask) layer.maskEdit = false;
-                layer.maskDirty = !!layer.mask;
+                layer.maskPx = snap.mask ? MaskPixels.fromImage(await snapImage(snap.mask), snap.mw, snap.mh) : null;
+                if (!layer.maskPx) layer.maskEdit = false;
+                layer.maskDirty = !!layer.maskPx;
                 layer._maskedValid = false;
                 layer.exportRef = null;
                 this.markLayerChanged(layer);
@@ -9664,7 +9657,8 @@ class InpaintEditor {
             for (const s of list) {
                 if (!s) continue;
                 kinds[s.kind] = (kinds[s.kind] || 0) + 1;
-                if (s.canvas && s.canvas.width && !undoSeen.has(s.canvas)) { undoSeen.add(s.canvas); bytes += px(s.canvas); }
+                const sc = canvasOf(s.px);   // a layerrect / selection step's pixels copy
+                if (sc && sc.width && !undoSeen.has(sc)) { undoSeen.add(sc); bytes += px(sc); }
                 for (const l of s.layers || []) {
                     // snapshot copies are spreads: they carry px / maskPx, not the aliases
                     for (const c of [canvasOf(l.px), canvasOf(l.maskPx), l._masked]) {
