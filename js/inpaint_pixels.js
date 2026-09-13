@@ -20,6 +20,12 @@
  *   `rect` ([x0, y0, x1, y1], null for everything) is dropped. `fn` must not read `ctx.canvas`
  *   and must not read pixels back from `ctx`: in the tile backend the context belongs to a
  *   scratch canvas of `rect`.
+ * - The transform `fn` receives is not the identity by contract: it is whatever maps the pixels'
+ *   own coordinates onto the canvas behind `ctx` (the identity in this backend, a translation by
+ *   the rect's origin on the tile backend's scratch). `fn` and every helper it hands `ctx` to may
+ *   only compose on it (`scale`, `translate`, `rotate`, `transform`, `save` / `restore`), never
+ *   `setTransform` / `resetTransform`, and must not take `getTransform()` as absolute
+ *   (docs/PLAN_BCE.md §C1 "C1 as built", rule 12).
  * - `version` changes on `touch()`. The editor's `touchSource` / `touchSourceRect` call it
  *   after every write, which is also what refreshes the display levels.
  * - Straight alpha in and out (`ImageData`), like the canvas itself.
@@ -145,9 +151,10 @@ export class LayerPixels {
     }
 
     /**
-     * Canvas 2D drawing into the pixels: `fn(ctx)` with the context reset to the identity
-     * transform, alpha 1 and source-over, clipped to `rect` when it is not the whole area.
-     * Returns what `fn` returns.
+     * Canvas 2D drawing into the pixels: `fn(ctx)` with the context reset to a fresh one's state
+     * (alpha 1, source-over, ...) and a transform that maps the pixels' own coordinates (the
+     * identity here; `fn` composes on it, never sets it: see the rules at the top), clipped to
+     * `rect` when it is not the whole area. Returns what `fn` returns.
      */
     drawInto(rect, fn) {
         const r = pixelRect(rect, this.width, this.height);

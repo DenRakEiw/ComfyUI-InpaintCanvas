@@ -76,6 +76,12 @@ async function snapImage(u) {
     return loadImageEl(typeof u === "string" ? u : await u);
 }
 
+/** An image `loadSnapImages` decoded for a restore; a missing one is a bug, not an empty picture. */
+function needImage(img) {
+    if (!img) throw new Error("the step's image was not loaded");
+    return img;
+}
+
 function loadImageEl(src) {
     return new Promise((resolve, reject) => {
         const img = new Image();
@@ -1198,6 +1204,7 @@ class InpaintEditor {
         this.selectionLabel = "";       // what the selection is, when it came from "Select by text"
         this.undo = [];
         this.redo = [];
+        this.historyGen = 0;            // bumped by every change an undo that is still loading its step must not run over
         this.selectionDirty = true;
         this.selectionLoose = false;   // cachedBounds is a superset of the selection, made exact on the next getBounds()
         this.selectionDataUrl = null;
@@ -3269,13 +3276,12 @@ class InpaintEditor {
         this.textEdit = null;
         te.ta.remove();
         clearTimeout(te.layer._textTimer);
-        if (!commit) {
-            te.layer.text.content = te.before.text.content;
-            this.renderTextLayer(te.layer);
-        } else {
-            if (te.layer.text.content !== te.before.text.content) this.pushUndoSnapshot(te.before);
-            this.renderTextLayer(te.layer);
-        }
+        // the step taken at the start holds a PNG of the layer: pushed when the content changed,
+        // released otherwise (a cancel or an unchanged Enter left its blob URL behind for good)
+        const changed = commit && te.layer.text.content !== te.before.text.content;
+        if (!commit) te.layer.text.content = te.before.text.content;
+        if (changed) this.pushUndoSnapshot(te.before); else this.releaseSnapshot(te.before);
+        this.renderTextLayer(te.layer);
         this.renderLayers();
         this.root.focus({ preventScroll: true });
     }
@@ -3432,7 +3438,9 @@ class InpaintEditor {
     }
 
     /** Crop the canvas: negative amounts per side. Layers keep their pixels and shift; nothing is baked. */
-    async cropCanvas(v) {
+    cropCanvas(v) { return this.trackEdit(this.cropCanvasNow(v)); }   // undo waits for the upload (see extendCanvas)
+
+    async cropCanvasNow(v) {
         if (!this.base) return;
         const W = this.width, H = this.height;
         const left = -Math.min(0, v.left || 0), top = -Math.min(0, v.top || 0);
@@ -3440,9 +3448,10 @@ class InpaintEditor {
         const nw = W - left - right, nh = H - top - bottom;
         if (nw < 8 || nh < 8) { this.setStatus("The canvas would be smaller than 8 px."); return; }
         if (!(left || top || right || bottom)) return;
+        let before = null, pushed = false;
         try {
             this.setStatus(`Cropping canvas to ${nw} × ${nh} ...`);
-            const before = this.snapshot({ kind: "canvas" });
+            before = this.snapshot({ kind: "canvas" });
             if (this.pending) this.cancelPending();
             const nb = makeCanvas(nw, nh);
             this.basePx.drawTo(nb.getContext("2d"), -left, -top);
@@ -3461,27 +3470,32 @@ class InpaintEditor {
             this.sel = this.sel.resized(nw, nh, { x: -left, y: -top });
             this.base = { ref, img };
             this.width = nw; this.height = nh;
-            this.pushUndoSnapshot(before);
+            pushed = true;
+            this.pushUndoSnapshot(before, { tracked: true });
             this.uploaded = this.makeUploaded();
             this.selectionDirty = true; this.selectionLoose = false;
             this.selectionDataUrl = null;
             this.renderLayers(); this.renderInfo(); this.fitView(); this.drawThumb(); this.notifyChanged();
             this.setStatus(`Canvas cropped to ${nw} × ${nh}; the layers keep their pixels (Ctrl+Z takes it back).`);
         } catch (err) {
+            if (!pushed) this.releaseSnapshot(before);
             console.error(err);
             this.setStatus(String(err.message || err));
         }
     }
 
     /** Scale the whole image (base, layers, selection) to a new size. */
-    async resizeImage(nw, nh) {
+    resizeImage(nw, nh) { return this.trackEdit(this.resizeImageNow(nw, nh)); }   // undo waits for the upload (see extendCanvas)
+
+    async resizeImageNow(nw, nh) {
         if (!this.base) return;
         nw = Math.round(nw); nh = Math.round(nh);
         if (!(nw >= 8 && nh >= 8) || (nw === this.width && nh === this.height)) { this.setStatus("Enter a new size."); return; }
         const W = this.width, H = this.height, sx = nw / W, sy = nh / H;
+        let before = null, pushed = false;
         try {
             this.setStatus(`Resizing to ${nw} × ${nh} ...`);
-            const before = this.snapshot({ kind: "canvas" });
+            before = this.snapshot({ kind: "canvas" });
             if (this.pending) this.cancelPending();
             const nb = makeCanvas(nw, nh);
             const nctx = nb.getContext("2d");
@@ -3512,13 +3526,15 @@ class InpaintEditor {
             this.sel = MaskPixels.fromCanvas(sel);
             this.base = { ref, img };
             this.width = nw; this.height = nh;
-            this.pushUndoSnapshot(before);
+            pushed = true;
+            this.pushUndoSnapshot(before, { tracked: true });
             this.uploaded = this.makeUploaded();
             this.selectionDirty = true; this.selectionLoose = false;
             this.selectionDataUrl = null;
             this.renderLayers(); this.renderInfo(); this.fitView(); this.drawThumb(); this.notifyChanged();
             this.setStatus(`Image resized to ${nw} × ${nh} (Ctrl+Z takes it back). Layers keep their own resolution.`);
         } catch (err) {
+            if (!pushed) this.releaseSnapshot(before);
             console.error(err);
             this.setStatus(String(err.message || err));
         }
@@ -4914,6 +4930,13 @@ class InpaintEditor {
      * Fill and outline a path on a stroke buffer sized like the layer. `build` draws the path
      * in image coordinates; the transform maps them onto the layer, so the outline width is in
      * image pixels whatever the layer's own resolution is.
+     *
+     * It sets an absolute transform, with the buffer's origin passed in, and that is not rule 12's
+     * case (docs/PLAN_BCE.md §C1): `ctx` is always a StrokeBuffer's context from `ensure()`, never
+     * one a drawInto hands out. Composing on `ensure()`'s translation instead is not the same
+     * matrix: the context keeps it in float32, and the composed translation differed in 774 of
+     * 1,392 measured layer / buffer combinations up to 15k (by up to 0.004 px). When C5 moves
+     * stroke buffers into drawInto, this composes, and that difference is C5's to measure.
      */
     paintShape(ctx, layer, build, closed, origin = [0, 0]) {
         const o = this.shapeOpts;
@@ -5029,7 +5052,7 @@ class InpaintEditor {
         target.drawInto(box, (ctx) => {
             ctx.globalAlpha = opacity;
             ctx.globalCompositeOperation = op;
-            ctx.setTransform(sx, 0, 0, sy, 0, 0);
+            ctx.scale(sx, sy);   // composed on drawInto's transform, never set over it (PLAN_BCE §C1 rule 12)
             ctx.drawImage(fill, r.x - layer.x, r.y - layer.y);
         });
         if (r.close) fill.close();
@@ -5054,7 +5077,9 @@ class InpaintEditor {
     /**
      * The selection mapped into `target`'s pixels (alpha = selected) inside the box
      * (x, y, w, h in target pixels), as a canvas of that size; `into` is reused when it fits.
-     * `target` is the layer's or the mask's pixels; only its size is read.
+     * `target` is the layer's or the mask's pixels; only its size is read. It sets absolute
+     * transforms, which is allowed because the canvas is its own (or `into`, a scratch it owns),
+     * never a context handed to a drawInto callback (docs/PLAN_BCE.md §C1 rule 12).
      */
     clipCanvasFor(layer, target, x, y, w, h, into = null) {
         const c = into && into.width === w && into.height === h ? into : makeCanvas(w, h);
@@ -5217,7 +5242,7 @@ class InpaintEditor {
         const opacity = this.brushOpacity;
         target.drawInto(null, (ctx) => {
             ctx.globalAlpha = opacity;
-            ctx.setTransform(target.width / layer.w, 0, 0, target.height / layer.h, 0, 0);
+            ctx.scale(target.width / layer.w, target.height / layer.h);   // composed (rule 12)
             ctx.drawImage(shape, -layer.x, -layer.y);
         });
         if (onMask) {
@@ -5309,7 +5334,7 @@ class InpaintEditor {
         const sel = this.sel;
         target.drawInto(null, (ctx) => {
             ctx.globalCompositeOperation = "destination-out";
-            ctx.setTransform(target.width / layer.w, 0, 0, target.height / layer.h, 0, 0);
+            ctx.scale(target.width / layer.w, target.height / layer.h);   // composed (rule 12)
             sel.drawTo(ctx, -layer.x, -layer.y);
         });
         if (onMask) this.markMaskChanged(layer); else this.markLayerChanged(layer);
@@ -5751,7 +5776,15 @@ class InpaintEditor {
 
     // ---- outpainting ---------------------------------------------------------
 
-    async extendCanvas(vals = null) {
+    /**
+     * Extend, crop, resize, merge into the base and flatten take their `canvas` step, upload the new
+     * base and push the step when it lands. They are tracked (`trackEdit`), so an undo pressed during
+     * the upload waits and takes the operation back; untracked, it undid the step below and the late
+     * push then released that undo's redo copy (a stroke lost for good, a merged layer twice).
+     */
+    extendCanvas(vals = null) { return this.trackEdit(this.extendCanvasNow(vals)); }
+
+    async extendCanvasNow(vals = null) {
         if (!this.base) { this.setStatus("Load an image first."); return; }
         if (!vals && this.extendInputs && Object.values(this.extendValues()).some((x) => x < 0)) { await this.applyCanvasFrame(); return; }
         const v = vals || this.extendValues();
@@ -5760,6 +5793,7 @@ class InpaintEditor {
         const W = this.width, H = this.height;
         const nw = W + left + right, nh = H + top + bottom;
         const before = this.snapshot({ kind: "canvas" });
+        let pushed = false;
         try {
             this.setStatus(`Extending canvas to ${nw} × ${nh} ...`);
             // Flatten what is visible now and fill the new border the chosen way.
@@ -5821,7 +5855,8 @@ class InpaintEditor {
             this.sel = MaskPixels.empty(nw, nh);
             this.sel.fill(null, "#ff0000");
             this.sel.clear([left, top, left + W, top + H]);
-            this.pushUndoSnapshot(before);
+            pushed = true;
+            this.pushUndoSnapshot(before, { tracked: true });
             this.uploaded = this.makeUploaded();
             this.selectionDirty = true; this.selectionLoose = false;
             this.selectionDataUrl = null;
@@ -5833,6 +5868,7 @@ class InpaintEditor {
             this.notifyChanged();
             this.setStatus(`Canvas is ${nw} × ${nh}. The new border is selected; press Generate to outpaint it (Ctrl+Z takes the extension back).`);
         } catch (err) {
+            if (!pushed) this.releaseSnapshot(before);   // its selection PNG is revoked, not left behind
             console.error(err);
             this.setStatus(String(err.message || err));
         }
@@ -5970,8 +6006,13 @@ class InpaintEditor {
         this.pushUndoSnapshot(this.snapshot(step));
     }
 
-    pushUndoSnapshot(snap) {
+    /**
+     * `tracked`: the push of an operation an undo waits for (`trackEdit`) after its await. It is the
+     * step that undo was pressed for, so it does not count as a change the waiting undo must stop at.
+     */
+    pushUndoSnapshot(snap, { tracked = false } = {}) {
         if (!snap) return;
+        if (!tracked) this.historyGen++;
         // the redo steps go first: the budget counts them, and trimming against it while they are
         // still counted threw away older undo steps that fit once the redo steps were gone
         for (const s of this.redo) this.releaseSnapshot(s);
@@ -5987,6 +6028,7 @@ class InpaintEditor {
      * the tab kept one undo step, and leaked the PNG blobs of its whole-layer steps.
      */
     clearUndo() {
+        this.historyGen++;
         for (const s of this.undo) this.releaseSnapshot(s);
         for (const s of this.redo) this.releaseSnapshot(s);
         this.undo = [];
@@ -5994,7 +6036,12 @@ class InpaintEditor {
         this.undoBytes = 0;
     }
 
-    async applySnapshot(snap) {
+    /**
+     * Put a step back, synchronously: the images it carries (`url`, `mask`, the canvas step's
+     * `selection`) were decoded by `loadSnapImages` before the step was taken off its stack, and
+     * come in `images`. A restore that awaited its PNG wrote over whatever was edited meanwhile.
+     */
+    applySnapshot(snap, images = {}) {
         if (snap.kind === "layers") {
             if (this.pending) this.cancelPending();
             // a spread carries px / maskPx and not the non-enumerable aliases: installed again
@@ -6007,11 +6054,10 @@ class InpaintEditor {
         }
         if (snap.kind === "canvas") {
             if (this.pending) this.cancelPending();
-            // the selection is decoded before anything is put back: a frame drawn while it decoded
+            // the selection was decoded before anything is put back: a frame drawn while it decoded
             // saw a new, empty selection, cached its display levels under the version the restored
             // one kept, and the restored selection's bounds came back empty
-            let selImg = null;
-            try { selImg = await snapImage(snap.selection); } catch (_) { /* empty selection */ }
+            const selImg = images.selection || null;   // null: its encode failed, an empty selection
             this.base = snap.base;
             this.width = snap.width;
             this.height = snap.height;
@@ -6042,7 +6088,7 @@ class InpaintEditor {
                 this.sel.clear();
                 this.sel.blit(snap.px, snap.x, snap.y, "copy");
             } else {
-                const img = snap.empty ? null : await snapImage(snap.url);
+                const img = snap.empty ? null : needImage(images.url);
                 const W = this.width, H = this.height;
                 this.sel.drawInto(null, (sctx) => {
                     sctx.clearRect(0, 0, W, H);
@@ -6056,7 +6102,7 @@ class InpaintEditor {
             const layer = this.layers.find((l) => l.id === snap.id);
             if (!layer) return;
             if (snap.kind === "layer") {
-                const img = await snapImage(snap.url);
+                const img = needImage(images.url);
                 // in place, from a fresh context: 0.1.11 drew with whatever a flip, a turn or a merge
                 // had left on the layer's context, and put a flipped layer back mirrored (rule 11)
                 const pixels = layer.px, W = pixels.width, H = pixels.height;
@@ -6087,7 +6133,7 @@ class InpaintEditor {
                 this.markFilterChanged(layer);
                 this.renderLayers();
             } else if (snap.kind === "mask") {
-                layer.maskPx = snap.url ? MaskPixels.fromImage(await snapImage(snap.url), snap.mw, snap.mh) : null;
+                layer.maskPx = snap.url ? MaskPixels.fromImage(needImage(images.url), snap.mw, snap.mh) : null;
                 if (!layer.maskPx) layer.maskEdit = false;
                 this.markMaskChanged(layer);
                 this.renderLayers();
@@ -6096,7 +6142,7 @@ class InpaintEditor {
                 // description that is being undone on top of the restored one
                 layer._textToken = (layer._textToken || 0) + 1;
                 layer._textRendering = 0;
-                const img = await snapImage(snap.url);
+                const img = needImage(images.url);
                 layer.px = LayerPixels.fromImage(img, snap.cw, snap.ch);   // replaced: rule 2
                 Object.assign(layer, { x: snap.x, y: snap.y, w: snap.w, h: snap.h });
                 layer.text = JSON.parse(JSON.stringify(snap.text));
@@ -6115,10 +6161,10 @@ class InpaintEditor {
                 if (snap.mask) this.markMaskChanged(layer, rect); else this.markLayerChanged(layer, rect);
                 this.refreshLayerThumb(layer);   // nothing else in the list changed
             } else if (snap.kind === "layerfull") {
-                const img = await snapImage(snap.url);
+                const img = needImage(images.url);
                 layer.px = LayerPixels.fromImage(img, snap.cw, snap.ch);   // replaced: rule 2
                 Object.assign(layer, { x: snap.x, y: snap.y, w: snap.w, h: snap.h });
-                layer.maskPx = snap.mask ? MaskPixels.fromImage(await snapImage(snap.mask), snap.mw, snap.mh) : null;
+                layer.maskPx = snap.mask ? MaskPixels.fromImage(needImage(images.mask), snap.mw, snap.mh) : null;
                 if (!layer.maskPx) layer.maskEdit = false;
                 layer.maskDirty = !!layer.maskPx;
                 layer._maskedValid = false;
@@ -6131,15 +6177,26 @@ class InpaintEditor {
     }
 
     /**
-     * Undo and redo run one after the other. A restore awaits a PNG decode, and a second Ctrl+Z
+     * Undo and redo run one after the other. A restore needs a PNG decode, and a second Ctrl+Z
      * (key repeat, a double click) used to take its redo copy before the first restore had
      * landed, and the decodes could land out of order: the pixels ended half undone and the redo
      * stack wrong. An operation that pushed its step and writes after an await (grow, feather,
-     * invert in the worker) is waited for first, so the undo takes back what it wrote.
+     * invert in the worker; extend, crop, resize, merge into the base and flatten, which push
+     * after their upload) is waited for first, so the undo takes back what it wrote.
+     *
+     * The step's images are decoded while it is still on its stack; then it is taken off, its redo
+     * copy made and the restore applied in one synchronous run. An edit made while the step decoded
+     * (a stroke, a marquee, a layer added, a new image: anything that moves `historyGen`) stops the
+     * undo with a status line instead: it used to land first and be overwritten by the restore, or
+     * be the step that was undone in place of the one Ctrl+Z was pressed for. An undo pressed while
+     * a stroke or a drag is held is refused too: it took back the gesture's own step, pushed at
+     * pointer down, and the finished gesture had none.
      */
-    undoStep() { return this.queueHistory(() => this.historyStepNow(false)); }
+    // `historyGen` is read when the key is pressed, not when the queued step runs: an edit made after
+    // that stops it, and so a held Ctrl+Z that is still queued never takes back a stroke made meanwhile
+    undoStep() { const gen = this.historyGen; return this.queueHistory(() => this.historyStepNow(false, gen)); }
 
-    redoStep() { return this.queueHistory(() => this.historyStepNow(true)); }
+    redoStep() { const gen = this.historyGen; return this.queueHistory(() => this.historyStepNow(true, gen)); }
 
     queueHistory(fn) {
         const prev = this._historyQueue;
@@ -6159,20 +6216,64 @@ class InpaintEditor {
         return promise;
     }
 
-    async historyStepNow(redo) {
+    /** A stroke, a marquee, a move or another editing drag is held (panning and guides are not edits). */
+    gestureHeld() {
+        const p = this.pointer;
+        return !!p && !["pan", "split", "guide"].includes(p.kind);
+    }
+
+    /** Decode the images a step carries, for `applySnapshot`. */
+    async loadSnapImages(snap) {
+        if (snap.kind === "canvas") {
+            let selection = null;
+            try { selection = await snapImage(snap.selection); } catch (_) { /* its encode failed: restored as an empty selection, as before */ }
+            return { selection };
+        }
+        const [url, mask] = await Promise.all([snap.url ? snapImage(snap.url) : null, snap.mask ? snapImage(snap.mask) : null]);
+        return { url, mask };
+    }
+
+    async historyStepNow(redo, gen = this.historyGen) {
+        const word = redo ? "redo" : "undo";
+        const held = () => {
+            if (!this.gestureHeld()) return false;
+            this.setStatus(`Release the button first: an ${word} does not interrupt a stroke or a drag.`);
+            return true;
+        };
+        // `gen` was taken before the wait: an edit made during it is not the step this undo was pressed for
         while (this._pendingEdits && this._pendingEdits.size) await Promise.all(Array.from(this._pendingEdits));
-        if (this.pending) this.cancelPending();
+        if (held()) return;
         // the stacks are looked up now, not when the step was queued: an edit or a new image replaces them
-        const snap = (redo ? this.redo : this.undo).pop();
+        const stack = () => (redo ? this.redo : this.undo);
+        const snap = stack()[stack().length - 1];
         if (!snap) return;
+        let images = {}, failed = null;
+        if (snap.kind === "canvas" || snap.url || snap.mask) {
+            try { images = await this.loadSnapImages(snap); } catch (err) { failed = err; }
+        }
+        const now = stack();
+        if (gen !== this.historyGen || now[now.length - 1] !== snap) {
+            // a step an edit released (a new image, a redo after an edit) has nothing left to say
+            if (now.includes(snap)) this.setStatus(`Nothing ${redo ? "redone" : "undone"}: the picture changed before the ${word} could run. Press ${redo ? "Ctrl+Shift+Z" : "Ctrl+Z"} again.`);
+            return;
+        }
+        if (held()) return;
+        if (this.pending) this.cancelPending();
+        now.pop();
+        if (failed) {
+            // a step whose pixels could not be kept (its encode failed): said, not thrown at a key handler
+            console.error(`Inpaint Canvas: ${word} step could not be restored`, failed);
+            this.setStatus(`That ${word} step could not be restored: ${(failed && failed.message) || failed}`);
+            this.releaseSnapshot(snap);
+            return;
+        }
         const current = this.snapshot(snap);
         if (current) { (redo ? this.undo : this.redo).push(current); this.undoBytes += current.bytes || 0; }
         try {
-            await this.applySnapshot(snap);
+            this.applySnapshot(snap, images);
         } catch (err) {
-            // a step whose pixels could not be kept (its encode failed): said, not thrown at a key handler
-            console.error("Inpaint Canvas: undo step could not be restored", err);
-            this.setStatus(`That ${redo ? "redo" : "undo"} step could not be restored: ${(err && err.message) || err}`);
+            console.error(`Inpaint Canvas: ${word} step could not be restored`, err);
+            this.setStatus(`That ${word} step could not be restored: ${(err && err.message) || err}`);
         } finally {
             this.releaseSnapshot(snap);
         }
@@ -6643,9 +6744,11 @@ class InpaintEditor {
         const m = MaskPixels.empty(layer.px.width, layer.px.height);
         const W = m.width, H = m.height;
         m.drawInto(null, (ctx) => {
-            ctx.setTransform(W / layer.w, 0, 0, H / layer.h, 0, 0);
+            // the scale composed on drawInto's transform and taken off again with restore (rule 12)
+            ctx.save();
+            ctx.scale(W / layer.w, H / layer.h);
             this.sel.drawTo(ctx, -layer.x, -layer.y);
-            ctx.setTransform(1, 0, 0, 1, 0, 0);
+            ctx.restore();
             ctx.globalCompositeOperation = "source-in";   // over the whole mask, as before
             ctx.fillStyle = "#ffffff";
             ctx.fillRect(0, 0, W, H);
@@ -6880,7 +6983,9 @@ class InpaintEditor {
     }
 
     /** Merge the active layer into the one below it (Ctrl+E); the bottom layer merges into the base. */
-    async mergeDown(layer = this.activeLayer()) {
+    mergeDown(layer = this.activeLayer()) { return this.trackEdit(this.mergeDownNow(layer)); }   // undo waits for the upload into the base (see extendCanvas)
+
+    async mergeDownNow(layer) {
         if (!layer) { this.setStatus("Select a layer to merge down."); return; }
         if (layer.locked) { this.setStatus(`${layer.name} is locked.`); return; }
         if (layer.kind === "filter") { this.setStatus("Filter layers cannot be merged into a layer; Flatten bakes them into the base."); return; }
@@ -6889,9 +6994,10 @@ class InpaintEditor {
         if (this.pending) this.cancelPending();
         if (!below) {
             if (this.isControl(layer) || this.isReference(layer)) { this.setStatus("Control and reference layers are not part of the image, there is nothing to merge into the base."); return; }
+            let before = null, pushed = false;
             try {
                 this.setStatus(`Merging ${layer.name} into the base ...`);
-                const before = this.snapshot({ kind: "canvas" });
+                before = this.snapshot({ kind: "canvas" });
                 const c = makeCanvas(this.width, this.height);
                 const ctx = c.getContext("2d");
                 this.basePx.drawTo(ctx, 0, 0);
@@ -6902,14 +7008,16 @@ class InpaintEditor {
                 ctx.globalCompositeOperation = "source-over";
                 const { ref } = await uploadCanvas(c, `n${this.node.id}_base`);
                 const img = await loadImageEl(viewUrl(ref));
-                this.pushUndoSnapshot(before);
-                this.layers = this.layers.filter((l) => l !== layer);
+                pushed = true;
+                this.pushUndoSnapshot(before, { tracked: true });
+                this.layers = this.layers.filter((l) => l.id !== layer.id);   // by id: a restore makes new layer objects
                 this.base = { ref, img };
                 this.activeLayerId = null;
                 this.uploaded = this.makeUploaded();
                 this.renderLayers(); this.renderHistory(); this.renderInfo(); this.draw(); this.drawThumb(); this.notifyChanged();
                 this.setStatus(`${layer.name} merged into the base (Ctrl+Z takes it back).`);
             } catch (err) {
+                if (!pushed) this.releaseSnapshot(before);
                 console.error(err);
                 this.setStatus(String(err.message || err));
             }
@@ -7490,6 +7598,7 @@ class InpaintEditor {
 
     async setBase(ref, img, { keepLayers = true } = {}) {
         const sizeChanged = img.naturalWidth !== this.width || img.naturalHeight !== this.height;
+        this.historyGen++;   // a restore still loading must not put the old document over the new image
         this.base = { ref, img };
         this.width = img.naturalWidth;
         this.height = img.naturalHeight;
@@ -7582,6 +7691,7 @@ class InpaintEditor {
         if (layer.maskPx === undefined) layer.maskPx = null;
         if (!layer.maskPx) { layer.maskRef = null; layer.maskDirty = false; layer.maskEdit = false; }
         if (!layer.match) layer.match = { strength: 0, source: "surroundings" };
+        this.historyGen++;   // no undo step, but a waiting restore of the layer list must not drop it
         this.layers.push(layer);
         if (activate) this.activeLayerId = layer.id;
         this.uploaded.baseHash = null;
@@ -8757,12 +8867,24 @@ class InpaintEditor {
         return c;
     }
 
-    async flatten() {
+    /**
+     * Bake the visible layers into the base. It is a `canvas` step, like a merge into the base: with
+     * no step and the history kept, an older `layers` step put the baked layers back on top of a
+     * base that already held them (a multiply layer applied twice).
+     */
+    flatten() { return this.trackEdit(this.flattenNow()); }   // undo waits for the upload (see extendCanvas)
+
+    async flattenNow() {
         if (!this.base || !this.layers.length) return;
+        if (this.pending) this.cancelPending();
+        let before = null, pushed = false;
         try {
             this.setStatus("Flattening ...");
+            before = this.snapshot({ kind: "canvas" });
             const { ref, hash } = await uploadCanvas(this.flattenToCanvas({ forRun: true }), `n${this.node.id}_base`);
             const img = await loadImageEl(viewUrl(ref));
+            pushed = true;
+            this.pushUndoSnapshot(before, { tracked: true });
             this.layers = this.layers.filter((l) => this.isControl(l) || this.isReference(l));
             this.activeLayerId = null;
             this.base = { ref, img };
@@ -8773,8 +8895,9 @@ class InpaintEditor {
             this.draw();
             this.drawThumb();
             this.notifyChanged();
-            this.setStatus("Flattened into base layer (control and reference layers kept).");
+            this.setStatus("Flattened into base layer (control and reference layers kept; Ctrl+Z takes it back).");
         } catch (err) {
+            if (!pushed) this.releaseSnapshot(before);
             console.error(err);
             this.setStatus(String(err.message || err));
         }
@@ -9667,6 +9790,12 @@ class InpaintEditor {
                 // came from those, so a restored selection counted as none
                 this.touchSource(this.sel);
                 this.selectionDirty = true; this.selectionLoose = false;
+                // and encoded again: a getValue while the layers loaded (the app's autosave, ComfyUI
+                // serializing the graph) stored the empty selection's PNG as up to date, and every
+                // later save wrote that until the selection was changed by hand
+                this.selectionSeq++;
+                this.selectionEncoded = false;
+                this.selectionDataUrl = null;
             }
             this.renderLayers();
             this.renderHistory();
@@ -9840,8 +9969,9 @@ class InpaintEditor {
     destroy() {
         if (this._compositor) { try { this._compositor.dispose(); } catch (_) { /* context gone */ } this._compositor = null; }
         this.matchBackdrop = null;
-        this.clearUndo();   // the blob URLs of the whole-layer steps are revoked, not left behind
         this.close();
+        // after close(), which commits an open text edit: that step's blob URL is revoked with the rest
+        this.clearUndo();   // the blob URLs of the whole-layer steps are revoked, not left behind
         try { this.resizeObserver.disconnect(); } catch (_) { /* ignore */ }
         try { this.thumbObserver.disconnect(); } catch (_) { /* ignore */ }
     }
