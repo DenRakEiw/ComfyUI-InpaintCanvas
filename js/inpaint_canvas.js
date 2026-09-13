@@ -2308,7 +2308,7 @@ class InpaintEditor {
         const layer = p.layer;
         if (p.mode === "rotate" && Math.abs(p.angle) < 1e-6) { this.cancelPending(); return; }
         this.pushUndo({ kind: "layerfull", id: layer.id });
-        if (layer.mask) this.applyMask(layer, { silent: true, undo: false });
+        if (layer.maskPx) this.applyMask(layer, { silent: true, undo: false });
         const n = this.pendingSubdivisions(p, true);
         let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
         for (let j = 0; j <= n; j++) for (let i = 0; i <= n; i++) {
@@ -2846,7 +2846,10 @@ class InpaintEditor {
         const live = !!(p && (p.kind === "layerpaint" || p.kind === "maskpaint") && p.layer === layer);
         if (!live && layer._masked && layer._maskedValid) return layer._masked;
         const base = this.layerWithStroke(layer);
-        const mask = this.maskWithStroke(layer);
+        // during a mask stroke on this layer the mask's live preview, otherwise the mask's own
+        // pixels (drawn through maskPx below); maskWithStroke would hand those back as a canvas
+        const mask = p && p.kind === "maskpaint" && p.layer === layer ? this.maskWithStroke(layer) : null;
+        const drawMask = (ctx, w, h) => { if (mask) ctx.drawImage(mask, 0, 0, w, h); else layer.maskPx.drawTo(ctx, 0, 0, w, h); };
         let out;
         if (live) {
             // the live copy is rebuilt inside the dab's rectangle only; destination-in would
@@ -2870,7 +2873,7 @@ class InpaintEditor {
                 ctx.clearRect(x, y, w, h);
                 ctx.drawImage(base, x, y, w, h, x, y, w, h);
                 ctx.globalCompositeOperation = "destination-in";
-                ctx.drawImage(mask, 0, 0, out.width, out.height);
+                drawMask(ctx, out.width, out.height);
                 ctx.restore();
             }
             return out;
@@ -2883,7 +2886,7 @@ class InpaintEditor {
         ctx.clearRect(0, 0, out.width, out.height);
         ctx.drawImage(base, 0, 0);
         ctx.globalCompositeOperation = "destination-in";
-        ctx.drawImage(mask, 0, 0, out.width, out.height);
+        drawMask(ctx, out.width, out.height);
         ctx.globalCompositeOperation = "source-over";
         layer._maskedValid = true;
         this.touchSource(out);
@@ -3322,7 +3325,7 @@ class InpaintEditor {
             return c;
         };
         l.canvas = flip(l.canvas);
-        if (l.mask) { l.mask = flip(l.mask); l.maskDirty = true; }
+        if (l.maskPx) { l.maskPx = MaskPixels.fromCanvas(flip(l.maskPx.toCanvas())); l.maskDirty = true; }
         this.markLayerChanged(l);
         this.renderLayers(); this.draw();
         this.setStatus(`${l.name} flipped ${axis === "h" ? "horizontally" : "vertically"}.`);
@@ -3344,7 +3347,7 @@ class InpaintEditor {
             return c;
         };
         l.canvas = rot(l.canvas);
-        if (l.mask) { l.mask = rot(l.mask); l.maskDirty = true; }
+        if (l.maskPx) { l.maskPx = MaskPixels.fromCanvas(rot(l.maskPx.toCanvas())); l.maskDirty = true; }
         const cx = l.x + l.w / 2, cy = l.y + l.h / 2;
         [l.w, l.h] = [l.h, l.w];
         l.x = Math.round(cx - l.w / 2); l.y = Math.round(cy - l.h / 2);
@@ -3409,7 +3412,8 @@ class InpaintEditor {
             for (const l of this.layers) {
                 if (l.kind === "filter") {
                     l.w = nw; l.h = nh; l._fcache = null;
-                    if (l.mask) { const m = makeCanvas(nw, nh); m.getContext("2d").drawImage(l.mask, -left, -top); l.mask = m; l.maskDirty = true; }
+                    // a new object (the canvas undo step holds the old one): the old mask placed at -left, -top
+                    if (l.maskPx) { l.maskPx = l.maskPx.resized(nw, nh, { x: -left, y: -top }); l.maskDirty = true; }
                 } else {
                     l.x -= left; l.y -= top;
                 }
@@ -3455,7 +3459,7 @@ class InpaintEditor {
             for (const l of this.layers) {
                 if (l.kind === "filter") {
                     l.w = nw; l.h = nh; l._fcache = null;
-                    if (l.mask) { const m = makeCanvas(nw, nh); const mc = m.getContext("2d"); mc.imageSmoothingEnabled = true; mc.drawImage(l.mask, 0, 0, nw, nh); l.mask = m; l.maskDirty = true; }
+                    if (l.maskPx) { const m = makeCanvas(nw, nh); const mc = m.getContext("2d"); mc.imageSmoothingEnabled = true; l.maskPx.drawTo(mc, 0, 0, nw, nh); l.maskPx = MaskPixels.fromCanvas(m); l.maskDirty = true; }
                 } else {
                     l.x = Math.round(l.x * sx); l.y = Math.round(l.y * sy);
                     l.w = Math.max(1, Math.round(l.w * sx)); l.h = Math.max(1, Math.round(l.h * sy));
@@ -5748,7 +5752,7 @@ class InpaintEditor {
                     const c = makeCanvas(nw, nh);
                     c.getContext("2d").drawImage(l.canvas, left, top);
                     l.canvas = c; l.x = 0; l.y = 0; l.w = nw; l.h = nh;
-                    if (l.mask) { const m = makeCanvas(nw, nh); m.getContext("2d").drawImage(l.mask, left, top); l.mask = m; l.maskDirty = true; l._maskedValid = false; }
+                    if (l.maskPx) { l.maskPx = l.maskPx.resized(nw, nh, { x: left, y: top }); l.maskDirty = true; l._maskedValid = false; }
                 } else {
                     l.x += left; l.y += top;
                 }
@@ -6332,7 +6336,7 @@ class InpaintEditor {
         if (chain && preview) chain = this.flushFilterChain(ctx, chain);   // the preview downscales on a canvas
         // A filter layer that covers its input one to one can leave its result on the GPU; a
         // mask, an opacity or a blend mode has to composite it onto the canvas.
-        const plain = !layer.mask && layer.opacity >= 1 && (!layer.blend || layer.blend === "normal") && !preview;
+        const plain = !layer.maskPx && layer.opacity >= 1 && (!layer.blend || layer.blend === "normal") && !preview;
         const keepSurface = plain && more && !this.filterChainOff && glChainUsable(ctx.canvas.width, ctx.canvas.height);
         const out = this.filteredCanvas(layer, chain ? chain.surface : ctx.canvas, forRun, preview, keepSurface);
         const rx = vp ? vp.x : 0, ry = vp ? vp.y : 0;
@@ -6344,7 +6348,7 @@ class InpaintEditor {
         chain = this.flushFilterChain(ctx, chain);   // the result goes onto the canvas, so the composite has to be there
         if (!out) return null;
         let src = out;
-        if (layer.mask) {
+        if (layer.maskPx) {
             if (!this.filterMaskCanvas || this.filterMaskCanvas.width !== out.width || this.filterMaskCanvas.height !== out.height) this.filterMaskCanvas = makeCanvas(out.width, out.height);
             const m = this.filterMaskCanvas;
             const mctx = m.getContext("2d");
@@ -6353,9 +6357,11 @@ class InpaintEditor {
             mctx.clearRect(0, 0, m.width, m.height);
             mctx.drawImage(out, 0, 0);
             mctx.globalCompositeOperation = "destination-in";
-            const mk = this.maskWithStroke(layer);
-            const ms = mk.width / this.width;   // a filter layer's mask covers the whole image
-            mctx.drawImage(mk, rx * ms, ry * ms, rw * ms, rh * ms, 0, 0, m.width, m.height);
+            const ms = layer.maskPx.width / this.width;   // a filter layer's mask covers the whole image
+            const g = this.pointer;
+            // during a mask stroke on this layer its live preview (the mask's size), otherwise the mask's own pixels
+            if (g && g.kind === "maskpaint" && g.layer === layer) mctx.drawImage(this.maskWithStroke(layer), rx * ms, ry * ms, rw * ms, rh * ms, 0, 0, m.width, m.height);
+            else layer.maskPx.drawTo(mctx, rx * ms, ry * ms, rw * ms, rh * ms, 0, 0, m.width, m.height);
             mctx.globalCompositeOperation = "source-over";
             src = m;
         }
@@ -6425,7 +6431,7 @@ class InpaintEditor {
 
     /** Remove the background of a layer with an RMBG node; the result becomes its transparency mask. */
     async cutoutLayer(layer) {
-        if (!layer || !layer.canvas) return;
+        if (!layer || !layer.px) return;
         const availCut = availableCutoutBackends();
         const backend = availCut.find((b) => b.id === this.cutoutSettings.backend) || availCut[0];
         if (!backend) { this.setStatus(hostText("noCutoutBackend", "No background removal model: download one in Settings › Helpers, or install comfyui-rmbg on the server.")); return; }
@@ -6436,7 +6442,7 @@ class InpaintEditor {
             this.setStatus(`Removing the background of ${layer.name} with ${backend.label} ...`);
             if (backend.inApp) { const img = await host.cutoutInApp(this, layer, backend); await this.applyCutoutImage(img, this.cutoutPending); return; }
             // The layer's own pixels (transparent parts turn black on the way to RGB).
-            const up = await uploadCanvas(layer.canvas, `n${this.node.id}_cutsrc`);
+            const up = await uploadCanvas(layer.px.toCanvas(), `n${this.node.id}_cutsrc`);
             const prompt = {
                 cut_load: { class_type: "InpaintCanvasLoadRef", inputs: { ref: JSON.stringify(up.ref) } },
                 ...backend.build("cut_load"),
@@ -6478,20 +6484,19 @@ class InpaintEditor {
     async applyCutoutImage(img, pending) {
         const layer = pending.layer;
         try {
-            const W = layer.canvas.width, H = layer.canvas.height;
+            const W = layer.px.width, H = layer.px.height;
+            // the model's grey answer (not a mask yet) scaled to the layer's own pixels, its R channel becomes the alpha
             const tmp = makeCanvas(W, H);
             const tctx = tmp.getContext("2d");
             tctx.drawImage(img, 0, 0, W, H);
             const src = tctx.getImageData(0, 0, W, H).data;
-            const m = makeCanvas(W, H);
-            const mctx = m.getContext("2d");
-            const out = mctx.createImageData(W, H);
+            const out = new ImageData(W, H);
             const d = out.data;
             let sum = 0;
             for (let i = 0; i < src.length; i += 4) { d[i] = 255; d[i + 1] = 255; d[i + 2] = 255; d[i + 3] = src[i]; sum += src[i]; }
-            mctx.putImageData(out, 0, 0);
+            const m = MaskPixels.fromImageData(out);
             this.pushUndo({ kind: "mask", id: layer.id });
-            layer.mask = m;
+            layer.maskPx = m;
             layer.maskEdit = false;
             this.markMaskChanged(layer);
             this.renderLayers();
@@ -6513,16 +6518,19 @@ class InpaintEditor {
         if (!layer || !this.sel) return;
         if (!this.getBounds()) { this.setStatus("Select the area to keep first."); return; }
         this.pushUndo({ kind: "mask", id: layer.id });
-        const m = makeCanvas(layer.canvas.width, layer.canvas.height);
-        const ctx = m.getContext("2d");
-        ctx.setTransform(m.width / layer.w, 0, 0, m.height / layer.h, 0, 0);
-        this.sel.drawTo(ctx, -layer.x, -layer.y);
-        ctx.setTransform(1, 0, 0, 1, 0, 0);
-        ctx.globalCompositeOperation = "source-in";
-        ctx.fillStyle = "#ffffff";
-        ctx.fillRect(0, 0, m.width, m.height);
-        ctx.globalCompositeOperation = "source-over";
-        layer.mask = m;
+        // a new mask at the layer's own resolution (the mask undo step holds the old one): the
+        // selection under the layer, turned white with its coverage kept in alpha
+        const m = MaskPixels.empty(layer.px.width, layer.px.height);
+        const W = m.width, H = m.height;
+        m.drawInto(null, (ctx) => {
+            ctx.setTransform(W / layer.w, 0, 0, H / layer.h, 0, 0);
+            this.sel.drawTo(ctx, -layer.x, -layer.y);
+            ctx.setTransform(1, 0, 0, 1, 0, 0);
+            ctx.globalCompositeOperation = "source-in";   // over the whole mask, as before
+            ctx.fillStyle = "#ffffff";
+            ctx.fillRect(0, 0, W, H);
+        });
+        layer.maskPx = m;
         layer.maskEdit = false;
         this.markMaskChanged(layer);
         this.renderLayers();
@@ -6532,13 +6540,15 @@ class InpaintEditor {
 
     /** Bake the mask into the layer's alpha. */
     applyMask(layer, { silent = false, undo = true } = {}) {
-        if (!layer || !layer.mask) return;
+        if (!layer || !layer.maskPx) return;
         if (undo) this.pushUndo({ kind: "layerfull", id: layer.id });
-        const px = this.layerPixels(layer);
-        const out = makeCanvas(layer.canvas.width, layer.canvas.height);
-        out.getContext("2d").drawImage(px, 0, 0);
-        layer.canvas = out;
-        layer.mask = null;
+        const masked = this.layerPixels(layer);
+        // new pixels, not a write into the old ones: the layerfull undo step and a running
+        // encode of it may still read the old object
+        const out = makeCanvas(layer.px.width, layer.px.height);
+        out.getContext("2d").drawImage(masked, 0, 0);
+        layer.px = LayerPixels.fromCanvas(out);
+        layer.maskPx = null;
         layer.maskRef = null;
         layer.maskDirty = false;
         layer.maskEdit = false;
@@ -6547,9 +6557,9 @@ class InpaintEditor {
     }
 
     removeMask(layer) {
-        if (!layer || !layer.mask) return;
+        if (!layer || !layer.maskPx) return;
         this.pushUndo({ kind: "mask", id: layer.id });
-        layer.mask = null;
+        layer.maskPx = null;
         layer.maskEdit = false;
         this.markMaskChanged(layer);
         this.renderLayers();
@@ -6558,7 +6568,7 @@ class InpaintEditor {
     }
 
     toggleMaskEdit(layer) {
-        if (!layer || !layer.mask) return;
+        if (!layer || !layer.maskPx) return;
         layer.maskEdit = !layer.maskEdit;
         for (const l of this.layers) if (l !== layer) l.maskEdit = false;
         this.activeLayerId = layer.id;
@@ -7724,15 +7734,15 @@ class InpaintEditor {
         }
         maskRow.appendChild(miniButton("mask", "Mask from selection: only the selected part of the layer stays visible", () => this.maskFromSelection(layer)));
         maskRow.appendChild(el("span", "ipc-grow"));
-        maskRow.appendChild(el("span", null, layer.mask ? (layer.maskEdit ? "mask ✎" : "mask") : "no mask"));
+        maskRow.appendChild(el("span", null, layer.maskPx ? (layer.maskEdit ? "mask ✎" : "mask") : "no mask"));
         const editBtn = miniButton("maskEdit", "Edit the mask with the paint (reveal) and erase (hide) tools", () => this.toggleMaskEdit(layer), layer.maskEdit ? "ipc-on" : "");
-        editBtn.disabled = !layer.mask;
+        editBtn.disabled = !layer.maskPx;
         maskRow.appendChild(editBtn);
         const applyBtn = miniButton("check", "Apply the mask to the pixels", () => this.applyMask(layer));
-        applyBtn.disabled = !layer.mask;
+        applyBtn.disabled = !layer.maskPx;
         maskRow.appendChild(applyBtn);
         const delMask = miniButton("trash", "Remove the mask (the pixels stay)", () => this.removeMask(layer), "ipc-del");
-        delMask.disabled = !layer.mask;
+        delMask.disabled = !layer.maskPx;
         maskRow.appendChild(delMask);
         return maskRow;
     }
@@ -8915,7 +8925,7 @@ class InpaintEditor {
             });
             ctx.restore();
         }
-        const maskLayer = this.layers.find((l) => l.mask && l.maskEdit && l.visible);
+        const maskLayer = this.layers.find((l) => l.maskPx && l.maskEdit && l.visible);
         if (maskLayer) {
             ctx.save();
             ctx.lineWidth = 2 / s;
@@ -9571,7 +9581,7 @@ class InpaintEditor {
         // untouched, otherwise the pixels with the mask applied (cached per layer).
         const references = [];
         for (const l of this.referenceLayers()) {
-            if (!l.mask && l.ref && !l.dirty) { references.push(l.ref); continue; }
+            if (!l.maskPx && l.ref && !l.dirty) { references.push(l.ref); continue; }
             if (!l.exportRef) {
                 const up = await uploadCanvas(this.layerPixels(l), `n${id}_ref`);
                 l.exportRef = up.ref;
