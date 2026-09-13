@@ -1,3 +1,4 @@
+// Generated from DenRakEiw/scumble renderer/editor/inpaint_filters.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // Inpaint Canvas - filter layers (grain, sharpen, blur, levels, curves,
 // brightness / contrast, hue / saturation, colour balance, black & white,
 // invert, LUT, vignette).
@@ -12,6 +13,7 @@
 // editor control lives in inpaint_curves.js.
 
 import { curveDefaults, curvesToTables, buildCurvesControl } from "./inpaint_curves.js";
+import { applyFilterGL, applyMatchGL, glToCanvas } from "./inpaint_filters_gl.js";
 
 function makeCanvas(w, h) {
     const c = document.createElement("canvas");
@@ -262,6 +264,8 @@ function applyGrain(src, p, info) {
  * Fully transparent pixels are left alone. The app overrides this with a shader pass.
  */
 export function matchCanvas(src, stats, strength) {
+    const gl = applyMatchGL(src, stats, strength);
+    if (gl) return gl;
     const W = src.width, H = src.height;
     const out = makeCanvas(W, H);
     const ctx = out.getContext("2d");
@@ -952,6 +956,9 @@ export const FILTERS = {
 
 export const FILTER_IDS = Object.keys(FILTERS);
 
+// table builders shared with the WebGL2 path
+export { levelsTable, brightnessContrastTable, hueSatMatrix, lightnessTable, colorBalanceTables, hueToRgb, LOOK_DEFAULT };
+
 export function filterDefaults(id) {
     const out = {};
     for (const p of (FILTERS[id] || FILTERS.grain).params) out[p.key] = p.default;
@@ -965,5 +972,8 @@ export function filterDefaults(id) {
 export function applyFilter(id, src, params, info = {}) {
     const f = FILTERS[id];
     if (!f) return src;
-    return f.apply(src, params || {}, info);
+    if (!info.cpu) { const gl = applyFilterGL(id, src, params || {}, info); if (gl) return gl; }
+    // A plugin filter that runs its own shader stages (def.chain) takes the texture as it is;
+    // every other apply() is a pixel loop and needs a canvas.
+    return f.apply(f.chain ? src : glToCanvas(src), params || {}, info);
 }

@@ -1,3 +1,4 @@
+// Generated from DenRakEiw/scumble renderer/editor/inpaint_canvas.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // Inpaint Canvas - layered canvas editor for ComfyUI.
 //
 // The node itself only shows a thumbnail and a button. The editor opens as a
@@ -12,15 +13,23 @@
 //     pass its source as `result_source`
 //   * receive stitched results from the backend and add them as layers
 
-import { app } from "../../scripts/app.js";
-import { api } from "../../scripts/api.js";
+import { api, host } from "./host.js";
 import { FILTERS, FILTER_IDS, filterDefaults, applyFilter, matchCanvas, lutFromCube, lutToCanvas, lutFromImage, plateStats } from "./inpaint_filters.js";
+import { isGLSurface, glChainUsable, beginScope, endScope, releaseSurface, surfaceToCanvas, drawSurfaceTo } from "./inpaint_filters_gl.js";
 import { TEXT_DEFAULTS, FONT_CATEGORIES, loadFontList, fontList, addUserFont, renderText } from "./inpaint_text.js";
-import { installBridge } from "./inpaint_bridge.js";
 import { readAbr, tipCanvas } from "./inpaint_brushes.js";
 import { floodMask, maskToColorCanvas, clipMaskToSelection, rgbToHex, growMask, invertMask, maskBounds } from "./inpaint_raster.js";
 import { buildPsd, buildOra } from "./inpaint_export.js";
 import { GLCompositor } from "./inpaint_compositor.js";
+
+/**
+ * Two hosts run this editor: Scumble (renderer/editor/host.js, the editor is the window) and
+ * the ComfyUI node (its js/host.js, the editor is an overlay over the graph). Where they word
+ * a text differently the host's `text` table answers; the fallback is Scumble's wording.
+ */
+function hostText(key, fallback) {
+    return (host.text && host.text[key]) || fallback;
+}
 
 const NODE_CLASS = "InpaintCanvas";
 const STITCH_CLASS = "InpaintCanvasStitch";
@@ -480,7 +489,7 @@ const SEGMENT_BACKENDS = [
         // The SAM3 checkpoint (sam3.safetensors from Hugging Face, license gated)
         // goes into models/checkpoints and loads through the normal checkpoint loader.
         checkpoint: () => {
-            const t = window.LiteGraph && LiteGraph.registered_node_types["CheckpointLoaderSimple"];
+            const t = host.nodeTypes()["CheckpointLoaderSimple"];
             const list = t && t.nodeData && t.nodeData.input && t.nodeData.input.required && t.nodeData.input.required.ckpt_name;
             const names = Array.isArray(list) && Array.isArray(list[0]) ? list[0] : [];
             return names.find((n) => /sam3/i.test(n)) || null;
@@ -573,8 +582,8 @@ const UPSAMPLE_BACKENDS = [
 ];
 
 function availableUpsampleBackends() {
-    const types = (window.LiteGraph && LiteGraph.registered_node_types) || {};
-    return UPSAMPLE_BACKENDS.filter((b) => b.needs.every((n) => !!types[n]));
+    const types = host.nodeTypes();
+    return [...UPSAMPLE_BACKENDS.filter((b) => b.needs.every((n) => !!types[n])), ...host.upsampleBackends()];
 }
 
 const UPSAMPLE_CASES = ["auto", "fill", "add", "remove", "edit", "outpaint"];
@@ -620,7 +629,7 @@ function builtInUpsampleInstruction(useCase, text, region, hint) {
 }
 
 function availableSegmentBackends() {
-    const types = (window.LiteGraph && LiteGraph.registered_node_types) || {};
+    const types = host.nodeTypes();
     return SEGMENT_BACKENDS.filter((b) => b.needs.every((n) => !!types[n]) && (!b.available || b.available(b)));
 }
 
@@ -678,8 +687,8 @@ const CUTOUT_BACKENDS = [
 ];
 
 function availableCutoutBackends() {
-    const types = (window.LiteGraph && LiteGraph.registered_node_types) || {};
-    return CUTOUT_BACKENDS.filter((b) => b.needs.every((n) => !!types[n]));
+    const types = host.nodeTypes();
+    return [...host.cutoutBackends(), ...CUTOUT_BACKENDS.filter((b) => b.needs.every((n) => !!types[n]))];
 }
 
 const isSettingOutput = (o) => !!(o && typeof o.name === "string" && /^setting_\d+$/.test(o.name));
@@ -711,7 +720,8 @@ const OBJECT_BACKEND = {
 };
 
 function objectBackendAvailable() {
-    const types = (window.LiteGraph && LiteGraph.registered_node_types) || {};
+    if (host.objectsInApp()) return true;
+    const types = host.nodeTypes();
     return OBJECT_BACKEND.needs.every((n) => !!types[n]);
 }
 
@@ -1276,7 +1286,7 @@ class InpaintEditor {
 
         // top bar
         const top = el("div", "ipc-top");
-        top.appendChild(el("span", "ipc-title", "Inpaint Canvas"));
+        if (host.overlay) top.appendChild(el("span", "ipc-title", "Inpaint Canvas"));
         this.fileInput = document.createElement("input");
         this.fileInput.type = "file";
         this.fileInput.accept = "image/*";
@@ -1381,26 +1391,31 @@ class InpaintEditor {
         top.appendChild(el("span", "ipc-grow"));
         this.modeSel = selectInput(["api", "local"], "api", "Which chain the result comes back from: API = the result input, Local = the result_local input. Only that chain runs.");
         this.modeSel.classList.add("ipc-mode");
-        this.modeSel.addEventListener("change", () => { this.genSettings.mode = this.modeSel.value; this.syncGenControls(); this.renderInfo(); this.notifyChanged(); });
+        this.modeSel.addEventListener("change", () => { this.genSettings.mode = this.modeSel.value; this.syncGenControls(); this.renderInfo(); this.notifyChanged(); host.modeChanged(this, this.modeSel.value); });
         top.appendChild(this.modeSel);
         this.generateBtn = iconButton("play", "Queue the workflow (Ctrl+Enter). The result comes back as a new layer.", () => this.generate(), "Generate");
         this.generateBtn.classList.add("ipc-primary");
         top.appendChild(this.generateBtn);
-        const closeBtn = iconButton("close", "Close editor (Esc)", () => this.close());
-        closeBtn.classList.add("ipc-danger");
-        top.appendChild(closeBtn);
+        if (host.overlay) {
+            // over the graph the editor needs its own way out; in the app it is the window
+            const closeBtn = iconButton("close", "Close editor (Esc)", () => this.close());
+            closeBtn.classList.add("ipc-danger");
+            top.appendChild(closeBtn);
+        }
         root.appendChild(top);
 
         // body
         const body = el("div", "ipc-body");
 
         const tools = el("div", "ipc-tools");
+        this.toolsEl = tools;
         this.toolButtons = {};
         const addTool = (id, title) => {
             const b = iconButton(id, title, () => this.setTool(id));
             this.toolButtons[id] = b;
             tools.appendChild(b);
         };
+        this._addTool = addTool;
         // Tool groups: one button per family, the button shows the family's current tool; hover,
         // right-click or hold opens the flyout with all of them (Photoshop / Krita style).
         this.toolGroups = [];
@@ -1521,6 +1536,7 @@ class InpaintEditor {
             pane.appendChild(d);
             return d;
         };
+        this.addSection = (title, open, build, paneId) => { const prev = pane; pane = this.panes[paneId] || prev; try { return section(title, open, build); } finally { pane = prev; } };
 
         const layersHead = el("h4", null, "Layers");
         layersHead.appendChild(el("span", "ipc-grow"));
@@ -1746,13 +1762,13 @@ class InpaintEditor {
             exp.appendChild(this.saveNameInput);
             this.saveFormatSel = selectInput(["png", "jpg", "webp", "psd", "ora"], "png", "PNG keeps the workflow inside the file (drop it onto ComfyUI to load it again), JPEG and WebP are smaller. PSD and ORA (OpenRaster, for GIMP and others) keep the layers: name, position, opacity, visibility, blend mode; filter layers are baked into the merged image only.");
             exp.appendChild(this.saveFormatSel);
-            const dl = iconButton("download", "Save and also download the file in the browser", () => this.exportImage({ download: true }), "Download");
+            const dl = iconButton("download", hostText("downloadTip", "Save the image to a file (Ctrl+S)"), () => this.exportImage({ download: true }), hostText("downloadLabel", "Save as"));
             dl.classList.add("ipc-small");
             exp.appendChild(dl);
-            const lay = iconButton("image", "Save the active layer alone as a PNG with transparency (output folder)", () => this.exportLayerPng(), "Layer");
+            const lay = iconButton("image", hostText("exportLayerTip", "Save the active layer alone as a PNG file with transparency"), () => this.exportLayerPng(), "Layer");
             lay.classList.add("ipc-small");
             exp.appendChild(lay);
-            const msk = iconButton("mask", "Save the selection as a black and white mask PNG (output folder)", () => this.exportMaskPng(), "Mask");
+            const msk = iconButton("mask", hostText("exportMaskTip", "Save the selection as a black and white mask PNG file"), () => this.exportMaskPng(), "Mask");
             msk.classList.add("ipc-small");
             exp.appendChild(msk);
             d.appendChild(exp);
@@ -1853,6 +1869,7 @@ class InpaintEditor {
             }, "Refine");
             this.refineBtn.classList.add("ipc-small");
             sec.appendChild(this.refineBtn);
+            host.buildGenerateExtras(this, sec);
             d.appendChild(sec);
         });
 
@@ -1936,7 +1953,7 @@ class InpaintEditor {
         const bottom = el("div", "ipc-bottom");
         this.statusEl = el("span", null, this.status);
         bottom.appendChild(this.statusEl);
-        bottom.appendChild(el("span", "ipc-kbd", "Wheel: zoom · Space/middle: pan · [ ]: size · Esc: close"));
+        bottom.appendChild(el("span", "ipc-kbd", host.overlay ? "Wheel: zoom · Space/middle: pan · [ ]: size · Esc: close" : "Wheel: zoom · Space/middle: pan · [ ]: size · Ctrl+Enter: generate"));
         root.appendChild(bottom);
 
         this.bindEvents();
@@ -1946,6 +1963,7 @@ class InpaintEditor {
         this.renderInfo();
         this.resizeObserver = new ResizeObserver(() => this.resizeCanvas());
         this.resizeObserver.observe(this.viewEl);
+        host.editorBuilt(this);
     }
 
     buildSubbar() {
@@ -2316,13 +2334,13 @@ class InpaintEditor {
     open() {
         if (this.isOpen) return;
         this.isOpen = true;
-        document.body.appendChild(this.root);
+        host.mount(this.root);
         // While the editor is open every shortcut belongs to it. The listener sits
         // on window in the capture phase so ComfyUI's own handlers (workflow undo on
         // Ctrl+Z, keybindings) never see the keys; otherwise Ctrl+Z would undo the
         // whole workflow state and reset the canvas.
         this._docKey = (e) => {
-            if (!this.isOpen) return;
+            if (!this.isOpen || !host.isActive(this)) return;
             const t = e.target;
             if (this.askOpen) return;   // the question dialog has its own keys
             if (t && t.closest && t.closest("dialog[open]")) return;   // a key inside an open <dialog> (a host settings dialog, a plugin's) stays with the dialog: Escape has to reach its native close
@@ -2337,7 +2355,7 @@ class InpaintEditor {
                 else if (this.flyout) this.closeFlyout();
                 else if (this.textEdit) this.endTextEdit(false);
                 else if (this.compare) { this.compare = null; if (this.compareBtn) this.compareBtn.classList.remove("ipc-on"); this.draw(); this.setStatus("Compare ended."); }
-                else this.close();
+                else host.onEscape(this);
                 return;
             }
             if (inField) return;   // typing in the editor's own fields: their handlers stop propagation themselves
@@ -2553,7 +2571,9 @@ class InpaintEditor {
         if (this.pending && tool !== "transform") this.cancelPending();
         if (this.polyPoints && tool !== "polygon") this.polyPoints = null;
         if (this.shapePoints && tool !== "shape") this.cancelShape();
+        const prevTool = this.tool;
         this.tool = tool;
+        host.toolChanged(this, tool, prevTool);
         if (this.hardCtl) {
             const v = Math.round(this.activeHardness() * 100);
             this.hardCtl.input.value = v;
@@ -2582,7 +2602,7 @@ class InpaintEditor {
 
     onKey(e) {
         const k = e.key.toLowerCase();
-        if (e.key === "Escape") { e.preventDefault(); if (this.pending) this.cancelPending(); else this.close(); return; }
+        if (e.key === "Escape") { e.preventDefault(); if (this.pending) this.cancelPending(); else host.onEscape(this); return; }
         if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); this.generate(); return; }
         if (e.key === "Enter" && this.pending) { e.preventDefault(); this.applyPending(); return; }
         if (e.key === "Enter" && this.polyPoints) { e.preventDefault(); this.closePolygon(); this.draw(); return; }
@@ -2624,6 +2644,7 @@ class InpaintEditor {
         if (e.shiftKey && k === "r") { this.setTool("ellipse"); return; }
         if (e.shiftKey && k === "t") { this.setTool("text"); return; }
         if (e.key === "\\") { e.preventDefault(); if (!e.repeat && !this.peekBase) { this.peekBase = true; this.peekHold = true; this.draw(); } return; }
+        if (host.pluginKey(this, e, k)) return;
         switch (k) {
             case "1": this.zoomTo(1); break;
             case "4": this.rotateView(-Math.PI / 12); break;
@@ -3054,6 +3075,7 @@ class InpaintEditor {
             }
             ctx.restore();
         }
+        host.pluginOverlay(this, ctx);
         ctx.setTransform(1, 0, 0, 1, 0, 0);
         if (this.compare && this.compare.a && this.compare.b) {
             const split = Math.min(0.95, Math.max(0.05, this.compare.split ?? 0.5));
@@ -3490,6 +3512,7 @@ class InpaintEditor {
         }
         if (e.button !== 0) return;
         const [ix, iy] = this.toImage(e);
+        if (host.pluginPointer(this, "down", e, ix, iy)) return;
         if (this.base) {
             const [cx, cy] = this.toCanvasPx(e);
             const dpr = window.devicePixelRatio || 1;
@@ -3673,6 +3696,7 @@ class InpaintEditor {
         if (!this.width) return;
         const [ix, iy] = this.toImage(e);
         this.hover = [ix, iy];
+        if (host.pluginPointer(this, "move", e, ix, iy)) return;
         const p = this.pointer;
         if (!p) {
             if (this.tool === "transform") this.updateTransformCursor(ix, iy);
@@ -3813,6 +3837,7 @@ class InpaintEditor {
         this.pointer = null;
         this.viewEl.classList.remove("ipc-panning");
         try { this.canvas.releasePointerCapture(e.pointerId); } catch (_) { /* ignore */ }
+        if (p.kind === "plugin") { host.pluginPointer(this, "up", e, ...this.toImage(e), p); return; }
         if (p.kind === "rect") {
             if (p.startPx && !p.moved) {
                 // a click without a drag deselects, like the lasso below. Without the screen
@@ -5242,7 +5267,7 @@ class InpaintEditor {
             const curUp = this.upsampleSettings.backend;
             this.upBackendSel.innerHTML = "";
             for (const b of ups) { const o = document.createElement("option"); o.value = b.id; o.textContent = b.label; this.upBackendSel.appendChild(o); }
-            if (!ups.length) { const o = document.createElement("option"); o.value = ""; o.textContent = "no language model nodes installed"; this.upBackendSel.appendChild(o); }
+            if (!ups.length) { const o = document.createElement("option"); o.value = ""; o.textContent = hostText("noUpsampleOption", "no language model (Settings › API providers, or ComfyUI-QwenVL)"); this.upBackendSel.appendChild(o); }
             if (ups.some((b) => b.id === curUp)) this.upBackendSel.value = curUp;
             this.upBtn.disabled = !ups.length;
         }
@@ -5259,7 +5284,7 @@ class InpaintEditor {
         let text = (this.segInput.value || "").trim();
         // Empty field but a prompt: let the language model name the object the prompt is about.
         const fromPrompt = !text && !!(this.promptInput.value || "").trim();
-        const llm = fromPrompt ? (UPSAMPLE_BACKENDS.find((b) => b.id === this.upBackendSel.value) || availableUpsampleBackends()[0]) : null;
+        const llm = fromPrompt ? (availableUpsampleBackends().find((b) => b.id === this.upBackendSel.value) || availableUpsampleBackends()[0]) : null;
         if (!text && !fromPrompt) { this.setStatus("Type what to select, e.g. \"shirt\", or write a prompt and press Go to select what it is about."); this.segInput.focus(); return; }
         if (fromPrompt && !llm) { this.setStatus("Type what to select: no language model nodes installed to derive it from the prompt."); this.segInput.focus(); return; }
         const backend = SEGMENT_BACKENDS.find((b) => b.id === this.segBackendSel.value) || availableSegmentBackends()[0];
@@ -5272,7 +5297,11 @@ class InpaintEditor {
             const prompt = {
                 seg_load: { class_type: "InpaintCanvasLoadRef", inputs: { ref: JSON.stringify(ref) } },
             };
-            if (fromPrompt) {
+            if (fromPrompt && llm.inApp) {
+                text = (await host.askLLM(llm, segmentTermInstruction(this.promptInput.value.trim()), this.promptContextCanvas())).text.replace(/[."']/g, "").trim();
+                if (!text) throw new Error(`${llm.label} named no object`);
+                this.setStatus(`Segmenting "${text}" (from the prompt, ${llm.label}) with ${backend.label} ...`);
+            } else if (fromPrompt) {
                 // term_run: VLM -> STRING, linked straight into the segmentation node's prompt input
                 Object.assign(prompt, llm.build("seg_load", segmentTermInstruction(this.promptInput.value.trim())));
                 prompt.term_run = prompt.up_run; delete prompt.up_run;
@@ -5391,8 +5420,8 @@ class InpaintEditor {
     async upsamplePrompt() {
         if (!this.base) { this.setStatus("Load an image first."); return; }
         if (this.upsamplePending) { this.setStatus("Upsampling is already running."); return; }
-        const backend = UPSAMPLE_BACKENDS.find((b) => b.id === this.upBackendSel.value) || availableUpsampleBackends()[0];
-        if (!backend) { this.setStatus("No language model nodes installed (ComfyUI-QwenVL, or the Gemini API node)."); return; }
+        const backend = availableUpsampleBackends().find((b) => b.id === this.upBackendSel.value) || availableUpsampleBackends()[0];
+        if (!backend) { this.setStatus(hostText("noUpsampleBackend", "No language model: add an OpenAI, Google or Anthropic key in Settings › API providers, or install ComfyUI-QwenVL on the server.")); return; }
         const text = (this.promptInput.value || "").trim();
         const useCase = this.resolveUseCase();
         const region = this.getBounds() ? (this.cropSettings.fill === "green" ? "the solid green area" : "the area inside the magenta outline") : "the whole image";
@@ -5400,6 +5429,7 @@ class InpaintEditor {
             this.upBtn.disabled = true;
             this.upsamplePending = { previous: this.promptInput.value, useCase };
             this.setStatus(`Upsampling the prompt for "${useCase}" with ${backend.label} ...`);
+            if (backend.inApp) { await host.upsampleInApp(this, backend, upsampleInstruction(useCase, text, region, this.getBounds() ? this.selectionLabel : "")); return; }
             const { ref } = await uploadCanvas(this.promptContextCanvas(), `n${this.node.id}_promptctx`);
             const prompt = {
                 up_load: { class_type: "InpaintCanvasLoadRef", inputs: { ref: JSON.stringify(ref) } },
@@ -5451,11 +5481,12 @@ class InpaintEditor {
     /** Make sure the object map matches the current source; run SAM2 if not. */
     async ensureObjects() {
         if (!this.base || this.objectsPending) return;
-        if (!objectBackendAvailable()) { this.setStatus("Object selection needs ComfyUI-segment-anything-2 (Kijai) for the SAM2 automatic mask generator."); return; }
+        if (!objectBackendAvailable()) { this.setStatus(hostText("noObjectBackend", "Object selection needs a SAM2 model: download one in Settings › Helpers, or install ComfyUI-segment-anything-2 (Kijai) on the server.")); return; }
         this.objectsPending = { stage: "upload" };
         try {
             const { ref, hash, layer } = await this.segmentSource();
             if (this.objects && this.objects.hash === hash && this.objects.w === this.width && this.objects.h === this.height) { this.objectsPending = null; return; }
+            if (host.objectsInApp()) { await host.findObjects(this, { hash, layer }); return; }
             this.setStatus(`Finding objects with ${OBJECT_BACKEND.label} ...`);
             const prompt = {
                 obj_load: { class_type: "InpaintCanvasLoadRef", inputs: { ref: JSON.stringify(ref) } },
@@ -5489,19 +5520,26 @@ class InpaintEditor {
             const d = ctx.getImageData(0, 0, w, h).data;
             const ids = new Uint16Array(w * h);
             for (let i = 0, j = 0; i < d.length; i += 4, j++) ids[j] = d[i] + (d[i + 1] << 8);
+            this.applySegmentIds(ids, w, h, info.count || 0, pending);
+        } catch (err) {
+            console.error(err);
+            this.setStatus("Could not read the object map: " + (err.message || err));
+        }
+    }
+
+    /** An object label map (0 = none) at w × h becomes this.objects, clipped to the source layer. */
+    applySegmentIds(ids, w, h, count, pending = {}) {
+        {
             if (pending.layer && w === this.width && h === this.height) {
                 const clip = this.layerAlpha(pending.layer);
                 for (let j = 0; j < ids.length; j++) if (!clip[j]) ids[j] = 0;
             }
-            this.objects = { hash: pending.hash, w, h, ids, count: info.count || 0, layerId: pending.layer ? pending.layer.id : null };
+            this.objects = { hash: pending.hash, w, h, ids, count, layerId: pending.layer ? pending.layer.id : null };
             this.objectShapeCache.clear();
             this.hoverObjectId = 0; this.hoverObjectCanvas = null;
-            this.setStatus(`${info.count || 0} objects found. Hover to preview, click to select, click again to deselect (Shift adds, Alt subtracts).`);
+            this.setStatus(`${count} objects found. Hover to preview, click to select, click again to deselect (Shift adds, Alt subtracts).`);
             if (this.hover) this.updateObjectHover(this.hover[0], this.hover[1]);
             this.draw();
-        } catch (err) {
-            console.error(err);
-            this.setStatus("Could not read the object map: " + (err.message || err));
         }
     }
 
@@ -5547,7 +5585,7 @@ class InpaintEditor {
     toggleObjectAt(ix, iy, p = {}) {
         if (!this.objects) { this.ensureObjects(); return; }
         const id = this.objectIdAt(ix, iy);
-        if (!id) { this.setStatus("No object here. Use the brush or lasso for this spot."); return; }
+        if (!id) { if (host.objectsInApp()) { host.selectPoint(this, ix, iy, p); return; } this.setStatus("No object here. Use the brush or lasso for this spot."); return; }
         const x = Math.floor(ix), y = Math.floor(iy);
         const already = this.selection.getContext("2d").getImageData(x, y, 1, 1).data[3] > 0;
         const subtract = p.alt ? true : (p.shift ? false : already);
@@ -6176,13 +6214,20 @@ class InpaintEditor {
         this.setStatus(`${layer.name}: back to synthetic grain.`);
     }
 
-    /** Filtered copy of `below` for a filter layer, cached until the composite or the parameters change. */
-    filteredCanvas(layer, below, forRun, preview) {
+    /**
+     * Filtered copy of `below` for a filter layer, cached until the composite or the parameters
+     * change. `below` is the composite so far: a canvas, or the GPU surface the filter layer
+     * before this one left behind. With `keepSurface` the result stays a surface for the next
+     * filter layer and is not cached; without it the surface is read back into a canvas. The
+     * stages inside one filter (the film look is colour, halation and grain) always chain on
+     * the GPU, which is where most of the canvas round trips were.
+     */
+    filteredCanvas(layer, below, forRun, preview, keepSurface = false) {
         const vp = this.viewPass;
         const key = JSON.stringify([layer.filter, layer.params, layer.lut && layer.lut.ref && layer.lut.ref.filename, layer.plate && layer.plate.ref && layer.plate.ref.filename, !!forRun, !!preview, below.width, below.height, vp ? [vp.x, vp.y] : 0]);
         const slot = vp ? (vp.sample ? "_fcacheSample" : "_fcacheView") : "_fcache";
         const c = layer[slot];
-        if (c && c.version === this.compositeVersion && c.key === key) return c.canvas;
+        if (!keepSurface && c && c.version === this.compositeVersion && c.key === key) return c.canvas;
         let input = below, scale = vp ? vp.sx : 1;
         if (preview) {
             const s = Math.min(1, 1024 / Math.max(below.width, below.height));
@@ -6200,14 +6245,30 @@ class InpaintEditor {
         // where the input sits in the image, in its own pixels: filters with a field of
         // their own (grain) anchor it there instead of at the corner of the preview
         const origin = vp ? [vp.x * vp.sx, vp.y * vp.sy] : [0, 0];
-        try { canvas = applyFilter(layer.filter, input, layer.params, { scale, origin, seed: layer.id, lut: layer._lutData, plate: layer._plateImg || null, plateKey: layer.plate && layer.plate.ref && layer.plate.ref.filename, plateMean: layer.plate && layer.plate.mean, plateStd: layer.plate && layer.plate.std, cache: layer[fxSlot] }); }
+        const chain = !this.filterChainOff && glChainUsable(input.width, input.height);   // filterChainOff: the Canvas 2D path, for composite_test
+        beginScope();
+        try { canvas = applyFilter(layer.filter, input, layer.params, { scale, origin, seed: layer.id, lut: layer._lutData, plate: layer._plateImg || null, plateKey: layer.plate && layer.plate.ref && layer.plate.ref.filename, plateMean: layer.plate && layer.plate.mean, plateStd: layer.plate && layer.plate.std, cache: layer[fxSlot], chain }); }
         catch (err) { console.error(err); }
+        canvas = endScope(canvas);
+        if (isGLSurface(canvas)) {
+            if (keepSurface) return canvas;                    // the next filter layer reads the texture
+            const flat = surfaceToCanvas(canvas);
+            if (canvas !== input) releaseSurface(canvas);      // a filter that did nothing hands its input back
+            canvas = flat;
+        }
         layer[slot] = { version: this.compositeVersion, key, canvas };
         return canvas;
     }
 
-    /** Draw a filter layer onto `ctx` (an image-sized canvas holding everything below it). */
-    applyFilterLayer(ctx, layer, index, forRun) {
+    /**
+     * Draw a filter layer onto `ctx` (a canvas holding everything below it), or hand its result
+     * on to the next filter layer as a GPU surface. `chain` is what the filter layer before it
+     * left there, `more` says another filter layer follows; the return value is the new chain,
+     * null once everything has been drawn. The pixels are the same either way: a result that
+     * goes onto the canvas is drawn over the composite exactly as before, and the held chain is
+     * flushed first (flushFilterChain), so only the upload of the next filter's input is saved.
+     */
+    applyFilterLayer(ctx, layer, index, forRun, chain = null, more = false) {
         if (!forRun) {
             // While something below the filter is being painted or moved, the cached
             // result would hide the live change: show the layers unfiltered instead.
@@ -6215,16 +6276,26 @@ class InpaintEditor {
             const gestureLayer = (p && p.layer) || (this.pending && this.pending.layer) || null;
             if (gestureLayer && gestureLayer !== layer) {
                 const gi = this.layers.indexOf(gestureLayer);
-                if (gi >= 0 && gi < index) return;
+                if (gi >= 0 && gi < index) return chain;
             }
         }
         const vp = this.viewPass;
         // the region pass already works at screen resolution; the 1024 px preview is for the full-size path
         const preview = !forRun && !vp && (this.filterPreview === layer.id || this.filterPreview === "*");
-        const out = this.filteredCanvas(layer, ctx.canvas, forRun, preview);
-        if (!out) return;
+        if (chain && preview) chain = this.flushFilterChain(ctx, chain);   // the preview downscales on a canvas
+        // A filter layer that covers its input one to one can leave its result on the GPU; a
+        // mask, an opacity or a blend mode has to composite it onto the canvas.
+        const plain = !layer.mask && layer.opacity >= 1 && (!layer.blend || layer.blend === "normal") && !preview;
+        const keepSurface = plain && more && !this.filterChainOff && glChainUsable(ctx.canvas.width, ctx.canvas.height);
+        const out = this.filteredCanvas(layer, chain ? chain.surface : ctx.canvas, forRun, preview, keepSurface);
         const rx = vp ? vp.x : 0, ry = vp ? vp.y : 0;
         const rw = vp ? vp.w : this.width, rh = vp ? vp.h : this.height;
+        if (isGLSurface(out)) {
+            if (chain && out !== chain.surface) releaseSurface(chain.surface);
+            return { surface: out, x: rx, y: ry, w: rw, h: rh };
+        }
+        chain = this.flushFilterChain(ctx, chain);   // the result goes onto the canvas, so the composite has to be there
+        if (!out) return null;
         let src = out;
         if (layer.mask) {
             if (!this.filterMaskCanvas || this.filterMaskCanvas.width !== out.width || this.filterMaskCanvas.height !== out.height) this.filterMaskCanvas = makeCanvas(out.width, out.height);
@@ -6246,6 +6317,33 @@ class InpaintEditor {
         ctx.drawImage(src, rx, ry, rw, rh);
         ctx.globalAlpha = 1;
         ctx.globalCompositeOperation = "source-over";
+        return null;
+    }
+
+    /** Draw what the filter chain left on the GPU onto `ctx` and give the surface back. */
+    flushFilterChain(ctx, chain) {
+        if (!chain) return null;
+        ctx.globalAlpha = 1;
+        ctx.globalCompositeOperation = "source-over";
+        if (!drawSurfaceTo(ctx, chain.surface, chain.x, chain.y, chain.w, chain.h)) {
+            const flat = surfaceToCanvas(chain.surface);
+            if (flat) ctx.drawImage(flat, chain.x, chain.y, chain.w, chain.h);
+        }
+        releaseSurface(chain.surface);
+        return null;
+    }
+
+    /** Is the next layer that gets drawn after `i` a filter layer? (may the chain go on?) */
+    nextIsFilterLayer(i, forRun) {
+        for (let j = i + 1; j < this.layers.length; j++) {
+            const l = this.layers[j];
+            if (this.compareShow && l.kind === "result" && l.id !== this.compareShow) continue;
+            if ((!l.visible && !(this.compareShow && l.id === this.compareShow)) || !l.canvas) continue;
+            if (l.kind === "filter") return true;
+            if (forRun && (this.isControl(l) || this.isReference(l))) continue;
+            return false;
+        }
+        return false;
     }
 
     markMaskChanged(layer, rect) {
@@ -6274,20 +6372,22 @@ class InpaintEditor {
         const cur = this.cutoutSettings.backend;
         this.cutoutSel.innerHTML = "";
         for (const b of avail) { const o = document.createElement("option"); o.value = b.id; o.textContent = b.label; this.cutoutSel.appendChild(o); }
-        if (!avail.length) { const o = document.createElement("option"); o.value = ""; o.textContent = "no RMBG nodes"; this.cutoutSel.appendChild(o); }
+        if (!avail.length) { const o = document.createElement("option"); o.value = ""; o.textContent = hostText("noCutoutOption", "no model (Settings › Helpers)"); this.cutoutSel.appendChild(o); }
         this.cutoutSel.value = avail.some((b) => b.id === cur) ? cur : (avail[0] ? avail[0].id : "");
     }
 
     /** Remove the background of a layer with an RMBG node; the result becomes its transparency mask. */
     async cutoutLayer(layer) {
         if (!layer || !layer.canvas) return;
-        const backend = CUTOUT_BACKENDS.find((b) => b.id === this.cutoutSettings.backend && availableCutoutBackends().includes(b)) || availableCutoutBackends()[0];
-        if (!backend) { this.setStatus("No background removal nodes installed (comfyui-rmbg or ComfyUI-BRIA_AI-RMBG)."); return; }
+        const availCut = availableCutoutBackends();
+        const backend = availCut.find((b) => b.id === this.cutoutSettings.backend) || availCut[0];
+        if (!backend) { this.setStatus(hostText("noCutoutBackend", "No background removal model: download one in Settings › Helpers, or install comfyui-rmbg on the server.")); return; }
         if (this.cutoutPending) { this.setStatus(`Still removing the background of ${this.cutoutPending.layer.name} ...`); return; }
         try {
             this.cutoutPending = { layer, backend };
             this.renderLayers();
             this.setStatus(`Removing the background of ${layer.name} with ${backend.label} ...`);
+            if (backend.inApp) { const img = await host.cutoutInApp(this, layer, backend); await this.applyCutoutImage(img, this.cutoutPending); return; }
             // The layer's own pixels (transparent parts turn black on the way to RGB).
             const up = await uploadCanvas(layer.canvas, `n${this.node.id}_cutsrc`);
             const prompt = {
@@ -6318,6 +6418,19 @@ class InpaintEditor {
         if (!this.layers.includes(layer)) { this.cutoutPending = null; this.renderLayers(); return; }
         try {
             const img = await loadImageEl(viewUrl({ filename: info.filename, subfolder: info.subfolder || SUBFOLDER, type: info.type || "temp" }));
+            await this.applyCutoutImage(img, pending);
+        } catch (err) {
+            console.error(err);
+            this.setStatus("Could not apply the cutout: " + (err.message || err));
+            if (this.cutoutPending === pending) this.cutoutPending = null;
+            this.renderLayers();
+        }
+    }
+
+    /** A grayscale mask (any size, white = keep) for the pending cutout's layer -> its transparency mask. */
+    async applyCutoutImage(img, pending) {
+        const layer = pending.layer;
+        try {
             const W = layer.canvas.width, H = layer.canvas.height;
             const tmp = makeCanvas(W, H);
             const tctx = tmp.getContext("2d");
@@ -6836,23 +6949,14 @@ class InpaintEditor {
     static referencedFiles() {
         const keep = new Set();
         const scan = (text) => { for (const m of String(text || "").matchAll(/"filename"\s*:\s*"([^"]+)"/g)) keep.add(m[1]); };
-        for (const n of (app.graph && app.graph._nodes) || []) {
-            const ed = n.inpaintEditor;
-            if (!ed) continue;
+        for (const text of host.referencedTexts ? host.referencedTexts() : []) scan(text);   // the node's open workflow tabs
+        for (const ed of host.editors()) {
             scan(ed.lastValueString);
             try { scan(ed.getValue()); } catch (_) { /* ignore */ }
             scan(JSON.stringify(ed.uploaded));
             scan(JSON.stringify(ed.layers.map((l) => [l.ref, l.maskRef, l.exportRef, l.lut && l.lut.ref, l.plate && l.plate.ref])));
             if (ed.base) scan(JSON.stringify(ed.base.ref));
         }
-        try {
-            const wf = app.extensionManager && app.extensionManager.workflow;
-            for (const w of (wf && wf.openWorkflows) || []) {
-                scan(w.content || w.originalContent || "");
-                if (w.activeState) scan(JSON.stringify(w.activeState));
-                if (w.initialState) scan(JSON.stringify(w.initialState));
-            }
-        } catch (_) { /* ignore */ }
         try { for (let i = 0; i < localStorage.length; i++) scan(localStorage.getItem(localStorage.key(i))); } catch (_) { /* ignore */ }
         return Array.from(keep);
     }
@@ -6890,9 +6994,10 @@ class InpaintEditor {
             c.getContext("2d").drawImage(this.layerPixels(l), l.x, l.y, l.w, l.h);
             const blob = await new Promise((r) => c.toBlob(r, "image/png"));
             const stem = (l.name || "layer").replace(/[^a-z0-9._ -]/gi, "_");
-            const ref = await uploadBlob(blob, `${stem}.png`, { overwrite: false, type: "output", subfolder: "" });
-            this.setStatus(`Saved output/${ref.filename} (${l.name}, ${this.width} × ${this.height} with transparency).`);
-            return ref;
+            const saved = await host.saveExport(blob, `${stem}.png`, { editor: this });
+            if (!saved) { this.setStatus("Save cancelled."); return null; }
+            this.setStatus(`Saved ${saved.path} (${l.name}, ${this.width} × ${this.height} with transparency).`);
+            return saved;
         } catch (err) { console.error(err); this.setStatus("Save failed: " + (err.message || err)); return null; }
     }
 
@@ -6902,9 +7007,10 @@ class InpaintEditor {
         try {
             const blob = await new Promise((r) => this.maskToCanvas().toBlob(r, "image/png"));
             const stem = ((this.saveNameInput && this.saveNameInput.value) || "inpaint_canvas").trim().replace(/\.[a-z0-9]+$/i, "").replace(/[^a-z0-9._ -]/gi, "_") || "inpaint_canvas";
-            const ref = await uploadBlob(blob, `${stem}_mask.png`, { overwrite: false, type: "output", subfolder: "" });
-            this.setStatus(`Saved output/${ref.filename} (mask, white = selected).`);
-            return ref;
+            const saved = await host.saveExport(blob, `${stem}_mask.png`, { editor: this });
+            if (!saved) { this.setStatus("Save cancelled."); return null; }
+            this.setStatus(`Saved ${saved.path} (mask, white = selected).`);
+            return saved;
         } catch (err) { console.error(err); this.setStatus("Save failed: " + (err.message || err)); return null; }
     }
 
@@ -6914,7 +7020,7 @@ class InpaintEditor {
         const stem = ((this.saveNameInput && this.saveNameInput.value) || "inpaint_canvas").trim().replace(/\.[a-z0-9]+$/i, "").replace(/[^a-z0-9._ -]/gi, "_") || "inpaint_canvas";
         try {
             this.setStatus("Saving ...");
-            const canvas = this.flattenToCanvas({ forRun: true });
+            const canvas = host.exportCanvas(this, fmt);
             let blob, note = "";
             if (fmt === "psd" || fmt === "ora") {
                 const t0 = performance.now();
@@ -6922,27 +7028,20 @@ class InpaintEditor {
                 blob = await buildLayered(fmt, { width: this.width, height: this.height, layers, composite: canvas });
                 note = `, ${layers.length} layers${skipped ? `, ${skipped} filter layer${skipped > 1 ? "s" : ""} only in the merged image` : ""}, ${Math.round(performance.now() - t0)} ms`;
             } else {
-                blob = await new Promise((r) => canvas.toBlob(r, fmt === "jpg" ? "image/jpeg" : fmt === "webp" ? "image/webp" : "image/png", 0.92));
+                blob = await new Promise((r) => canvas.toBlob(r, fmt === "jpg" ? "image/jpeg" : fmt === "webp" ? "image/webp" : "image/png", host.exportQuality(this)));
             }
             if (fmt === "png") {
                 // Same metadata as SaveImage: the workflow (and the canvas prompt), so the file loads back into ComfyUI.
                 try {
-                    const workflow = this.node.graph && this.node.graph.serialize ? this.node.graph.serialize() : app.graph.serialize();
+                    const workflow = host.workflowForPng(this);
                     blob = pngWithText(await blob.arrayBuffer(), { workflow: asciiJson(workflow), inpaint_canvas: asciiJson({ prompt: this.promptText, negative: this.negativeText, width: this.width, height: this.height, seed: this.genSettings.seed, mode: this.genSettings.mode }) });
                 } catch (err) { console.warn("Inpaint Canvas: could not embed the workflow", err); }
             }
-            // Into the output root like SaveImage, not into inpaint_canvas (that folder is working files the cleanup may delete).
-            const ref = await uploadBlob(blob, `${stem}.${fmt}`, { overwrite: false, type: "output", subfolder: "" });
+            const saved = await host.saveExport(blob, `${stem}.${fmt}`, { editor: this, download });
+            if (!saved) { this.setStatus("Save cancelled."); return null; }
             const kb = Math.round(blob.size / 1024);
-            this.setStatus(`Saved output/${ref.subfolder ? ref.subfolder + "/" : ""}${ref.filename} (${this.width} × ${this.height}, ${kb >= 1024 ? (kb / 1024).toFixed(1) + " MB" : kb + " kB"}${fmt === "png" ? ", workflow embedded" : ""}${note}).`);
-            if (download) {
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement("a");
-                a.href = url; a.download = ref.filename;
-                document.body.appendChild(a); a.click(); a.remove();
-                setTimeout(() => URL.revokeObjectURL(url), 5000);
-            }
-            return ref;
+            this.setStatus(`Saved ${saved.path} (${canvas.width} × ${canvas.height}, ${kb >= 1024 ? (kb / 1024).toFixed(1) + " MB" : kb + " kB"}${fmt === "png" ? ", " + hostText("pngEmbedded", "recipe embedded") : ""}${note}).`);
+            return saved;
         } catch (err) {
             console.error(err);
             this.setStatus("Save failed: " + (err.message || err));
@@ -7157,8 +7256,7 @@ class InpaintEditor {
     }
 
     widgetValue(name, fallback) {
-        const w = this.node.widgets && this.node.widgets.find((x) => x.name === name);
-        return w ? (+w.value || 0) : fallback;
+        return host.widgetValue(this, name, fallback);
     }
 
     renderInfo() {
@@ -7707,7 +7805,7 @@ class InpaintEditor {
                 const sel = document.createElement("select");
                 sel.className = "ipc-sel";
                 sel.style.gridColumn = "2 / -1";
-                sel.title = "Film stock: sets amount, grain size and colour share (grain character only, the colour look is a LUT's job). Values assume a picture of about 2000 px.";
+                sel.title = p.title || (p.key !== "preset" ? p.label : hostText("filmPresetTip", "Film stock: sets amount, grain size and colour share (grain character only, the colour look is a LUT's job). Values assume a picture of about 2000 px. Film names are trademarks of their owners; the looks are Scumble's own approximations, not licensed products."));
                 let group = null;
                 for (const o of p.options) {
                     const opt = document.createElement("option"); opt.value = o.id; opt.textContent = o.label;
@@ -7724,6 +7822,7 @@ class InpaintEditor {
                     if (!preset) return;
                     this.pushUndo({ kind: "filter", id: layer.id });
                     layer.params[p.key] = preset.id;
+                    if (p.key !== "preset") { this.markFilterChanged(layer); return; }
                     for (const [k, v] of Object.entries(preset)) if (k !== "id" && k !== "label" && k !== "group") layer.params[k] = v;
                     if (!("look" in preset)) layer.params.look = null;
                     // layer names are not editable, so the preset may name the layer
@@ -7731,7 +7830,7 @@ class InpaintEditor {
                     this.markFilterChanged(layer);
                     this.renderLayers();
                 });
-                presetSel = sel;
+                if (p.key === "preset") presetSel = sel;
                 box.appendChild(sel);
                 continue;
             }
@@ -8281,18 +8380,21 @@ class InpaintEditor {
             const vp = this.viewPass;
             if (bs) ctx.drawImage(this.displaySource(bs, vp ? vp.sx : 1), 0, 0, this.width, this.height);
         }
+        let chain = null;   // filter layers that follow each other keep the composite on the GPU
         for (let i = 0; i < this.layers.length; i++) {
             const layer = this.layers[i];
             if (this.compareShow && layer.kind === "result" && layer.id !== this.compareShow) continue;
             if ((!layer.visible && !(this.compareShow && layer.id === this.compareShow)) || !layer.canvas) continue;
-            if (layer.kind === "filter") { if (!controlOnly) this.applyFilterLayer(ctx, layer, i, forRun); continue; }
+            if (layer.kind === "filter") { if (!controlOnly) chain = this.applyFilterLayer(ctx, layer, i, forRun, chain, this.nextIsFilterLayer(i, forRun)); continue; }
             const ctrl = this.isControl(layer);
             if (controlOnly && !ctrl) continue;
             if (forRun && (ctrl || this.isReference(layer))) continue;
+            chain = this.flushFilterChain(ctx, chain);
             ctx.globalAlpha = layer.opacity;
             ctx.globalCompositeOperation = (!controlOnly && layer.blend && layer.blend !== "normal") ? layer.blend : "source-over";
             this.drawLayer(ctx, layer);
         }
+        chain = this.flushFilterChain(ctx, chain);
         ctx.globalAlpha = 1;
         ctx.globalCompositeOperation = "source-over";
     }
@@ -8944,9 +9046,13 @@ class InpaintEditor {
 
     /** Connected setting outputs with their targets: [{index, output, node, inputName, spec, widget}]. */
     settingTargets() {
+        return host.settingTargets(this);
+    }
+
+    settingTargetsFromGraph() {
         const res = [];
         const outs = this.node.outputs || [];
-        const graph = this.node.graph || app.graph;
+        const graph = this.node.graph || (host.graph ? host.graph() : null);
         for (let i = FIXED_OUTPUTS; i < outs.length; i++) {
             const o = outs[i];
             if (!isSettingOutput(o) || !o.links || !o.links.length) continue;
@@ -9012,6 +9118,7 @@ class InpaintEditor {
             list.appendChild(el("span", null, "Wire a setting output of the node into any widget (lora_name, ckpt_name, steps ...) and it shows up here."));
             return;
         }
+        host.renderPresets(this, list, targets);
         for (const t of targets) {
             const key = String(t.index);
             const entry = this.settings[key];
@@ -9046,6 +9153,10 @@ class InpaintEditor {
     /** Name of the result input the current mode expects, and whether something is wired to it. */
     /** Which result input the run will use: the mode's own, or the other one when only that is wired. */
     resultInputState() {
+        return host.resultInputState(this);
+    }
+
+    resultInputStateFromGraph() {
         const want = this.genSettings.mode === "local" ? "result_local" : "result";
         const other = want === "result" ? "result_local" : "result";
         const wired = (name) => { const input = (this.node.inputs || []).find((i) => i.name === name); return !!(input && input.link != null); };
@@ -9121,6 +9232,8 @@ class InpaintEditor {
         const freed = this.releaseCaches({ deep: true });
         const mb = Math.round(freed / 1048576);
         this.drawSoon();
+        try { await host.freeHelpers(); } catch (err) { console.warn(err); }
+        if (!host.connected) { this.helperUsed = false; this.setStatus(`Freed ${mb} MB of caches; the in-app helper models are unloaded too.`); return; }
         try {
             this.setStatus(`Freed ${mb} MB of caches. Freeing helper models (SAM, Qwen-VL) from VRAM ...`);
             const r = await api.fetchApi("/free", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ unload_models: true, free_memory: true }) });
@@ -9144,15 +9257,7 @@ class InpaintEditor {
             // model such as Flux.2 gets the whole card; in API mode they simply stay resident.
             if (this.genSettings.mode === "local" && this.helperUsed) await this.freeHelperModels();
             this.setStatus(wired ? `Queueing (${this.genSettings.mode}, seed ${this.genSettings.seed}, result from ${name}) ...` : `Queueing, but nothing is wired into "result" or "result_local": the result will not come back into the canvas.`);
-            try {
-                await app.queuePrompt(0);
-            } catch (first) {
-                // Some third-party extensions wrap queuePrompt and throw once on the
-                // first call after a page load. One retry gets past that.
-                console.warn("Inpaint Canvas: queuePrompt failed once, retrying", first);
-                await new Promise((r) => setTimeout(r, 300));
-                await app.queuePrompt(0);
-            }
+            await host.queueGenerate(this);
         } catch (err) {
             console.error(err);
             this.setStatus(String(err.message || err));
@@ -9165,8 +9270,7 @@ class InpaintEditor {
     // ---- persistence -------------------------------------------------------
 
     notifyChanged() {
-        try { this.node.graph && this.node.graph.setDirtyCanvas && this.node.graph.setDirtyCanvas(true, true); } catch (_) { /* ignore */ }
-        try { app.canvas && app.canvas.setDirty && app.canvas.setDirty(true, true); } catch (_) { /* ignore */ }
+        host.changed(this);
     }
 
     /** Encode the selection PNG for getValue off the main thread and save again when it lands. */
@@ -9522,233 +9626,5 @@ class InpaintEditor {
     }
 }
 
-// ---------------------------------------------------------------------------
-// extension registration
-// ---------------------------------------------------------------------------
-
-app.registerExtension({
-    name: "inpaint.InpaintCanvas",
-
-    async beforeRegisterNodeDef(nodeType, nodeData) {
-        if (nodeData.name === NODE_CLASS) {
-            /**
-             * Outputs after the fixed ones: the connected setting slots plus one free
-             * one, then the tail outputs (reference_images). Setting slots keep their
-             * index while connected; the tail moves and the queuePrompt wrapper maps
-             * its visible slot to the backend slot (FIXED_OUTPUTS + SETTING_SLOTS + i).
-             */
-            const syncSettingOutputs = (node) => {
-                const graph = node.graph || app.graph;
-                let highest = 0;
-                for (const o of node.outputs || []) if (isSettingOutput(o) && o.links && o.links.length) highest = Math.max(highest, settingIndex(o));
-                const want = Math.min(SETTING_SLOTS, highest + 1);
-                // drop free setting slots above the wanted count (from the end: removeOutput reindexes later links)
-                for (let i = node.outputs.length - 1; i >= FIXED_OUTPUTS; i--) {
-                    const o = node.outputs[i];
-                    if (isSettingOutput(o) && settingIndex(o) > want) node.removeOutput(i);
-                }
-                for (const t of TAIL_OUTPUTS) if (!node.outputs.some((o) => o && o.name === t.name)) node.addOutput(t.name, t.type, { label: t.label });
-                for (let n = 1; n <= want; n++) if (!node.outputs.some((o) => isSettingOutput(o) && settingIndex(o) === n)) node.addOutput(`setting_${n}`, "*");
-                // order: fixed, settings by number, tail; then point every link at its slot
-                // outputs from older versions that no longer exist (reference_images) go away
-                for (let i = node.outputs.length - 1; i >= FIXED_OUTPUTS; i--) {
-                    const o = node.outputs[i];
-                    if (!isSettingOutput(o) && !TAIL_OUTPUTS.some((t) => o && o.name === t.name)) node.removeOutput(i);
-                }
-                const fixed = node.outputs.slice(0, FIXED_OUTPUTS);
-                const settings = node.outputs.filter(isSettingOutput).sort((a, b) => settingIndex(a) - settingIndex(b));
-                const tail = TAIL_OUTPUTS.map((t) => node.outputs.find((o) => o && o.name === t.name)).filter(Boolean);
-                const ordered = fixed.concat(settings, tail);
-                if (ordered.some((o, i) => node.outputs[i] !== o) || ordered.length !== node.outputs.length) {
-                    node.outputs.splice(0, node.outputs.length, ...ordered);
-                }
-                node.outputs.forEach((o, i) => {
-                    for (const id of (o && o.links) || []) { const link = linkOf(graph, id); if (link) link.origin_slot = i; }
-                    if (isSettingOutput(o)) { const n = settingIndex(o); o.label = (o.links && o.links.length) ? `setting ${n}` : `setting ${n} (free)`; }
-                    const t = TAIL_OUTPUTS.find((x) => o && x.name === o.name);
-                    if (t) o.label = t.label;
-                });
-                node.setSize([node.size[0], Math.max(node.size[1], node.computeSize()[1])]);
-            };
-            const onNodeCreated = nodeType.prototype.onNodeCreated;
-            nodeType.prototype.onNodeCreated = function () {
-                const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
-                const editor = new InpaintEditor(this);
-                this.inpaintEditor = editor;
-                const widget = this.addDOMWidget("canvas_state", "INPAINT_CANVAS", editor.nodeRoot, {
-                    getValue: () => editor.getValue(),
-                    setValue: (v) => { editor.setValue(v); },
-                    getMinHeight: () => 220,
-                });
-                widget.serializeValue = async () => editor.serializeForPrompt();
-                editor.widget = widget;
-                for (const name of ["padding", "target_size", "multiple_of"]) {
-                    const w = this.widgets && this.widgets.find((x) => x.name === name);
-                    if (!w) continue;
-                    const cb = w.callback;
-                    w.callback = function () { const x = cb ? cb.apply(this, arguments) : undefined; editor.renderInfo(); editor.draw(); return x; };
-                }
-                const [w, h] = this.size;
-                this.setSize([Math.max(w, 340), Math.max(h, 500)]);
-                syncSettingOutputs(this);
-                return r;
-            };
-
-            // Setting outputs behave like a Primitive node's: the next free slot
-            // appears once the previous one is connected, and the editor lists a
-            // control per connected target.
-            const onConnectionsChange = nodeType.prototype.onConnectionsChange;
-            nodeType.prototype.onConnectionsChange = function (type, slot, connected, linkInfo, ioSlot) {
-                const r = onConnectionsChange ? onConnectionsChange.apply(this, arguments) : undefined;
-                if (type === LiteGraph.OUTPUT && slot >= FIXED_OUTPUTS && isSettingOutput(this.outputs && this.outputs[slot])) {
-                    syncSettingOutputs(this);
-                    setTimeout(() => { if (this.inpaintEditor) this.inpaintEditor.settingsChanged(); }, 0);
-                } else if (type === LiteGraph.OUTPUT && this.inpaintEditor) {
-                    setTimeout(() => this.inpaintEditor.renderInfo(), 0);
-                } else if (type === LiteGraph.INPUT && this.inpaintEditor) {
-                    setTimeout(() => this.inpaintEditor.renderInfo(), 0);
-                }
-                return r;
-            };
-
-            // Workflows saved before a widget was added carry their values shifted
-            // by one. Put the canvas JSON back where it belongs and reset any widget
-            // that received a string instead of a number.
-            const onConfigure = nodeType.prototype.onConfigure;
-            nodeType.prototype.onConfigure = function (info) {
-                const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
-                const values = (info && info.widgets_values) || [];
-                const json = values.find((v) => typeof v === "string" && v.trim().startsWith("{"));
-                if (json && this.widgets) {
-                    for (const w of this.widgets) {
-                        if (w.name === "canvas_state") {
-                            const ed = this.inpaintEditor;
-                            if (ed && ed.lastValueString !== json) w.value = json;
-                        } else if (typeof w.value === "string" && w.value.trim().startsWith("{")) {
-                            w.value = w.options && w.options.default != null ? w.options.default : (w.name === "multiple_of" ? 64 : 0);
-                        }
-                    }
-                }
-                // links are restored after configure; refresh the setting controls once the graph is complete
-                setTimeout(() => { syncSettingOutputs(this); if (this.inpaintEditor) { this.inpaintEditor.renderSettings(); this.inpaintEditor.renderInfo(); } }, 0);
-                return r;
-            };
-
-            const onExecuted = nodeType.prototype.onExecuted;
-            nodeType.prototype.onExecuted = function (output) {
-                onExecuted?.apply(this, arguments);
-                if (output && output.inpaint_result && this.inpaintEditor) {
-                    this.inpaintEditor.addResults(output.inpaint_result);
-                }
-            };
-
-            const onRemoved = nodeType.prototype.onRemoved;
-            nodeType.prototype.onRemoved = function () {
-                try { this.inpaintEditor?.destroy(); } catch (_) { /* ignore */ }
-                return onRemoved?.apply(this, arguments);
-            };
-        }
-
-        if (nodeData.name === STITCH_CLASS) {
-            const onExecuted = nodeType.prototype.onExecuted;
-            nodeType.prototype.onExecuted = function (output) {
-                onExecuted?.apply(this, arguments);
-                for (const r of (output && output.inpaint_result) || []) {
-                    const target = r.canvas_node != null ? app.graph.getNodeById(+r.canvas_node) : null;
-                    if (target && target.inpaintEditor) target.inpaintEditor.addResults([r]);
-                }
-            };
-        }
-    },
-
-    setup() {
-        // Commands from the MCP server (mcp/inpaint_canvas_mcp.py) arrive over the websocket.
-        installBridge({ api, app, viewUrl, loadImageEl, makeCanvas, FILTERS, filterDefaults, NODE_CLASS });
-
-        // The result back-link is a cycle from the graph's point of view. Strip it
-        // from the prompt and pass the source node instead; the backend expands an
-        // ephemeral stitch node that reads from that source.
-        const origQueue = api.queuePrompt;
-        api.queuePrompt = async function (number, prompt, ...rest) {
-            const output = prompt && prompt.output;
-            if (output) {
-                const canvasIds = new Set();
-                for (const [id, node] of Object.entries(output)) {
-                    if (node.class_type !== NODE_CLASS) continue;
-                    canvasIds.add(String(id));
-                    for (const [input, key] of [["result", "result_source"], ["result_local", "result_source_local"]]) {
-                        const link = node.inputs && node.inputs[input];
-                        if (Array.isArray(link)) {
-                            node.inputs[key] = `${link[0]}:${link[1]}`;
-                            delete node.inputs[input];
-                        } else if (node.inputs) {
-                            delete node.inputs[key];
-                        }
-                    }
-                }
-                // Tail outputs sit right after the visible setting slots in the node but
-                // after all SETTING_SLOTS in the backend: map the slot by output name.
-                if (canvasIds.size) {
-                    for (const node of Object.values(output)) {
-                        for (const [name, v] of Object.entries(node.inputs || {})) {
-                            if (!Array.isArray(v) || v.length !== 2 || !canvasIds.has(String(v[0]))) continue;
-                            const gnode = app.graph.getNodeById(+v[0]);
-                            const o = gnode && gnode.outputs && gnode.outputs[v[1]];
-                            const ti = o ? TAIL_OUTPUTS.findIndex((t) => t.name === o.name) : -1;
-                            if (ti >= 0) node.inputs[name] = [v[0], FIXED_OUTPUTS + SETTING_SLOTS + ti];
-                        }
-                    }
-                }
-            }
-            return origQueue.call(this, number, prompt, ...rest);
-        };
-
-        api.addEventListener("execution_error", ({ detail }) => {
-            const id = detail && (detail.node_id || "");
-            const node = app.graph.getNodeById(+String(id).split(".")[0]);
-            if (node && node.inpaintEditor) node.inpaintEditor.setStatus("Error: " + (detail.exception_message || "execution failed"));
-            // helper prompts (segmentation) carry ids that are not graph nodes
-            for (const n of app.graph._nodes) {
-                const ed = n.inpaintEditor;
-                if (ed && ed.segmentPromptId && detail && detail.prompt_id === ed.segmentPromptId) {
-                    ed.segmentPending = null;
-                    ed.segBtn.disabled = false;
-                    ed.setStatus("Segmentation failed: " + (detail.exception_message || "execution failed"));
-                }
-                if (ed && ed.objectsPromptId && detail && detail.prompt_id === ed.objectsPromptId) {
-                    ed.objectsPending = null;
-                    ed.setStatus("Object detection failed: " + (detail.exception_message || "execution failed"));
-                }
-                if (ed && ed.upsamplePromptId && detail && detail.prompt_id === ed.upsamplePromptId) {
-                    ed.upsamplePending = null;
-                    ed.upBtn.disabled = false;
-                    ed.setStatus("Upsampling failed: " + (detail.exception_message || "execution failed"));
-                }
-                if (ed && ed.cutoutPromptId && detail && detail.prompt_id === ed.cutoutPromptId) {
-                    ed.cutoutPending = null;
-                    ed.renderLayers();
-                    ed.setStatus("Background removal failed: " + (detail.exception_message || "execution failed"));
-                }
-            }
-        });
-
-        // Masks and texts produced by helper prompts are routed to their canvas by id.
-        api.addEventListener("executed", ({ detail }) => {
-            const out = detail && detail.output;
-            if (out && out.inpaint_text) {
-                for (const info of out.inpaint_text) {
-                    const node = app.graph.getNodeById(+info.canvas_node);
-                    if (node && node.inpaintEditor) node.inpaintEditor.applyTextResult(info);
-                }
-            }
-            if (!out || !out.inpaint_mask) return;
-            for (const info of out.inpaint_mask) {
-                const node = app.graph.getNodeById(+info.canvas_node);
-                if (!node || !node.inpaintEditor) continue;
-                if (info.purpose === "segments") node.inpaintEditor.applySegmentsFile(info);
-                else if (info.purpose === "cutout") node.inpaintEditor.applyCutoutFile(info);
-                else node.inpaintEditor.applyMaskFile(info);
-            }
-        });
-    },
-});
+// everything the hosts use: Scumble's shell, commands and plugins, the node's extension (js/inpaint_node.js)
+export { InpaintEditor, viewUrl, loadImageEl, makeCanvas, uploadBlob, uploadCanvas, CROP_DEFAULTS, GEN_DEFAULTS, FIXED_OUTPUTS, SETTING_SLOTS, TAIL_OUTPUTS, NODE_CLASS, STITCH_CLASS, isSettingOutput, settingIndex, linkOf, el, icon, iconButton, miniButton, selectInput, numberInput };

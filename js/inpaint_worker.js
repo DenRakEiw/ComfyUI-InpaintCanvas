@@ -1,3 +1,4 @@
+// Generated from DenRakEiw/scumble renderer/editor/inpaint_worker.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 /**
  * The editor's worker: everything that used to stall the main thread with a whole image
  * in hand. It runs in the ComfyUI page and in the app alike (a module worker created from

@@ -1,3 +1,4 @@
+// Generated from DenRakEiw/scumble renderer/editor/inpaint_curves.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // Inpaint Canvas - curves: monotone cubic interpolation (Fritsch-Carlson) into
 // 256-entry tables and the curve editor control that the "Curves" filter layer
 // shows in its layer row. The filter itself lives in inpaint_filters.js; this

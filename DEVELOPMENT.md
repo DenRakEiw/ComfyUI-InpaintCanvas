@@ -1,5 +1,7 @@
 # Development notes
 
+> **js/ is generated** (build 6d275d05e2028193 from scumble cc3be22+local changes): every file in js/ except host.js, inpaint_node.js and inpaint_bridge.js comes from `renderer/editor/` in DenRakEiw/scumble through its `tools/build_node.py`. Edit the editor there, build, commit both repos.
+
 Everything that is not obvious from the code. Written so a fresh session can
 continue without the chat history. Dates are 2026-09-04 unless stated.
 
@@ -1105,7 +1107,6 @@ means an old server and says so. The MCP server's `_upload` does the same. Pillo
 refuses anything above ~178 MP. Unit test of the route logic: scratchpad
 `patch_bigupload.py` session, aiohttp app with a 1 MB limit, 5 MB body passes,
 dedup / suffix / overwrite / traversal / bad type / empty body covered.
-
 
 ## 21. The drawing pipeline for large images (2026-09-10)
 

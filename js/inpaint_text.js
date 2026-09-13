@@ -1,3 +1,4 @@
+// Generated from DenRakEiw/scumble renderer/editor/inpaint_text.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 /**
  * Text layers for the Inpaint Canvas editor: the bundled fonts (js/fonts, OFL / Apache
  * licensed, see fonts.json and licenses/), fonts the user uploads to
@@ -5,7 +6,7 @@
  * canvas at twice the layer's size (downscaled when composited, so edges stay crisp
  * after scaling).
  */
-import { api } from "../../scripts/api.js";
+import { api } from "./host.js";
 
 const FONT_DIR = new URL("./fonts/", import.meta.url);
 const FONT_EXT = /\.(ttf|otf|woff2?)$/i;

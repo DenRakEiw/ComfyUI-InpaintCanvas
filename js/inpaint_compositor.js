@@ -1,3 +1,4 @@
+// Generated from DenRakEiw/scumble renderer/editor/inpaint_compositor.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 /**
  * The WebGL2 compositor (large-image plan, phase 5).
  *

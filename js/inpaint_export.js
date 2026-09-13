@@ -1,3 +1,4 @@
+// Generated from DenRakEiw/scumble renderer/editor/inpaint_export.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 /**
  * Layered export: PSD (Photoshop, 8-bit RGB, PackBits) and ORA (OpenRaster, the native
  * layered format of Krita and GIMP: a zip of PNGs plus stack.xml). Both take the same
