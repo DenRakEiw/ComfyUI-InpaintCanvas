@@ -1064,7 +1064,9 @@ const STROKE_SCRATCH_KEEP_PX = 16 * 1024 * 1024;
  * be a canvas the size of the layer per gesture (600 MB on a 15k layer, and as much again
  * for the selection clip). `ensure(x0, y0, x1, y1)` makes the buffer hold that box and
  * hands back its context translated so callers keep drawing in target pixels; `all()` is
- * the whole target (a gradient). `canvas` is null until the first dab.
+ * the whole target (a gradient). `canvas` is null until the first dab. The target is the
+ * pixels the stroke goes into (a layer's `px`, a mask's `maskPx`); only its size is read.
+ * The buffer itself stays a canvas in C1 (docs/PLAN_BCE.md §C1 rule 8).
  */
 class StrokeBuffer {
     constructor(target) {
@@ -2881,7 +2883,7 @@ class InpaintEditor {
     maskWithStroke(layer) {
         const p = this.pointer;
         if (!p || p.kind !== "maskpaint" || p.layer !== layer) return layer.maskPx ? layer.maskPx.toCanvas() : null;
-        const target = layer.maskPx.toCanvas();
+        const target = layer.maskPx;
         let fresh = false;
         if (!this.maskPreview || this.maskPreview.width !== target.width || this.maskPreview.height !== target.height) {
             this.maskPreview = makeCanvas(target.width, target.height);
@@ -3596,7 +3598,7 @@ class InpaintEditor {
             if (layer && layer.kind === "filter") { this.setStatus("Filter layers have no pixels to smudge."); return; }
             if (!layer) layer = this.baseCopyLayer();
             this.pushUndo({ kind: "layer", id: layer.id });
-            this.pointer = { kind: "smudge", layer, last: [ix, iy], clip: this.strokeClip(layer, layer.canvas), pressure: e.pointerType === "pen" && e.pressure > 0 ? e.pressure : 1 };
+            this.pointer = { kind: "smudge", layer, last: [ix, iy], clip: this.strokeClip(layer, layer.px), pressure: e.pointerType === "pen" && e.pressure > 0 ? e.pressure : 1 };
         } else if (this.tool === "clone" || this.tool === "heal") {
             if (e.altKey) {
                 this.cloneSource = { x: ix, y: iy };
@@ -3615,8 +3617,8 @@ class InpaintEditor {
             if (!o.aligned || !this.cloneOffset) this.cloneOffset = { x: this.cloneSource.x - ix, y: this.cloneSource.y - iy };
             const sample = this.sampleCanvas(o.sample);
             const heal = this.tool === "heal";
-            const stroke = new StrokeBuffer(layer.canvas);
-            this.pointer = { kind: "layerpaint", layer, stroke, clip: this.strokeClip(layer, layer.canvas), erase: false, last: [ix, iy], pressure: e.pointerType === "pen" && e.pressure > 0 ? e.pressure : 1,
+            const stroke = new StrokeBuffer(layer.px);
+            this.pointer = { kind: "layerpaint", layer, stroke, clip: this.strokeClip(layer, layer.px), erase: false, last: [ix, iy], pressure: e.pointerType === "pen" && e.pressure > 0 ? e.pressure : 1,
                 clone: { sample, dest: heal ? (o.sample === "image" ? sample : this.compositeCanvas()) : null, off: this.cloneOffset, heal } };
             this.cloneDab(this.pointer, ix, iy, ix, iy);
         } else if (this.tool === "gradient") {
@@ -3624,8 +3626,8 @@ class InpaintEditor {
             if (layer && layer.locked) { this.setStatus(`${layer.name} is locked.`); return; }
             if (layer && layer.kind === "filter") { this.setStatus("Filter layers have no pixels. Select a paint or image layer."); return; }
             if (!layer) layer = this.addPaintLayer();
-            const stroke = new StrokeBuffer(layer.canvas);
-            this.pointer = { kind: "layerpaint", grad: true, layer, stroke, clip: this.strokeClip(layer, layer.canvas), erase: false, start: [ix, iy], last: [ix, iy] };
+            const stroke = new StrokeBuffer(layer.px);
+            this.pointer = { kind: "layerpaint", grad: true, layer, stroke, clip: this.strokeClip(layer, layer.px), erase: false, start: [ix, iy], last: [ix, iy] };
         } else if (this.tool === "shape") {
             this.shapePointerDown(ix, iy, e, isDouble);
         } else if ((this.tool === "paint" || this.tool === "erase") && this.quickMask) {
@@ -3640,11 +3642,11 @@ class InpaintEditor {
             // Shift+click: a straight line from where the last stroke on this layer ended
             const prev = this.lastStrokeEnd;
             const lineFrom = e.shiftKey && prev && layer && prev.layerId === layer.id ? [prev.x, prev.y] : null;
-            if (layer && layer.alphaLock && this.tool === "erase" && !(layer.mask && layer.maskEdit)) { this.setStatus(`${layer.name} has its alpha locked: nothing to erase. Unlock alpha first.`); return; }
-            if (layer && layer.mask && layer.maskEdit) {
+            if (layer && layer.alphaLock && this.tool === "erase" && !(layer.maskPx && layer.maskEdit)) { this.setStatus(`${layer.name} has its alpha locked: nothing to erase. Unlock alpha first.`); return; }
+            if (layer && layer.maskPx && layer.maskEdit) {
                 // Painting on the transparency mask: paint reveals, erase hides.
-                const stroke = new StrokeBuffer(layer.mask);
-                this.pointer = { kind: "maskpaint", layer, stroke, clip: this.strokeClip(layer, layer.mask), erase: this.tool === "erase", white: true, last: [ix, iy], pressure };
+                const stroke = new StrokeBuffer(layer.maskPx);
+                this.pointer = { kind: "maskpaint", layer, stroke, clip: this.strokeClip(layer, layer.maskPx), erase: this.tool === "erase", white: true, last: [ix, iy], pressure };
                 if (lineFrom && prev.mask) this.layerDab(this.pointer, lineFrom[0], lineFrom[1], ix, iy); else this.layerDab(this.pointer, ix, iy, ix, iy);
                 this.draw();
                 return;
@@ -3654,8 +3656,8 @@ class InpaintEditor {
                 if (this.tool === "erase") { this.setStatus("The base layer cannot be erased. Select a layer or add a paint layer."); return; }
                 layer = this.addPaintLayer();
             }
-            const stroke = new StrokeBuffer(layer.canvas);
-            this.pointer = { kind: "layerpaint", layer, stroke, clip: this.strokeClip(layer, layer.canvas), erase: this.tool === "erase", last: [ix, iy], pressure };
+            const stroke = new StrokeBuffer(layer.px);
+            this.pointer = { kind: "layerpaint", layer, stroke, clip: this.strokeClip(layer, layer.px), erase: this.tool === "erase", last: [ix, iy], pressure };
             if (lineFrom && !prev.mask) this.layerDab(this.pointer, lineFrom[0], lineFrom[1], ix, iy); else this.layerDab(this.pointer, ix, iy, ix, iy);
         } else if (this.tool === "transform") {
             const layer = this.activeLayer();
@@ -3903,7 +3905,7 @@ class InpaintEditor {
         } else if (p.kind === "object") {
             if (!p.moved) this.toggleObjectAt(...this.toImage(e), p);
         } else if (p.kind === "layerpaint") {
-            const box = this.strokeRect(p, p.layer.canvas);
+            const box = this.strokeRect(p, p.layer.px);
             this.commitStroke(p);
             this.markLayerChanged(p.layer, box);
             this.releaseStrokeScratch();
@@ -3913,7 +3915,7 @@ class InpaintEditor {
         } else if (p.kind === "smudge") {
             this.markLayerChanged(p.layer);
         } else if (p.kind === "maskpaint") {
-            const box = this.strokeRect(p, p.layer.mask);
+            const box = this.strokeRect(p, p.layer.maskPx);
             this.commitStroke(p);
             this.markMaskChanged(p.layer, box);
             this.releaseStrokeScratch();
@@ -4570,10 +4572,14 @@ class InpaintEditor {
         return layer;
     }
 
-    /** Smudge: drag the pixels under the brush along the stroke, directly on the layer canvas. */
+    /**
+     * Smudge: drag the pixels under the brush along the stroke, directly on the layer's
+     * pixels. Every step reads what the step before wrote: the read goes into the dab scratch
+     * before that step's own write, which is one drawInto per step.
+     */
     smudgeDab(p, x0, y0, x1, y1) {
-        const layer = p.layer, c = layer.canvas;
-        const sx = c.width / layer.w, sy = c.height / layer.h;
+        const layer = p.layer, target = layer.px;
+        const sx = target.width / layer.w, sy = target.height / layer.h;
         const lx0 = (x0 - layer.x) * sx, ly0 = (y0 - layer.y) * sy, lx1 = (x1 - layer.x) * sx, ly1 = (y1 - layer.y) * sy;
         const r = Math.max(1, this.brushSize * (sx + sy) / 4 * Math.max(0.05, Math.min(1, p.pressure || 1)));
         const size = Math.ceil(r * 2);
@@ -4581,7 +4587,7 @@ class InpaintEditor {
         if (!this._smudgeDab || this._smudgeDab.width !== size) this._smudgeDab = makeCanvas(size, size);
         const d = this._smudgeDab, dctx = d.getContext("2d");
         const mask = this.dabMask(r, this.hardness);
-        const ctx = c.getContext("2d");
+        const op = layer.alphaLock ? "source-atop" : "source-over";
         const dist = Math.hypot(lx1 - lx0, ly1 - ly0);
         const steps = Math.max(1, Math.ceil(dist / Math.max(1, r * 0.25)));
         let px = lx0, py = ly0;
@@ -4589,21 +4595,24 @@ class InpaintEditor {
             const x = lx0 + (lx1 - lx0) * i / steps, y = ly0 + (ly1 - ly0) * i / steps;
             dctx.globalCompositeOperation = "source-over";
             dctx.clearRect(0, 0, size, size);
-            dctx.drawImage(c, px - r, py - r, size, size, 0, 0, size, size);
+            // the source rectangle is fractional and may reach outside the pixels: drawImage clips and resamples it as before
+            target.drawTo(dctx, px - r, py - r, size, size, 0, 0, size, size);
             dctx.globalCompositeOperation = "destination-in";
             dctx.drawImage(mask, 0, 0);
-            if (p.clip) { this._smudgeClip = this.clipCanvasFor(layer, c, x - r, y - r, size, size, this._smudgeClip); dctx.drawImage(this._smudgeClip, 0, 0); }
-            ctx.save();
-            ctx.globalAlpha = strength;
-            ctx.globalCompositeOperation = layer.alphaLock ? "source-atop" : "source-over";
-            ctx.drawImage(d, x - r, y - r);
-            ctx.restore();
+            if (p.clip) { this._smudgeClip = this.clipCanvasFor(layer, target, x - r, y - r, size, size, this._smudgeClip); dctx.drawImage(this._smudgeClip, 0, 0); }
+            const dx = x - r, dy = y - r;
+            // the dab lands on [dx, dx + size) at a fractional position; a pixel of margin covers its soft edge
+            target.drawInto([dx - 1, dy - 1, dx + size + 1, dy + size + 1], (ctx) => {
+                ctx.globalAlpha = strength;
+                ctx.globalCompositeOperation = op;
+                ctx.drawImage(d, dx, dy);
+            });
             px = x; py = y;
         }
         layer._maskedValid = false;
         layer._mcache = null;
         layer._mcacheView = null; layer._mcacheSample = null;
-        this.touchSource(c);
+        this.touchSource(target);
     }
 
     /** Mean RGB of a region of an image-sized canvas, via an 8 × 8 downscale. */
@@ -4705,8 +4714,8 @@ class InpaintEditor {
         if (kind === "rectangle" || kind === "ellipse" || kind === "freehand") {
             const layer = this.shapeTarget();
             if (!layer) return;
-            const stroke = new StrokeBuffer(layer.canvas);
-            this.pointer = { kind: "layerpaint", shape: kind, layer, stroke, clip: this.strokeClip(layer, layer.canvas),
+            const stroke = new StrokeBuffer(layer.px);
+            this.pointer = { kind: "layerpaint", shape: kind, layer, stroke, clip: this.strokeClip(layer, layer.px),
                 erase: false, start: [ix, iy], cur: [ix, iy], path: [[ix, iy]], last: [ix, iy] };
             return;
         }
@@ -4853,7 +4862,7 @@ class InpaintEditor {
         const layer = this.shapeTarget();
         if (!layer) { this.draw(); return; }
         if (closed && !this.shapeOpts.fill && !this.shapeOpts.stroke) { this.setStatus("Neither fill nor outline is on: nothing to draw."); this.draw(); return; }
-        const stroke = new StrokeBuffer(layer.canvas);
+        const stroke = new StrokeBuffer(layer.px);
         // the box of the points and their handles, outline included: the buffer and the undo
         // step cover that, not the layer
         const pad = (this.shapeOpts.width || 0) / 2 + 2;
@@ -4867,9 +4876,9 @@ class InpaintEditor {
         const sx = layer.canvas.width / layer.w, sy = layer.canvas.height / layer.h;
         const ctx = stroke.ensure((box[0] - layer.x) * sx, (box[1] - layer.y) * sy, (box[2] - layer.x) * sx, (box[3] - layer.y) * sy);
         this.paintShape(ctx, layer, (c) => this.shapePointPath(c, pts, closed, null), closed, [stroke.x, stroke.y]);
-        const p = { kind: "layerpaint", layer, stroke, clip: this.strokeClip(layer, layer.canvas), erase: false };
+        const p = { kind: "layerpaint", layer, stroke, clip: this.strokeClip(layer, layer.px), erase: false };
         this.strokeBounds(p, box[0], box[1], box[2], box[3], 0);
-        const rect = this.strokeRect(p, layer.canvas);
+        const rect = this.strokeRect(p, layer.px);
         this.commitStroke(p);
         this.markLayerChanged(layer, rect);
         this.releaseStrokeScratch();
@@ -4926,18 +4935,21 @@ class InpaintEditor {
         if (!n) { if (r.close) fill.close(); this.setStatus("Nothing to fill here (outside the selection?)."); return; }
         if (!layer) layer = this.addPaintLayer();
         // the undo step is a copy of the box the fill can touch, in the layer's own pixels
-        const sx = layer.canvas.width / layer.w, sy = layer.canvas.height / layer.h;
+        const target = layer.px;
+        const sx = target.width / layer.w, sy = target.height / layer.h;
         const lx = (r.x - layer.x) * sx, ly = (r.y - layer.y) * sy, lw = r.w * sx, lh = r.h * sy;
         this.pushUndoSnapshot(this.snapshotRect(layer, { x: lx, y: ly, w: lw, h: lh }));
-        const ctx = layer.canvas.getContext("2d");
-        ctx.save();
-        ctx.globalAlpha = this.brushOpacity;
-        ctx.globalCompositeOperation = layer.alphaLock ? "source-atop" : "source-over";
-        ctx.setTransform(sx, 0, 0, sy, 0, 0);
-        ctx.drawImage(fill, r.x - layer.x, r.y - layer.y);
-        ctx.restore();
+        // the fill is r.w x r.h at (r.x, r.y), scaled into the layer's pixels: it covers the box, nothing outside
+        const box = [Math.floor(lx), Math.floor(ly), Math.ceil(lx + lw), Math.ceil(ly + lh)];
+        const opacity = this.brushOpacity, op = layer.alphaLock ? "source-atop" : "source-over";
+        target.drawInto(box, (ctx) => {
+            ctx.globalAlpha = opacity;
+            ctx.globalCompositeOperation = op;
+            ctx.setTransform(sx, 0, 0, sy, 0, 0);
+            ctx.drawImage(fill, r.x - layer.x, r.y - layer.y);
+        });
         if (r.close) fill.close();
-        this.markLayerChanged(layer, [Math.floor(lx), Math.floor(ly), Math.ceil(lx + lw), Math.ceil(ly + lh)]);
+        this.markLayerChanged(layer, box);
         this.draw();
         this.setStatus(`Filled ${n.toLocaleString()} px on ${layer.name} (${Math.round(performance.now() - t0)} ms).`);
     }
@@ -4952,12 +4964,13 @@ class InpaintEditor {
         return !!(this.selection && this.getBounds()) || null;
     }
 
-    /** A stroke buffer for `target` (a layer canvas or a mask); tests build gestures with it. */
+    /** A stroke buffer for `target` (a layer's `px` or a mask's `maskPx`; only the size is read); tests build gestures with it. */
     newStrokeBuffer(target) { return new StrokeBuffer(target); }
 
     /**
      * The selection mapped into `target`'s pixels (alpha = selected) inside the box
      * (x, y, w, h in target pixels), as a canvas of that size; `into` is reused when it fits.
+     * `target` is the layer's or the mask's pixels; only its size is read.
      */
     clipCanvasFor(layer, target, x, y, w, h, into = null) {
         const c = into && into.width === w && into.height === h ? into : makeCanvas(w, h);
@@ -4984,7 +4997,7 @@ class InpaintEditor {
         if (!p.clip) return sb.canvas;
         // the clip for this buffer, drawn again only when the buffer grew (a new canvas)
         if (!p.clipCanvas || p.clipOf !== sb.canvas) {
-            p.clipCanvas = this.clipCanvasFor(p.layer, p.kind === "maskpaint" ? p.layer.mask : p.layer.canvas, sb.x, sb.y, sb.w, sb.h, p.clipCanvas);
+            p.clipCanvas = this.clipCanvasFor(p.layer, p.kind === "maskpaint" ? p.layer.maskPx : p.layer.px, sb.x, sb.y, sb.w, sb.h, p.clipCanvas);
             p.clipOf = sb.canvas;
         }
         if (!this.clipScratch || this.clipScratch.width !== sb.w || this.clipScratch.height !== sb.h) { this.clipScratch = makeCanvas(sb.w, sb.h); this.clipScratch._livePreview = true; }
@@ -5002,18 +5015,20 @@ class InpaintEditor {
 
     /** Apply the stroke buffer to the layer (or its mask) with the brush opacity. */
     commitStroke(p) {
-        const target = p.kind === "maskpaint" ? p.layer.mask : p.layer.canvas;
+        const target = p.kind === "maskpaint" ? p.layer.maskPx : p.layer.px;
         // the undo step is a copy of what the stroke touched, taken before it is applied
         if (!p.noUndo) this.pushUndoSnapshot(this.strokeUndo(p, target));
         const cs = this.clippedStroke(p);
         if (!cs) return;
-        const ctx = target.getContext("2d");
-        ctx.save();
-        ctx.setTransform(1, 0, 0, 1, 0, 0);
-        ctx.globalAlpha = this.brushOpacity;
-        ctx.globalCompositeOperation = p.erase ? "destination-out" : (p.kind === "layerpaint" && p.layer.alphaLock ? "source-atop" : "source-over");
-        ctx.drawImage(cs, p.stroke.x, p.stroke.y);
-        ctx.restore();
+        const sb = p.stroke;
+        const opacity = this.brushOpacity;
+        const op = p.erase ? "destination-out" : (p.kind === "layerpaint" && p.layer.alphaLock ? "source-atop" : "source-over");
+        // the clipped stroke is the buffer's size at the buffer's origin: unscaled, on whole pixels
+        target.drawInto([sb.x, sb.y, sb.x + cs.width, sb.y + cs.height], (ctx) => {
+            ctx.globalAlpha = opacity;
+            ctx.globalCompositeOperation = op;
+            ctx.drawImage(cs, sb.x, sb.y);
+        });
     }
 
     /**
@@ -5028,7 +5043,7 @@ class InpaintEditor {
         }
     }
 
-    /** A live preview's dirty rectangle in `target`'s pixels (clamped), taken; null when nothing changed. */
+    /** A live preview's dirty rectangle in `target`'s pixels (clamped), taken; null when nothing changed. `target`: pixels or a canvas of their size. */
     takeDirty(p, key, layer, target) {
         const d = p[key];
         if (!d) return null;
@@ -5043,7 +5058,8 @@ class InpaintEditor {
      * Bring a live preview up to date inside `box` (target pixels; null for all of it, once
      * per gesture): the target's own pixels there, then the stroke over them with the brush
      * opacity and operation. A preview used to be rebuilt whole on every frame, three
-     * full-size blits per dab on a 15k layer.
+     * full-size blits per dab on a 15k layer. `target` is the layer's or the mask's pixels;
+     * the preview stays a canvas in C1 (docs/PLAN_BCE.md §C1 rule 8).
      */
     refreshStrokePreview(preview, target, p, box, op) {
         const [x, y, w, h] = box ? [box[0], box[1], box[2] - box[0], box[3] - box[1]] : [0, 0, target.width, target.height];
@@ -5054,7 +5070,7 @@ class InpaintEditor {
         ctx.globalCompositeOperation = "source-over";
         ctx.globalAlpha = 1;
         ctx.clearRect(x, y, w, h);
-        ctx.drawImage(target, x, y, w, h, x, y, w, h);
+        target.drawTo(ctx, x, y, w, h, x, y, w, h);
         const cs = this.clippedStroke(p);
         if (cs) {
             const sb = p.stroke;
@@ -5080,7 +5096,7 @@ class InpaintEditor {
     layerWithStroke(layer) {
         const p = this.pointer;
         if (!p || p.kind !== "layerpaint" || p.layer !== layer) return layer.px ? layer.px.toCanvas() : null;
-        const target = layer.px.toCanvas();
+        const target = layer.px;
         let fresh = false;
         if (!this.strokePreview || this.strokePreview.width !== target.width || this.strokePreview.height !== target.height) {
             this.strokePreview = makeCanvas(target.width, target.height);
@@ -5099,7 +5115,7 @@ class InpaintEditor {
         let layer = this.activeLayer();
         if (!layer) layer = this.addPaintLayer();
         if (layer.locked) { this.setStatus(`${layer.name} is locked.`); return; }
-        const onMask = !!(layer.mask && layer.maskEdit);
+        const onMask = !!(layer.maskPx && layer.maskEdit);
         if (layer.kind === "filter" && !onMask) { this.setStatus("Filter layers have no pixels to fill. Use \"mask from selection\" to limit the filter instead."); return; }
         this.pushUndo(onMask ? { kind: "mask", id: layer.id } : { kind: "layer", id: layer.id });
         const shape = makeCanvas(this.width, this.height);
@@ -5108,26 +5124,20 @@ class InpaintEditor {
         sctx.globalCompositeOperation = "source-in";
         sctx.fillStyle = onMask ? "#ffffff" : this.color;
         sctx.fillRect(0, 0, this.width, this.height);
+        // the image-sized shape scaled into the target's pixels, at the brush opacity; the whole area (null)
+        const target = onMask ? layer.maskPx : layer.px;
+        const opacity = this.brushOpacity;
+        target.drawInto(null, (ctx) => {
+            ctx.globalAlpha = opacity;
+            ctx.setTransform(target.width / layer.w, 0, 0, target.height / layer.h, 0, 0);
+            ctx.drawImage(shape, -layer.x, -layer.y);
+        });
         if (onMask) {
-            const m = layer.mask;
-            const mctx = m.getContext("2d");
-            mctx.save();
-            mctx.globalAlpha = this.brushOpacity;
-            mctx.setTransform(m.width / layer.w, 0, 0, m.height / layer.h, 0, 0);
-            mctx.drawImage(shape, -layer.x, -layer.y);
-            mctx.restore();
             this.markMaskChanged(layer);
             this.draw();
             this.setStatus(`${layer.name}: selection revealed on the mask.`);
             return;
         }
-        const c = layer.canvas;
-        const ctx = c.getContext("2d");
-        ctx.save();
-        ctx.globalAlpha = this.brushOpacity;
-        ctx.setTransform(c.width / layer.w, 0, 0, c.height / layer.h, 0, 0);
-        ctx.drawImage(shape, -layer.x, -layer.y);
-        ctx.restore();
         this.markLayerChanged(layer);
         this.draw();
     }
@@ -5203,16 +5213,16 @@ class InpaintEditor {
         const layer = this.activeLayer();
         if (!layer) { this.setStatus("The base layer cannot be erased. Select a layer, or paint on the base first to get a layer."); return; }
         if (layer.locked) { this.setStatus(`${layer.name} is locked.`); return; }
-        const onMask = !!(layer.mask && layer.maskEdit);
+        const onMask = !!(layer.maskPx && layer.maskEdit);
         if (layer.kind === "filter" && !onMask) { this.setStatus("Filter layers have no pixels. Use \"mask from selection\" to limit the filter instead."); return; }
         this.pushUndo(onMask ? { kind: "mask", id: layer.id } : { kind: "layer", id: layer.id });
-        const target = onMask ? layer.mask : layer.canvas;
-        const ctx = target.getContext("2d");
-        ctx.save();
-        ctx.globalCompositeOperation = "destination-out";
-        ctx.setTransform(target.width / layer.w, 0, 0, target.height / layer.h, 0, 0);
-        ctx.drawImage(this.selection, -layer.x, -layer.y);
-        ctx.restore();
+        const target = onMask ? layer.maskPx : layer.px;
+        const selection = this.selection;   // the selection read stays on its canvas until step (d)
+        target.drawInto(null, (ctx) => {
+            ctx.globalCompositeOperation = "destination-out";
+            ctx.setTransform(target.width / layer.w, 0, 0, target.height / layer.h, 0, 0);
+            ctx.drawImage(selection, -layer.x, -layer.y);
+        });
         if (onMask) this.markMaskChanged(layer); else this.markLayerChanged(layer);
         this.draw();
         this.setStatus(`${layer.name}: selected ${onMask ? "part of the mask hidden" : "pixels cleared"}.`);
