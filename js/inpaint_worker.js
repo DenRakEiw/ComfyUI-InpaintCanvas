@@ -123,7 +123,11 @@ async function run(msg) {
     throw new Error("unknown job " + msg.op);
 }
 
-self.onmessage = async (e) => {
+// ComfyUI imports every .js of the node's js/ into its page as an extension, this file too.
+// There `self` is the window: a handler on it would answer any message posted to the page
+// with an error posted to the page, which it receives again, forever. Only a worker listens.
+const inWorker = typeof WorkerGlobalScope !== "undefined" && self instanceof WorkerGlobalScope;
+if (inWorker) self.onmessage = async (e) => {
     const msg = e.data || {};
     try {
         const result = await run(msg);
