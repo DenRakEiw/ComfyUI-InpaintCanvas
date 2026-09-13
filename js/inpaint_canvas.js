@@ -2832,7 +2832,7 @@ class InpaintEditor {
 
     /** Visible reference layers in panel order (top of the list = reference 1). */
     referenceLayers() {
-        return this.layers.filter((l) => this.isReference(l) && l.visible && l.canvas).reverse();
+        return this.layers.filter((l) => this.isReference(l) && l.visible && l.px).reverse();
     }
 
     /**
@@ -7031,15 +7031,18 @@ class InpaintEditor {
     // ---- export -----------------------------------------------------------------
 
     /** Save the visible composite (filters applied, no control / reference layers) to output/inpaint_canvas. */
-    /** The layers as PSD / ORA see them: pixels at image resolution, bottom first, the base as "Background". */
+    /**
+     * The layers as PSD / ORA see them: pixels at image resolution, bottom first, the base as
+     * "Background". The descriptors are not layers: each holds its own export copy as `canvas`.
+     */
     exportLayerStack() {
         const layers = [];
         const bg = makeCanvas(this.width, this.height);
-        bg.getContext("2d").drawImage(this.base.img, 0, 0);
+        this.basePx.drawTo(bg.getContext("2d"), 0, 0);   // unscaled (PLAN_BCE §C1 rule 6)
         layers.push({ name: "Background", x: 0, y: 0, canvas: bg, opacity: 1, visible: true, blend: "normal" });
         let skipped = 0;
         for (const l of this.layers) {
-            if (l.kind === "filter" || !l.canvas) { skipped++; continue; }
+            if (l.kind === "filter" || !l.px) { skipped++; continue; }
             const w = Math.max(1, Math.round(l.w)), h = Math.max(1, Math.round(l.h));
             const c = makeCanvas(w, h);
             const ctx = c.getContext("2d");
@@ -7055,7 +7058,7 @@ class InpaintEditor {
     /** The active layer alone as a PNG with transparency, into the output folder. */
     async exportLayerPng() {
         const l = this.activeLayer();
-        if (!l || l.kind === "filter" || !l.canvas) { this.setStatus("Select a pixel layer to save it on its own."); return null; }
+        if (!l || l.kind === "filter" || !l.px) { this.setStatus("Select a pixel layer to save it on its own."); return null; }
         try {
             const c = makeCanvas(this.width, this.height);
             c.getContext("2d").drawImage(this.layerPixels(l), l.x, l.y, l.w, l.h);
@@ -8657,16 +8660,19 @@ class InpaintEditor {
         }
     }
 
-    /** Upload every edited layer so its pixels survive a reload. */
+    /**
+     * Upload every edited layer so its pixels survive a reload. Only dirty pixels are
+     * materialised (autosave calls this for every tab); the file name is the PNG's hash.
+     */
     async syncLayers() {
         for (const layer of this.layers) {
-            if (layer.dirty && layer.canvas) {
-                const { ref } = await uploadCanvas(layer.canvas, `n${this.node.id}_layer`);
+            if (layer.dirty && layer.px) {
+                const { ref } = await uploadCanvas(layer.px.toCanvas(), `n${this.node.id}_layer`);
                 layer.ref = ref;
                 layer.dirty = false;
             }
-            if (layer.maskDirty && layer.mask) {
-                const { ref } = await uploadCanvas(layer.mask, `n${this.node.id}_lmask`);
+            if (layer.maskDirty && layer.maskPx) {
+                const { ref } = await uploadCanvas(layer.maskPx.toCanvas(), `n${this.node.id}_lmask`);
                 layer.maskRef = ref;
                 layer.maskDirty = false;
             }
