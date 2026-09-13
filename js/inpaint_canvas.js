@@ -196,16 +196,25 @@ function workerCall(op, args = {}, transfer = []) {
     });
 }
 
-/** PNG of a canvas, plus the upload hash when asked for; encoded in the worker if there is one. */
-async function encodeCanvas(canvas, { hash = false } = {}) {
+/**
+ * PNG of a canvas, plus the upload hash when asked for; encoded in the worker if there is one.
+ * `snapshot`: the caller writes into the canvas right after handing it over (an undo step of the
+ * pixels before an edit). The worker gets a bitmap taken at the call, but the main-thread fallback
+ * after a failed worker job would encode the canvas as it is by then, after the edit, so such a
+ * call fails instead: an undo step that says it is lost, not one that restores the edit.
+ */
+async function encodeCanvas(canvas, { hash = false, snapshot = false } = {}) {
     if (editorWorker()) {
+        let failure = "no image in the answer";
         try {
             const bitmap = await createImageBitmap(canvas);
             const r = await workerCall("png", { bitmap, hash }, [bitmap]);
             if (r.blob) return { blob: r.blob, hash: r.hash };
         } catch (err) {
-            console.warn("Inpaint Canvas: encoding in the worker failed, using the main thread:", (err && err.message) || err);
+            failure = (err && err.message) || String(err);
         }
+        if (snapshot) throw new Error("the pixels could not be encoded in the worker (" + failure + ")");
+        console.warn("Inpaint Canvas: encoding in the worker failed, using the main thread:", failure);
     }
     const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
     return { blob, hash: hash ? await hashBlob(blob) : null };
@@ -236,8 +245,8 @@ async function buildLayered(format, { width, height, layers, composite }) {
     return format === "psd" ? buildPsd({ width, height, layers, composite }) : buildOra({ width, height, layers, composite });
 }
 
-function canvasToBlob(canvas) {
-    return encodeCanvas(canvas).then((r) => r.blob);
+function canvasToBlob(canvas, opts) {
+    return encodeCanvas(canvas, opts).then((r) => r.blob);
 }
 
 async function hashBlob(blob) {
@@ -1052,6 +1061,32 @@ let CLIPBOARD = null;
 // A live preview canvas above this many pixels is given back after the gesture (a 15k
 // layer's is 600 MB); smaller ones are kept for the next stroke.
 const STROKE_SCRATCH_KEEP_PX = 16 * 1024 * 1024;
+
+/**
+ * What an editor has uploaded, by hash. Setting `baseHash` to null (the base or a layer that is
+ * part of it changed) moves the composite version on. A class with the accessor on its prototype
+ * and the editor in a non-enumerable field: the accessor closures that `makeUploaded` used to put
+ * on an object literal ended up in V8's allocation site for that literal, and kept the editor they
+ * closed over, a closed tab with all its pixels, alive for good.
+ */
+class UploadCache {
+    constructor(editor) {
+        this.baseRef = null;
+        this.maskHash = null;
+        this.maskRef = null;
+        this.controlHash = null;
+        this.controlRef = null;
+        Object.defineProperty(this, "_editor", { value: editor, enumerable: false });
+        Object.defineProperty(this, "_baseHash", { value: null, writable: true, enumerable: false });
+    }
+
+    get baseHash() { return this._baseHash; }
+
+    set baseHash(v) {
+        if (v == null) this._editor.compositeVersion++;
+        this._baseHash = v;
+    }
+}
 
 /**
  * A stroke's pixels while the button is down: a canvas that covers what the gesture has
@@ -3939,6 +3974,11 @@ class InpaintEditor {
             this.shapeDrag = null;
         } else if (p.kind === "smudge") {
             this.markLayerChanged(p.layer);
+        } else if (p.kind === "maskpaint" && !p.layer.maskPx) {
+            // the mask went away while the button was down (Ctrl+Z of the step that made it, or an
+            // agent's undo): the stroke has nothing to land on and ends like a cancelled one
+            this.releaseStrokeScratch();
+            this.draw();
         } else if (p.kind === "maskpaint") {
             const box = this.strokeRect(p, p.layer.maskPx);
             this.commitStroke(p);
@@ -3997,7 +4037,6 @@ class InpaintEditor {
         const r = this.brushSize / 2 + 2;
         const p = this.pointer;
         if (p && p.kind === "selpaint") this.strokeBounds(p, x0, y0, x1, y1, r);
-        this.touchSourceRect(this.sel, Math.min(x0, x1) - r, Math.min(y0, y1) - r, Math.max(x0, x1) + r, Math.max(y0, y1) + r);
         const subtract = this.pointer && this.pointer.kind === "selpaint" ? !!this.pointer.subtract : this.tool === "deselect";
         const size = this.brushSize;
         // The round line reaches half the brush past its ends, but the clip must hold Skia's
@@ -4016,6 +4055,9 @@ class InpaintEditor {
             sctx.lineTo(x1 + 0.01, y1 + 0.01);
             sctx.stroke();
         });
+        // after the write (the contract's order): before it, the display levels were refreshed from
+        // the selection without this dab, and a fast stroke zoomed out showed gaps until pointer up
+        this.touchSourceRect(this.sel, Math.min(x0, x1) - r, Math.min(y0, y1) - r, Math.max(x0, x1) + r, Math.max(y0, y1) + r);
     }
 
     /**
@@ -4308,8 +4350,10 @@ class InpaintEditor {
         this.setStatus(`${r.count.toLocaleString()} px ${mode === "replace" ? "selected" : mode === "add" ? "added" : "subtracted"} (${Math.round(performance.now() - t0)} ms).`);
     }
 
-    /** Soften the selection edge: gaussian blur of the mask. */
-    async featherSelection(r) {
+    /** Soften the selection edge: gaussian blur of the mask. Undo waits for it (it writes after the worker's answer). */
+    featherSelection(r) { return this.trackEdit(this.featherSelectionNow(r)); }
+
+    async featherSelectionNow(r) {
         if (!this.getBounds()) { this.setStatus("Nothing selected to feather."); return; }
         r = Math.max(0.5, Math.min(512, +r || 0));
         this.pushUndo({ kind: "selection" });
@@ -5056,6 +5100,7 @@ class InpaintEditor {
     /** Apply the stroke buffer to the layer (or its mask) with the brush opacity. */
     commitStroke(p) {
         const target = p.kind === "maskpaint" ? p.layer.maskPx : p.layer.px;
+        if (!target) return;   // a mask removed under the gesture: nothing to write into
         // the undo step is a copy of what the stroke touched, taken before it is applied
         if (!p.noUndo) this.pushUndoSnapshot(this.strokeUndo(p, target));
         const cs = this.clippedStroke(p);
@@ -5164,6 +5209,9 @@ class InpaintEditor {
         sctx.globalCompositeOperation = "source-in";
         sctx.fillStyle = onMask ? "#ffffff" : this.color;
         sctx.fillRect(0, 0, this.width, this.height);
+        // a mask is replaced, not written (rule 2): the `mask` step restores by replacing it, and an
+        // older `layers` / `canvas` step still holds the old object, which has to stay as it was
+        if (onMask) layer.maskPx = layer.maskPx.clone();
         // the image-sized shape scaled into the target's pixels, at the brush opacity; the whole area (null)
         const target = onMask ? layer.maskPx : layer.px;
         const opacity = this.brushOpacity;
@@ -5256,6 +5304,7 @@ class InpaintEditor {
         const onMask = !!(layer.maskPx && layer.maskEdit);
         if (layer.kind === "filter" && !onMask) { this.setStatus("Filter layers have no pixels. Use \"mask from selection\" to limit the filter instead."); return; }
         this.pushUndo(onMask ? { kind: "mask", id: layer.id } : { kind: "layer", id: layer.id });
+        if (onMask) layer.maskPx = layer.maskPx.clone();   // replaced, as in fillSelection (rule 2)
         const target = onMask ? layer.maskPx : layer.px;
         const sel = this.sel;
         target.drawInto(null, (ctx) => {
@@ -5270,7 +5319,9 @@ class InpaintEditor {
 
     // ---- selection: grow / shrink / from layer ------------------------------
 
-    async growSelection(n) {
+    growSelection(n) { return this.trackEdit(this.growSelectionNow(n)); }   // undo waits for it, as for feather
+
+    async growSelectionNow(n) {
         if (!this.sel || !n) return;
         const W = this.width, H = this.height;
         const grow = n > 0, r = Math.abs(n);
@@ -5789,9 +5840,12 @@ class InpaintEditor {
 
     // ---- undo ----------------------------------------------------------------
 
-    /** PNG of a canvas as a blob URL, encoded off the main thread; undo steps hold the promise. */
+    /**
+     * PNG of a canvas as a blob URL, encoded off the main thread; undo steps hold the promise. The
+     * canvas is a `toCanvas()` view that the edit writes into next, so it is encoded as a snapshot.
+     */
     snapUrl(canvas) {
-        const p = canvasToBlob(canvas).then((blob) => URL.createObjectURL(blob));
+        const p = canvasToBlob(canvas, { snapshot: true }).then((blob) => URL.createObjectURL(blob));
         p.catch(() => null);
         return p;
     }
@@ -5871,16 +5925,30 @@ class InpaintEditor {
         snap.px = null;
     }
 
+    /**
+     * A layer as a `layers` / `canvas` step keeps it: the pixels by reference (they are replaced,
+     * never written, by the operations those steps undo), and its own copies of what the text
+     * and filter controls change in place (the text description, the filter parameters, colour
+     * match, LUT, plate), copied as their own undo steps copy them. A shared object brought an
+     * undone text size or slider value back when an older step was undone.
+     */
+    snapshotLayer(l) {
+        const c = { ...l };
+        if (l.text) c.text = JSON.parse(JSON.stringify(l.text));
+        for (const k of ["params", "match", "lut", "plate"]) if (l[k] && typeof l[k] === "object") c[k] = { ...l[k] };
+        return c;
+    }
+
     snapshot(step) {
         if (step.kind === "layerrect") {
             const l = this.layers.find((x) => x.id === step.id);
             return l ? this.snapshotRect(l, step, step.mask) : null;
         }
         if (step.kind === "selection") return this.snapshotSelection();
-        if (step.kind === "layers") return { kind: "layers", layers: this.layers.map((l) => ({ ...l })), activeLayerId: this.activeLayerId };
+        if (step.kind === "layers") return { kind: "layers", layers: this.layers.map((l) => this.snapshotLayer(l)), activeLayerId: this.activeLayerId };
         if (step.kind === "canvas") {
             // base, size, selection and the layer list (shallow copies: the canvases themselves are never mutated by extend / crop, only replaced)
-            return { kind: "canvas", base: this.base, width: this.width, height: this.height, selection: this.snapUrl(this.sel.toCanvas()), layers: this.layers.map((l) => ({ ...l })), activeLayerId: this.activeLayerId };
+            return { kind: "canvas", base: this.base, width: this.width, height: this.height, selection: this.snapUrl(this.sel.toCanvas()), layers: this.layers.map((l) => this.snapshotLayer(l)), activeLayerId: this.activeLayerId };
         }
         const layer = this.layers.find((l) => l.id === step.id);
         if (!layer) return null;
@@ -5890,7 +5958,8 @@ class InpaintEditor {
         if (step.kind === "mask") return { kind: "mask", id: layer.id, url: layer.maskPx ? this.snapUrl(layer.maskPx.toCanvas()) : null, mw: layer.maskPx ? layer.maskPx.width : 0, mh: layer.maskPx ? layer.maskPx.height : 0 };
         if (step.kind === "match") return { kind: "match", id: layer.id, match: { ...(layer.match || { strength: 0, source: "surroundings" }) } };
         if (step.kind === "filter") return { kind: "filter", id: layer.id, filter: layer.filter, params: { ...(layer.params || {}) }, lut: layer.lut ? { ...layer.lut } : null, lutData: layer._lutData || null, plate: layer.plate ? { ...layer.plate } : null, plateImg: layer._plateImg || null, name: layer.name };
-        if (step.kind === "text") return { kind: "text", id: layer.id, text: JSON.parse(JSON.stringify(layer.text || TEXT_DEFAULTS)), url: this.snapUrl(layer.px.toCanvas()), cw: layer.px.width, ch: layer.px.height, x: layer.x, y: layer.y, w: layer.w, h: layer.h };
+        if (step.kind === "text") return { kind: "text", id: layer.id, text: JSON.parse(JSON.stringify(layer.text || TEXT_DEFAULTS)), url: this.snapUrl(layer.px.toCanvas()), cw: layer.px.width, ch: layer.px.height, x: layer.x, y: layer.y, w: layer.w, h: layer.h,
+            behind: !!layer._textRendering };
         if (step.kind === "layerfull") return { kind: "layerfull", id: layer.id, url: this.snapUrl(layer.px.toCanvas()), cw: layer.px.width, ch: layer.px.height, x: layer.x, y: layer.y, w: layer.w, h: layer.h,
             mask: layer.maskPx ? this.snapUrl(layer.maskPx.toCanvas()) : null, mw: layer.maskPx ? layer.maskPx.width : 0, mh: layer.maskPx ? layer.maskPx.height : 0 };
         return null;
@@ -5903,11 +5972,26 @@ class InpaintEditor {
 
     pushUndoSnapshot(snap) {
         if (!snap) return;
+        // the redo steps go first: the budget counts them, and trimming against it while they are
+        // still counted threw away older undo steps that fit once the redo steps were gone
+        for (const s of this.redo) this.releaseSnapshot(s);
+        this.redo = [];
         this.undo.push(snap);
         this.undoBytes += snap.bytes || 0;
         while (this.undo.length > MAX_UNDO || (this.undoBytes > MAX_UNDO_BYTES && this.undo.length > 1)) this.releaseSnapshot(this.undo.shift());
+    }
+
+    /**
+     * Drop the whole history: every step is released (its blob URLs revoked, its bytes taken off
+     * the budget). A plain `undo = []` left the old document's bytes on the budget for good, so
+     * the tab kept one undo step, and leaked the PNG blobs of its whole-layer steps.
+     */
+    clearUndo() {
+        for (const s of this.undo) this.releaseSnapshot(s);
         for (const s of this.redo) this.releaseSnapshot(s);
+        this.undo = [];
         this.redo = [];
+        this.undoBytes = 0;
     }
 
     async applySnapshot(snap) {
@@ -5923,16 +6007,20 @@ class InpaintEditor {
         }
         if (snap.kind === "canvas") {
             if (this.pending) this.cancelPending();
+            // the selection is decoded before anything is put back: a frame drawn while it decoded
+            // saw a new, empty selection, cached its display levels under the version the restored
+            // one kept, and the restored selection's bounds came back empty
+            let selImg = null;
+            try { selImg = await snapImage(snap.selection); } catch (_) { /* empty selection */ }
             this.base = snap.base;
             this.width = snap.width;
             this.height = snap.height;
             this.layers = snap.layers.map((l) => installLayerAliases({ ...l, dirty: true, exportRef: null, _maskedValid: false, _mcache: null, _fxCache: null, maskDirty: !!l.maskPx }));
             this.activeLayerId = snap.activeLayerId;
-            const sel = this.sel = MaskPixels.empty(this.width, this.height);
-            try {
-                const img = await snapImage(snap.selection);
-                sel.drawInto(null, (ctx) => ctx.drawImage(img, 0, 0));
-            } catch (_) { /* empty selection */ }
+            const sel = MaskPixels.empty(this.width, this.height);
+            if (selImg) sel.drawInto(null, (ctx) => ctx.drawImage(selImg, 0, 0));
+            this.sel = sel;
+            this.touchSource(sel);
             this.uploaded = this.makeUploaded();
             this.selectionDirty = true; this.selectionLoose = false;
             this.selectionDataUrl = null;
@@ -6004,6 +6092,10 @@ class InpaintEditor {
                 this.markMaskChanged(layer);
                 this.renderLayers();
             } else if (snap.kind === "text") {
+                // a render still waiting for its font is dropped: it would put the pixels of the
+                // description that is being undone on top of the restored one
+                layer._textToken = (layer._textToken || 0) + 1;
+                layer._textRendering = 0;
                 const img = await snapImage(snap.url);
                 layer.px = LayerPixels.fromImage(img, snap.cw, snap.ch);   // replaced: rule 2
                 Object.assign(layer, { x: snap.x, y: snap.y, w: snap.w, h: snap.h });
@@ -6011,6 +6103,9 @@ class InpaintEditor {
                 layer._maskedValid = false;
                 this.markLayerChanged(layer);
                 this.renderLayers();
+                // taken while a render was on its way (a redo copy of an edit not drawn yet): the
+                // pixels are older than the description, so they are drawn from it again
+                if (snap.behind) this.renderTextLayer(layer);
             } else if (snap.kind === "layerrect") {
                 const target = snap.mask ? layer.maskPx : layer.px;
                 if (target && snap.px) target.blit(snap.px, snap.x, snap.y, "copy");
@@ -6035,24 +6130,52 @@ class InpaintEditor {
         this.draw();
     }
 
-    async undoStep() {
-        if (this.pending) this.cancelPending();
-        const snap = this.undo.pop();
-        if (!snap) return;
-        const current = this.snapshot(snap);
-        if (current) { this.redo.push(current); this.undoBytes += current.bytes || 0; }
-        await this.applySnapshot(snap);
-        this.releaseSnapshot(snap);
+    /**
+     * Undo and redo run one after the other. A restore awaits a PNG decode, and a second Ctrl+Z
+     * (key repeat, a double click) used to take its redo copy before the first restore had
+     * landed, and the decodes could land out of order: the pixels ended half undone and the redo
+     * stack wrong. An operation that pushed its step and writes after an await (grow, feather,
+     * invert in the worker) is waited for first, so the undo takes back what it wrote.
+     */
+    undoStep() { return this.queueHistory(() => this.historyStepNow(false)); }
+
+    redoStep() { return this.queueHistory(() => this.historyStepNow(true)); }
+
+    queueHistory(fn) {
+        const prev = this._historyQueue;
+        const run = prev ? prev.then(fn) : fn();   // idle: starts now, as before (nothing waits a tick)
+        const settled = run.then(() => {}, () => {});
+        this._historyQueue = settled;
+        settled.then(() => { if (this._historyQueue === settled) this._historyQueue = null; });
+        return run;
     }
 
-    async redoStep() {
+    /** Keep `promise` (an edit that pushed its undo step and still writes) in front of the next undo / redo. */
+    trackEdit(promise) {
+        const edits = this._pendingEdits || (this._pendingEdits = new Set());
+        const done = promise.then(() => {}, () => {});
+        edits.add(done);
+        done.then(() => edits.delete(done));
+        return promise;
+    }
+
+    async historyStepNow(redo) {
+        while (this._pendingEdits && this._pendingEdits.size) await Promise.all(Array.from(this._pendingEdits));
         if (this.pending) this.cancelPending();
-        const snap = this.redo.pop();
+        // the stacks are looked up now, not when the step was queued: an edit or a new image replaces them
+        const snap = (redo ? this.redo : this.undo).pop();
         if (!snap) return;
         const current = this.snapshot(snap);
-        if (current) { this.undo.push(current); this.undoBytes += current.bytes || 0; }
-        await this.applySnapshot(snap);
-        this.releaseSnapshot(snap);
+        if (current) { (redo ? this.undo : this.redo).push(current); this.undoBytes += current.bytes || 0; }
+        try {
+            await this.applySnapshot(snap);
+        } catch (err) {
+            // a step whose pixels could not be kept (its encode failed): said, not thrown at a key handler
+            console.error("Inpaint Canvas: undo step could not be restored", err);
+            this.setStatus(`That ${redo ? "redo" : "undo"} step could not be restored: ${(err && err.message) || err}`);
+        } finally {
+            this.releaseSnapshot(snap);
+        }
     }
 
     // ---- selection ops -----------------------------------------------------
@@ -6066,7 +6189,9 @@ class InpaintEditor {
         this.draw();
     }
 
-    async invertSelection() {
+    invertSelection() { return this.trackEdit(this.invertSelectionNow()); }   // undo waits for it, as for feather
+
+    async invertSelectionNow() {
         if (!this.sel) return;
         this.pushUndo({ kind: "selection" });
         const done = await this.selectionInWorker("invert", {});
@@ -6172,15 +6297,7 @@ class InpaintEditor {
 
     /** The upload cache; clearing baseHash means "the composite changed" and bumps compositeVersion. */
     makeUploaded() {
-        const ed = this;
-        let baseHash = null;
-        const u = { baseRef: null, maskHash: null, maskRef: null, controlHash: null, controlRef: null };
-        Object.defineProperty(u, "baseHash", {
-            enumerable: true,
-            get: () => baseHash,
-            set: (v) => { if (v == null) ed.compositeVersion++; baseHash = v; },
-        });
-        return u;
+        return new UploadCache(this);
     }
 
     // ---- filter layers ------------------------------------------------------------
@@ -6868,7 +6985,9 @@ class InpaintEditor {
     async renderTextLayer(layer, { keepScale = true } = {}) {
         if (!layer || layer.kind !== "text" || !layer.text) return;
         const token = (layer._textToken = (layer._textToken || 0) + 1);
+        layer._textRendering = token;   // a text undo step taken meanwhile knows its pixels are behind
         const { canvas, res, missing } = await renderText(layer.text);
+        if (layer._textRendering === token) layer._textRendering = 0;
         if (layer._textToken !== token || !this.layers.includes(layer)) return;
         const oldRes = (layer.text && layer.text.res) || 2;
         const k = keepScale && layer.px && layer.px.width > 1 ? layer.w / (layer.px.width / oldRes) : 1;
@@ -7374,11 +7493,12 @@ class InpaintEditor {
         this.base = { ref, img };
         this.width = img.naturalWidth;
         this.height = img.naturalHeight;
-        if (!keepLayers || sizeChanged) { this.layers = []; this.activeLayerId = null; }
+        // the history goes with the layers: a step of the old document applied to a new image put
+        // its layers (or its base, for a crop) back on top of it
+        if (!keepLayers || sizeChanged) { this.layers = []; this.activeLayerId = null; this.clearUndo(); }
         if (!this.sel || sizeChanged) {
             this.sel = MaskPixels.empty(this.width, this.height);
-            this.undo = [];
-            this.redo = [];
+            this.clearUndo();
         }
         this.uploaded.baseHash = null;
         this.uploaded.baseRef = null;
@@ -8041,7 +8161,7 @@ class InpaintEditor {
             this.sel = null;
         }
         await this.setBase(ref, img, { keepLayers });
-        this.undo = []; this.redo = [];
+        this.clearUndo();
         this.renderHistory();
         this.renderSelectionList();
         return { width: this.width, height: this.height };
@@ -8089,7 +8209,7 @@ class InpaintEditor {
             this.compare = null;
             this.sel = null;
             await this.setBase(ref, img, { keepLayers: false });
-            this.undo = []; this.redo = [];
+            this.clearUndo();
             this.renderHistory();
             this.renderSelectionList();
             this.setStatus(`New ${w} × ${h} canvas. Load an image as a layer, paint, or select and generate.`);
@@ -9542,6 +9662,10 @@ class InpaintEditor {
                 if (stale()) return;
                 // over what setBase left (source-over, as always: a same-size restore keeps the old selection too)
                 this.sel.drawInto(null, (ctx) => ctx.drawImage(sel, 0, 0));
+                // touched after the write: setBase's info line and first frame built the display
+                // levels of the empty selection under the same version, and above 1 MP the bounds
+                // came from those, so a restored selection counted as none
+                this.touchSource(this.sel);
                 this.selectionDirty = true; this.selectionLoose = false;
             }
             this.renderLayers();
@@ -9716,6 +9840,7 @@ class InpaintEditor {
     destroy() {
         if (this._compositor) { try { this._compositor.dispose(); } catch (_) { /* context gone */ } this._compositor = null; }
         this.matchBackdrop = null;
+        this.clearUndo();   // the blob URLs of the whole-layer steps are revoked, not left behind
         this.close();
         try { this.resizeObserver.disconnect(); } catch (_) { /* ignore */ }
         try { this.thumbObserver.disconnect(); } catch (_) { /* ignore */ }

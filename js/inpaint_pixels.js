@@ -12,7 +12,10 @@
  * - Write only through `writeRect`, `drawInto`, `blit`, `clear`, `fill`. A canvas handed out
  *   by `toCanvas()` is a read-only view; in the tile backend it is a copy, so a write into it
  *   is lost. `setPixelsOptions({ copy: true })` makes this backend hand out copies too, which
- *   is how the gates prove that no call site writes into one.
+ *   is how the gates prove that no call site writes into one. It is valid only until the next
+ *   write: in this backend it is the pixels themselves, so a caller that keeps it across an
+ *   await (an encode, a worker job) and needs the pixels as they were takes them at the call
+ *   (`createImageBitmap`, `clone()`, `copyRect`) and never reads the canvas again afterwards.
  * - `drawInto(rect, fn)`: `fn(ctx)` draws in the pixels' own coordinates; what falls outside
  *   `rect` ([x0, y0, x1, y1], null for everything) is dropped. `fn` must not read `ctx.canvas`
  *   and must not read pixels back from `ctx`: in the tile backend the context belongs to a
