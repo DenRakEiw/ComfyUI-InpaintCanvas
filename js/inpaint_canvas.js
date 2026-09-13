@@ -426,7 +426,8 @@ function drawTriangle(ctx, img, s0, s1, s2, d0, d1, d2) {
 /**
  * Draw `img` through a deformation: `dst(u, v)` gives the destination point for
  * the normalised source position (u, v) in [0, 1]. The image is split into an
- * nx by ny mesh of triangle pairs.
+ * nx by ny mesh of triangle pairs. `img` is a canvas (a layer's `px.toCanvas()`, taken once
+ * by the caller): every triangle draws the whole of it.
  */
 function drawMesh(ctx, img, dst, nx, ny) {
     const W = img.width, H = img.height;
@@ -2311,8 +2312,10 @@ class InpaintEditor {
         }
         minX = Math.floor(minX); minY = Math.floor(minY); maxX = Math.ceil(maxX); maxY = Math.ceil(maxY);
         const bw = Math.max(1, maxX - minX), bh = Math.max(1, maxY - minY);
+        // the source once, after applyMask above replaced the pixels; the mesh draws it per triangle
+        const src = layer.px.toCanvas();
         // Keep the layer's native resolution (pixels per image unit).
-        const res = Math.max(layer.canvas.width / layer.w, layer.canvas.height / layer.h, 1);
+        const res = Math.max(src.width / layer.w, src.height / layer.h, 1);
         const out = makeCanvas(Math.round(bw * res), Math.round(bh * res));
         const ctx = out.getContext("2d");
         ctx.imageSmoothingEnabled = true;
@@ -2323,13 +2326,16 @@ class InpaintEditor {
             ctx.save();
             ctx.translate(X, Y);
             ctx.rotate(p.angle);
-            ctx.scale(layer.w * res / layer.canvas.width, layer.h * res / layer.canvas.height);
-            ctx.drawImage(layer.canvas, 0, 0);
+            ctx.scale(layer.w * res / src.width, layer.h * res / src.height);
+            ctx.drawImage(src, 0, 0);
             ctx.restore();
         } else {
-            drawMesh(ctx, layer.canvas, dst, n, n);
+            drawMesh(ctx, src, dst, n, n);
         }
-        layer.canvas = out;
+        // no state is left behind on the new pixels' context (PLAN_BCE §C1 rule 11)
+        ctx.imageSmoothingQuality = "low";
+        // replaced, not written (another size; the "layerfull" undo PNG may still be encoding from the old pixels)
+        layer.px = LayerPixels.fromCanvas(out);
         layer.x = minX; layer.y = minY; layer.w = bw; layer.h = bh;
         this.pending = null;
         this.markLayerChanged(layer);
@@ -3208,7 +3214,7 @@ class InpaintEditor {
         if (!te) return;
         const l = te.layer, t = l.text, dpr = window.devicePixelRatio || 1;
         const [sx, sy] = this.imageToScreen(l.x, l.y);
-        const k = l.canvas && l.canvas.width > 1 ? l.w / (l.canvas.width / (t.res || 2)) : 1;
+        const k = l.px && l.px.width > 1 ? l.w / (l.px.width / (t.res || 2)) : 1;
         const z = this.view.scale / dpr;
         const fs = Math.max(4, t.size * k * z);
         const pad = Math.max(0, (t.size * 0.15 + (t.outline || 0)) * k * z);
@@ -3316,9 +3322,11 @@ class InpaintEditor {
             const ctx = c.getContext("2d");
             if (axis === "h") { ctx.translate(src.width, 0); ctx.scale(-1, 1); } else { ctx.translate(0, src.height); ctx.scale(1, -1); }
             ctx.drawImage(src, 0, 0);
+            ctx.setTransform(1, 0, 0, 1, 0, 0);   // no mirror left on the new pixels' context (PLAN_BCE §C1 rule 11)
             return c;
         };
-        l.canvas = flip(l.canvas);
+        // replaced, not written (the "layerfull" undo PNG may still be encoding from the old pixels)
+        l.px = LayerPixels.fromCanvas(flip(l.px.toCanvas()));
         if (l.maskPx) { l.maskPx = MaskPixels.fromCanvas(flip(l.maskPx.toCanvas())); l.maskDirty = true; }
         this.markLayerChanged(l);
         this.renderLayers(); this.draw();
@@ -3338,9 +3346,11 @@ class InpaintEditor {
             ctx.translate(c.width / 2, c.height / 2);
             ctx.rotate(dir * Math.PI / 2);
             ctx.drawImage(src, -src.width / 2, -src.height / 2);
+            ctx.setTransform(1, 0, 0, 1, 0, 0);   // no turn left on the new pixels' context (PLAN_BCE §C1 rule 11)
             return c;
         };
-        l.canvas = rot(l.canvas);
+        // replaced, not written (the "layerfull" undo PNG may still be encoding from the old pixels)
+        l.px = LayerPixels.fromCanvas(rot(l.px.toCanvas()));
         if (l.maskPx) { l.maskPx = MaskPixels.fromCanvas(rot(l.maskPx.toCanvas())); l.maskDirty = true; }
         const cx = l.x + l.w / 2, cy = l.y + l.h / 2;
         [l.w, l.h] = [l.h, l.w];
@@ -4596,7 +4606,7 @@ class InpaintEditor {
     /** The base as an image layer (for tools that need pixels of their own, e.g. smudge on the base). */
     baseCopyLayer() {
         const c = makeCanvas(this.width, this.height);
-        c.getContext("2d").drawImage(this.base.img, 0, 0);
+        this.basePx.drawTo(c.getContext("2d"), 0, 0);   // unscaled (PLAN_BCE §C1 rule 6)
         const layer = this.addLayer({ name: "Base copy", kind: "image", ref: null, px: LayerPixels.fromCanvas(c), x: 0, y: 0, w: this.width, h: this.height, dirty: true }, { activate: true });
         this.setStatus("The base cannot be edited directly: a copy layer was added.");
         return layer;
@@ -4863,7 +4873,7 @@ class InpaintEditor {
      */
     paintShape(ctx, layer, build, closed, origin = [0, 0]) {
         const o = this.shapeOpts;
-        const sx = layer.canvas.width / layer.w, sy = layer.canvas.height / layer.h;
+        const sx = layer.px.width / layer.w, sy = layer.px.height / layer.h;
         ctx.save();
         // image coordinates to the layer's pixels, less the stroke buffer's origin
         ctx.setTransform(sx, 0, 0, sy, -layer.x * sx - origin[0], -layer.y * sy - origin[1]);
@@ -4903,7 +4913,7 @@ class InpaintEditor {
             }
         }
         const box = [bx0 - pad, by0 - pad, bx1 + pad, by1 + pad];
-        const sx = layer.canvas.width / layer.w, sy = layer.canvas.height / layer.h;
+        const sx = layer.px.width / layer.w, sy = layer.px.height / layer.h;
         const ctx = stroke.ensure((box[0] - layer.x) * sx, (box[1] - layer.y) * sy, (box[2] - layer.x) * sx, (box[3] - layer.y) * sy);
         this.paintShape(ctx, layer, (c) => this.shapePointPath(c, pts, closed, null), closed, [stroke.x, stroke.y]);
         const p = { kind: "layerpaint", layer, stroke, clip: this.strokeClip(layer, layer.px), erase: false };
@@ -5742,10 +5752,10 @@ class InpaintEditor {
             // Everything visible was baked into the new base; keep control and reference layers.
             const kept = this.layers.filter((l) => this.isControl(l) || this.isReference(l));
             for (const l of kept) {
-                if (l.kind === "paint" && l.canvas.width === W && l.canvas.height === H && l.w === W && l.h === H) {
-                    const c = makeCanvas(nw, nh);
-                    c.getContext("2d").drawImage(l.canvas, left, top);
-                    l.canvas = c; l.x = 0; l.y = 0; l.w = nw; l.h = nh;
+                if (l.kind === "paint" && l.px.width === W && l.px.height === H && l.w === W && l.h === H) {
+                    // a new object (the canvas undo step holds the old one): the old pixels placed at left, top
+                    l.px = l.px.resized(nw, nh, { x: left, y: top });
+                    l.x = 0; l.y = 0; l.w = nw; l.h = nh;
                     if (l.maskPx) { l.maskPx = l.maskPx.resized(nw, nh, { x: left, y: top }); l.maskDirty = true; l._maskedValid = false; }
                 } else {
                     l.x += left; l.y += top;
@@ -6805,6 +6815,10 @@ class InpaintEditor {
         ctx.globalAlpha = layer.opacity;
         ctx.globalCompositeOperation = layer.blend && layer.blend !== "normal" ? layer.blend : "source-over";
         ctx.drawImage(this.layerPixels(layer), (layer.x - x0) * res, (layer.y - y0) * res, layer.w * res, layer.h * res);
+        // no alpha, blend or smoothing left on the new pixels' context (PLAN_BCE §C1 rule 11)
+        ctx.globalAlpha = 1;
+        ctx.globalCompositeOperation = "source-over";
+        ctx.imageSmoothingQuality = "low";
         below.px = LayerPixels.fromCanvas(c);   // replaced, not written: the "layers" undo step holds the old pixels
         below.x = x0; below.y = y0; below.w = w; below.h = h;
         below.maskPx = null; below.maskRef = null; below.maskDirty = false; below.maskEdit = false;
@@ -6857,8 +6871,9 @@ class InpaintEditor {
         const { canvas, res, missing } = await renderText(layer.text);
         if (layer._textToken !== token || !this.layers.includes(layer)) return;
         const oldRes = (layer.text && layer.text.res) || 2;
-        const k = keepScale && layer.canvas && layer.canvas.width > 1 ? layer.w / (layer.canvas.width / oldRes) : 1;
-        layer.canvas = canvas;
+        const k = keepScale && layer.px && layer.px.width > 1 ? layer.w / (layer.px.width / oldRes) : 1;
+        // adopts the rendered canvas: replaced, not written (its size changes with every edit)
+        layer.px = LayerPixels.fromCanvas(canvas);
         layer.text.res = res;
         layer.w = Math.max(1, Math.round(canvas.width / res * k));
         layer.h = Math.max(1, Math.round(canvas.height / res * k));
