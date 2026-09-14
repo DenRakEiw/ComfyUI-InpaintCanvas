@@ -132,6 +132,10 @@ function link(gl, vsSrc, fsSrc) {
 // source is 384 MB and 48 small ones are 12.
 const TEXTURE_BUDGET = 1024 * 1024 * 1024;
 const TEXTURE_CACHE = 64;   // and a plain count, so a stack of tiny sources cannot grow forever
+// and an age: the map keys on the source canvases and keeps them alive, so a source no composite asked
+// for in this many composites is dropped whatever the budget says (a layer's replaced pixels after a
+// flip or a transform: charged only their window's bytes, they could otherwise stay for a long time)
+const TEXTURE_STALE = 300;
 
 // A source above this many pixels is not uploaded whole: the compositor keeps a window of it,
 // the part the view shows plus a margin of half the view on each side (phase A item 4 of
@@ -301,6 +305,11 @@ export class GLCompositor {
 
     /** Drop the textures that no recent frame asked for, oldest first, never this frame's. */
     _evict() {
+        for (const [src, e] of this.textures) {
+            if (this.frame - (e.used || 0) <= TEXTURE_STALE) continue;
+            try { this.gl.deleteTexture(e.tex); } catch (_) { /* context gone */ }
+            this.textures.delete(src);
+        }
         let bytes = 0;
         for (const e of this.textures.values()) bytes += (e.w || 0) * (e.h || 0) * 4;
         if (bytes <= TEXTURE_BUDGET && this.textures.size <= TEXTURE_CACHE) return;
@@ -319,16 +328,17 @@ export class GLCompositor {
      * textures (RGBA8, so w * h * 4) and the bytes of the two ping-pong targets.
      */
     stats() {
-        let bytes = 0, windows = 0, windowBytes = 0;
-        for (const e of this.textures.values()) {
+        let bytes = 0, windows = 0, windowBytes = 0, sourceBytes = 0;
+        for (const [src, e] of this.textures) {
             const b = (e.w || 0) * (e.h || 0) * 4;
             bytes += b;
             if (e.window) { windows++; windowBytes += b; }
+            sourceBytes += (src.width || 0) * (src.height || 0) * 4;   // the canvases the map keeps alive as keys
         }
         let targetBytes = 0;
         for (const t of this.targets) if (t) targetBytes += (t.w || 0) * (t.h || 0) * 4;
         const scratchBytes = this.scratch ? this.scratch.width * this.scratch.height * 4 : 0;
-        return { entries: this.textures.size, bytes, targetBytes, windows, windowBytes, scratchBytes, windowUploads: this.windowUploads || 0, budget: TEXTURE_BUDGET, limit: TEXTURE_CACHE, lost: this.lost };
+        return { entries: this.textures.size, bytes, sourceBytes, targetBytes, windows, windowBytes, scratchBytes, windowUploads: this.windowUploads || 0, budget: TEXTURE_BUDGET, limit: TEXTURE_CACHE, stale: TEXTURE_STALE, lost: this.lost };
     }
 
     /** Drop the texture of a source the editor threw away. */
