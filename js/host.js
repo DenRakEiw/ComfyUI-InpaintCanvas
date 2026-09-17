@@ -120,6 +120,11 @@ export const host = {
         return g && g.serialize ? g.serialize() : app.graph.serialize();
     },
 
+    /** The node exports the picture as it is (no Size row, no frame), so a PNG may be written in bands (scumble E2). */
+    exportIsPlain() {
+        return true;
+    },
+
     exportCanvas(editor) {
         return editor.flattenToCanvas({ forRun: true });
     },
