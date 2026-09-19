@@ -78,6 +78,21 @@ Optional node packs, each enabling one editor feature:
 The editor lists only the backends whose nodes are installed. Filter layers,
 reference layers, masks, save and cleanup need nothing beyond the node.
 
+## Run on RunPod
+
+Ready-made pod templates with ComfyUI, Inpaint Canvas and the optional node packs
+(RMBG, segment-anything-2, QwenVL) preinstalled. Pick the one matching your GPU:
+
+| Template | GPUs |
+| --- | --- |
+| [comfyui-inpaintcanvas_cuda12.8](https://console.runpod.io/hub/template/jqnwohuj7e?ref=3zsdbw4e) | RTX 4090, L40S, A40, A100 and older |
+| [comfyui-inpaintcanvas_cuda13.0](https://console.runpod.io/hub/template/ng13om779a?ref=3zsdbw4e) | Blackwell: RTX 5090, RTX PRO 4500 / 6000 |
+
+Set `JUPYTER_PASSWORD` and `FILEBROWSER_PASSWORD` when you deploy. `HF_TOKEN` plus
+`COMFY_MODEL_PRESET=flux2-klein` downloads the models of the local Flux.2 Klein example on
+first boot. Image source and details:
+[DenRakEiw/inpaint_canvas_runpod](https://github.com/DenRakEiw/inpaint_canvas_runpod).
+
 ## Quick start
 
 ![The Flux.2 API example: Inpaint Canvas wired into the Flux.2 Image node and back into result](docs/img/example-api.jpg)
