@@ -269,11 +269,17 @@ def _ensure_min_span(a0, a1, limit, min_size):
 
 
 def _dilate_mask(mask, px):
-    """Binary-ish dilation of a [H, W] mask by ``px`` pixels (square kernel)."""
+    """Binary-ish dilation of a [H, W] mask by ``px`` pixels (square kernel).
+
+    A square max filter is separable: the max over the rows, then over the columns, gives
+    the same values as one k x k max_pool2d at 2k comparisons a pixel instead of k * k
+    (a grow of 68 px on a 6000 x 4000 mask took 15 minutes on one core, now seconds)."""
     if px <= 0:
         return mask
-    k = 2 * int(px) + 1
-    out = torch.nn.functional.max_pool2d(mask[None, None], kernel_size=k, stride=1, padding=int(px))
+    p = int(px)
+    k = 2 * p + 1
+    out = torch.nn.functional.max_pool2d(mask[None, None], kernel_size=(1, k), stride=1, padding=(0, p))
+    out = torch.nn.functional.max_pool2d(out, kernel_size=(k, 1), stride=1, padding=(p, 0))
     return out[0, 0]
 
 
@@ -756,20 +762,27 @@ class InpaintCanvasStitch:
         same_aspect = bool(emitted) and abs(src.shape[2] / src.shape[1] - emitted[0] / emitted[1]) < 0.01
         patch = _resize_image(src, w, h, crop="disabled" if same_aspect else "center")[0]
 
+        # The masks on a window around the region, not the whole picture: the dilation and
+        # blur tails end inside the margin (the app's stitch.js does the same), and a
+        # whole-picture mask of a large document cost minutes on the CPU.
+        grow, blend_px = int(info.get("grow", 0)), int(info.get("blend", 0))
+        margin = int(math.ceil(max(feather, grow, blend_px) * 2 + 3 * max(feather, blend_px) / 2.5)) + 8
+        wx0, wy0 = max(0, x - margin), max(0, y - margin)
+        wx1, wy1 = min(width, x + w + margin), min(height, y + h + margin)
         if info.get("paste") == "crop":
             # Paste the whole returned rectangle (edit models re-render the crop as a
             # whole and it is consistent in itself); only the rectangle's border fades
             # into the base, over the feather width, inside the rectangle.
-            rect = torch.zeros((height, width), dtype=torch.float32)
-            rect[y:y + h, x:x + w] = 1.0
-            f = max(8, feather, int(info.get("blend", 0)))
+            rect = torch.zeros((wy1 - wy0, wx1 - wx0), dtype=torch.float32)
+            rect[y - wy0:y - wy0 + h, x - wx0:x - wx0 + w] = 1.0
+            f = max(8, feather, blend_px)
             full = _blur_mask(_erode_mask(rect, f // 2), f / 2.5) * rect
         elif info.get("auto_feather"):
             # Krita-style: opaque inside the selection, soft transition outside it.
-            full = _composite_mask(mask, int(info.get("grow", 0)), feather, int(info.get("blend", 0)))
+            full = _composite_mask(mask[wy0:wy1, wx0:wx1], grow, feather, blend_px)
         else:
-            full = _blur_mask(mask, feather)
-        blend = full[y:y + h, x:x + w]
+            full = _blur_mask(mask[wy0:wy1, wx0:wx1], feather)
+        blend = full[y - wy0:y - wy0 + h, x - wx0:x - wx0 + w]
         blend3 = blend[..., None]
 
         out = base.clone()
