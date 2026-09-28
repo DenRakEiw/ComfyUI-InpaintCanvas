@@ -161,6 +161,10 @@ export const host = {
     async askLLM() { throw new Error("in-app language models are a Scumble feature"); },
     cutoutBackends() { return []; },
     async cutoutInApp() { throw new Error("in-app background removal is a Scumble feature"); },
+    removeSupported: false,   // the Remove tool (LaMa in-app) is not built into the node's tool column
+    removeModel() { return null; },
+    async removeInApp() { throw new Error("Remove is a Scumble feature"); },
+    async warmRemove() { return null; },
     async freeHelpers() {},
     upsampleInstruction: null,   // the built-in upsample instruction (Scumble hands out its templates)
     generateNewAvailable() { return false; },
