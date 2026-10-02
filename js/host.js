@@ -164,6 +164,7 @@ export const host = {
     removeSupported: false,   // the Remove tool (LaMa in-app) is not built into the node's tool column
     refTokens: false,         // @img tokens for reference layers are a Scumble feature (docs/PLAN_REFS.md); the node keeps "ref N"
     async refLayout() { return null; },   // what a provider route calls each reference is a Scumble feature (item 26 step 26c2)
+    boxSwitch() { return null; },         // boxes in the prompt are a Scumble feature (item 28 S3d): the Boxes row stays hidden
     removeModel() { return null; },
     async removeInApp() { throw new Error("Remove is a Scumble feature"); },
     async warmRemove() { return null; },
