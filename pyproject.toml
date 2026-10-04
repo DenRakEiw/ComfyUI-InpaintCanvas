@@ -1,12 +1,14 @@
 [project]
 name = "comfyui-inpaintcanvas"
-description = "Krita-style inpainting inside ComfyUI: a layered canvas with selection tools (brush, lasso, polygon, SAM2 objects, SAM3 text), the selected region goes to any inpaint chain and comes back as a layer. Reference layers for Flux.2 multi-reference editing, RMBG cutouts, film grain and LUT filter layers, prompt upsampling."
-version = "0.3.2"
+description = "Krita-style inpainting inside ComfyUI: a layered canvas with selection tools (brush, lasso, polygon, SAM2 objects, SAM3 text), the selected region goes to any inpaint chain and comes back as a layer. Reference layers for Flux.2 multi-reference editing, RMBG cutouts, film grain and LUT filter layers, prompt upsampling. The same editor is also a standalone desktop app, Scumble (https://github.com/DenRakEiw/scumble), which renders through ComfyUI with this pack or through API providers."
+version = "0.3.3"
 license = { file = "LICENSE" }
 dependencies = []
 
 [project.urls]
 Repository = "https://github.com/DenRakEiw/ComfyUI-InpaintCanvas"
+Scumble = "https://github.com/DenRakEiw/scumble"
+Homepage = "https://www.denrakeiw.com/scumble"
 
 [tool.comfy]
 PublisherId = "denrakeiw"

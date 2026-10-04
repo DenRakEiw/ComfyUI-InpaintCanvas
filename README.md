@@ -5,6 +5,13 @@ layers, the selection and the prompt. The selected region goes out as a crop,
 any inpaint chain works on it, and the result is wired straight back into the
 same node, where it lands as a new layer. Select the next spot, generate again.
 
+**Also as a desktop app: [Scumble](https://github.com/DenRakEiw/scumble).** The same
+editor runs standalone, with tabs, documents and PSD / ORA export. It renders through
+your own ComfyUI (with this node pack installed there) or through API providers with
+your own keys. Windows: [Microsoft Store](https://apps.microsoft.com/detail/9NDBTNNMXF2R)
+or [GitHub releases](https://github.com/DenRakEiw/scumble/releases); more on
+[denrakeiw.com/scumble](https://www.denrakeiw.com/scumble).
+
 ![The editor: a photo with a marching-ants selection, the crop rectangle and the side panel](docs/img/editor.jpg)
 
 **Video tutorial** (3 min): swapping the wheels on a BMW 635 CSi with a
