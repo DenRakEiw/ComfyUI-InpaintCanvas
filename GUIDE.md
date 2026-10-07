@@ -2,7 +2,7 @@
 
 ## Overview
 
-Inpaint Canvas is a Krita-style image editor inside a ComfyUI node. One node holds the image, the layers, the selection and the prompt. The selected region leaves the node as a crop, any inpaint chain works on it, and the decoded result is wired back into the same node, where it lands as a new layer. Select the next spot, generate again, and finish the picture with layers, retouch tools and filter layers without leaving ComfyUI.
+Inpaint Canvas is a layered image editor inside a ComfyUI node. One node holds the image, the layers, the selection and the prompt. The selected region leaves the node as a crop, any inpaint chain works on it, and the decoded result is wired back into the same node, where it lands as a new layer. Select the next spot, generate again, and finish the picture with layers, retouch tools and filter layers without leaving ComfyUI.
 
 Open the editor with the **Open editor** button on the node. Esc closes it. While it is open every shortcut belongs to the editor.
 

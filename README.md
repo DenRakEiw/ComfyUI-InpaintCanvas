@@ -64,12 +64,20 @@ A compact English manual for a Note node or a text display lives in
 
 ## Installation
 
+Inpaint Canvas is not in the ComfyUI Manager's list yet. Once it is, you can
+install it there by searching for Inpaint Canvas. Until then, clone the
+repository into ComfyUI's `custom_nodes` folder:
+
 ```bash
 cd ComfyUI/custom_nodes
 git clone https://github.com/DenRakEiw/ComfyUI-InpaintCanvas
 ```
 
-Restart ComfyUI. The node itself has no extra Python dependencies beyond what
+Restart ComfyUI. To update later, run `git pull` in that folder and restart.
+
+The package on the Comfy Registry (what the Manager and `comfy node install`
+fetch) holds the node and the editor only; the MCP server (`mcp/`), the tests
+and the development notes are in the git repository. The node itself has no extra Python dependencies beyond what
 ComfyUI ships (OpenCV is used for the *border* fill when available).
 
 Optional node packs, each enabling one editor feature:
@@ -633,7 +641,9 @@ rectangle or by text, set the prompt, generate, look at the result, blend it wit
 colour match, add filters and text and export, all in the editor that is open in your
 browser tab, step by step and undoable. Setup, the tool list and how it works are in
 [mcp/README.md](mcp/README.md). It needs `pip install mcp` in the Python that runs the
-server and only answers requests from localhost.
+server and only answers requests from localhost. The server is part of the git
+repository, not of the registry package: with a Manager install, take the `mcp`
+folder from a git clone.
 
 ## Node reference
 
@@ -712,6 +722,9 @@ changed, and the stitch only happens while it runs.
 
 Files: uploads go to `input/inpaint_canvas/`, stitched patches to
 `output/inpaint_canvas/`, helper-prompt results to `temp/inpaint_canvas/`.
+The node reads and writes only inside ComfyUI's input, output and temp folders:
+a file name with `..`, an absolute path, or a link that points elsewhere is
+refused.
 Edited layers are uploaded when the editor closes and before every run. The
 workflow stores file references, the selection and the settings, not the
 pixels of the layers.
@@ -719,7 +732,8 @@ pixels of the layers.
 ## Development
 
 See `DEVELOPMENT.md` for the mechanisms, measurements, test recipes and the
-invariants that must not be broken.
+invariants that must not be broken. The path tests run without ComfyUI:
+`python -m unittest discover -s tests -v` from the repository root.
 
 ## License
 

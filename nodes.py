@@ -61,17 +61,60 @@ def _dir_for_type(kind):
     return folder_paths.get_input_directory()
 
 
+# Every name a client sends (a reference's filename and subfolder, the upload route's query, the node
+# id and purpose that become part of a file name) stays inside ComfyUI's input, output or temp folder:
+# NUL bytes, absolute and drive-prefixed paths and ".." segments are refused, and the final path is
+# resolved with realpath (symlinks and junctions followed) and must still lie inside the resolved base.
+_UNSAFE_NAME_CHARS = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _name_token(value, fallback="x"):
+    """A client-given id or label as part of a file name: letters, digits, '.', '_' and '-' only."""
+    token = _UNSAFE_NAME_CHARS.sub("_", "" if value is None else str(value))[:64]
+    return token or fallback
+
+
+def _check_relative(part):
+    """Refuse a client-given path part that could leave its base folder."""
+    if "\x00" in part:
+        raise ValueError("Inpaint Canvas: NUL byte in a path")
+    if (os.path.isabs(part) or part.startswith(("/", "\\")) or os.path.splitdrive(part)[0]
+            or (os.name == "nt" and ":" in part)):
+        # on Windows a ':' starts a drive ("D:x") or an alternate data stream; valid names have none
+        raise ValueError(f"Inpaint Canvas: absolute paths are not allowed: {part!r}")
+    if ".." in part.replace("\\", "/").split("/"):
+        raise ValueError(f"Inpaint Canvas: '..' is not allowed in a path: {part!r}")
+
+
+def _inside(base, *parts):
+    """Join client-given ``parts`` below ``base`` and return the resolved path. Raises ValueError
+    for an unsafe part (see _check_relative) or when the resolved path is not inside the resolved
+    ``base``, e.g. through a symlink or a junction that points elsewhere."""
+    root = os.path.realpath(base)
+    clean = []
+    for part in parts:
+        part = "" if part is None else str(part)
+        _check_relative(part)
+        clean.append(part)
+    path = os.path.realpath(os.path.join(root, *clean))
+    try:
+        inside = os.path.commonpath((root, path)) == root
+    except ValueError:   # another drive
+        inside = False
+    if not inside:
+        raise ValueError("Inpaint Canvas: path outside of the ComfyUI directories")
+    return path
+
+
 def _ref_path(ref):
-    """Resolve a {filename, subfolder, type} reference to an absolute path."""
-    if not ref or not ref.get("filename"):
+    """Resolve a {filename, subfolder, type} reference to an absolute path inside the ComfyUI
+    input, output or temp folder."""
+    if not isinstance(ref, dict) or not ref.get("filename"):
         raise ValueError("Inpaint Canvas: no image reference given")
-    base = _dir_for_type(ref.get("type", "input"))
-    sub = os.path.normpath(ref.get("subfolder", "") or "")
-    if sub == ".":
-        sub = ""
-    path = os.path.abspath(os.path.join(base, sub, ref["filename"]))
-    if os.path.commonpath((os.path.abspath(base), path)) != os.path.abspath(base):
-        raise ValueError("Inpaint Canvas: reference outside of the ComfyUI directories")
+    name = str(ref["filename"])
+    if name in (".", ".."):
+        raise ValueError("Inpaint Canvas: no image reference given")
+    path = _inside(_dir_for_type(ref.get("type", "input")), ref.get("subfolder", "") or "", name)
     if not os.path.isfile(path):
         raise FileNotFoundError(f"Inpaint Canvas: file not found: {path}")
     return path
@@ -156,7 +199,7 @@ def _cleanup_files(keep, dry_run=True, min_age=CLEANUP_MIN_AGE):
             continue
         for name in os.listdir(folder):
             path = os.path.join(folder, name)
-            if not os.path.isfile(path):
+            if os.path.islink(path) or not os.path.isfile(path):
                 continue
             if kind != "temp" and not INTERNAL_FILE_RE.match(name):
                 continue
@@ -574,7 +617,7 @@ class InpaintCanvas:
     FUNCTION = "run"
     CATEGORY = "image/inpaint"
     OUTPUT_NODE = True
-    DESCRIPTION = ("Krita-style inpainting inside ComfyUI: load an image, paint a selection, "
+    DESCRIPTION = ("Inpainting with layers inside ComfyUI: load an image, paint a selection, "
                    "inpaint the emitted crop with any nodes you like, and wire the result back "
                    "into this node. Each result lands on the canvas as a new layer.")
 
@@ -805,12 +848,13 @@ class InpaintCanvasStitch:
         out_dir = os.path.join(folder_paths.get_output_directory(), SUBFOLDER)
         os.makedirs(out_dir, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")
-        filename = f"n{info.get('canvas_node', 'x')}_result_{stamp}.png"
+        node_tok = _name_token(info.get("canvas_node"))   # stitch_info is a client string: no separators in the name
+        filename = f"n{node_tok}_result_{stamp}.png"
         counter = 1
         while os.path.exists(os.path.join(out_dir, filename)):
-            filename = f"n{info.get('canvas_node', 'x')}_result_{stamp}_{counter}.png"
+            filename = f"n{node_tok}_result_{stamp}_{counter}.png"
             counter += 1
-        Image.fromarray(rgba_np, "RGBA").save(os.path.join(out_dir, filename), compress_level=4)
+        Image.fromarray(rgba_np, "RGBA").save(_inside(out_dir, filename), compress_level=4)
 
         return {
             "ui": {
@@ -883,7 +927,9 @@ class InpaintCanvasMaskOut:
         out_dir = os.path.join(folder_paths.get_temp_directory(), SUBFOLDER)
         os.makedirs(out_dir, exist_ok=True)
         _prune_temp()
-        filename = f"n{canvas_node or 'x'}_{purpose}_{time.strftime('%H%M%S')}_{int(time.time() * 1000) % 1000:03d}.png"
+        # canvas_node and purpose are widget strings: only their safe characters go into the file name
+        filename = f"n{_name_token(canvas_node)}_{_name_token(purpose, '')}_{time.strftime('%H%M%S')}_{int(time.time() * 1000) % 1000:03d}.png"
+        path = _inside(out_dir, filename)
         if isinstance(label, (list, tuple)):
             label = " ".join(str(t) for t in label)
         label = " ".join(str(label or "").strip().strip("\"'.").split())
@@ -908,12 +954,12 @@ class InpaintCanvasMaskOut:
             rgb = np.zeros((labels.shape[0], labels.shape[1], 3), dtype=np.uint8)
             rgb[..., 0] = labels & 255
             rgb[..., 1] = labels >> 8
-            Image.fromarray(rgb, "RGB").save(os.path.join(out_dir, filename), compress_level=1)
+            Image.fromarray(rgb, "RGB").save(path, compress_level=1)
             info.update({"width": int(labels.shape[1]), "height": int(labels.shape[0]), "count": int(count)})
             return {"ui": {"inpaint_mask": [info]}}
         merged = m.max(dim=0).values if m.shape[0] > 1 else m[0]
         arr = (merged.numpy() * 255).astype(np.uint8)
-        Image.fromarray(arr, "L").save(os.path.join(out_dir, filename), compress_level=1)
+        Image.fromarray(arr, "L").save(path, compress_level=1)
         info.update({"width": int(arr.shape[1]), "height": int(arr.shape[0]), "coverage": float(merged.mean())})
         return {"ui": {"inpaint_mask": [info]}}
 
@@ -986,8 +1032,8 @@ class InpaintCanvasObjectMap:
         out_dir = os.path.join(folder_paths.get_temp_directory(), SUBFOLDER)
         os.makedirs(out_dir, exist_ok=True)
         _prune_temp()
-        filename = f"n{canvas_node or 'x'}_segments_{time.strftime('%H%M%S')}_{int(time.time() * 1000) % 1000:03d}.png"
-        Image.fromarray(rgb, "RGB").save(os.path.join(out_dir, filename), compress_level=1)
+        filename = f"n{_name_token(canvas_node)}_segments_{time.strftime('%H%M%S')}_{int(time.time() * 1000) % 1000:03d}.png"
+        Image.fromarray(rgb, "RGB").save(_inside(out_dir, filename), compress_level=1)
         return {"ui": {"inpaint_mask": [{
             "filename": filename, "subfolder": SUBFOLDER, "type": "temp",
             "canvas_node": canvas_node, "purpose": "segments",
@@ -1080,13 +1126,19 @@ def _register_routes():
         kind = str(q.get("type") or "input")
         if kind not in ("input", "output", "temp"):
             return web.json_response({"error": "type must be input, output or temp"}, status=400)
-        base = os.path.abspath(_dir_for_type(kind))
-        sub = os.path.normpath(str(q.get("subfolder") or "")).strip()
+        raw_sub = str(q.get("subfolder") or "")
+        sub = os.path.normpath(raw_sub).strip()
         if sub in (".", ""):
             sub = ""
-        folder = os.path.abspath(os.path.join(base, sub))
-        if os.path.commonpath((base, folder)) != base:
+        try:
+            _check_relative(raw_sub)   # ".." is refused before normpath could fold it away
+            folder = _inside(_dir_for_type(kind), sub)
+        except ValueError:
             return web.json_response({"error": "subfolder outside of the ComfyUI directories"}, status=400)
+        try:
+            _inside(folder, filename)
+        except ValueError:
+            return web.json_response({"error": "invalid filename"}, status=400)
         os.makedirs(folder, exist_ok=True)
         overwrite = str(q.get("overwrite") or "").lower() in ("1", "true")
         tmp = os.path.join(folder, f".upload_{int(time.time() * 1000)}_{os.getpid()}.part")

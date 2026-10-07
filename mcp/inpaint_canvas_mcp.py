@@ -55,7 +55,7 @@ BROWSER_FLAGS = ["--headless=new", "--disable-gpu", "--hide-scrollbars", "--no-f
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
-INSTRUCTIONS = """Inpaint Canvas is a Krita-style image editor inside a ComfyUI node. You control the editor that is
+INSTRUCTIONS = """Inpaint Canvas is a layered image editor inside a ComfyUI node. You control the editor that is
 open in the user's browser. Typical round trip: load_image (or inpaint_status to see what is loaded) ->
 select_rect / select_by_text -> set_prompt -> generate (the result comes back as a layer on top of the
 selection) -> screenshot to look at it -> set_layer(match=...) to blend the colours -> export_image.
