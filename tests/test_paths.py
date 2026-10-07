@@ -18,6 +18,8 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
+from urllib.parse import quote, urlencode
 
 import torch
 from aiohttp import web
@@ -201,6 +203,32 @@ class RefPathTests(PathBase):
                 with self.assertRaises(ValueError):
                     nodes._ref_path(ref)
 
+    def test_names_the_file_system_rewrites_are_refused(self):
+        bad = [
+            {"filename": "...", "subfolder": "inpaint_canvas"},
+            {"filename": " ", "subfolder": "inpaint_canvas"},
+            {"filename": ". .", "subfolder": "inpaint_canvas"},
+            {"filename": "top.png", "subfolder": "..."},
+            {"filename": "photo.png", "subfolder": "inpaint_canvas/..."},
+            {"filename": "x.png", "subfolder": "inpaint_canvas/ /fonts"},
+        ]
+        if os.name == "nt":
+            # Windows drops a trailing '.' or ' ': each of these was an alias of an existing file before
+            bad += [
+                {"filename": "photo.png.", "subfolder": "inpaint_canvas"},
+                {"filename": "photo.png ", "subfolder": "inpaint_canvas"},
+                {"filename": "photo.png", "subfolder": "inpaint_canvas."},
+                {"filename": "x.png", "subfolder": "inpaint_canvas/fonts "},
+                {"filename": "nul", "subfolder": ""},
+                {"filename": "CON.png", "subfolder": "inpaint_canvas"},
+                {"filename": "x.png", "subfolder": "inpaint_canvas/COM1"},
+                {"filename": "a?.png", "subfolder": "inpaint_canvas"},
+            ]
+        for ref in bad:
+            with self.subTest(ref=ref):
+                with self.assertRaises(ValueError):
+                    nodes._ref_path(ref)
+
     def test_url_encoded_names_stay_literal(self):
         # The node never URL-decodes a reference: "%2e%2e" is a plain folder name inside the input folder.
         for ref in ({"filename": "secret.png", "subfolder": "%2e%2e/%2e%2e/outside"},
@@ -259,6 +287,58 @@ class RefPathTests(PathBase):
         self.assertNotEqual(nodes.InpaintCanvasLoadRef.IS_CHANGED(bad), nodes.InpaintCanvasLoadRef.IS_CHANGED(bad))   # NaN
 
 
+class NameRuleTests(unittest.TestCase):
+    """_check_name with both rule sets, whatever the OS the tests run on."""
+
+    VALID = ("photo.png", "my image (1).png", "n1_base_abc.png", ".hidden", "a..b.png", " leading.png", "x.con",
+             "CONSOLE.png", "nul_x.png", "COM10.png", "LPT.png", "inpaint_canvas/fonts", "inpaint_canvas\\fonts",
+             ".", "", "inpaint_canvas/./fonts", "%2e%2e")
+    ONLY_DOTS_OR_SPACES = ("...", "....", " ", "  ", ". .", " .", ". ", "inpaint_canvas/...", "a/ /b", "a\\...\\b")
+    WINDOWS_ONLY = ("a.", "a.png.", "a ", "a.png ", "inpaint_canvas./x.png", "inpaint_canvas /x.png",
+                    "NUL", "nul", "Nul.png", "nul .png", "CON", "con.tar.gz", "PRN", "AUX.txt", "COM1", "com1.png",
+                    "COM9", "COM0", "LPT1", "lpt1.txt", "LPT0", "COM" + chr(0xB9), "lpt" + chr(0xB3) + ".png",
+                    "CONIN$", "conout$.txt", "inpaint_canvas/CON/x.png", "inpaint_canvas\\nul",
+                    "a?.png", "a*.png", 'a"b.png', "a<b.png", "a>b.png", "a|b.png", "a" + chr(1) + "b.png",
+                    "a" + chr(31) + ".png", "a\tb.png")
+
+    def test_valid_names_pass(self):
+        for name in self.VALID:
+            for windows in (False, True):
+                with self.subTest(name=name, windows=windows):
+                    nodes._check_name(name, windows=windows)
+
+    def test_only_dots_or_spaces_are_refused_everywhere(self):
+        for name in self.ONLY_DOTS_OR_SPACES:
+            for windows in (False, True):
+                with self.subTest(name=name, windows=windows):
+                    with self.assertRaises(ValueError):
+                        nodes._check_name(name, windows=windows)
+
+    def test_windows_rules(self):
+        for name in self.WINDOWS_ONLY:
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    nodes._check_name(name, windows=True)
+                nodes._check_name(name, windows=False)   # valid names on other systems
+
+    def test_inside_applies_the_rules(self):
+        base = tempfile.mkdtemp(prefix="ic_names_")
+        try:
+            self.assertEqual(os.path.normcase(nodes._inside(base, "inpaint_canvas", "photo.png")),
+                             os.path.normcase(os.path.join(os.path.realpath(base), "inpaint_canvas", "photo.png")))
+            for parts in (("...",), ("inpaint_canvas", "..."), ("...", "photo.png"), (" ",)):
+                with self.subTest(parts=parts):
+                    with self.assertRaises(ValueError):
+                        nodes._inside(base, *parts)
+            if os.name == "nt":
+                for parts in (("photo.png.",), ("NUL",), ("inpaint_canvas", "com1.png"), ("a?.png",)):
+                    with self.subTest(parts=parts):
+                        with self.assertRaises(ValueError):
+                            nodes._inside(base, *parts)
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+
 class WriteNameTests(PathBase):
     def test_name_token(self):
         self.assertEqual(nodes._name_token("12"), "12")
@@ -297,6 +377,13 @@ class WriteNameTests(PathBase):
                 self.assertEqual(info["canvas_node"], canvas_node)   # echoed back unchanged for the editor
         self.assertEqual(self.outside_files(), before)
 
+    def test_mask_out_odd_ids_still_write_inside(self):
+        # a token sits inside "n<id>_<purpose>_<stamp>.png": dots, spaces and device names are harmless there
+        for canvas_node, purpose in (("1", "..."), ("...", "segment"), ("nul", "con"), ("5.", "x "), ("COM1", "lpt1")):
+            with self.subTest(canvas_node=canvas_node, purpose=purpose):
+                info = self._mask_out(canvas_node, purpose)
+                self.assertTrue(os.path.isfile(os.path.join(DIRS["temp"], "inpaint_canvas", info["filename"])), info)
+
     def test_stitch_cannot_write_outside(self):
         before = self.outside_files()
         base = {"filename": "photo.png", "subfolder": "inpaint_canvas", "type": "input"}
@@ -333,7 +420,12 @@ class RouteTests(PathBase):
     def tearDown(self):
         self.loop.run_until_complete(self.client.close())
         self.loop.close()
+        parts = self.parts()
         super().tearDown()
+        self.assertEqual(parts, [], "an upload left a .part file behind")
+
+    def parts(self):
+        return [f for f in self.all_files() if f.endswith(".part")]
 
     def upload(self, query, body=b"PNGDATA"):
         async def go():
@@ -402,6 +494,72 @@ class RouteTests(PathBase):
             status, data = self.upload("filename=..%5C..%5C..%5Coutside%5Cevil2.png&subfolder=inpaint_canvas&type=input")
             self.assertEqual((status, data["name"]), (200, "evil2.png"))
         self.assertEqual(self.outside_files(), before)
+
+    def test_upload_dot_and_space_names_are_refused(self):
+        # "..." with overwrite=true was a 500 that left a .part file on Windows (the name is the folder there)
+        before = self.all_files()
+        cases = [("...", "inpaint_canvas"), ("....", "inpaint_canvas"), (". .", "inpaint_canvas"), (". . .", ""),
+                 ("a.png", "..."), ("a.png", "inpaint_canvas/..."), ("a.png", "inpaint_canvas/ . /x"), ("...", "")]
+        for name, sub in cases:
+            for overwrite in ("true", "false"):
+                q = urlencode({"filename": name, "subfolder": sub, "type": "input", "overwrite": overwrite}, quote_via=quote)
+                with self.subTest(query=q):
+                    status, data = self.upload(q)
+                    self.assertEqual(status, 400, data)
+                    self.assertIn("error", data)
+        self.assertEqual(self.all_files(), before)
+
+    def test_upload_windows_names_are_refused(self):
+        if os.name != "nt":
+            self.skipTest("Windows naming rules")
+        before = self.all_files()
+        cases = [("a.png.", "inpaint_canvas"), ("photo.png.", "inpaint_canvas"), ("nul", "inpaint_canvas"),
+                 ("NUL.png", "inpaint_canvas"), ("con.tar.gz", ""), ("COM1.png", "inpaint_canvas"), ("lpt9", ""),
+                 ("COM" + chr(0xB9) + ".png", ""), ("a?.png", "inpaint_canvas"), ("a*.png", ""), ('a".png', ""),
+                 ("a|.png", ""), ("a<b>.png", ""), ("a" + chr(1) + ".png", "inpaint_canvas"),
+                 ("a.png", "CON"), ("a.png", "inpaint_canvas."), ("a.png", "inpaint_canvas/nul"),
+                 ("a.png", "inpaint_canvas/fonts./x")]
+        for name, sub in cases:
+            for overwrite in ("true", "false"):
+                q = urlencode({"filename": name, "subfolder": sub, "type": "input", "overwrite": overwrite}, quote_via=quote)
+                with self.subTest(query=q):
+                    status, data = self.upload(q)
+                    self.assertEqual(status, 400, data)
+        self.assertEqual(self.all_files(), before)
+        # surrounding spaces are stripped from the name and the subfolder, as before
+        status, data = self.upload(urlencode({"filename": " b.png ", "subfolder": "inpaint_canvas ", "type": "input"}, quote_via=quote))
+        self.assertEqual((status, data["name"], data["subfolder"]), (200, "b.png", "inpaint_canvas"))
+
+    def test_upload_never_leaves_a_part_file(self):
+        folder = os.path.join(DIRS["input"], "inpaint_canvas")
+        os.makedirs(os.path.join(folder, "taken.png"))
+        q = "filename=taken.png&subfolder=inpaint_canvas&type=input"
+        status, data = self.upload(q + "&overwrite=true")   # a folder of that name: os.replace would fail
+        self.assertEqual(status, 400, data)
+        self.assertEqual(self.parts(), [])
+        status, data = self.upload(q + "&overwrite=false")  # renamed past the folder, as before
+        self.assertEqual((status, data["name"]), (200, "taken (1).png"))
+        status, data = self.upload("filename=a.png&subfolder=inpaint_canvas%2Fphoto.png&type=input")
+        self.assertEqual(status, 400, data)                  # the subfolder is a file
+        status, data = self.upload("filename=empty.png&subfolder=inpaint_canvas&type=input", b"")
+        self.assertEqual(status, 400, data)
+        self.assertEqual(self.parts(), [])
+        with mock.patch.object(nodes, "UPLOAD_MAX_BYTES", 4):
+            status, data = self.upload("filename=big.png&subfolder=inpaint_canvas&type=input")
+        self.assertEqual(status, 413, data)
+        self.assertEqual(self.parts(), [])
+        with mock.patch.object(nodes.os, "replace", side_effect=OSError("disk full")):
+            status, data = self.upload("filename=fail.png&subfolder=inpaint_canvas&type=input&overwrite=true")
+        self.assertEqual((status, data), (500, {"error": "disk full"}))
+        self.assertEqual(self.parts(), [])
+        status, data = self.upload("filename=same.png&subfolder=inpaint_canvas&type=input")
+        self.assertEqual((status, data["name"]), (200, "same.png"))
+        status, data = self.upload("filename=same.png&subfolder=inpaint_canvas&type=input&overwrite=false")
+        self.assertEqual((status, data["name"]), (200, "same.png"))   # same bytes: the existing file is kept
+        self.assertEqual(self.parts(), [])
+        names = [os.path.basename(f) for f in self.all_files()]
+        for name in ("big.png", "fail.png", "empty.png", "a.png"):
+            self.assertNotIn(name, names)
 
     def test_upload_double_encoded_stays_inside(self):
         # aiohttp decodes once: "%252e%252e" arrives as the literal folder name "%2e%2e", inside input/

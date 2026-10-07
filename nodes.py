@@ -65,7 +65,13 @@ def _dir_for_type(kind):
 # id and purpose that become part of a file name) stays inside ComfyUI's input, output or temp folder:
 # NUL bytes, absolute and drive-prefixed paths and ".." segments are refused, and the final path is
 # resolved with realpath (symlinks and junctions followed) and must still lie inside the resolved base.
+# A name the file system would not store as given is refused too (_check_name): only dots or spaces,
+# and on Windows a trailing '.' or ' ' (dropped there, so "..." is the folder itself), <>"|?* or a
+# control character, or a device name.
 _UNSAFE_NAME_CHARS = re.compile(r"[^A-Za-z0-9._-]")
+_WIN_BAD_CHARS = frozenset('<>"|?*')
+_WIN_DEVICE_NAMES = frozenset({"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+                              | {p + c for p in ("COM", "LPT") for c in "0123456789" + chr(0xB9) + chr(0xB2) + chr(0xB3)})
 
 
 def _name_token(value, fallback="x"):
@@ -86,15 +92,36 @@ def _check_relative(part):
         raise ValueError(f"Inpaint Canvas: '..' is not allowed in a path: {part!r}")
 
 
+def _check_name(part, windows=os.name == "nt"):
+    """Refuse a client-given path part with a segment the file system would not store as given: only
+    dots or spaces ("...", " "; "." stays the folder itself), and on Windows a segment that ends in
+    '.' or ' ' (Windows drops them: "..." is the folder, "a.png." is "a.png"), holds one of <>"|?* or
+    a control character, or is a device name (CON, PRN, AUX, NUL, COM0-9, LPT0-9, also "nul.png")."""
+    for seg in part.replace("\\", "/").split("/"):
+        if seg in ("", "."):
+            continue
+        if not seg.strip(". "):
+            raise ValueError(f"Inpaint Canvas: a name of only dots or spaces is not allowed: {part!r}")
+        if not windows:
+            continue
+        if seg[-1] in ". ":
+            raise ValueError(f"Inpaint Canvas: a name ending in '.' or ' ' is not allowed: {part!r}")
+        if any(c in _WIN_BAD_CHARS or ord(c) < 32 for c in seg):
+            raise ValueError(f"Inpaint Canvas: a name with one of <>\"|?* or a control character is not allowed: {part!r}")
+        if seg.partition(".")[0].rstrip(" ").upper() in _WIN_DEVICE_NAMES:
+            raise ValueError(f"Inpaint Canvas: a device name is not allowed: {part!r}")
+
+
 def _inside(base, *parts):
     """Join client-given ``parts`` below ``base`` and return the resolved path. Raises ValueError
-    for an unsafe part (see _check_relative) or when the resolved path is not inside the resolved
-    ``base``, e.g. through a symlink or a junction that points elsewhere."""
+    for an unsafe part (see _check_relative and _check_name) or when the resolved path is not inside
+    the resolved ``base``, e.g. through a symlink or a junction that points elsewhere."""
     root = os.path.realpath(base)
     clean = []
     for part in parts:
         part = "" if part is None else str(part)
         _check_relative(part)
+        _check_name(part)
         clean.append(part)
     path = os.path.realpath(os.path.join(root, *clean))
     try:
@@ -1130,58 +1157,65 @@ def _register_routes():
         sub = os.path.normpath(raw_sub).strip()
         if sub in (".", ""):
             sub = ""
+
+        def reason(err):
+            return str(err).replace("Inpaint Canvas: ", "", 1)
+
         try:
             _check_relative(raw_sub)   # ".." is refused before normpath could fold it away
             folder = _inside(_dir_for_type(kind), sub)
-        except ValueError:
-            return web.json_response({"error": "subfolder outside of the ComfyUI directories"}, status=400)
+        except ValueError as err:
+            return web.json_response({"error": f"invalid subfolder: {reason(err)}"}, status=400)
         try:
             _inside(folder, filename)
-        except ValueError:
-            return web.json_response({"error": "invalid filename"}, status=400)
-        os.makedirs(folder, exist_ok=True)
+        except ValueError as err:
+            return web.json_response({"error": f"invalid filename: {reason(err)}"}, status=400)
+        if os.path.lexists(folder) and not os.path.isdir(folder):
+            return web.json_response({"error": "invalid subfolder: a file of that name exists"}, status=400)
         overwrite = str(q.get("overwrite") or "").lower() in ("1", "true")
-        tmp = os.path.join(folder, f".upload_{int(time.time() * 1000)}_{os.getpid()}.part")
+        stem, ext = os.path.splitext(filename)
+        path = os.path.join(folder, filename)
+        if overwrite and os.path.isdir(path):
+            return web.json_response({"error": "invalid filename: a folder of that name exists"}, status=400)
+        # the random part keeps two uploads of the same millisecond apart; the finally removes the
+        # .part file on every way out (refused, too large, empty, failed, or already renamed)
+        tmp = os.path.join(folder, f".upload_{int(time.time() * 1000)}_{os.getpid()}_{os.urandom(4).hex()}.part")
         size = 0
         h = hashlib.md5()
         try:
+            os.makedirs(folder, exist_ok=True)
             with open(tmp, "wb") as f:
                 async for chunk in request.content.iter_chunked(1 << 20):
                     size += len(chunk)
                     if size > UPLOAD_MAX_BYTES:
-                        raise web.HTTPRequestEntityTooLarge(max_size=UPLOAD_MAX_BYTES, actual_size=size)
+                        return web.json_response({"error": f"file larger than {UPLOAD_MAX_BYTES // 1024 ** 3} GB"}, status=413)
                     h.update(chunk)
                     f.write(chunk)
-        except web.HTTPRequestEntityTooLarge:
-            try: os.remove(tmp)
-            except OSError: pass
-            return web.json_response({"error": f"file larger than {UPLOAD_MAX_BYTES // 1024 ** 3} GB"}, status=413)
+            if size == 0:
+                return web.json_response({"error": "empty body"}, status=400)
+            if not overwrite:
+                i = 1
+                while os.path.exists(path):
+                    # same bytes under the same name: keep the existing file (ComfyUI does the same)
+                    try:
+                        with open(path, "rb") as f:
+                            same = hashlib.md5(f.read()).digest() == h.digest()
+                    except OSError:
+                        same = False
+                    if same:
+                        return web.json_response({"name": os.path.basename(path), "subfolder": sub, "type": kind, "size": size})
+                    filename = f"{stem} ({i}){ext}"
+                    path = os.path.join(folder, filename)
+                    i += 1
+            os.replace(tmp, path)
+            return web.json_response({"name": filename, "subfolder": sub, "type": kind, "size": size})
         except Exception as e:
-            try: os.remove(tmp)
-            except OSError: pass
             return web.json_response({"error": str(e)}, status=500)
-        if size == 0:
-            os.remove(tmp)
-            return web.json_response({"error": "empty body"}, status=400)
-        stem, ext = os.path.splitext(filename)
-        path = os.path.join(folder, filename)
-        if not overwrite:
-            i = 1
-            while os.path.exists(path):
-                # same bytes under the same name: keep the existing file (ComfyUI does the same)
-                try:
-                    with open(path, "rb") as f:
-                        same = hashlib.md5(f.read()).digest() == h.digest()
-                except OSError:
-                    same = False
-                if same:
-                    os.remove(tmp)
-                    return web.json_response({"name": os.path.basename(path), "subfolder": sub, "type": kind, "size": size})
-                filename = f"{stem} ({i}){ext}"
-                path = os.path.join(folder, filename)
-                i += 1
-        os.replace(tmp, path)
-        return web.json_response({"name": filename, "subfolder": sub, "type": kind, "size": size})
+        finally:
+            try:
+                os.remove(tmp)   # gone already after the os.replace
+            except OSError:
+                pass
 
     # ---- command bridge for the MCP server (mcp/inpaint_canvas_mcp.py) -----------------
     # A command is pushed to the browser over ComfyUI's own websocket as the event
