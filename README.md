@@ -73,12 +73,13 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/DenRakEiw/ComfyUI-InpaintCanvas
 ```
 
-Restart ComfyUI. To update later, run `git pull` in that folder and restart.
+Restart ComfyUI. The node itself has no extra Python dependencies beyond what
+ComfyUI ships (OpenCV is used for the *border* fill when available). To update
+later, run `git pull` in that folder and restart.
 
-The package on the Comfy Registry (what the Manager and `comfy node install`
-fetch) holds the node and the editor only; the MCP server (`mcp/`), the tests
-and the development notes are in the git repository. The node itself has no extra Python dependencies beyond what
-ComfyUI ships (OpenCV is used for the *border* fill when available).
+The package on the Comfy Registry (what `comfy node install` and a versioned
+install from the Manager fetch) holds the node and the editor only; the MCP
+server (`mcp/`), the tests and the development notes are in the git repository.
 
 Optional node packs, each enabling one editor feature:
 
@@ -642,8 +643,8 @@ colour match, add filters and text and export, all in the editor that is open in
 browser tab, step by step and undoable. Setup, the tool list and how it works are in
 [mcp/README.md](mcp/README.md). It needs `pip install mcp` in the Python that runs the
 server and only answers requests from localhost. The server is part of the git
-repository, not of the registry package: with a Manager install, take the `mcp`
-folder from a git clone.
+repository, not of the registry package: after a registry install, take the
+`mcp` folder from a git clone.
 
 ## Node reference
 
