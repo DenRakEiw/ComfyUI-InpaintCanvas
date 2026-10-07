@@ -1,6 +1,6 @@
 # ComfyUI-InpaintCanvas
 
-Krita-style inpainting without leaving ComfyUI. One node holds the image, the
+Inpainting with layers, without leaving ComfyUI. One node holds the image, the
 layers, the selection and the prompt. The selected region goes out as a crop,
 any inpaint chain works on it, and the result is wired straight back into the
 same node, where it lands as a new layer. Select the next spot, generate again.
@@ -48,7 +48,7 @@ Highlights
   default, or fill, add, remove, outpaint descriptions.
 - **View**: rulers with guides, grid, before / after, side-by-side compare of
   two results, rotate the view, 100 % zoom; a tool column with grouped tools
-  and flyouts like Photoshop.
+  and flyouts.
 - **Export**: PNG with the workflow embedded, JPEG, WebP, and layered
   **PSD** or **ORA** (Krita / GIMP), plus the active layer or the selection
   mask as PNG; cleanup of the node's working files from inside the editor.
@@ -159,15 +159,14 @@ empty, so the node shows "No image" until you load one.
 
 ### Selecting
 
-The selection is shown as a marching-ants outline like in Krita and
-Photoshop; the dashed-square button in the toolbar switches to a red tint
+The selection is shown as a marching-ants outline; the dashed-square button in the toolbar switches to a red tint
 (useful to see a soft or grown selection as an area). The blue dashed
 rectangle is the crop that leaves the node, not the selection.
 
-Rectangle and lasso replace the selection like in Krita and Photoshop; hold
+Rectangle and lasso replace the selection; hold
 Shift to add, Alt to subtract. The brush adds, with Alt it subtracts.
 
-The tool column on the left groups related tools Photoshop-style: a button
+The tool column on the left groups related tools: a button
 shows the group's current tool and a small triangle. Left-click picks that
 tool; right-click, holding the button or clicking the triangle opens the
 group (selection brushes, marquees, smart selection, brushes, retouch,
@@ -193,8 +192,7 @@ it from a layer, and **saves** selections with the workflow to load them again
 later (Shift+click adds, Alt+click subtracts). `[` and `]` change the brush size, the top bar holds
 size, hardness, opacity and the paint colour.
 
-- **Close loops** (toggle under the selection tools) works like Photoshop's
-  Selection Brush: end a stroke where it started and the inside is filled as
+- **Close loops** (toggle under the selection tools): end a stroke where it started and the inside is filled as
   well. A small gap is bridged with a straight line, a loop against the image
   border counts, and the deselect brush cuts loops out the same way.
 - **Object selection (O)**: on first use SAM2 finds every object in the image
@@ -220,7 +218,7 @@ size, hardness, opacity and the paint colour.
 - **Grow / Shrink** by n pixels (exact distance transform), **From layer**
   takes the opaque area of the active layer. Clear the selection (Ctrl+D),
   invert it (Ctrl+I). **Clear** (Del) deletes the selected pixels of the
-  active layer, like Krita: select what you want to keep, invert, Del.
+  active layer: select what you want to keep, invert, Del.
   Without a selection, Del deletes the active layer. **Ctrl+C** copies the
   selected pixels of the active layer (Ctrl+Shift+C from everything
   visible), **Ctrl+X** cuts them, **Ctrl+V** pastes them as a new layer at
@@ -233,9 +231,8 @@ size, hardness, opacity and the paint colour.
   paint layer automatically, the base itself is never erased. Fill the
   selection with the colour (Shift+F). Soft brushes stamp radial dabs, opacity
   applies per stroke. With a selection present, brush and eraser only touch
-  the selected area, like in Krita and Photoshop; clear the selection
-  (Ctrl+D) to paint freely. The eraser has its own hardness, soft by default like
-  Krita's Eraser Soft; the Hardness slider always shows and edits the active
+  the selected area; clear the selection
+  (Ctrl+D) to paint freely. The eraser has its own hardness, soft by default; the Hardness slider always shows and edits the active
   tool's value, both are remembered. Shift+click draws a straight line from
   where the last stroke on that layer ended; a pen's pressure scales the
   brush size.
@@ -257,7 +254,7 @@ size, hardness, opacity and the paint colour.
 - **Transform (T)** has four modes in the bar above the canvas. *Scale*: drag
   inside to move, corners scale proportionally (Shift for free aspect), edge
   handles scale one axis, arrow keys nudge (Shift: 10 px). Drag just outside
-  a corner to rotate, as in Krita and Photoshop (Shift snaps to 15°); while
+  a corner to rotate (Shift snaps to 15°); while
   the rotation is pending the handles still scale and the inside still moves,
   Enter bakes it. *Rotate* does the same from the bar with an angle field.
   *Distort*: drag the four corners (perspective). *Warp*: bend the layer with
@@ -325,8 +322,7 @@ size, hardness, opacity and the paint colour.
   with the image's border colour, *crop* to cover, or *stretch*. Not for
   chains that VAE-encode `crop_image`, they would encode the references too.
 - **Filter layers**: see the section below.
-- **Layer masks and cutouts** (Krita's transparency masks, LayerForge's
-  background removal): every layer row has a mask row. *Cutout* runs one of
+- **Layer masks and cutouts**: every layer row has a mask row. *Cutout* runs one of
   the installed background removal nodes on the layer (comfyui-rmbg's
   RMBG-2.0, BiRefNet or BEN2, or BRIA RMBG 1.4; the model select shows up on
   the active layer) and turns the result into a transparency mask, so a
@@ -378,16 +374,16 @@ cutout are not available on them (mask editing is).
   channel, Shift+Reset all four.
 - **Brightness / Contrast**: brightness lifts or lowers with the ends
   protected (white stays white, black stays black); contrast pivots around
-  mid grey like Photoshop's legacy control (+100 is nearly a threshold,
+  mid grey, the classic control (+100 is nearly a threshold,
   −100 flat grey).
 - **Hue / Saturation**: hue rotation (±180°), saturation (−100 = grey,
-  +100 doubles) and lightness (blends towards white or black), like
-  Photoshop's Hue/Saturation in master mode.
+  +100 doubles) and lightness (blends towards white or black),
+  applied to all colours at once.
 - **Colour balance**: cyan–red, magenta–green and yellow–blue for shadows,
   midtones and highlights each, with *Preserve luminosity* (on by default)
   keeping the brightness where it was.
 - **Black & white**: channel weights for red, green and blue (30/59/11 by
-  default; only their ratio matters) like Photoshop's Black & White, plus a
+  default; only their ratio matters), plus a
   tint hue and strength for sepia and split-tone looks.
 - **Invert**: negative of the image below (no parameters).
 - **LUT**: load any 3D `.cube` with a strength slider; the LUT is stored
@@ -469,8 +465,7 @@ size that actually leaves the node, and four settings stored with the canvas:
   selection diagonal plus the feather plus 4 px) and never emits a crop
   smaller than 512 px on a side when the image allows it. Small fixes get a
   tight crop, large selections get room. *manual* uses the `padding` widget.
-- **Feather** *auto* derives the mask edge from the selection size the way
-  the Krita AI plugin does: feather 10 % of the diagonal (at least 32 px), a
+- **Feather** *auto* derives the mask edge from the selection size: feather 10 % of the diagonal (at least 32 px), a
   4 px hard grow plus half the feather, a blend of at most 25 px for the
   composite. `crop_mask` is then the grown and feathered mask, and the stitch
   keeps the result fully opaque inside your selection with a soft transition
@@ -617,8 +612,8 @@ editor step, not the workflow.
 ### View
 
 Zoom with the wheel, pan with Space, the middle mouse or H; F fits, 1 shows
-100 % (one image pixel per screen pixel), 4 / 6 rotate the view by 15° like
-Krita and 5 resets it. The view buttons in the top bar
+100 % (one image pixel per screen pixel), 4 / 6 rotate the view by 15° and 5
+resets it. The view buttons in the top bar
 toggle **rulers** (Ctrl+Shift+R; drag a guide out of a ruler, drag it back
 to remove it, double-click a ruler clears them, layers snap to guides), the
 **grid** (Ctrl+Shift+G, 64 px) and **before / after** (hold \ or click:
