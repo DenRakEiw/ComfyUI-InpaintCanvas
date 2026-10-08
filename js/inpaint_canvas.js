@@ -3098,7 +3098,6 @@ class InpaintEditor {
         // (Shift+J reaches Patch through Remove, whose model line would stay otherwise)
         if (tool === "patch") this.setStatus("Lasso the spot (or select it), then drag the selection to where the picture is right; Mode Destination copies it there instead.");
         if (tool !== "object") { this.hoverObjectId = 0; this.hoverObjectCanvas = null; }
-        else this.ensureObjects();
         if (tool === "remove" && prevTool !== "remove") this.warmRemove();
         if (tool === "liquify" && prevTool !== "liquify") this.setStatus("Liquify: push, grow, shrink or swirl the active layer with the brush; Restore brings it back. Every stroke is one undo step.");
         // Move fills the old place with LaMa: loaded while the user aims, as for Remove (Extend needs no model)
@@ -5769,11 +5768,6 @@ class InpaintEditor {
             if (this.tool === "object") this.updateObjectHover(ix, iy);
             this.drawSoon();
             return;
-        }
-        if (p.kind === "object") {
-            const [cx, cy] = this.toCanvasPx(e);
-            if (Math.hypot(cx - p.start[0], cy - p.start[1]) > 4) p.moved = true;
-            this.updateObjectHover(ix, iy);
         }
         if (p.kind === "pan") {
             const [cx, cy] = this.toCanvasPx(e);
