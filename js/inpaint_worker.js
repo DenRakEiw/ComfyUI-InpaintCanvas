@@ -975,6 +975,100 @@ export function rangeSelectJob(msg) {
                 }
             }
         }
+    } else if (source === "logit") {
+        const logits = msg.logits instanceof Float32Array ? msg.logits : new Float32Array(msg.logits.data || msg.logits);
+        const n = msg.n || 256;
+        const m = msg.m || [n / W, 0, 0, n / H, -0.5, -0.5];
+
+        let clipBuf = null;
+        if (msg.clip) {
+            clipBuf = new Uint8Array(W * (y1 - y0));
+            storeRows(msg.clip, 0, W, y0, y1 - y0, clipBuf, true);
+        }
+
+        const tileCols = Math.ceil(W / TILE);
+        const startTileY = Math.floor(y0 / TILE);
+        const endTileY = Math.ceil(y1 / TILE);
+
+        const startTileX = msg.box ? Math.max(0, Math.floor(msg.box[0] / TILE)) : 0;
+        const endTileX = msg.box ? Math.min(tileCols, Math.ceil(msg.box[2] / TILE)) : tileCols;
+
+        for (let ty = startTileY; ty < endTileY; ty++) {
+            const tileY0 = ty * TILE;
+            const tileY1 = Math.min(tileY0 + TILE, H);
+            for (let tx = startTileX; tx < endTileX; tx++) {
+                const tileX0 = tx * TILE;
+                const tileX1 = Math.min(tileX0 + TILE, W);
+
+                const alpha = new Uint8Array(TILE * TILE);
+                let zeros = 0, fulls = 0;
+                let tMinX = TILE, tMinY = TILE, tMaxX = -1, tMaxY = -1;
+
+                for (let py = 0; py < TILE; py++) {
+                    const y = tileY0 + py;
+                    if (y < y0 || y >= y1 || y >= H) {
+                        zeros += TILE;
+                        continue;
+                    }
+                    const pyOffset = py * TILE;
+                    const clipRowOffset = (y - y0) * W;
+                    const pyCentre = y + 0.5;
+
+                    for (let px = 0; px < TILE; px++) {
+                        const x = tileX0 + px;
+                        if (x >= W) {
+                            zeros++;
+                            continue;
+                        }
+                        const pxCentre = x + 0.5;
+                        const mx = m[0] * pxCentre + m[2] * pyCentre + m[4];
+                        const my = m[1] * pxCentre + m[3] * pyCentre + m[5];
+                        const fx = Math.min(n - 1, Math.max(0, mx));
+                        const fy = Math.min(n - 1, Math.max(0, my));
+                        const ix = Math.floor(fx), txFrac = fx - ix, ix1 = Math.min(n - 1, ix + 1);
+                        const iy = Math.floor(fy), tyFrac = fy - iy, iy1 = Math.min(n - 1, iy + 1);
+                        const r0 = iy * n, r1 = iy1 * n;
+                        const v = (logits[r0 + ix] * (1 - txFrac) + logits[r0 + ix1] * txFrac) * (1 - tyFrac)
+                                + (logits[r1 + ix] * (1 - txFrac) + logits[r1 + ix1] * txFrac) * tyFrac;
+
+                        let a = v > 0 ? (invert ? 0 : 255) : (invert ? 255 : 0);
+                        if (clipBuf && a > 0) {
+                            if (!clipBuf[clipRowOffset + x]) a = 0;
+                        }
+
+                        alpha[pyOffset + px] = a;
+                        alphaSum += a;
+                        if (a === 0) {
+                            zeros++;
+                        } else {
+                            if (a === 255) fulls++;
+                            if (px < tMinX) tMinX = px;
+                            if (px > tMaxX) tMaxX = px;
+                            if (py < tMinY) tMinY = py;
+                            if (py > tMaxY) tMaxY = py;
+                        }
+                    }
+                }
+
+                if (zeros === TILE * TILE) {
+                    continue;
+                }
+                if (fulls === TILE * TILE && (tileX1 - tileX0) === TILE && (tileY1 - tileY0) === TILE) {
+                    tiles.push({ tx, ty, full: true });
+                    bX0 = Math.min(bX0, tileX0);
+                    bY0 = Math.min(bY0, tileY0);
+                    bX1 = Math.max(bX1, tileX0 + TILE);
+                    bY1 = Math.max(bY1, tileY0 + TILE);
+                } else {
+                    tiles.push({ tx, ty, alpha: alpha.buffer });
+                    transfer.push(alpha.buffer);
+                    bX0 = Math.min(bX0, tileX0 + tMinX);
+                    bY0 = Math.min(bY0, tileY0 + tMinY);
+                    bX1 = Math.max(bX1, tileX0 + tMaxX + 1);
+                    bY1 = Math.max(bY1, tileY0 + tMaxY + 1);
+                }
+            }
+        }
     } else {
         throw new Error(`unknown source "${source}"`);
     }

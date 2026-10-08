@@ -156,6 +156,7 @@ export const host = {
     objectsInApp() { return false; },
     async findObjects() {},
     async selectPoint() {},
+    async selectBox() {},
     upsampleBackends() { return []; },
     async upsampleInApp() { throw new Error("in-app language models are a Scumble feature"); },
     async askLLM() { throw new Error("in-app language models are a Scumble feature"); },

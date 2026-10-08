@@ -250,14 +250,14 @@ function buildTools(ed, body) {
         { icon: "loop", label: "Close loops", title: "Close loops: end a brush stroke where it started and the inside is filled too. Also for the subtract brush.", toggle: () => ed.fillEnclosed, onClick: () => { ed.fillEnclosed = !ed.fillEnclosed; ed.setStatus(ed.fillEnclosed ? "Close loops on: end a stroke where it started to fill the inside." : "Close loops off."); } },
     ]);
     addGroup([
-        { tool: "rect", label: "Rectangle", key: "R", title: "Rectangle selection (R): replaces the selection, Shift adds, Alt subtracts, Ctrl keeps it square. Drag inside an existing selection to move its outline." },
-        { tool: "ellipse", label: "Ellipse", key: "Shift+R", title: "Ellipse selection (Shift+R): replaces the selection, Shift adds, Alt subtracts, Ctrl keeps it a circle. Drag inside an existing selection to move its outline." },
-        { tool: "lasso", label: "Lasso", key: "L", title: "Lasso selection (L): replaces the selection, Shift adds, Alt subtracts" },
-        { tool: "polygon", label: "Polygon", key: "Shift+L", title: "Polygon selection (Shift+L): click point by point, click the first point, double-click or Enter to close, Backspace removes the last point, Esc cancels. Replaces the selection, Shift adds, Alt subtracts." },
+        { tool: "rect", label: "Rectangle", key: "R", title: "Rectangle selection (R): replaces the selection, Shift adds, Alt subtracts, Shift+Alt intersects, Ctrl keeps it square. Drag inside an existing selection to move its outline." },
+        { tool: "ellipse", label: "Ellipse", key: "Shift+R", title: "Ellipse selection (Shift+R): replaces the selection, Shift adds, Alt subtracts, Shift+Alt intersects, Ctrl keeps it a circle. Drag inside an existing selection to move its outline." },
+        { tool: "lasso", label: "Lasso", key: "L", title: "Lasso selection (L): replaces the selection, Shift adds, Alt subtracts, Shift+Alt intersects" },
+        { tool: "polygon", label: "Polygon", key: "Shift+L", title: "Polygon selection (Shift+L): click point by point, click the first point, double-click or Enter to close, Backspace removes the last point, Esc cancels. Replaces the selection, Shift adds, Alt subtracts, Shift+Alt intersects." },
     ]);
     addGroup([
-        { tool: "object", label: "Object", key: "O", title: "Object selection (O): hover to see objects, click to select, click again to deselect. Shift adds, Alt subtracts." },
-        { tool: "wand", label: "Magic wand", key: "W", title: "Magic wand (W): selects the area of similar colour under the cursor. Tolerance, contiguous and the sample source are in the bar above the canvas. Shift adds, Alt subtracts." },
+        { tool: "object", label: "Object", key: "O", title: "Object selection (O): hover to see objects, click to select, click again to deselect. Shift adds, Alt subtracts, Shift+Alt intersects." },
+        { tool: "wand", label: "Magic wand", key: "W", title: "Magic wand (W): selects the area of similar colour under the cursor. Tolerance, contiguous and the sample source are in the bar above the canvas. Shift adds, Alt subtracts, Shift+Alt intersects." },
     ]);
     ed.quickMaskBtn = iconButton("quickmask", "Quick mask (Q): while on, the paint and erase tools edit the selection (paint selects, erase deselects, the bucket works like the wand) and the selection is shown as a red tint.", () => ed.toggleQuickMask());
     tools.appendChild(ed.quickMaskBtn);

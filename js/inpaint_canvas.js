@@ -19,7 +19,7 @@ import { isGLSurface, glChainUsable, beginScope, endScope, releaseSurface, surfa
 import { TEXT_DEFAULTS, FONT_CATEGORIES, loadFontList, fontList, addUserFont, renderText, textAngle, textFrame, fontCss } from "./inpaint_text.js";
 import { readAbr, tipCanvas } from "./inpaint_brushes.js";
 import { setKernels, kernelsMode, OPS, deflate, smudgeDab as smudgeDabKernel, SMUDGE_ALPHA_LOCK, SMUDGE_PICKUP, compositeTile, poissonBlend as poissonBlendKernel, distTransform } from "./px/kernels.js";
-import { floodMask, maskToColorCanvas, clipMaskToSelection, rgbToHex, hexToRgb, growMask, invertMask, maskBounds, selModeOf, selectionGco, tilesSource, bytesSource } from "./inpaint_raster.js";
+import { floodMask, maskToColorCanvas, clipMaskToSelection, rgbToHex, hexToRgb, growMask, invertMask, maskBounds, selModeOf, selectionGco, tilesSource, bytesSource, rectSource } from "./inpaint_raster.js";
 import { GLCompositor } from "./inpaint_compositor.js";
 import { LayerPixels, MaskPixels, canvasOf, displayCanvasIfMade, installLayerAliases, deprecatedPixels, pixelsOptions, BLIT_MARGIN, resetContext } from "./inpaint_pixels.js";
 import { INTERACTIVE, EXPORT } from "./inpaint_pool.js";
@@ -2547,7 +2547,7 @@ class InpaintEditor {
             freehand: "Draw with the cursor held down",
         };
         if (tool === "canvas") this.syncFrameControls();
-        const hints = { canvas: "Edges crop or extend, outside turns, Ctrl+drag straightens; Enter or a double click applies, Esc resets", shape: shapeHints[this.shapeOpts.kind] || "", select: "Paint to select, Alt subtracts", deselect: "Paint to deselect", paint: "Alt+click picks a colour, Shift+click draws a line", erase: "Shift+click draws a line", wand: "Click to select the similar area; Shift adds, Alt subtracts", bucket: "Click to fill; Shift+F fills the whole selection", gradient: "Drag from the colour to where it should have faded", eyedropper: "Click to pick a colour", smudge: this.smudgeOpts && this.smudgeOpts.mode === "blur" ? "Paint over what should soften" : this.smudgeOpts && this.smudgeOpts.mode === "sharpen" ? "Paint over what should crisp up; a little goes a long way" : "Drag across an edge to soften it", tone: this.toneHint(), remove: "Brush over what should go: it is filled from its surroundings when you let go", patch: this.patchOpts.mode === "destination" ? "Lasso what to copy, then drag the selection to where the copy should go" : "Lasso the spot, then drag the selection to where the picture is right", contentmove: this.moveOpts.mode === "extend" ? "Lasso what to copy, then drag it: the copy blends in where you let go" : "Lasso the object, then drag it: it blends in where you let go, and its old place is filled", liquify: this.liquifyHint(), clone: this.cloneSource ? "Paint to copy from the source (Alt+click moves it)" : "Alt+click sets the source point", heal: this.cloneSource ? "Paint to repair with the source's texture (Alt+click moves it)" : "Alt+click sets the source point" };
+        const hints = { canvas: "Edges crop or extend, outside turns, Ctrl+drag straightens; Enter or a double click applies, Esc resets", shape: shapeHints[this.shapeOpts.kind] || "", select: "Paint to select, Alt subtracts", deselect: "Paint to deselect", paint: "Alt+click picks a colour, Shift+click draws a line", erase: "Shift+click draws a line", wand: "Click to select the similar area; Shift adds, Alt subtracts, Shift+Alt intersects", bucket: "Click to fill; Shift+F fills the whole selection", gradient: "Drag from the colour to where it should have faded", eyedropper: "Click to pick a colour", smudge: this.smudgeOpts && this.smudgeOpts.mode === "blur" ? "Paint over what should soften" : this.smudgeOpts && this.smudgeOpts.mode === "sharpen" ? "Paint over what should crisp up; a little goes a long way" : "Drag across an edge to soften it", tone: this.toneHint(), remove: "Brush over what should go: it is filled from its surroundings when you let go", patch: this.patchOpts.mode === "destination" ? "Lasso what to copy, then drag the selection to where the copy should go" : "Lasso the spot, then drag the selection to where the picture is right", contentmove: this.moveOpts.mode === "extend" ? "Lasso what to copy, then drag it: the copy blends in where you let go" : "Lasso the object, then drag it: it blends in where you let go, and its old place is filled", liquify: this.liquifyHint(), clone: this.cloneSource ? "Paint to copy from the source (Alt+click moves it)" : "Alt+click sets the source point", heal: this.cloneSource ? "Paint to repair with the source's texture (Alt+click moves it)" : "Alt+click sets the source point" };
         this.optsHint.textContent = hints[tool] || "";
     }
 
@@ -5550,7 +5550,7 @@ class InpaintEditor {
             this.draw();
             return;
         } else if (this.tool === "object") {
-            this.pointer = { kind: "object", start: [cx, cy], moved: false, shift: e.shiftKey, alt: e.altKey };
+            this.pointer = { kind: "object", start: [cx, cy], startImg: [ix, iy], curImg: [ix, iy], moved: false, mode: selModeOf(e, "add"), shift: e.shiftKey, alt: e.altKey };
         } else if (this.tool === "eyedropper" || (this.tool === "paint" && e.altKey)) {
             this.pickColor(ix, iy);
             return;
@@ -5825,6 +5825,12 @@ class InpaintEditor {
                 p.cur = [p.start[0] + Math.sign(dx || 1) * m, p.start[1] + Math.sign(dy || 1) * m];
             } else p.cur = [ix, iy];
             p.mode = selModeOf(e);
+        } else if (p.kind === "object") {
+            p.curImg = [ix, iy];
+            p.mode = selModeOf(e, "add");
+            const dx = Math.abs(ix - p.startImg[0]), dy = Math.abs(iy - p.startImg[1]);
+            if (dx >= 4 || dy >= 4) p.moved = true;
+            this.draw();
         } else if (p.kind === "selmove") {
             const mx = Math.round(ix - p.start[0]), my = Math.round(iy - p.start[1]);
             if (mx || my) p.moved = true;
@@ -6037,7 +6043,21 @@ class InpaintEditor {
             // lies within the dabs' box; that box is the new bounds (an add) or their superset (a subtract)
             this.markSelectionChanged(p.bounds ? this.boundsAfter(p.subtract ? "subtract" : "add", p.bounds) : undefined, p.bounds);
         } else if (p.kind === "object") {
-            if (!p.moved) this.toggleObjectAt(...this.toImage(e), p);
+            const cur = p.curImg || this.toImage(e);
+            const start = p.startImg || cur;
+            const dx = Math.abs(cur[0] - start[0]), dy = Math.abs(cur[1] - start[1]);
+            if (p.moved && dx >= 4 && dy >= 4) {
+                const box = [
+                    Math.max(0, Math.min(start[0], cur[0])),
+                    Math.max(0, Math.min(start[1], cur[1])),
+                    Math.min(this.width, Math.max(start[0], cur[0])),
+                    Math.min(this.height, Math.max(start[1], cur[1])),
+                ];
+                host.selectBox(this, box, { mode: p.mode || "add" });
+            } else {
+                this.toggleObjectAt(...this.toImage(e), p);
+            }
+            this.draw();
         } else if (p.kind === "layerpaint") {
             this.finishStroke(p);   // the stabiliser's rest of the string, before the box is taken
             // heal: the blend replaces the dabs' colours; a large stroke is blended in a worker and commits when it lands
@@ -6800,6 +6820,207 @@ class InpaintEditor {
         this.draw();
         this.setStatus("Selection by range cancelled");
         return true;
+    }
+
+    /**
+     * Banded combine of raw SAM2 logits into the selection (R1-S9).
+     * Evaluates logits bilinearly per tile in worker (or canvas loop), clips to layer alpha if given,
+     * and runs only over the box of positive logits plus one cell.
+     *
+     * @param {{ logits: Float32Array, n?: number, score?: number }} res
+     * @param {{ mode?: "replace" | "add" | "subtract" | "intersect", label?: string, layer?: any, box?: number[], point?: number[] }} [opts]
+     */
+    async selectLogits(res, { mode = "replace", label = "Object selection", layer = null, box = null, point = null } = {}) {
+        if (!res || !res.logits) throw new Error("selectLogits: missing logits in result");
+        const logits = res.logits instanceof Float32Array ? res.logits : new Float32Array(res.logits.data || res.logits);
+        const n = res.n || 256;
+        const W = this.width, H = this.height;
+
+        let minGx = n, maxGx = -1, minGy = n, maxGy = -1;
+        for (let gy = 0; gy < n; gy++) {
+            const r = gy * n;
+            for (let gx = 0; gx < n; gx++) {
+                if (logits[r + gx] > 0) {
+                    if (gx < minGx) minGx = gx;
+                    if (gx > maxGx) maxGx = gx;
+                    if (gy < minGy) minGy = gy;
+                    if (gy > maxGy) maxGy = gy;
+                }
+            }
+        }
+
+        if (maxGx < 0) {
+            const desc = box ? "in the box." : "at this spot. Use the brush or lasso here.";
+            this.setStatus("SAM2 found nothing " + desc);
+            return { bounds: this.getBounds(), score: res.score, tiles: 0 };
+        }
+
+        // Expand by 1 cell in grid
+        minGx = Math.max(0, minGx - 1);
+        maxGx = Math.min(n - 1, maxGx + 1);
+        minGy = Math.max(0, minGy - 1);
+        maxGy = Math.min(n - 1, maxGy + 1);
+
+        const imgX0 = Math.max(0, Math.floor((minGx * W) / n));
+        const imgX1 = Math.min(W, Math.ceil(((maxGx + 1) * W) / n));
+        const imgY0 = Math.max(0, Math.floor((minGy * H) / n));
+        const imgY1 = Math.min(H, Math.ceil(((maxGy + 1) * H) / n));
+        const boundsBox = [imgX0, imgY0, imgX1, imgY1];
+
+        const oldBounds = this.getBounds();
+        this.pushUndo({ kind: "selection", label });
+        if (mode === "replace") {
+            this.selectionLabel = "";
+            this.sel.clear();
+        }
+
+        if (mode === "intersect") {
+            this.sel.combine(rectSource(boundsBox), "intersect");
+        }
+
+        const jobInvert = (mode === "intersect");
+        const bandMode = (mode === "replace") ? "add" : ((mode === "intersect") ? "subtract" : mode);
+
+        let unionBounds = null;
+        let totalTiles = 0;
+        let totalAlpha = 0;
+
+        const startY = Math.floor(imgY0 / RANGE_BAND_ROWS) * RANGE_BAND_ROWS;
+        const endY = Math.min(H, Math.ceil(imgY1 / RANGE_BAND_ROWS) * RANGE_BAND_ROWS);
+
+        if (this.tileMode && !editorPool().off) {
+            const group = "select_logits_" + Date.now();
+            const bandPromises = [];
+            for (let y0 = startY; y0 < endY; y0 += RANGE_BAND_ROWS) {
+                const y1 = Math.min(y0 + RANGE_BAND_ROWS, H);
+                const clip = (layer && isTilePixels(layer.px)) ? storeArgs(layer.px, layer.x, layer.y, y0, y1) : null;
+                const msg = {
+                    op: "range_select",
+                    W, H, y0, y1,
+                    source: "logit",
+                    logits,
+                    n,
+                    box: boundsBox,
+                    invert: jobInvert,
+                    clip,
+                };
+                bandPromises.push(
+                    editorPool().run("range_select", msg, [], { priority: INTERACTIVE, group })
+                        .then((bRes) => ({ y0, y1, bRes }))
+                );
+            }
+
+            for (const p of bandPromises) {
+                const { y0, y1, bRes } = await p;
+                totalAlpha += bRes.alphaSum || 0;
+                if (bRes.tiles && bRes.tiles.length > 0) {
+                    totalTiles += bRes.tiles.length;
+                    const src = tilesSource(bRes.tiles, [0, 0], [0, y0, W, y1]);
+                    this.sel.combine(src, bandMode);
+                }
+                if (bRes.bounds) {
+                    if (!unionBounds) {
+                        unionBounds = [...bRes.bounds];
+                    } else {
+                        unionBounds[0] = Math.min(unionBounds[0], bRes.bounds[0]);
+                        unionBounds[1] = Math.min(unionBounds[1], bRes.bounds[1]);
+                        unionBounds[2] = Math.max(unionBounds[2], bRes.bounds[2]);
+                        unionBounds[3] = Math.max(unionBounds[3], bRes.bounds[3]);
+                    }
+                }
+            }
+        } else {
+            // Canvas backend (or pool worker off): main-thread loop over bands
+            const sx = n / W, sy = n / H;
+            const clip = layer ? this.layerAlpha(layer) : null;
+
+            for (let y0 = startY; y0 < endY; y0 += RANGE_BAND_ROWS) {
+                const y1 = Math.min(y0 + RANGE_BAND_ROWS, H);
+                const bh = y1 - y0;
+                const alpha = new Uint8Array(W * bh);
+
+                let bX0 = Infinity, bY0 = Infinity, bX1 = -Infinity, bY1 = -Infinity;
+                for (let py = 0; py < bh; py++) {
+                    const y = y0 + py;
+                    const pyOffset = py * W;
+                    const fy = Math.min(n - 1, Math.max(0, (y + 0.5) * sy - 0.5));
+                    const iy = Math.floor(fy), tyFrac = fy - iy, iy1 = Math.min(n - 1, iy + 1);
+                    const r0 = iy * n, r1 = iy1 * n;
+
+                    for (let x = imgX0; x < imgX1; x++) {
+                        const fx = Math.min(n - 1, Math.max(0, (x + 0.5) * sx - 0.5));
+                        const ix = Math.floor(fx), txFrac = fx - ix, ix1 = Math.min(n - 1, ix + 1);
+                        const v = (logits[r0 + ix] * (1 - txFrac) + logits[r0 + ix1] * txFrac) * (1 - tyFrac)
+                                + (logits[r1 + ix] * (1 - txFrac) + logits[r1 + ix1] * txFrac) * tyFrac;
+
+                        let a = v > 0 ? (jobInvert ? 0 : 255) : (jobInvert ? 255 : 0);
+                        if (clip && a > 0 && !clip[y * W + x]) a = 0;
+
+                        alpha[pyOffset + x] = a;
+                        totalAlpha += a;
+                        if (a > 0) {
+                            if (x < bX0) bX0 = x;
+                            if (x > bX1) bX1 = x;
+                            if (y < bY0) bY0 = y;
+                            if (y > bY1) bY1 = y;
+                        }
+                    }
+                }
+
+                if (Number.isFinite(bX0)) {
+                    const bandBounds = [bX0, bY0, bX1 + 1, bY1 + 1];
+                    if (!unionBounds) {
+                        unionBounds = [...bandBounds];
+                    } else {
+                        unionBounds[0] = Math.min(unionBounds[0], bandBounds[0]);
+                        unionBounds[1] = Math.min(unionBounds[1], bandBounds[1]);
+                        unionBounds[2] = Math.max(unionBounds[2], bandBounds[2]);
+                        unionBounds[3] = Math.max(unionBounds[3], bandBounds[3]);
+                    }
+                }
+
+                const src = bytesSource(alpha, 0, y0, W, bh);
+                this.sel.combine(src, bandMode);
+                totalTiles += Math.ceil(W / 256) * Math.ceil(bh / 256);
+            }
+        }
+
+        let hint;
+        if (mode === "replace") {
+            hint = unionBounds;
+        } else if (mode === "add") {
+            hint = oldBounds && unionBounds
+                ? [Math.min(oldBounds[0], unionBounds[0]), Math.min(oldBounds[1], unionBounds[1]),
+                   Math.max(oldBounds[2], unionBounds[2]), Math.max(oldBounds[3], unionBounds[3])]
+                : (oldBounds || unionBounds);
+        } else if (mode === "subtract") {
+            hint = oldBounds;
+        } else if (mode === "intersect") {
+            hint = oldBounds && unionBounds
+                ? [Math.max(oldBounds[0], unionBounds[0]), Math.max(oldBounds[1], unionBounds[1]),
+                   Math.min(oldBounds[2], unionBounds[2]), Math.min(oldBounds[3], unionBounds[3])]
+                : (unionBounds || oldBounds);
+        }
+
+        const touched = oldBounds && unionBounds
+            ? [Math.min(oldBounds[0], unionBounds[0]), Math.min(oldBounds[1], unionBounds[1]),
+               Math.max(oldBounds[2], unionBounds[2]), Math.max(oldBounds[3], unionBounds[3])]
+            : (oldBounds || unionBounds || [0, 0, W, H]);
+
+        this.markSelectionChanged(hint, touched);
+        this.draw();
+
+        const pct = Math.max(1, Math.round(100 * totalAlpha / (Math.max(1, W * H) * 255)));
+        const scoreStr = res.score != null ? res.score.toFixed(2) : "1.00";
+        const verb = (mode === "subtract") ? "Removed" : ((mode === "intersect") ? "Kept" : "Selected");
+        const desc = box ? "in the box" : "at this point";
+        this.setStatus(`${verb} what SAM2 sees ${desc} (${pct} % of the picture, score ${scoreStr})`);
+
+        return {
+            bounds: this.getBounds(),
+            score: res.score,
+            tiles: totalTiles,
+        };
     }
 
     /**
@@ -11527,7 +11748,7 @@ class InpaintEditor {
             this.objects = { hash: pending.hash, w, h, ids, count, layerId: pending.layer ? pending.layer.id : null };
             this.objectShapeCache.clear();
             this.hoverObjectId = 0; this.hoverObjectCanvas = null;
-            this.setStatus(`${count} objects found. Hover to preview, click to select, click again to deselect (Shift adds, Alt subtracts).`);
+            this.setStatus(`${count} objects found. Hover to preview, click to select, click again to deselect (Shift adds, Alt subtracts, Shift+Alt intersects).`);
             if (this.hover) this.updateObjectHover(this.hover[0], this.hover[1]);
             this.draw();
         }
@@ -19537,6 +19758,14 @@ class InpaintEditor {
                     ctx.strokeRect(p.start[0], p.start[1], p.cur[0] - p.start[0], p.cur[1] - p.start[1]);
                 }
             }, s);
+            ctx.restore();
+        }
+        if (p && p.kind === "object" && p.moved && p.startImg && p.curImg) {
+            ctx.save();
+            ctx.strokeStyle = "#4a90d9";
+            ctx.lineWidth = 1.5 / s;
+            ctx.setLineDash([6 / s, 4 / s]);
+            ctx.strokeRect(p.startImg[0], p.startImg[1], p.curImg[0] - p.startImg[0], p.curImg[1] - p.startImg[1]);
             ctx.restore();
         }
         if (this.lassoPoints && this.lassoPoints.length > 1) {
