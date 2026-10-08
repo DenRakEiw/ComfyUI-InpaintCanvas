@@ -11792,8 +11792,8 @@ class InpaintEditor {
 
     /** Click in the object tool: toggle the object under the cursor in the selection. */
     toggleObjectAt(ix, iy, p = {}) {
-        if (!this.objects) { this.ensureObjects(); return; }
-        const id = this.objectIdAt(ix, iy);
+        if (!this.objects && !host.objectsInApp()) { this.ensureObjects(); return; }
+        const id = this.objects ? this.objectIdAt(ix, iy) : 0;
         if (!id) { if (host.objectsInApp()) { host.selectPoint(this, ix, iy, p); return; } this.setStatus("No object here. Use the brush or lasso for this spot."); return; }
         const x = Math.floor(ix), y = Math.floor(iy);
         const already = this.sel.readRect(x, y, 1, 1).data[3] > 0;
