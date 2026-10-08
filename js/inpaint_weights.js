@@ -49,8 +49,8 @@ export function sstep(a, b, x) {
 export function rangeWeight(v, r) {
     const fLo = r.fLo || 0;
     const fHi = r.fHi || 0;
-    const wLo = fLo > 0 ? sstep(r.lo - fLo, r.lo, v) : (v >= r.lo ? 1 : 0);
-    const wHi = fHi > 0 ? (1 - sstep(r.hi, r.hi + fHi, v)) : (v <= r.hi ? 1 : 0);
+    const wLo = fLo > 0 ? sstep(r.lo - fLo, r.lo, v) : (v >= r.lo - 1e-12 ? 1 : 0);
+    const wHi = fHi > 0 ? (1 - sstep(r.hi, r.hi + fHi, v)) : (v <= r.hi + 1e-12 ? 1 : 0);
     const w = wLo * wHi;
     return r.invert ? 1 - w : w;
 }
@@ -267,8 +267,8 @@ float w_sstep(float a, float b, float x) {
 }
 
 float w_range(float v, vec4 r /* lo, hi, fLo, fHi */, bool inv) {
-    float wLo = r.z > 0.0 ? w_sstep(r.x - r.z, r.x, v) : (v >= r.x ? 1.0 : 0.0);
-    float wHi = r.w > 0.0 ? (1.0 - w_sstep(r.y, r.y + r.w, v)) : (v <= r.y ? 1.0 : 0.0);
+    float wLo = r.z > 0.0 ? w_sstep(r.x - r.z, r.x, v) : (v >= r.x - 1e-5 ? 1.0 : 0.0);
+    float wHi = r.w > 0.0 ? (1.0 - w_sstep(r.y, r.y + r.w, v)) : (v <= r.y + 1e-5 ? 1.0 : 0.0);
     float w = wLo * wHi;
     return inv ? 1.0 - w : w;
 }

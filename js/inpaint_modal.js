@@ -8,6 +8,7 @@ import { host } from "./host.js";
 import { el, iconButton, miniButton, selectInput, numberInput, hostText, REF_FITS, REF_DEFAULTS, UPSAMPLE_CASES, randomSeed, brushSizeToSlider, sliderToBrushSize } from "./inpaint_canvas.js";
 import { selModeOf } from "./inpaint_raster.js";
 import { PromptField, RefBar } from "./prompt_field.js";
+import { buildRangeBar } from "./inpaint_rangebar.js";
 
 /**
  * The whole dialog of one editor. The order is the one the method had, and the two joints it kept
@@ -31,7 +32,6 @@ export function buildEditorModal(ed) {
     buildReferences(ed);
     buildUndoHistory(ed, section);
     buildSelection(ed, section);
-    buildDepth(ed, section);
     buildCanvasPanel(ed, section);
     buildExport(ed, section);
     toGenPane();
@@ -600,6 +600,9 @@ function buildSelection(ed, section) {
         d.appendChild(sv);
         ed.renderSelectionList();
 
+        // select by range (Nik-9 Parity R1-S6)
+        buildRangeSelect(ed, d);
+
         // select by text
         const seg = el("div", "ipc-sec");
         const row = el("div", "ipc-seg");
@@ -649,13 +652,144 @@ function buildSelection(ed, section) {
     });
 }
 
-/** Depth map: compute / recompute, view toggle, staleness (Nik-9 Parity R1-S3b). */
-function buildDepth(ed, section) {
-    section("Depth", false, (d) => {
+/** Select by range (Nik-9 Parity R1-S6). */
+function buildRangeSelect(ed, d) {
+    const block = el("div", "ipc-sec");
+    ed.rangeBlock = block;
+
+    // Header: Depth row (Nik-9 Parity R1-S3b moved here; absent when host.depthSupported === false)
+    if (host.depthSupported !== false) {
         ed.depthContainer = el("div", "ipc-depth-container");
-        d.appendChild(ed.depthContainer);
+        block.appendChild(ed.depthContainer);
         ed.renderDepthRow();
+    } else {
+        ed.depthContainer = null;
+    }
+
+    if (!ed.rangeLimit) {
+        ed.rangeLimit = {
+            source: host.depthSupported !== false ? "depth" : "luma",
+            lo: 0,
+            hi: 0.3,
+            fLo: 0.05,
+            fHi: 0.05,
+            invert: false,
+            color: "#ffffff",
+            tol: 30,
+        };
+    }
+    if (host.depthSupported === false && ed.rangeLimit.source === "depth") {
+        ed.rangeLimit.source = "luma";
+    }
+    ed.rangeMode = ed.rangeMode || "replace";
+
+    // Source select row
+    const srcRow = el("div", "ipc-row");
+    const srcLab = el("label", null, "Source");
+    const sources = [];
+    if (host.depthSupported !== false) {
+        sources.push({ value: "depth", label: "Depth" });
+    }
+    sources.push({ value: "luma", label: "Luminosity" });
+    sources.push({ value: "color", label: "Colour" });
+    ed.rangeSourceSel = selectInput(sources, ed.rangeLimit.source, "Range source: Depth, Luminosity or Colour");
+    srcLab.appendChild(ed.rangeSourceSel);
+    srcRow.appendChild(srcLab);
+    block.appendChild(srcRow);
+
+    // Colour row: colour swatch and tolerance (visible when source === "color")
+    const colorRow = el("div", "ipc-row");
+    colorRow.style.display = ed.rangeLimit.source === "color" ? "" : "none";
+    const colorLab = el("label", null, "Colour");
+    ed.rangeColorInput = document.createElement("input");
+    ed.rangeColorInput.type = "color";
+    ed.rangeColorInput.value = ed.rangeLimit.color || "#ffffff";
+    ed.rangeColorInput.title = "Target colour";
+    ed.rangeColorInput.addEventListener("input", () => {
+        ed.rangeLimit.color = ed.rangeColorInput.value;
+        if (ed.rangeBar) ed.rangeBar.refresh();
     });
+    colorLab.appendChild(ed.rangeColorInput);
+    colorRow.appendChild(colorLab);
+
+    const tolLab = el("label", null, "Tolerance");
+    ed.rangeTolInput = numberInput(ed.rangeLimit.tol ?? 30, 0, 100, "Colour tolerance (0..100)", 48);
+    ed.rangeTolInput.addEventListener("input", () => {
+        ed.rangeLimit.tol = parseFloat(ed.rangeTolInput.value) || 0;
+        if (ed.rangeBar) ed.rangeBar.refresh();
+    });
+    tolLab.appendChild(ed.rangeTolInput);
+    colorRow.appendChild(tolLab);
+    block.appendChild(colorRow);
+
+    // Range bar container
+    const barWrap = el("div", "ipc-rangebar-container");
+    block.appendChild(barWrap);
+
+    const mountRangeBar = () => {
+        barWrap.innerHTML = "";
+        const source = ed.rangeLimit.source;
+        ed.rangeBar = buildRangeBar(ed.rangeLimit, {
+            gradient: source,
+            histogram: () => {
+                if (source === "depth") return ed.mapHistogram("depth");
+                if (source === "luma") {
+                    const h = ed.pictureHistogram();
+                    return h ? h.luma : null;
+                }
+                return ed.similarityHistogram(ed.rangeLimit);
+            },
+            begin: () => ed.setRangePreview(ed.rangeLimit),
+            preview: (r) => ed.setRangePreview({ ...ed.rangeLimit, ...r }),
+            commit: (r) => { ed.rangeLimit = { ...ed.rangeLimit, ...r }; },
+            stop: () => ed.setRangePreview(null),
+            pick: () => ed.pickOnce(source),
+            hover: (on) => ed.setRangePreview(on ? ed.rangeLimit : null),
+            title: "Range",
+            onEnter: () => ed.selectRange(ed.rangeLimit, ed.rangeMode),
+        });
+        barWrap.appendChild(ed.rangeBar.el);
+    };
+
+    mountRangeBar();
+
+    ed.rangeSourceSel.addEventListener("change", () => {
+        ed.rangeLimit.source = ed.rangeSourceSel.value;
+        colorRow.style.display = ed.rangeLimit.source === "color" ? "" : "none";
+        mountRangeBar();
+    });
+
+    // Mode buttons
+    const modes = el("div", "ipc-modes");
+    ed.rangeModeButtons = {};
+    for (const [id, label, title] of [
+        ["replace", "Replace", "Replace the selection"],
+        ["add", "Add", "Add to the selection"],
+        ["subtract", "Subtract", "Remove from the selection"],
+        ["intersect", "Intersect", "Intersect with the selection"],
+    ]) {
+        const b = el("button", "ipc-ib", label);
+        b.type = "button";
+        b.title = title;
+        b.addEventListener("click", (e) => {
+            e.stopPropagation();
+            ed.rangeMode = id;
+            for (const [k, x] of Object.entries(ed.rangeModeButtons)) x.classList.toggle("ipc-active", k === id);
+        });
+        ed.rangeModeButtons[id] = b;
+        modes.appendChild(b);
+    }
+    ed.rangeModeButtons[ed.rangeMode || "replace"].classList.add("ipc-active");
+    block.appendChild(modes);
+
+    // Select button row
+    const actRow = el("div", "ipc-row");
+    ed.rangeSelectBtn = iconButton("magic", "Select pixels matching the range", () => ed.selectRange(ed.rangeLimit, ed.rangeMode), "Select");
+    ed.rangeSelectBtn.classList.add("ipc-small", "ipc-primary");
+    actRow.appendChild(ed.rangeSelectBtn);
+    block.appendChild(actRow);
+
+    d.appendChild(block);
 }
 
 /** Canvas: size, extend, the frame and the local files. */

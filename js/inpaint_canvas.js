@@ -15,7 +15,7 @@
 
 import { api, host } from "./host.js";
 import { FILTERS, FILTER_IDS, filterDefaults, applyFilter, matchCanvas, lutFromCube, lutToCanvas, lutFromImage, plateStats, colourStats, fillPixels, hexRgb } from "./inpaint_filters.js";
-import { isGLSurface, glChainUsable, beginScope, endScope, releaseSurface, surfaceToCanvas, drawSurfaceTo, surfaceFromBytes, readSurfaceBytes, glMaxSide, glReleaseLargeSurfaces, runShader } from "./inpaint_filters_gl.js";
+import { isGLSurface, glChainUsable, beginScope, endScope, releaseSurface, surfaceToCanvas, drawSurfaceTo, surfaceFromBytes, readSurfaceBytes, glMaxSide, glReleaseLargeSurfaces, runShader, glToCanvas } from "./inpaint_filters_gl.js";
 import { TEXT_DEFAULTS, FONT_CATEGORIES, loadFontList, fontList, addUserFont, renderText, textAngle, textFrame, fontCss } from "./inpaint_text.js";
 import { readAbr, tipCanvas } from "./inpaint_brushes.js";
 import { setKernels, kernelsMode, OPS, deflate, smudgeDab as smudgeDabKernel, SMUDGE_ALPHA_LOCK, SMUDGE_PICKUP, compositeTile, poissonBlend as poissonBlendKernel, distTransform } from "./px/kernels.js";
@@ -42,9 +42,9 @@ import { removeCrop, toModelImage, toModelMask, fromModel } from "./inpaint_remo
 import { LiquifyField, gridStep, previewBlock, liquifyFalloff } from "./inpaint_liquify.js";
 import { labelMap, sameLabels, remap, mapOffset, namesFor, parse, normalize, compare, checkNote, referencesText, referencesRule } from "./reftokens.js";
 import { fitLayerRGBA, workScale } from "./edgefit.js";
-import { STALE_DIFF, GUIDE, RANGE_BAND_ROWS } from "./inpaint_depth.js";
-import { packRG16, mapToJSON, mapFromJSON, fingerprint, fingerprintDiff, passToMap } from "./inpaint_maps.js";
-import { normalizeLimit, u16Bilinear, rangeWeight } from "./inpaint_weights.js";
+import { STALE_DIFF, GUIDE, RANGE_BAND_ROWS, WORK_MAX, modelSize, workSize, disparityRange } from "./inpaint_depth.js";
+import { packRG16, mapToJSON, mapFromJSON, fingerprint, fingerprintDiff, passToMap, makeMap } from "./inpaint_maps.js";
+import { normalizeLimit, u16Bilinear, rangeWeight, opp, colourSimilarity, hexToRgb as hexToRgb01, WEIGHTS_GLSL } from "./inpaint_weights.js";
 
 /**
  * The pixel backend a new editor takes (docs/PLAN_BCE.md §C2 step b): the host's choice when it made
@@ -336,6 +336,26 @@ const LINEAR_LIGHT_CLIP_SHADER = {
     label: "linear light, clipped",
     uniforms: { u_layer: "sampler2D", u_clip: "sampler2D", u_opacity: "float" },
     code: LINEAR_LIGHT_SHADER.code.replace("float as = S.a * u_opacity,", "float as = S.a * u_opacity * texture(u_clip, uv).a,"),
+};
+
+/** Red range preview tint shader (R1-S6). */
+const RANGE_PREVIEW_SHADER = {
+    label: "range preview",
+    uniforms: {
+        u_source: "int",
+        u_range: "vec4",
+        u_invert: "bool",
+        u_ref: "vec3",
+        u_tol: "float",
+    },
+    code: `
+${WEIGHTS_GLSL}
+
+vec4 shade(vec4 color, vec2 uv) {
+    float w = w_limit(u_source, color.rgb, 0.0, u_range, u_invert, u_ref, u_tol);
+    return vec4(1.0, 0.0, 0.0, w * color.a);
+}
+`,
 };
 const ROLES = ["none", "reference", "scribble", "lineart", "depth", "pose", "canny", "other"];
 // Outputs after the setting slots (none at the moment). The backend would declare
@@ -777,7 +797,13 @@ function selectInput(options, value, title) {
     s.title = title;
     for (const o of options) {
         const opt = document.createElement("option");
-        opt.value = o; opt.textContent = o;
+        if (typeof o === "object" && o !== null) {
+            opt.value = o.value ?? o.id;
+            opt.textContent = o.label ?? o.title ?? opt.value;
+        } else {
+            opt.value = o;
+            opt.textContent = o;
+        }
         s.appendChild(opt);
     }
     s.value = value;
@@ -1974,6 +2000,20 @@ class InpaintEditor {
         this.showDepthMap = false;
         this.maps = {};
         this.mapsVersion = 0;
+        this.rangeLimit = {
+            source: host.depthSupported !== false ? "depth" : "luma",
+            lo: 0,
+            hi: 0.3,
+            fLo: 0.05,
+            fHi: 0.05,
+            invert: false,
+            color: "#ffffff",
+            tol: 30,
+        };
+        this.rangeMode = "replace";
+        this._rangeTint = null;
+        this.mapView = null;
+        this._pendingPick = null;
         this.geometrySeq = 0;
         let selDisplay = "ants";
         try { selDisplay = localStorage.getItem("ipc.selectionDisplay") || "ants"; } catch (_) { /* no storage */ }
@@ -2760,7 +2800,19 @@ class InpaintEditor {
                 if (this.promptField && this.promptField.popupOpen()) { e.stopImmediatePropagation(); e.preventDefault(); this.promptField.closePopups(); return; }
                 if (t === this.promptInput) return;
                 e.stopImmediatePropagation(); e.preventDefault();
-                if (this.pointer && this.pointer.kind === "patchdrag") { const p = this.pointer; this.pointer = null; this.patchDone(p); this.draw(); this.setStatus(`${p.tool === "contentmove" ? "Move" : "Patch"} cancelled.`); }
+                if (this._pendingPick) {
+                    this._pendingPick = null;
+                    if (this._pickResolve) { const r = this._pickResolve; this._pickResolve = null; r(null); }
+                    this.draw();
+                    this.setStatus("Pick cancelled.");
+                }
+                else if (this.rangePending) {
+                    this.cancelRange();
+                }
+                else if (this._rangeTint) {
+                    this.setRangePreview(null);
+                }
+                else if (this.pointer && this.pointer.kind === "patchdrag") { const p = this.pointer; this.pointer = null; this.patchDone(p); this.draw(); this.setStatus(`${p.tool === "contentmove" ? "Move" : "Patch"} cancelled.`); }
                 else if (this.pending) this.cancelPending();
                 else if (this.polyPoints) { this.polyPoints = null; this.draw(); this.setStatus("Polygon cancelled."); }
                 else if (this.shapePoints) { this.cancelShape(); this.draw(); this.setStatus("Shape cancelled."); }
@@ -3060,7 +3112,24 @@ class InpaintEditor {
         // character it types, never a Ctrl shortcut (AltGr+8 moved the layer down instead of making the brush smaller)
         const altGr = !!(e.getModifierState && e.getModifierState("AltGraph"));
         const ctrl = (e.ctrlKey || e.metaKey) && !(altGr && e.altKey);   // Windows' AltGr is Ctrl+Alt; a real Ctrl with Linux's AltGr stays Ctrl
-        if (e.key === "Escape") { e.preventDefault(); if (this.rangePending) this.cancelRange(); else if (this.pending) this.cancelPending(); else host.onEscape(this); return; }
+        if (e.key === "Escape") {
+            e.preventDefault();
+            if (this._pendingPick) {
+                this._pendingPick = null;
+                if (this._pickResolve) { const r = this._pickResolve; this._pickResolve = null; r(null); }
+                this.draw();
+                this.setStatus("Pick cancelled.");
+            } else if (this.rangePending) {
+                this.cancelRange();
+            } else if (this._rangeTint) {
+                this.setRangePreview(null);
+            } else if (this.pending) {
+                this.cancelPending();
+            } else {
+                host.onEscape(this);
+            }
+            return;
+        }
         if (ctrl && e.key === "Enter") { e.preventDefault(); this.generate(); return; }
         if (e.key === "Enter" && this.pending) { e.preventDefault(); this.applyPending(); return; }
         if (e.key === "Enter" && this.polyPoints) { e.preventDefault(); this.closePolygon(); this.draw(); return; }
@@ -4823,7 +4892,11 @@ class InpaintEditor {
         this._depthOverlayCanvas = null;
         this._picStats = null;
         this._picStatsRun = null;
+        this._rangeTint = null;
+        this._rangeSampleCache = null;
         if (this._mapHistCache) this._mapHistCache.clear();
+        if (this._simHistCache) this._simHistCache.clear();
+        if (this._depthProxies) this._depthProxies.clear();
     }
 
     // ---- the whole document straightened and cropped in one step (PLAN_0_1_31 §7, 23b) -------------------------------
@@ -5385,6 +5458,10 @@ class InpaintEditor {
         }
         if (e.button !== 0) return;
         const [ix, iy] = this.toImage(e);
+        if (this._pendingPick) {
+            this.handlePickOnce(this._pendingPick, ix, iy);
+            return;
+        }
         if (host.pluginPointer(this, "down", e, ix, iy)) return;
         if (this.base) {
             const [cx, cy] = this.toCanvasPx(e);
@@ -6405,57 +6482,152 @@ class InpaintEditor {
         let unionBounds = null;
         let totalTiles = 0;
         let totalAlpha = 0;
+        let held = null;
 
         try {
             if (this.tileMode && !editorPool().off) {
                 // Tiles backend: pool jobs over bands
-                const map = this.maps.depth;
-                const m = passToMap(map, 1);
+                if (limit.source === "depth") {
+                    const map = this.maps.depth;
+                    const m = passToMap(map, 1);
 
-                const bandPromises = [];
-                for (let y0 = 0; y0 < H; y0 += RANGE_BAND_ROWS) {
-                    const y1 = Math.min(y0 + RANGE_BAND_ROWS, H);
-                    const msg = {
-                        op: "range_select",
-                        W, H, y0, y1,
-                        source: limit.source,
-                        limit,
-                        invert: jobInvert,
-                        map: { w: map.w, h: map.h, data: map.data, m },
-                    };
-                    bandPromises.push(
-                        editorPool().run("range_select", msg, [], { priority: INTERACTIVE, group })
-                            .then((res) => ({ y0, y1, res }))
-                    );
-                }
-
-                for (const p of bandPromises) {
-                    const { y0, y1, res } = await p;
-                    if (this.rangePending !== pendingRecord) return { bounds: null, seconds: 0, tiles: 0 };
-
-                    totalAlpha += res.alphaSum || 0;
-                    if (res.tiles && res.tiles.length > 0) {
-                        totalTiles += res.tiles.length;
-                        const src = tilesSource(res.tiles, [0, 0], [0, y0, W, y1]);
-                        this.sel.combine(src, bandMode);
+                    const bandPromises = [];
+                    for (let y0 = 0; y0 < H; y0 += RANGE_BAND_ROWS) {
+                        const y1 = Math.min(y0 + RANGE_BAND_ROWS, H);
+                        const msg = {
+                            op: "range_select",
+                            W, H, y0, y1,
+                            source: limit.source,
+                            limit,
+                            invert: jobInvert,
+                            map: { w: map.w, h: map.h, data: map.data, m },
+                        };
+                        bandPromises.push(
+                            editorPool().run("range_select", msg, [], { priority: INTERACTIVE, group })
+                                .then((res) => ({ y0, y1, res }))
+                        );
                     }
-                    if (res.bounds) {
-                        if (!unionBounds) {
-                            unionBounds = [...res.bounds];
-                        } else {
-                            unionBounds[0] = Math.min(unionBounds[0], res.bounds[0]);
-                            unionBounds[1] = Math.min(unionBounds[1], res.bounds[1]);
-                            unionBounds[2] = Math.max(unionBounds[2], res.bounds[2]);
-                            unionBounds[3] = Math.max(unionBounds[3], res.bounds[3]);
+
+                    for (const p of bandPromises) {
+                        const { y0, y1, res } = await p;
+                        if (this.rangePending !== pendingRecord) return { bounds: null, seconds: 0, tiles: 0 };
+
+                        totalAlpha += res.alphaSum || 0;
+                        if (res.tiles && res.tiles.length > 0) {
+                            totalTiles += res.tiles.length;
+                            const src = tilesSource(res.tiles, [0, 0], [0, y0, W, y1]);
+                            this.sel.combine(src, bandMode);
                         }
+                        if (res.bounds) {
+                            if (!unionBounds) {
+                                unionBounds = [...res.bounds];
+                            } else {
+                                unionBounds[0] = Math.min(unionBounds[0], res.bounds[0]);
+                                unionBounds[1] = Math.min(unionBounds[1], res.bounds[1]);
+                                unionBounds[2] = Math.max(unionBounds[2], res.bounds[2]);
+                                unionBounds[3] = Math.max(unionBounds[3], res.bounds[3]);
+                            }
+                        }
+                    }
+                } else {
+                    // Luma or color source on tiles: hold stack and at most 2 bands in flight
+                    try {
+                        held = await this.holdRunStack({ forRun: true });
+                    } catch (_) {
+                        held = null;
+                    }
+
+                    const consumeBand = (by0, by1, res) => {
+                        totalAlpha += res.alphaSum || 0;
+                        if (res.tiles && res.tiles.length > 0) {
+                            totalTiles += res.tiles.length;
+                            const src = tilesSource(res.tiles, [0, 0], [0, by0, W, by1]);
+                            this.sel.combine(src, bandMode);
+                        }
+                        if (res.bounds) {
+                            if (!unionBounds) {
+                                unionBounds = [...res.bounds];
+                            } else {
+                                unionBounds[0] = Math.min(unionBounds[0], res.bounds[0]);
+                                unionBounds[1] = Math.min(unionBounds[1], res.bounds[1]);
+                                unionBounds[2] = Math.max(unionBounds[2], res.bounds[2]);
+                                unionBounds[3] = Math.max(unionBounds[3], res.bounds[3]);
+                            }
+                        }
+                    };
+
+                    const runBand = async (y0, y1) => {
+                        const bh = y1 - y0;
+                        const bandBox = [0, y0, W, y1];
+                        let sab = null;
+                        let filled = false;
+                        if (typeof SharedArrayBuffer !== "undefined") {
+                            sab = new SharedArrayBuffer(W * bh * 4);
+                        }
+                        if (held && sab) {
+                            filled = await this.fillBoxFromStack(held, bandBox, sab, { priority: INTERACTIVE, group });
+                        }
+                        if (!filled) {
+                            const boxRes = await this.readBoxBytes(bandBox, { forRun: true, priority: INTERACTIVE, held });
+                            if (boxRes && boxRes.data) {
+                                if (boxRes.data.buffer instanceof SharedArrayBuffer) {
+                                    sab = boxRes.data.buffer;
+                                } else {
+                                    if (!sab) sab = new SharedArrayBuffer(W * bh * 4);
+                                    new Uint8Array(sab).set(new Uint8Array(boxRes.data.buffer, boxRes.data.byteOffset, boxRes.data.byteLength));
+                                }
+                            }
+                        }
+                        const msg = {
+                            op: "range_select",
+                            W, H, y0, y1,
+                            source: limit.source,
+                            limit,
+                            invert: jobInvert,
+                            sab,
+                        };
+                        const res = await editorPool().run("range_select", msg, [], { priority: INTERACTIVE, group });
+                        return { y0, y1, res };
+                    };
+
+                    const inFlight = [];
+                    for (let y0 = 0; y0 < H; y0 += RANGE_BAND_ROWS) {
+                        const y1 = Math.min(y0 + RANGE_BAND_ROWS, H);
+                        if (this.rangePending !== pendingRecord) break;
+                        inFlight.push(runBand(y0, y1));
+                        if (inFlight.length >= 2) {
+                            const item = await inFlight.shift();
+                            if (this.rangePending !== pendingRecord) break;
+                            consumeBand(item.y0, item.y1, item.res);
+                        }
+                    }
+                    while (inFlight.length > 0) {
+                        const item = await inFlight.shift();
+                        if (this.rangePending !== pendingRecord) break;
+                        consumeBand(item.y0, item.y1, item.res);
                     }
                 }
             } else {
                 // Canvas backend (or pool worker off): main-thread loop over bands
-                const map = this.maps.depth;
-                const m = passToMap(map, 1);
-                const mapData = map.data;
-                const mapW = map.w, mapH = map.h;
+                let flatCtx = null;
+                if (limit.source !== "depth") {
+                    const flat = this.flattenToCanvas({ forRun: true });
+                    flatCtx = flat.getContext("2d");
+                }
+                let map = null, m = null, mapData = null, mapW = 0, mapH = 0;
+                if (limit.source === "depth") {
+                    map = this.maps.depth;
+                    m = passToMap(map, 1);
+                    mapData = map.data;
+                    mapW = map.w;
+                    mapH = map.h;
+                }
+                let colorRef = null, colorTol = 30;
+                if (limit.source === "color") {
+                    const rgbRef = hexToRgb01(limit.color || "#ffffff");
+                    colorRef = opp(rgbRef[0], rgbRef[1], rgbRef[2]);
+                    colorTol = limit.tol ?? 30;
+                }
 
                 for (let y0 = 0; y0 < H; y0 += RANGE_BAND_ROWS) {
                     if (this.rangePending !== pendingRecord) return { bounds: null, seconds: 0, tiles: 0 };
@@ -6465,24 +6637,53 @@ class InpaintEditor {
 
                     let bX0 = Infinity, bY0 = Infinity, bX1 = -Infinity, bY1 = -Infinity;
 
-                    for (let py = 0; py < bh; py++) {
-                        const y = y0 + py;
-                        const pyOffset = py * W;
-                        const pyCentre = y + 0.5;
-                        for (let px = 0; px < W; px++) {
-                            const pxCentre = px + 0.5;
-                            const mx = m[0] * pxCentre + m[2] * pyCentre + m[4];
-                            const my = m[1] * pxCentre + m[3] * pyCentre + m[5];
-                            const v = u16Bilinear(mapData, mapW, mapH, mx, my);
-                            const w = rangeWeight(v, limit);
-                            const a = Math.round(255 * (jobInvert ? 1 - w : w));
-                            alpha[pyOffset + px] = a;
-                            totalAlpha += a;
-                            if (a > 0) {
-                                if (px < bX0) bX0 = px;
-                                if (px > bX1) bX1 = px;
-                                if (y < bY0) bY0 = y;
-                                if (y > bY1) bY1 = y;
+                    if (limit.source === "depth") {
+                        for (let py = 0; py < bh; py++) {
+                            const y = y0 + py;
+                            const pyOffset = py * W;
+                            const pyCentre = y + 0.5;
+                            for (let px = 0; px < W; px++) {
+                                const pxCentre = px + 0.5;
+                                const mx = m[0] * pxCentre + m[2] * pyCentre + m[4];
+                                const my = m[1] * pxCentre + m[3] * pyCentre + m[5];
+                                const v = u16Bilinear(mapData, mapW, mapH, mx, my);
+                                const w = rangeWeight(v, limit);
+                                const a = Math.round(255 * (jobInvert ? 1 - w : w));
+                                alpha[pyOffset + px] = a;
+                                totalAlpha += a;
+                                if (a > 0) {
+                                    if (px < bX0) bX0 = px;
+                                    if (px > bX1) bX1 = px;
+                                    if (y < bY0) bY0 = y;
+                                    if (y > bY1) bY1 = y;
+                                }
+                            }
+                        }
+                    } else {
+                        const imgData = flatCtx.getImageData(0, y0, W, bh);
+                        const d = imgData.data;
+                        const isLuma = limit.source === "luma";
+                        for (let py = 0; py < bh; py++) {
+                            const y = y0 + py;
+                            const pyOffset = py * W;
+                            for (let px = 0; px < W; px++) {
+                                const idx = (pyOffset + px) * 4;
+                                let v;
+                                if (isLuma) {
+                                    v = (0.299 * d[idx] + 0.587 * d[idx + 1] + 0.114 * d[idx + 2]) / 255;
+                                } else {
+                                    v = colourSimilarity(d[idx] / 255, d[idx + 1] / 255, d[idx + 2] / 255, colorRef, colorTol);
+                                }
+                                const w = rangeWeight(v, limit);
+                                const a = Math.round(255 * (jobInvert ? 1 - w : w));
+                                alpha[pyOffset + px] = a;
+                                totalAlpha += a;
+                                if (a > 0) {
+                                    if (px < bX0) bX0 = px;
+                                    if (px > bX1) bX1 = px;
+                                    if (y < bY0) bY0 = y;
+                                    if (y > bY1) bY1 = y;
+                                }
                             }
                         }
                     }
@@ -6526,7 +6727,10 @@ class InpaintEditor {
 
             const pct = Math.round(100 * totalAlpha / (Math.max(1, W * H) * 255));
             const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
-            this.setStatus(`Selected ${pct} % of the picture by ${limit.source} (near ${limit.lo.toFixed(2)} – far ${limit.hi.toFixed(2)}) in ${elapsed} s`);
+            const rangeStr = limit.source === "depth"
+                ? `near ${limit.lo.toFixed(2)} – far ${limit.hi.toFixed(2)}`
+                : `${limit.lo.toFixed(2)} – ${limit.hi.toFixed(2)}`;
+            this.setStatus(`Selected ${pct} % of the picture by ${limit.source} (${rangeStr}) in ${elapsed} s`);
 
             return {
                 bounds: this.getBounds(),
@@ -6548,6 +6752,10 @@ class InpaintEditor {
             }
             throw err;
         } finally {
+            if (held) {
+                try { held.release(); } catch (_) {}
+                held = null;
+            }
             if (this.rangePending === pendingRecord) {
                 this.rangePending = null;
             }
@@ -11601,7 +11809,8 @@ class InpaintEditor {
             con.appendChild(row);
             return;
         }
-        if (!this.depth) {
+        const depthMap = (this.maps && this.maps.depth) || this.depth;
+        if (!depthMap) {
             const row = el("div", "ipc-sec");
             const btn = iconButton("magic", "Compute 16-bit depth map with Depth Anything V2 Small", () => this.ensureDepthMap(), "Compute depth map");
             btn.classList.add("ipc-small", "ipc-primary");
@@ -11611,20 +11820,21 @@ class InpaintEditor {
         }
         const stale = this.isDepthStale();
         const row = el("div", "ipc-sec");
-        const info = el("span", null, `${this.depth.w} × ${this.depth.h}` + (stale ? " (stale)" : ""));
+        const info = el("span", null, `${depthMap.w} × ${depthMap.h}` + (stale ? " (stale)" : ""));
         if (stale) info.classList.add("ipc-warn");
         row.appendChild(info);
         const recomputeBtn = iconButton("refresh", "Recompute depth map for the current picture", () => this.ensureDepthMap({ force: true }), "Recompute");
         recomputeBtn.classList.add("ipc-small");
         if (stale) recomputeBtn.classList.add("ipc-primary");
         row.appendChild(recomputeBtn);
-        const viewBtn = iconButton("eye", "Toggle depth map view on canvas", () => {
-            this.showDepthMap = !this.showDepthMap;
-            viewBtn.classList.toggle("ipc-toggle-on", !!this.showDepthMap);
+        const viewBtn = iconButton("eye", "Show depth map on canvas", () => {
+            this.mapView = this.mapView === "depth" ? null : "depth";
+            viewBtn.classList.toggle("ipc-toggle-on", this.mapView === "depth");
             this.draw();
-        }, "View");
+        }, "Show map");
         viewBtn.classList.add("ipc-small");
-        viewBtn.classList.toggle("ipc-toggle-on", !!this.showDepthMap);
+        viewBtn.classList.toggle("ipc-toggle-on", this.mapView === "depth");
+        this.depthViewBtn = viewBtn;
         row.appendChild(viewBtn);
         con.appendChild(row);
     }
@@ -13346,6 +13556,364 @@ class InpaintEditor {
             }
         }
         return null;
+    }
+
+    /**
+     * 256-bin histogram of colour similarity over a 256 px sample (R1-S6 / R1-S8).
+     * Cached per (compositeVersion, color, tol).
+     * @param {Object} limit - Range limit containing { color, tol }
+     * @param {Object} [sample] - Optional custom sample { bytes, w, h }
+     * @returns {Float64Array | null}
+     */
+    similarityHistogram(limit, sample = null) {
+        if (!limit) return null;
+        const color = limit.color || "#ffffff";
+        const tol = limit.tol ?? 30;
+        const samp = sample || this.pictureSample();
+        if (!samp || !samp.bytes) return null;
+        let key = null;
+        if (!sample) {
+            if (!this._simHistCache) this._simHistCache = new Map();
+            key = `${this.compositeVersion}:${color}:${tol}`;
+            if (this._simHistCache.has(key)) return this._simHistCache.get(key);
+        }
+        const rgbRef = hexToRgb01(color);
+        const colorRef = opp(rgbRef[0], rgbRef[1], rgbRef[2]);
+        const px = samp.bytes;
+        const hist = new Float64Array(256);
+        for (let i = 0; i < px.length; i += 4) {
+            const a = px[i + 3] / 255;
+            if (!a) continue;
+            const sim = colourSimilarity(px[i] / 255, px[i + 1] / 255, px[i + 2] / 255, colorRef, tol);
+            const bin = Math.min(255, Math.max(0, Math.floor(sim * 256)));
+            hist[bin] += a;
+        }
+        if (!sample && key) {
+            this._simHistCache.set(key, hist);
+        }
+        return hist;
+    }
+
+    /**
+     * Samples the depth map at image coordinates (ix, iy), returning a value in 0..1 (R1-S6).
+     * @param {number} ix
+     * @param {number} iy
+     * @returns {number}
+     */
+    depthAt(ix, iy) {
+        const map = (this.maps && this.maps.depth) || this.depth;
+        if (!map) return 0;
+        const data = map.u16 || map.data;
+        if (!data || !map.w || !map.h) return 0;
+        if (map.xf) {
+            const m = passToMap(map, 1);
+            const pxCentre = ix + 0.5;
+            const pyCentre = iy + 0.5;
+            const mx = m[0] * pxCentre + m[2] * pyCentre + m[4];
+            const my = m[1] * pxCentre + m[3] * pyCentre + m[5];
+            return u16Bilinear(data, map.w, map.h, mx, my);
+        }
+        const mx = (ix / (this.width || 1)) * map.w;
+        const my = (iy / (this.height || 1)) * map.h;
+        return u16Bilinear(data, map.w, map.h, mx, my);
+    }
+
+    /**
+     * Greyscale canvas proxy of a feature map downsampled to <= maxSize on long side (R1-S6).
+     * Cached per dataVersion.
+     */
+    depthProxy(map, maxSize = 2048) {
+        if (!map) return null;
+        const key = `${maxSize}:${map.dataVersion ?? map.version ?? 1}`;
+        if (!this._depthProxies) this._depthProxies = new Map();
+        if (this._depthProxies.has(key)) return this._depthProxies.get(key);
+
+        const data = map.u16 || map.data;
+        if (!data || !map.w || !map.h) return null;
+        const dw = map.w, dh = map.h;
+        const maxSide = Math.max(dw, dh);
+        const scale = maxSide > maxSize ? maxSize / maxSide : 1;
+        const pw = Math.max(1, Math.round(dw * scale));
+        const ph = Math.max(1, Math.round(dh * scale));
+
+        const c = document.createElement("canvas");
+        c.width = pw; c.height = ph;
+        const ctx = c.getContext("2d");
+        const idata = ctx.createImageData(pw, ph);
+        const d32 = idata.data;
+
+        for (let y = 0; y < ph; y++) {
+            const sy = Math.min(dh - 1, Math.floor(y / scale));
+            const yOffset = sy * dw;
+            const rowOffset = y * pw * 4;
+            for (let x = 0; x < pw; x++) {
+                const sx = Math.min(dw - 1, Math.floor(x / scale));
+                const v = (data[yOffset + sx] >> 8) & 0xff;
+                const idx = rowOffset + x * 4;
+                d32[idx] = v;
+                d32[idx + 1] = v;
+                d32[idx + 2] = v;
+                d32[idx + 3] = 255;
+            }
+        }
+        ctx.putImageData(idata, 0, 0);
+        this._depthProxies.set(key, c);
+        return c;
+    }
+
+    depthProxy2048(map) {
+        return this.depthProxy(map, 2048);
+    }
+
+    depthProxy1024(map) {
+        return this.depthProxy(map, 1024);
+    }
+
+    depthProxy1024Data(map) {
+        if (!map) return null;
+        const key = `data1024:${map.dataVersion ?? map.version ?? 1}`;
+        if (!this._depthProxies) this._depthProxies = new Map();
+        if (this._depthProxies.has(key)) return this._depthProxies.get(key);
+
+        const data = map.u16 || map.data;
+        if (!data || !map.w || !map.h) return null;
+        const dw = map.w, dh = map.h;
+        const maxSide = Math.max(dw, dh);
+        const scale = maxSide > 1024 ? 1024 / maxSide : 1;
+        const pw = Math.max(1, Math.round(dw * scale));
+        const ph = Math.max(1, Math.round(dh * scale));
+        const vals = new Float32Array(pw * ph);
+
+        for (let y = 0; y < ph; y++) {
+            const sy = Math.min(dh - 1, Math.floor(y / scale));
+            const yOffset = sy * dw;
+            const rowOffset = y * pw;
+            for (let x = 0; x < pw; x++) {
+                const sx = Math.min(dw - 1, Math.floor(x / scale));
+                vals[rowOffset + x] = data[yOffset + sx] / 65535;
+            }
+        }
+        const res = { vals, w: pw, h: ph };
+        this._depthProxies.set(key, res);
+        return res;
+    }
+
+    /**
+     * Sets or clears live red preview tint for range selection (R1-S6).
+     * Builds this._rangeTint and calls drawSoon().
+     * @param {Object | null} limit
+     */
+    setRangePreview(limit) {
+        if (!limit) {
+            this._rangeTint = null;
+            this.drawSoon();
+            return;
+        }
+
+        if (limit.source === "depth") {
+            const map = (this.maps && this.maps.depth) || this.depth;
+            if (!map) {
+                this._rangeTint = null;
+                this.drawSoon();
+                return;
+            }
+            const pdata = this.depthProxy1024Data(map);
+            if (!pdata) {
+                this._rangeTint = null;
+                this.drawSoon();
+                return;
+            }
+            const { vals, w, h } = pdata;
+
+            if (!this._depthTintCanvas || this._depthTintCanvas.width !== w || this._depthTintCanvas.height !== h) {
+                this._depthTintCanvas = document.createElement("canvas");
+                this._depthTintCanvas.width = w;
+                this._depthTintCanvas.height = h;
+                this._depthTintCtx = this._depthTintCanvas.getContext("2d");
+                this._depthTintImg = this._depthTintCtx.createImageData(w, h);
+            }
+            const imgData = this._depthTintImg;
+            const d32 = imgData.data;
+            const n = w * h;
+            for (let i = 0, j = 0; i < n; i++, j += 4) {
+                const wt = rangeWeight(vals[i], limit);
+                d32[j] = 255;
+                d32[j + 1] = 0;
+                d32[j + 2] = 0;
+                d32[j + 3] = Math.round(wt * 255);
+            }
+            this._depthTintCtx.putImageData(imgData, 0, 0);
+            this._rangeTint = {
+                canvas: this._depthTintCanvas,
+                xf: map.xf || [this.width, 0, 0, this.height, 0, 0],
+            };
+            this.drawSoon();
+            return;
+        }
+
+        // luma or color
+        const vr = this.viewportRegion();
+        const box = vr ? [Math.max(0, vr.x), Math.max(0, vr.y), Math.min(this.width, vr.x + vr.w), Math.min(this.height, vr.y + vr.h)] : [0, 0, this.width, this.height];
+        const bw = box[2] - box[0], bh = box[3] - box[1];
+        if (bw <= 0 || bh <= 0) {
+            this._rangeTint = null;
+            this.drawSoon();
+            return;
+        }
+        const scale = vr ? vr.scale : Math.min(1, 1024 / Math.max(this.width, this.height));
+        const boxKey = `${box[0]},${box[1]},${box[2]},${box[3]}`;
+        const cacheKey = `${this.compositeVersion}:${boxKey}:${scale}`;
+
+        if (!this._rangeSampleCache || this._rangeSampleCache.key !== cacheKey) {
+            const sampleCanvas = this.sampleRegion("image", box, scale, { forRun: true });
+            const sctx = sampleCanvas.getContext("2d", { willReadFrequently: true });
+            const imgData = sctx.getImageData(0, 0, sampleCanvas.width, sampleCanvas.height);
+            this._rangeSampleCache = {
+                key: cacheKey,
+                version: this.compositeVersion,
+                canvas: sampleCanvas,
+                imgData,
+                box,
+                scale,
+                w: sampleCanvas.width,
+                h: sampleCanvas.height,
+            };
+        }
+
+        const cached = this._rangeSampleCache;
+        const cw = cached.w, ch = cached.h;
+
+        let tintOut = null;
+        let colorRef = [0, 0, 0], colorTol = limit.tol ?? 30;
+        if (limit.source === "color") {
+            const rgbRef = hexToRgb01(limit.color || "#ffffff");
+            colorRef = opp(rgbRef[0], rgbRef[1], rgbRef[2]);
+        }
+        const rVec = [limit.lo ?? 0, limit.hi ?? 1, limit.fLo ?? 0, limit.fHi ?? 0];
+        try {
+            const uniforms = {
+                u_source: limit.source === "color" ? 2 : 1,
+                u_range: rVec,
+                u_invert: limit.invert ? 1 : 0,
+                u_ref: colorRef,
+                u_tol: colorTol,
+            };
+            const shRes = runShader(RANGE_PREVIEW_SHADER, cached.canvas, uniforms);
+            if (shRes) {
+                tintOut = glToCanvas(shRes);
+            }
+        } catch (_) {
+            tintOut = null;
+        }
+
+        if (!tintOut) {
+            if (!this._tintCpuCanvas || this._tintCpuCanvas.width !== cw || this._tintCpuCanvas.height !== ch) {
+                this._tintCpuCanvas = document.createElement("canvas");
+                this._tintCpuCanvas.width = cw;
+                this._tintCpuCanvas.height = ch;
+                this._tintCpuCtx = this._tintCpuCanvas.getContext("2d");
+                this._tintCpuImg = this._tintCpuCtx.createImageData(cw, ch);
+            }
+            const srcData = cached.imgData.data;
+            const outImg = this._tintCpuImg;
+            const outData = outImg.data;
+            const isLuma = limit.source === "luma";
+            for (let i = 0; i < srcData.length; i += 4) {
+                const a = srcData[i + 3] / 255;
+                if (!a) {
+                    outData[i] = 255;
+                    outData[i + 1] = 0;
+                    outData[i + 2] = 0;
+                    outData[i + 3] = 0;
+                    continue;
+                }
+                const r = srcData[i] / 255, g = srcData[i + 1] / 255, b = srcData[i + 2] / 255;
+                const v = isLuma ? (0.299 * r + 0.587 * g + 0.114 * b) : colourSimilarity(r, g, b, colorRef, colorTol);
+                const wt = rangeWeight(v, limit);
+                outData[i] = 255;
+                outData[i + 1] = 0;
+                outData[i + 2] = 0;
+                outData[i + 3] = Math.round(wt * 255 * a);
+            }
+            this._tintCpuCtx.putImageData(outImg, 0, 0);
+            tintOut = this._tintCpuCanvas;
+        }
+
+        this._rangeTint = {
+            canvas: tintOut,
+            box: [box[0], box[1], bw, bh],
+        };
+        this.drawSoon();
+    }
+
+    /**
+     * Arms a one-shot click to pick range value from the picture (R1-S6).
+     * @param {"depth" | "luma" | "color"} source
+     * @returns {Promise<number | string | null>}
+     */
+    pickOnce(source = "depth") {
+        this._pendingPick = source;
+        const name = source === "depth" ? "depth" : source === "luma" ? "luminosity" : "colour";
+        this.setStatus(`Click the picture to pick ${name} … (Esc cancels)`);
+        this.draw();
+        return new Promise((resolve) => {
+            this._pickResolve = resolve;
+        });
+    }
+
+    async handlePickOnce(source, ix, iy) {
+        this._pendingPick = null;
+        this.setStatus("");
+        const px = Math.max(0, Math.min(this.width - 1, Math.floor(ix)));
+        const py = Math.max(0, Math.min(this.height - 1, Math.floor(iy)));
+        let pickedVal = null;
+
+        if (source === "depth") {
+            const v = this.depthAt(ix, iy);
+            pickedVal = v;
+            const w = (this.rangeLimit.hi ?? 0.3) - (this.rangeLimit.lo ?? 0);
+            const half = w / 2;
+            let lo = Math.max(0, v - half);
+            let hi = Math.min(1, v + half);
+            if (lo === 0) hi = Math.min(1, w);
+            if (hi === 1) lo = Math.max(0, 1 - w);
+            this.rangeLimit.lo = lo;
+            this.rangeLimit.hi = hi;
+            if (this.rangeBar) this.rangeBar.set(this.rangeLimit);
+        } else if (source === "luma") {
+            const res = await this.readBoxBytes([px, py, px + 1, py + 1], { forRun: true });
+            const d = res ? res.data : null;
+            if (d && d.length >= 3) {
+                const v = (0.299 * d[0] + 0.587 * d[1] + 0.114 * d[2]) / 255;
+                pickedVal = v;
+                const w = (this.rangeLimit.hi ?? 0.3) - (this.rangeLimit.lo ?? 0);
+                const half = w / 2;
+                let lo = Math.max(0, v - half);
+                let hi = Math.min(1, v + half);
+                if (lo === 0) hi = Math.min(1, w);
+                if (hi === 1) lo = Math.max(0, 1 - w);
+                this.rangeLimit.lo = lo;
+                this.rangeLimit.hi = hi;
+                if (this.rangeBar) this.rangeBar.set(this.rangeLimit);
+            }
+        } else if (source === "color") {
+            const res = await this.readBoxBytes([px, py, px + 1, py + 1], { forRun: true });
+            const d = res ? res.data : null;
+            if (d && d.length >= 3) {
+                const toHex = (n) => n.toString(16).padStart(2, "0");
+                const hex = `#${toHex(d[0])}${toHex(d[1])}${toHex(d[2])}`;
+                pickedVal = hex;
+                this.rangeLimit.color = hex;
+                if (this.rangeColorInput) this.rangeColorInput.value = hex;
+                if (this.rangeBar) this.rangeBar.refresh();
+            }
+        }
+        if (this._pickResolve) {
+            const r = this._pickResolve;
+            this._pickResolve = null;
+            r(pickedVal);
+        }
+        this.draw();
     }
 
     /**
@@ -15414,6 +15982,10 @@ class InpaintEditor {
         this.base = { ref, px };
         this.width = px.width;
         this.height = px.height;
+        this._rangeTint = null;
+        this.mapView = null;
+        this._pendingPick = null;
+        if (this.depthViewBtn) this.depthViewBtn.classList.remove("ipc-toggle-on");
         // the history goes with the layers: a step of the old document applied to a new image put
         // its layers (or its base, for a crop) back on top of it
         if (!keepLayers || sizeChanged) {
@@ -18496,8 +19068,35 @@ class InpaintEditor {
             ctx.restore();
         }
 
-        if (this.showDepthMap && this.depth && !this.spaceDown) {
+        if (this.mapView === "depth" && !this.spaceDown) {
+            const map = (this.maps && this.maps.depth) || this.depth;
+            if (map) {
+                const proxy = this.depthProxy2048(map);
+                if (proxy) {
+                    const xf = map.xf || [this.width, 0, 0, this.height, 0, 0];
+                    ctx.save();
+                    ctx.transform(...xf);
+                    ctx.drawImage(proxy, 0, 0, 1, 1);
+                    ctx.restore();
+                }
+            }
+        } else if (this.showDepthMap && this.depth && !this.spaceDown) {
             this.drawDepthOverlay(ctx);
+        }
+
+        if (this._rangeTint && !this.spaceDown) {
+            ctx.save();
+            ctx.globalAlpha = 0.4;
+            if (this._rangeTint.xf) {
+                ctx.transform(...this._rangeTint.xf);
+                ctx.drawImage(this._rangeTint.canvas, 0, 0, 1, 1);
+            } else if (this._rangeTint.box) {
+                const [bx, by, bw, bh] = this._rangeTint.box;
+                ctx.drawImage(this._rangeTint.canvas, bx, by, bw, bh);
+            } else {
+                ctx.drawImage(this._rangeTint.canvas, 0, 0, this.width, this.height);
+            }
+            ctx.restore();
         }
 
         if (this.getBounds()) {
@@ -19203,6 +19802,10 @@ class InpaintEditor {
                 if (stale()) return;
                 await this.setBase(state.base, img, { keepLayers: false });
             }
+            this._rangeTint = null;
+            this.mapView = null;
+            this._pendingPick = null;
+            if (this.depthViewBtn) this.depthViewBtn.classList.remove("ipc-toggle-on");
             this.setPromptText(state.prompt || "", { history: "reset" });
             this.cropSettings = state.crop ? { ...CROP_DEFAULTS, ...state.crop } : { ...CROP_LEGACY };
             this.syncCropControls();

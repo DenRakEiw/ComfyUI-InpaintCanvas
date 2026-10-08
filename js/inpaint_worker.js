@@ -51,7 +51,7 @@ import { readTiff, tiffPart } from "./inpaint_tiff.js";
 import { resampleStore } from "./inpaint_resample.js";
 import { liquifyStore } from "./inpaint_liquify.js";
 import { guidedFar } from "./inpaint_depth.js";
-import { u16Bilinear, rangeWeight, LUMA, opp, colourSimilarity } from "./inpaint_weights.js";
+import { u16Bilinear, rangeWeight, LUMA, opp, colourSimilarity, hexToRgb as hexToRgb01 } from "./inpaint_weights.js";
 import { mipChain, mipChainBytes, clampExtend, compositeTile, matchPixels, psdPackRows, kernelsReady, setKernels, rustPx, kernelsInUse, releaseIfLarge, deflate, resampleBlock, poissonBlend, boxBlurs } from "./px/kernels.js";
 
 const TILE = 256, LEVELS = 5, TILE_BYTES = TILE * TILE * 4;
@@ -893,7 +893,88 @@ export function rangeSelectJob(msg) {
             }
         }
     } else if (source === "luma" || source === "color") {
-        throw new Error(`source "${source}" not supported in R1-S5a`);
+        const buf = new Uint8Array(msg.sab || msg.buffer);
+        const isLuma = source === "luma";
+        let colorRef = null, colorTol = 30;
+        if (!isLuma) {
+            const rgbRef = hexToRgb01(limit.color || "#ffffff");
+            colorRef = opp(rgbRef[0], rgbRef[1], rgbRef[2]);
+            colorTol = limit.tol ?? 30;
+        }
+
+        const tileCols = Math.ceil(W / TILE);
+        const startTileY = Math.floor(y0 / TILE);
+        const endTileY = Math.ceil(y1 / TILE);
+
+        for (let ty = startTileY; ty < endTileY; ty++) {
+            const tileY0 = ty * TILE;
+            const tileY1 = Math.min(tileY0 + TILE, H);
+            for (let tx = 0; tx < tileCols; tx++) {
+                const tileX0 = tx * TILE;
+                const tileX1 = Math.min(tileX0 + TILE, W);
+
+                const alpha = new Uint8Array(TILE * TILE);
+                let zeros = 0, fulls = 0;
+                let tMinX = TILE, tMinY = TILE, tMaxX = -1, tMaxY = -1;
+
+                for (let py = 0; py < TILE; py++) {
+                    const y = tileY0 + py;
+                    if (y < y0 || y >= y1 || y >= H) {
+                        zeros += TILE;
+                        continue;
+                    }
+                    const pyOffset = py * TILE;
+                    const rowOffset = (y - y0) * W;
+
+                    for (let px = 0; px < TILE; px++) {
+                        const x = tileX0 + px;
+                        if (x >= W) {
+                            zeros++;
+                            continue;
+                        }
+                        const offset = (rowOffset + x) * 4;
+                        let v;
+                        if (isLuma) {
+                            v = (0.299 * buf[offset] + 0.587 * buf[offset + 1] + 0.114 * buf[offset + 2]) / 255;
+                        } else {
+                            v = colourSimilarity(buf[offset] / 255, buf[offset + 1] / 255, buf[offset + 2] / 255, colorRef, colorTol);
+                        }
+                        const w = rangeWeight(v, limit);
+                        const a = Math.round(255 * (invert ? 1 - w : w));
+
+                        alpha[pyOffset + px] = a;
+                        alphaSum += a;
+                        if (a === 0) {
+                            zeros++;
+                        } else {
+                            if (a === 255) fulls++;
+                            if (px < tMinX) tMinX = px;
+                            if (px > tMaxX) tMaxX = px;
+                            if (py < tMinY) tMinY = py;
+                            if (py > tMaxY) tMaxY = py;
+                        }
+                    }
+                }
+
+                if (zeros === TILE * TILE) {
+                    continue;
+                }
+                if (fulls === TILE * TILE && (tileX1 - tileX0) === TILE && (tileY1 - tileY0) === TILE) {
+                    tiles.push({ tx, ty, full: true });
+                    bX0 = Math.min(bX0, tileX0);
+                    bY0 = Math.min(bY0, tileY0);
+                    bX1 = Math.max(bX1, tileX0 + TILE);
+                    bY1 = Math.max(bY1, tileY0 + TILE);
+                } else {
+                    tiles.push({ tx, ty, alpha: alpha.buffer });
+                    transfer.push(alpha.buffer);
+                    bX0 = Math.min(bX0, tileX0 + tMinX);
+                    bY0 = Math.min(bY0, tileY0 + tMinY);
+                    bX1 = Math.max(bX1, tileX0 + tMaxX + 1);
+                    bY1 = Math.max(bY1, tileY0 + tMaxY + 1);
+                }
+            }
+        }
     } else {
         throw new Error(`unknown source "${source}"`);
     }
