@@ -45,6 +45,7 @@ import { fitLayerRGBA, workScale } from "./edgefit.js";
 import { STALE_DIFF, GUIDE, RANGE_BAND_ROWS, WORK_MAX, modelSize, workSize, disparityRange } from "./inpaint_depth.js";
 import { packRG16, mapToJSON, mapFromJSON, fingerprint, fingerprintDiff, passToMap, makeMap } from "./inpaint_maps.js";
 import { normalizeLimit, u16Bilinear, rangeWeight, opp, colourSimilarity, hexToRgb as hexToRgb01, WEIGHTS_GLSL } from "./inpaint_weights.js";
+import "./inpaint_limit.js";
 
 /**
  * The pixel backend a new editor takes (docs/PLAN_BCE.md §C2 step b): the host's choice when it made
@@ -13245,7 +13246,13 @@ class InpaintEditor {
         const seed = was === "fill" ? hex(prev.color) : was === "gradient" ? hex(prev.from) : hex(this.color);
         layer.filter = id;
         layer.params = filterDefaults(id);
-        if (prev.limit) layer.params.limit = { ...prev.limit };
+        if (prev.limit) {
+            layer.params.limit = { ...prev.limit };
+            if (FILTERS[id] && FILTERS[id].over && layer.params.limit.source !== "depth") {
+                delete layer.params.limit;
+                this.setStatus("Fill layers take a depth limit only: non-depth limit dropped.");
+            }
+        }
         if (seed && id === "fill") layer.params.color = seed;
         if (seed && id === "gradient") { layer.params.from = seed; layer.params.to = seed; layer.params.to_opacity = 0; }
         // layer names are not editable: the type (or a preset, see the preset select) names the layer
