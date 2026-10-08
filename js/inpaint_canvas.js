@@ -46,6 +46,7 @@ import { STALE_DIFF, GUIDE, RANGE_BAND_ROWS, WORK_MAX, modelSize, workSize, disp
 import { packRG16, mapToJSON, mapFromJSON, fingerprint, fingerprintDiff, passToMap, makeMap } from "./inpaint_maps.js";
 import { normalizeLimit, u16Bilinear, rangeWeight, opp, colourSimilarity, hexToRgb as hexToRgb01, WEIGHTS_GLSL } from "./inpaint_weights.js";
 import { limitAlphaRows } from "./inpaint_limit.js";
+import { buildRangeBar } from "./inpaint_rangebar.js";
 
 /**
  * The pixel backend a new editor takes (docs/PLAN_BCE.md §C2 step b): the host's choice when it made
@@ -1651,6 +1652,14 @@ const STYLE = `
 .ipc-rangebar-btn.ipc-active { background:var(--sc-selected, #2b3a4f); color:var(--sc-active, #7cc7ff); border-color:var(--sc-active, #4a90d9); }
 .ipc-rangebar-canvas { width:100%; height:26px; border:1px solid var(--sc-line, #3a3a3a); border-radius:var(--sc-radius-sm, 3px);
   background:var(--sc-well, #161616); display:block; cursor:crosshair; touch-action:none; box-sizing:border-box; }
+.ipc-limit-block { grid-column:1 / -1; display:flex; flex-direction:column; gap:4px; margin-top:4px; padding-top:4px; border-top:1px solid var(--sc-line, #333); }
+.ipc-limit-head { display:flex; align-items:center; gap:6px; font-size:11px; }
+.ipc-limit-label { font-weight:500; color:var(--sc-fg-2, #aaa); min-width:32px; }
+.ipc-limit-sel { flex:1; max-width:none; }
+.ipc-limit-color-row { display:flex; align-items:center; gap:8px; font-size:11px; color:var(--sc-fg-2, #aaa); }
+.ipc-limit-color-row label { display:flex; align-items:center; gap:4px; }
+.ipc-limit-note { font-size:11px; color:var(--sc-warn, #e5a040); display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+.ipc-limit-bar-wrap { width:100%; min-width:0; }
 `;
 
 function injectStyle() {
@@ -2015,6 +2024,7 @@ class InpaintEditor {
         this._rangeTint = null;
         this.mapView = null;
         this._pendingPick = null;
+        this._pendingPickTarget = null;
         this.geometrySeq = 0;
         let selDisplay = "ants";
         try { selDisplay = localStorage.getItem("ipc.selectionDisplay") || "ants"; } catch (_) { /* no storage */ }
@@ -2803,6 +2813,7 @@ class InpaintEditor {
                 e.stopImmediatePropagation(); e.preventDefault();
                 if (this._pendingPick) {
                     this._pendingPick = null;
+                    this._pendingPickTarget = null;
                     if (this._pickResolve) { const r = this._pickResolve; this._pickResolve = null; r(null); }
                     this.draw();
                     this.setStatus("Pick cancelled.");
@@ -3117,6 +3128,7 @@ class InpaintEditor {
             e.preventDefault();
             if (this._pendingPick) {
                 this._pendingPick = null;
+                this._pendingPickTarget = null;
                 if (this._pickResolve) { const r = this._pickResolve; this._pickResolve = null; r(null); }
                 this.draw();
                 this.setStatus("Pick cancelled.");
@@ -13865,10 +13877,12 @@ class InpaintEditor {
     /**
      * Arms a one-shot click to pick range value from the picture (R1-S6).
      * @param {"depth" | "luma" | "color"} source
+     * @param {(val: number | string | null, meta?: any) => void} [onPick] - Optional target callback (R1-S8)
      * @returns {Promise<number | string | null>}
      */
-    pickOnce(source = "depth") {
+    pickOnce(source = "depth", onPick = null) {
         this._pendingPick = source;
+        this._pendingPickTarget = typeof onPick === "function" ? onPick : null;
         const name = source === "depth" ? "depth" : source === "luma" ? "luminosity" : "colour";
         this.setStatus(`Click the picture to pick ${name} … (Esc cancels)`);
         this.draw();
@@ -13878,7 +13892,9 @@ class InpaintEditor {
     }
 
     async handlePickOnce(source, ix, iy) {
+        const targetCb = this._pendingPickTarget;
         this._pendingPick = null;
+        this._pendingPickTarget = null;
         this.setStatus("");
         const px = Math.max(0, Math.min(this.width - 1, Math.floor(ix)));
         const py = Math.max(0, Math.min(this.height - 1, Math.floor(iy)));
@@ -13887,21 +13903,7 @@ class InpaintEditor {
         if (source === "depth") {
             const v = this.depthAt(ix, iy);
             pickedVal = v;
-            const w = (this.rangeLimit.hi ?? 0.3) - (this.rangeLimit.lo ?? 0);
-            const half = w / 2;
-            let lo = Math.max(0, v - half);
-            let hi = Math.min(1, v + half);
-            if (lo === 0) hi = Math.min(1, w);
-            if (hi === 1) lo = Math.max(0, 1 - w);
-            this.rangeLimit.lo = lo;
-            this.rangeLimit.hi = hi;
-            if (this.rangeBar) this.rangeBar.set(this.rangeLimit);
-        } else if (source === "luma") {
-            const res = await this.readBoxBytes([px, py, px + 1, py + 1], { forRun: true });
-            const d = res ? res.data : null;
-            if (d && d.length >= 3) {
-                const v = (0.299 * d[0] + 0.587 * d[1] + 0.114 * d[2]) / 255;
-                pickedVal = v;
+            if (!targetCb) {
                 const w = (this.rangeLimit.hi ?? 0.3) - (this.rangeLimit.lo ?? 0);
                 const half = w / 2;
                 let lo = Math.max(0, v - half);
@@ -13912,6 +13914,24 @@ class InpaintEditor {
                 this.rangeLimit.hi = hi;
                 if (this.rangeBar) this.rangeBar.set(this.rangeLimit);
             }
+        } else if (source === "luma") {
+            const res = await this.readBoxBytes([px, py, px + 1, py + 1], { forRun: true });
+            const d = res ? res.data : null;
+            if (d && d.length >= 3) {
+                const v = (0.299 * d[0] + 0.587 * d[1] + 0.114 * d[2]) / 255;
+                pickedVal = v;
+                if (!targetCb) {
+                    const w = (this.rangeLimit.hi ?? 0.3) - (this.rangeLimit.lo ?? 0);
+                    const half = w / 2;
+                    let lo = Math.max(0, v - half);
+                    let hi = Math.min(1, v + half);
+                    if (lo === 0) hi = Math.min(1, w);
+                    if (hi === 1) lo = Math.max(0, 1 - w);
+                    this.rangeLimit.lo = lo;
+                    this.rangeLimit.hi = hi;
+                    if (this.rangeBar) this.rangeBar.set(this.rangeLimit);
+                }
+            }
         } else if (source === "color") {
             const res = await this.readBoxBytes([px, py, px + 1, py + 1], { forRun: true });
             const d = res ? res.data : null;
@@ -13919,9 +13939,18 @@ class InpaintEditor {
                 const toHex = (n) => n.toString(16).padStart(2, "0");
                 const hex = `#${toHex(d[0])}${toHex(d[1])}${toHex(d[2])}`;
                 pickedVal = hex;
-                this.rangeLimit.color = hex;
-                if (this.rangeColorInput) this.rangeColorInput.value = hex;
-                if (this.rangeBar) this.rangeBar.refresh();
+                if (!targetCb) {
+                    this.rangeLimit.color = hex;
+                    if (this.rangeColorInput) this.rangeColorInput.value = hex;
+                    if (this.rangeBar) this.rangeBar.refresh();
+                }
+            }
+        }
+        if (targetCb) {
+            try {
+                targetCb(pickedVal, { ix, iy, source });
+            } catch (err) {
+                console.error("pickOnce target callback failed:", err);
             }
         }
         if (this._pickResolve) {
@@ -16001,6 +16030,7 @@ class InpaintEditor {
         this._rangeTint = null;
         this.mapView = null;
         this._pendingPick = null;
+        this._pendingPickTarget = null;
         if (this.depthViewBtn) this.depthViewBtn.classList.remove("ipc-toggle-on");
         // the history goes with the layers: a step of the old document applied to a new image put
         // its layers (or its base, for a crop) back on top of it
@@ -16934,7 +16964,274 @@ class InpaintEditor {
             box.appendChild(range);
             box.appendChild(val);
         }
+        const limitBlock = this.buildLimitBlock(layer);
+        if (limitBlock) {
+            box.appendChild(limitBlock);
+            box.limitBlock = limitBlock;
+            if (limitBlock.rangeBar) box.rangeBar = limitBlock.rangeBar;
+        }
         return box;
+    }
+
+    /**
+     * Builds the Limit block for a filter or fill layer (R1-S8):
+     * source select (Off, Depth, Luminosity, Colour; fill layers Off and Depth only),
+     * range bar with below-layer histogram, eyedropper, live preview, and inline depth compute button.
+     * @param {Object} layer
+     * @returns {HTMLElement}
+     */
+    buildLimitBlock(layer) {
+        const block = el("div", "ipc-limit-block");
+        block.style.gridColumn = "1 / -1";
+        const stop = (e) => e.stopPropagation();
+
+        const head = el("div", "ipc-limit-head");
+        const lab = el("span", "ipc-limit-label", "Limit");
+        head.appendChild(lab);
+
+        const sel = document.createElement("select");
+        sel.className = "ipc-sel ipc-limit-sel";
+        sel.title = "Limit filter effect by picture range";
+
+        const isFill = this.isFillLayer(layer);
+        const options = [
+            { id: "off", label: "Off" },
+            ...(host.depthSupported !== false ? [{ id: "depth", label: "Depth" }] : []),
+            ...(!isFill ? [
+                { id: "luma", label: "Luminosity" },
+                { id: "color", label: "Colour" },
+            ] : []),
+        ];
+
+        for (const opt of options) {
+            const o = document.createElement("option");
+            o.value = opt.id;
+            o.textContent = opt.label;
+            sel.appendChild(o);
+        }
+
+        const curLimit = (layer.params && layer.params.limit) || null;
+        let curSource = (curLimit && curLimit.source) || "off";
+        if (!options.some((o) => o.id === curSource)) curSource = "off";
+        sel.value = curSource;
+
+        sel.addEventListener("click", stop);
+        sel.addEventListener("keydown", stop);
+        head.appendChild(sel);
+        block.appendChild(head);
+
+        const content = el("div", "ipc-limit-content");
+        content.style.display = "flex";
+        content.style.flexDirection = "column";
+        content.style.gap = "4px";
+        block.appendChild(content);
+
+        const mount = (source) => {
+            content.innerHTML = "";
+            block.rangeBar = null;
+            layer._rangeBar = null;
+            if (source === "off") return;
+
+            // Depth map check
+            if (source === "depth") {
+                const hasDepth = !!((this.maps && this.maps.depth) || this.depth);
+                const limitMissing = !hasDepth || !!(this._lastFilterInfoBySite && this._lastFilterInfoBySite[layer.id]?.limitMissing);
+                if (limitMissing || !hasDepth) {
+                    const noteRow = el("div", "ipc-limit-note");
+                    noteRow.appendChild(el("span", null, "needs a depth map: compute it first"));
+                    const compBtn = iconButton("magic", "Compute 16-bit depth map with Depth Anything V2 Small", async () => {
+                        try {
+                            await this.ensureDepthMap();
+                            this.renderLayers();
+                        } catch (err) {
+                            console.error("Depth estimation failed:", err);
+                        }
+                    }, "Compute depth map");
+                    compBtn.classList.add("ipc-small", "ipc-primary");
+                    noteRow.appendChild(compBtn);
+                    content.appendChild(noteRow);
+                }
+            }
+
+            let colorInput = null;
+            let tolInput = null;
+
+            // Colour source controls: swatch and tolerance
+            if (source === "color") {
+                const colorRow = el("div", "ipc-limit-color-row");
+                const colorLab = el("label", null, "Colour");
+                colorInput = document.createElement("input");
+                colorInput.type = "color";
+                colorInput.className = "ipc-fxcolor";
+                colorInput.value = (layer.params.limit && layer.params.limit.color) || "#ffffff";
+                colorInput.title = "Reference colour";
+                colorInput.addEventListener("click", stop);
+                colorInput.addEventListener("pointerdown", stop);
+                colorInput.addEventListener("keydown", stop);
+                colorInput.addEventListener("input", () => {
+                    if (!layer._undoPending) layer._undoPending = this.snapshot({ kind: "filter", id: layer.id });
+                    layer.params = { ...layer.params, limit: normalizeLimit({ ...(layer.params.limit || {}), color: colorInput.value }) };
+                    this.filterPreview = layer.id;
+                    this.markFilterChanged(layer, { soon: true });
+                    if (block.rangeBar) block.rangeBar.refresh();
+                });
+                colorInput.addEventListener("change", () => {
+                    this.filterPreview = null;
+                    if (layer._undoPending) {
+                        this.pushUndoSnapshot(layer._undoPending, { label: "Filter limit" });
+                        layer._undoPending = null;
+                    }
+                    layer.params = { ...layer.params, limit: normalizeLimit({ ...(layer.params.limit || {}), color: colorInput.value }) };
+                    this.markFilterChanged(layer);
+                    if (block.rangeBar) block.rangeBar.refresh();
+                });
+                colorLab.appendChild(colorInput);
+                colorRow.appendChild(colorLab);
+
+                const tolLab = el("label", null, "Tolerance");
+                tolInput = document.createElement("input");
+                tolInput.type = "number";
+                tolInput.min = "0";
+                tolInput.max = "100";
+                tolInput.step = "1";
+                tolInput.value = (layer.params.limit && layer.params.limit.tol != null) ? layer.params.limit.tol : 30;
+                tolInput.className = "ipc-num";
+                tolInput.style.width = "48px";
+                tolInput.title = "Colour tolerance (0..100)";
+                tolInput.addEventListener("click", stop);
+                tolInput.addEventListener("pointerdown", stop);
+                tolInput.addEventListener("keydown", stop);
+                tolInput.addEventListener("input", () => {
+                    if (!layer._undoPending) layer._undoPending = this.snapshot({ kind: "filter", id: layer.id });
+                    const tolVal = Math.max(0, Math.min(100, parseFloat(tolInput.value) || 0));
+                    layer.params = { ...layer.params, limit: normalizeLimit({ ...(layer.params.limit || {}), tol: tolVal }) };
+                    this.filterPreview = layer.id;
+                    this.markFilterChanged(layer, { soon: true });
+                    if (block.rangeBar) block.rangeBar.refresh();
+                });
+                tolInput.addEventListener("change", () => {
+                    this.filterPreview = null;
+                    if (layer._undoPending) {
+                        this.pushUndoSnapshot(layer._undoPending, { label: "Filter limit" });
+                        layer._undoPending = null;
+                    }
+                    const tolVal = Math.max(0, Math.min(100, parseFloat(tolInput.value) || 0));
+                    layer.params = { ...layer.params, limit: normalizeLimit({ ...(layer.params.limit || {}), tol: tolVal }) };
+                    this.markFilterChanged(layer);
+                    if (block.rangeBar) block.rangeBar.refresh();
+                });
+                tolLab.appendChild(tolInput);
+                colorRow.appendChild(tolLab);
+                content.appendChild(colorRow);
+            }
+
+            // Range bar
+            const barWrap = el("div", "ipc-limit-bar-wrap");
+            const curLim = (layer.params && layer.params.limit && layer.params.limit.source === source)
+                ? layer.params.limit
+                : normalizeLimit({
+                    source,
+                    lo: 0.0,
+                    hi: source === "depth" ? 0.5 : 0.7,
+                    fLo: 0.05,
+                    fHi: 0.05,
+                    invert: false,
+                    color: "#ffffff",
+                    tol: 30,
+                });
+
+            const bar = buildRangeBar(curLim, {
+                gradient: source,
+                histogram: () => {
+                    if (source === "depth") return this.mapHistogram("depth");
+                    if (source === "luma") {
+                        const h = this.belowHistogram(layer);
+                        return h ? h.luma : null;
+                    }
+                    if (source === "color") {
+                        return this.similarityHistogram(layer.params.limit || curLim, this.belowSample(layer));
+                    }
+                    return null;
+                },
+                begin: () => {
+                    if (!layer._undoPending) layer._undoPending = this.snapshot({ kind: "filter", id: layer.id });
+                },
+                preview: (r) => {
+                    const cur = layer.params.limit || curLim;
+                    layer.params = { ...layer.params, limit: normalizeLimit({ ...cur, ...r }) };
+                    this.filterPreview = layer.id;
+                    this.markFilterChanged(layer, { soon: true });
+                },
+                commit: (r) => {
+                    this.filterPreview = null;
+                    if (!layer._undoPending) {
+                        layer._undoPending = this.snapshot({ kind: "filter", id: layer.id });
+                    }
+                    const cur = layer.params.limit || curLim;
+                    if (r) {
+                        layer.params = { ...layer.params, limit: normalizeLimit({ ...cur, ...r }) };
+                    }
+                    if (layer._undoPending) {
+                        this.pushUndoSnapshot(layer._undoPending, { label: "Filter limit" });
+                        layer._undoPending = null;
+                    }
+                    this.markFilterChanged(layer);
+                },
+                stop: () => {
+                    this.filterPreview = null;
+                    this.markFilterChanged(layer);
+                },
+                pick: () => this.pickOnce(source, (val) => {
+                    if (source === "color" && typeof val === "string") {
+                        if (colorInput) colorInput.value = val;
+                        if (block.rangeBar) block.rangeBar.refresh();
+                    }
+                }),
+            });
+
+            block.rangeBar = bar;
+            layer._rangeBar = bar;
+            barWrap.appendChild(bar.el);
+            content.appendChild(barWrap);
+        };
+
+        mount(curSource);
+
+        sel.addEventListener("change", () => {
+            const val = sel.value;
+            if (val === "off") {
+                if (layer.params && layer.params.limit) {
+                    this.pushUndoSnapshot(this.snapshot({ kind: "filter", id: layer.id }), { label: "Filter limit" });
+                    const next = { ...layer.params };
+                    delete next.limit;
+                    layer.params = next;
+                    this.filterPreview = null;
+                    this.markFilterChanged(layer);
+                    this.renderLayers();
+                } else {
+                    mount("off");
+                }
+            } else {
+                const cur = layer.params.limit || {};
+                const nextLimit = normalizeLimit({
+                    source: val,
+                    lo: cur.lo ?? 0.0,
+                    hi: cur.hi ?? (val === "depth" ? 0.5 : 0.7),
+                    fLo: cur.fLo ?? 0.05,
+                    fHi: cur.fHi ?? 0.05,
+                    invert: !!cur.invert,
+                    color: cur.color || "#ffffff",
+                    tol: cur.tol ?? 30,
+                });
+                this.pushUndoSnapshot(this.snapshot({ kind: "filter", id: layer.id }), { label: "Filter limit" });
+                layer.params = { ...layer.params, limit: nextLimit };
+                this.filterPreview = null;
+                this.markFilterChanged(layer);
+                this.renderLayers();
+            }
+        });
+
+        return block;
     }
 
     // ---- history -------------------------------------------------------------
@@ -19821,6 +20118,7 @@ class InpaintEditor {
             this._rangeTint = null;
             this.mapView = null;
             this._pendingPick = null;
+            this._pendingPickTarget = null;
             if (this.depthViewBtn) this.depthViewBtn.classList.remove("ipc-toggle-on");
             this.setPromptText(state.prompt || "", { history: "reset" });
             this.cropSettings = state.crop ? { ...CROP_DEFAULTS, ...state.crop } : { ...CROP_LEGACY };
