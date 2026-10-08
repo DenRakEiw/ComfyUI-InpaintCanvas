@@ -4,9 +4,13 @@
 // shows in its layer row. The filter itself lives in inpaint_filters.js; this
 // file only knows about point lists ([[x, y], ...] in 0..255) and DOM.
 
+import { THEME } from "./inpaint_theme.js";
+
 export const CURVE_CHANNELS = ["rgb", "r", "g", "b"];
 const CHANNEL_LABEL = { rgb: "RGB", r: "R", g: "G", b: "B" };
 const CHANNEL_COLOR = { rgb: "#e6e6e6", r: "#ff6a6a", g: "#6fdc6f", b: "#6f9dff" };
+/** The colour a channel's curve is drawn in: the master curve follows the skin (THEME), r, g and b stay. */
+const channelColor = (ch) => (ch === "rgb" ? THEME.curveRgb : CHANNEL_COLOR[ch]);
 
 export function identityCurve() { return [[0, 0], [255, 255]]; }
 export function curveDefaults() { return { rgb: identityCurve(), r: identityCurve(), g: identityCurve(), b: identityCurve() }; }
@@ -105,7 +109,7 @@ export function buildCurvesControl(layer, param, callbacks, { histogram } = {}) 
     const mkButton = (text, title) => {
         const b = document.createElement("button");
         b.type = "button"; b.textContent = text; b.title = title;
-        b.style.cssText = "font:11px system-ui,sans-serif;padding:1px 7px;border-radius:4px;border:1px solid #3a3a3a;background:#161616;color:#aaa;cursor:pointer;";
+        b.style.cssText = "font:11px var(--sc-font, system-ui,sans-serif);padding:1px 7px;border-radius:var(--sc-radius, 4px);border:1px solid var(--sc-line, #3a3a3a);background:var(--sc-field, #161616);color:var(--sc-fg-2, #aaa);cursor:pointer;";
         return b;
     };
     for (const ch of CURVE_CHANNELS) {
@@ -133,7 +137,7 @@ export function buildCurvesControl(layer, param, callbacks, { histogram } = {}) 
 
     const canvas = document.createElement("canvas");
     canvas.width = Math.round(BOX_W * dpr); canvas.height = Math.round(BOX_H * dpr);
-    canvas.style.cssText = `width:${BOX_W}px;height:${BOX_H}px;max-width:100%;border:1px solid #3a3a3a;border-radius:4px;background:#161616;cursor:crosshair;touch-action:none;display:block;`;
+    canvas.style.cssText = `width:${BOX_W}px;height:${BOX_H}px;max-width:100%;border:1px solid var(--sc-line, #3a3a3a);border-radius:var(--sc-radius-sm, 4px);background:var(--sc-well, #161616);cursor:crosshair;touch-action:none;display:block;`;
     canvas.title = "Click adds a point, drag moves it, drag it out of the box or double-click removes it";
     wrap.appendChild(canvas);
     const ctx = canvas.getContext("2d");
@@ -147,8 +151,8 @@ export function buildCurvesControl(layer, param, callbacks, { histogram } = {}) 
     const syncButtons = () => {
         for (const ch of CURVE_CHANNELS) {
             const on = ch === state.channel;
-            chButtons[ch].style.background = on ? "#2b3a4f" : "#161616";
-            chButtons[ch].style.color = on ? (ch === "rgb" ? "#7cc7ff" : CHANNEL_COLOR[ch]) : "#aaa";
+            chButtons[ch].style.background = on ? "var(--sc-selected, #2b3a4f)" : "var(--sc-field, #161616)";
+            chButtons[ch].style.color = on ? (ch === "rgb" ? "var(--sc-active, #7cc7ff)" : CHANNEL_COLOR[ch]) : "var(--sc-fg-2, #aaa)";
         }
     };
 
@@ -172,14 +176,14 @@ export function buildCurvesControl(layer, param, callbacks, { histogram } = {}) 
     function draw() {
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
         ctx.clearRect(0, 0, BOX_W, BOX_H);
-        ctx.fillStyle = "#161616"; ctx.fillRect(0, 0, BOX_W, BOX_H);
+        ctx.fillStyle = THEME.curveBg; ctx.fillRect(0, 0, BOX_W, BOX_H);
         // histogram of the filter input (luma), when the editor can provide one
         const hist = typeof histogram === "function" ? histogram() : null;
         if (hist && hist.length === 256) {
             let mx = 0;
             for (let i = 0; i < 256; i++) if (hist[i] > mx) mx = hist[i];
             if (mx > 0) {
-                ctx.fillStyle = "#2e2e2e";
+                ctx.fillStyle = THEME.curveHist;
                 for (let i = 0; i < 256; i++) {
                     const hh = Math.sqrt(hist[i] / mx) * innerH;   // sqrt: a single peak does not flatten the rest
                     const [x0] = toPx(i, 0);
@@ -188,7 +192,7 @@ export function buildCurvesControl(layer, param, callbacks, { histogram } = {}) 
             }
         }
         // grid and the identity diagonal
-        ctx.strokeStyle = "#2a2a2a"; ctx.lineWidth = 1;
+        ctx.strokeStyle = THEME.curveGrid; ctx.lineWidth = 1;
         ctx.beginPath();
         for (let i = 0; i <= 4; i++) {
             const x = Math.round(PAD + innerW * i / 4) + 0.5, y = Math.round(PAD + innerH * i / 4) + 0.5;
@@ -196,26 +200,26 @@ export function buildCurvesControl(layer, param, callbacks, { histogram } = {}) 
             ctx.moveTo(PAD, y); ctx.lineTo(PAD + innerW, y);
         }
         ctx.stroke();
-        ctx.strokeStyle = "#333";
+        ctx.strokeStyle = THEME.curveDiag;
         ctx.beginPath(); ctx.moveTo(...toPx(0, 0)); ctx.lineTo(...toPx(255, 255)); ctx.stroke();
         // the other channels, faint
         const c = curves();
         for (const ch of CURVE_CHANNELS) {
             if (ch === state.channel || isIdentityCurve(c[ch])) continue;
-            drawCurve(curveTable(c[ch]), CHANNEL_COLOR[ch], 0.35, 1);
+            drawCurve(curveTable(c[ch]), channelColor(ch), 0.35, 1);
         }
         const pts = points();
-        drawCurve(curveTable(pts), CHANNEL_COLOR[state.channel], 1, 1.5);
+        drawCurve(curveTable(pts), channelColor(state.channel), 1, 1.5);
         for (let i = 0; i < pts.length; i++) {
             const [px, py] = toPx(pts[i][0], pts[i][1]);
             const active = state.drag ? state.drag.idx === i : state.hover === i;
             ctx.beginPath(); ctx.arc(px, py, active ? 4 : 3, 0, Math.PI * 2);
-            ctx.fillStyle = active ? "#fff" : "#161616";
+            ctx.fillStyle = active ? THEME.curvePoint : THEME.curveBg;
             ctx.fill();
-            ctx.strokeStyle = CHANNEL_COLOR[state.channel]; ctx.lineWidth = 1.5; ctx.stroke();
+            ctx.strokeStyle = channelColor(state.channel); ctx.lineWidth = 1.5; ctx.stroke();
         }
         if (state.drag && state.drag.removed) {
-            ctx.fillStyle = "#888"; ctx.font = "10px system-ui, sans-serif"; ctx.textAlign = "center";
+            ctx.fillStyle = THEME.curveHint; ctx.font = "10px system-ui, sans-serif"; ctx.textAlign = "center";
             ctx.fillText("release to remove the point", BOX_W / 2, BOX_H - 4);
         }
     }

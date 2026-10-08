@@ -154,7 +154,8 @@ function renderTiled(g, uTile, uDstTop, W, H, label) {
     const out = makeCanvas(W, H);
     const octx = out.getContext("2d");
     let tw = gl.drawingBufferWidth, th = gl.drawingBufferHeight;
-    if (tw >= W && th >= H) {
+    const maxDraw = testLimits && testLimits.maxDraw ? testLimits.maxDraw : Infinity;
+    if (tw >= W && th >= H && W * H <= maxDraw) {
         gl.viewport(0, 0, W, H);
         gl.uniform2f(uTile, 0, 0);
         gl.drawArrays(gl.TRIANGLES, 0, 3);
@@ -200,7 +201,7 @@ function renderToTexture(g, uTile, uDstTop, W, H, label, octx) {
     let tex = null, fbo = null;
     try {
         tex = gl.createTexture();
-        gl.activeTexture(gl.TEXTURE6);
+        gl.activeTexture(gl.TEXTURE0 + g.scratchUnit);
         gl.bindTexture(gl.TEXTURE_2D, tex);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
@@ -221,8 +222,10 @@ function renderToTexture(g, uTile, uDstTop, W, H, label, octx) {
         if (err !== gl.NO_ERROR) { console.warn("WebGL2 filter", label, "GL error", err); gl.bindFramebuffer(gl.FRAMEBUFFER, null); return null; }
         gl.bindFramebuffer(gl.FRAMEBUFFER, null);
         // the texture holds the result bottom up, like the canvas: tile y0 sits at H - y0 - h
+        const maxDraw = testLimits && testLimits.maxDraw ? testLimits.maxDraw : Infinity;
         let tw = Math.max(1, Math.min(W, gl.drawingBufferWidth));
         let th = Math.max(1, Math.min(H, gl.drawingBufferHeight));
+        if (tw * th > maxDraw) th = Math.max(1, Math.floor(maxDraw / tw));
         for (let y0 = 0; y0 < H; y0 += th) {
             for (let x0 = 0; x0 < W; x0 += tw) {
                 const w = Math.min(tw, W - x0), h = Math.min(th, H - y0);
@@ -323,7 +326,7 @@ function createSurface(g, w, h) {
     let tex = null, fbo = null;
     try {
         tex = gl.createTexture();
-        gl.activeTexture(gl.TEXTURE7);
+        gl.activeTexture(gl.TEXTURE0 + g.scratchUnit);
         gl.bindTexture(gl.TEXTURE_2D, tex);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
@@ -463,7 +466,77 @@ function bindSource(g, src) {
 
 /** Should this pass write into a surface? */
 function wantSurface(g, info, W, H) {
-    return !!(info && info.chain) && W * H <= CHAIN_MAX_PIXELS && W <= g.max && H <= g.max;
+    // `chain: "bands"` (B item 7): a band of an export comes as bytes and leaves as bytes, so a surface is the way out
+    // whatever its size; the cap is the screen's (above it the pool no longer holds a frame's surfaces)
+    return !!(info && info.chain) && (info.chain === "bands" || W * H <= CHAIN_MAX_PIXELS) && W <= g.max && H <= g.max;
+}
+
+/**
+ * RGBA8 bytes (straight alpha, the first row the picture's top, `w` x `h`) as a surface the caller owns and gives back
+ * with releaseSurface() (docs/PLAN_BCE.md §3b, B item 7): what the pool's workers composited goes to the filters
+ * without a canvas. The bytes may lie in a SharedArrayBuffer. Null without a GPU path or above its texture size.
+ */
+export function surfaceFromBytes(bytes, w, h) {
+    const g = context();
+    if (!g || !(w > 0 && h > 0) || w > g.max || h > g.max || bytes.length < w * h * 4) return null;
+    const { gl } = g;
+    const s = acquireSurface(g, w, h);
+    if (!s) return null;
+    try {
+        gl.activeTexture(gl.TEXTURE0 + g.scratchUnit);
+        gl.bindTexture(gl.TEXTURE_2D, s.tex);
+        // Chromium applies both switches to typed-array uploads too (CLAUDE.md, traps)
+        gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, bytes);
+        STATS.uploads++;
+        const err = gl.getError();
+        if (err !== gl.NO_ERROR) throw new Error("GL error " + err);
+        return s;
+    } catch (err) {
+        console.warn("WebGL2 filter surface from bytes failed:", err.message || err);
+        releaseSurface(s);
+        return null;
+    }
+}
+
+/** The rectangle (x, y, w, h) of a surface as RGBA8 bytes into `out` (it may lie in a SharedArrayBuffer), top row first. False when it cannot be read. */
+export function readSurfaceBytes(s, x, y, w, h, out) {
+    const g = context();
+    if (!g || !isGLSurface(s) || s.gen !== g.gen || out.length < w * h * 4) return false;
+    const { gl } = g;
+    try {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, s.fbo);
+        gl.pixelStorei(gl.PACK_ALIGNMENT, 4);
+        gl.readPixels(x, y, w, h, gl.RGBA, gl.UNSIGNED_BYTE, out);   // a surface holds the picture top down
+        STATS.readbacks++;
+        const err = gl.getError();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        if (err !== gl.NO_ERROR) { console.warn("WebGL2 surface read error", err); return false; }
+        return true;
+    } catch (err) {
+        console.warn("WebGL2 surface read failed:", err.message || err);
+        try { gl.bindFramebuffer(gl.FRAMEBUFFER, null); } catch (_) { /* ignore */ }
+        return false;
+    }
+}
+
+/** The largest side a surface may have here, 0 without a GPU path. */
+export function glMaxSide() {
+    const g = context();
+    return g ? g.max : 0;
+}
+
+/** Idle surfaces above the screen's cap leave the pool: only a band of an export makes them, and one is 60 to 100 MB. */
+export function glReleaseLargeSurfaces() {
+    let freed = 0;
+    for (const [key, list] of POOL) {
+        if (!list.length || list[0].width * list[0].height <= CHAIN_MAX_PIXELS) continue;
+        while (list.length) { const s = list.pop(); poolBytes -= s.bytes; freed += s.bytes; destroySurface(s); }
+        POOL.delete(key);
+    }
+    return freed;
 }
 
 /** Draw the current program into a pooled surface (its first row is the image's top). */
@@ -549,7 +622,9 @@ export function drawSurfaceTo(ctx, s, dx, dy, dw, dh) {
 
 let G = null;          // the shared context, created on first use
 let unavailable = false;
+let testLimits = null;
 const lutTextures = new WeakMap();   // lut object -> { tex, gen }
+const staticTextures = new WeakMap(); // targetObj -> { tex, gen, key }
 
 function makeCanvas(w, h) {
     const c = document.createElement("canvas");
@@ -584,7 +659,7 @@ function texture2d(gl, unit, filter) {
 }
 
 function context() {
-    if (G && !G.lost) return G;
+    if (G && !G.lost && !(G.gl.isContextLost && G.gl.isContextLost())) return G;
     if (unavailable) return null;
     try {
         const canvas = document.createElement("canvas");
@@ -628,7 +703,9 @@ function context() {
         const emptyLut = gl.createTexture();
         gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_3D, emptyLut);
         gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA8, 1, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]));
-        G = { gl, canvas, prog, u, aPos, texSrc, texTable, texOffsets, emptyNoise, emptyLut, max, gen, lost: false, max3d: gl.getParameter(gl.MAX_3D_TEXTURE_SIZE) };
+        const maxUnits = gl.getParameter(gl.MAX_TEXTURE_IMAGE_UNITS) || 16;
+        const scratchUnit = maxUnits - 1;
+        G = { gl, canvas, prog, u, aPos, texSrc, texTable, texOffsets, emptyNoise, emptyLut, max, gen, lost: false, max3d: gl.getParameter(gl.MAX_3D_TEXTURE_SIZE), scratchUnit, uploads: 0 };
         return G;
     } catch (err) {
         console.warn("WebGL2 filters unavailable:", err.message || err);
@@ -714,9 +791,10 @@ const SETUP = {
         const { gl, u } = g;
         const k = Math.max(0, Math.min(1, (p.amount ?? 50) / 100));
         if (!k) return false;
-        // the statistics need pixels: a chained input is a texture, so the CPU path takes over there
-        if (isGLSurface(src)) return null;
-        const st = colourStats(src);
+        // the statistics need pixels: a chained input is a texture, so without the picture's own (`info.stats`, E3) the
+        // CPU path takes over there
+        if (!info.stats && isGLSurface(src)) return null;
+        const st = info.stats || colourStats(src);
         gl.uniform1i(u.u_mode, 7);
         gl.uniform3f(u.u_nMean, st.mean[0] / 255, st.mean[1] / 255, st.mean[2] / 255);
         gl.uniform3f(u.u_nLo, st.lo[0] / 255, st.lo[1] / 255, st.lo[2] / 255);
@@ -894,6 +972,12 @@ uniform vec2 u_tile;
 uniform float u_scale;
 uniform float u_seed;
 uniform bool u_dstTop;
+uniform vec2 u_pictureSize;
+uniform vec2 u_pictureOrigin;
+// E3: where uv of the input lies in the whole picture (0..1), and the whole picture's size in the input's pixels
+// (u_pictureSize). A pass composites a part of the picture (the screen's region, a band of an export); a filter whose
+// geometry belongs to the picture (a frame, a light leak) uses these instead of uv and u_size.
+vec2 pictureUv(vec2 uv) { return (u_pictureOrigin + uv * u_size) / u_pictureSize; }
 ${decls}
 out vec4 o;
 ${def.code}
@@ -917,34 +1001,88 @@ function pluginProgram(g, pg) {
     if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error("program: " + gl.getProgramInfoLog(prog));
     pg.prog = prog;
     pg.u = {};
-    for (const name of ["u_src", "u_size", "u_scale", "u_seed", "u_tile", "u_dstTop", ...Object.keys(pg.def.uniforms || {})]) pg.u[name] = gl.getUniformLocation(prog, name);
-    for (const [name, type] of Object.entries(pg.def.uniforms || {})) if (type === "sampler2D") pg.samplers.push({ name, unit: PLUGIN_TEX_UNIT + pg.samplers.length, tex: null });
+    for (const name of ["u_src", "u_size", "u_scale", "u_seed", "u_tile", "u_dstTop", "u_pictureSize", "u_pictureOrigin", ...Object.keys(pg.def.uniforms || {})]) pg.u[name] = gl.getUniformLocation(prog, name);
+    for (const [name, type] of Object.entries(pg.def.uniforms || {})) {
+        if (type === "sampler2D") {
+            const unit = PLUGIN_TEX_UNIT + pg.samplers.length;
+            if (unit >= g.scratchUnit) throw new Error("too many samplers");
+            pg.samplers.push({ name, unit, tex: null });
+        }
+    }
     return prog;
 }
 
 /**
  * Upload one plugin sampler: a canvas / ImageData / image, or { data, width, height } with a
- * Uint8(Clamped)Array (RGBA8) or a Float32Array (RGBA32F, e.g. control point tables); `linear`
- * on the value picks bilinear filtering (8-bit sources only).
+ * Uint8(Clamped)Array (RGBA8, or RG8 for channels: 2) or a Float32Array (RGBA32F, or R32F for
+ * channels: 1); `linear` on the value picks bilinear filtering (8-bit RGBA only).
+ * Values with static: true are cached by data object, key and context gen.
  */
-function uploadSampler(gl, s, v) {
+function uploadSampler(g, s, v) {
+    const { gl } = g;
     gl.activeTexture(gl.TEXTURE0 + s.unit);
     if (isGLSurface(v)) { gl.bindTexture(gl.TEXTURE_2D, v.tex); return; }   // another stage's result, already a texture
+
+    const targetObj = (v && typeof v.data === "object" && v.data !== null) ? v.data : (typeof v === "object" && v !== null ? v : null);
+    if (v && v.static && targetObj) {
+        const cached = staticTextures.get(targetObj);
+        if (cached && cached.gen === g.gen && cached.key === v.key) {
+            gl.bindTexture(gl.TEXTURE_2D, cached.tex);
+            return;
+        }
+        const tex = (cached && cached.gen === g.gen) ? cached.tex : gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        uploadSamplerData(g, v);
+        staticTextures.set(targetObj, { tex, gen: g.gen, key: v.key });
+        return;
+    }
+
     if (!s.tex) s.tex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, s.tex);
-    const isFloat = !!(v && v.data instanceof Float32Array);
-    const f = v && v.linear && !isFloat ? gl.LINEAR : gl.NEAREST;
+    uploadSamplerData(g, v);
+}
+
+function uploadSamplerData(g, v) {
+    const { gl } = g;
+    const isTyped = !!(v && v.data && v.width);
+    const isFloat = isTyped && (v.data instanceof Float32Array);
+    const ch = (v && v.channels) || 4;
+    const f = (ch === 4 && !isFloat && v && v.linear) ? gl.LINEAR : gl.NEAREST;
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, f);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, f);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    if (v && v.data && v.width) {
+
+    if (isTyped) {
+        gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+        gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE);
+        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
         const w = v.width | 0, h = (v.height | 0) || 1;
-        if (isFloat) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, v.data);
-        else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, v.data instanceof Uint8Array ? v.data : new Uint8Array(v.data.buffer, v.data.byteOffset, v.data.byteLength));
+        if (ch === 2) {
+            const bytes = v.data instanceof Uint8Array ? v.data : new Uint8Array(v.data.buffer, v.data.byteOffset, v.data.byteLength);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG8, w, h, 0, gl.RG, gl.UNSIGNED_BYTE, bytes);
+        } else if (ch === 1) {
+            if (isFloat) gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, w, h, 0, gl.RED, gl.FLOAT, v.data);
+            else {
+                const bytes = v.data instanceof Uint8Array ? v.data : new Uint8Array(v.data.buffer, v.data.byteOffset, v.data.byteLength);
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, w, h, 0, gl.RED, gl.UNSIGNED_BYTE, bytes);
+            }
+        } else {
+            if (isFloat) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, v.data);
+            else {
+                const bytes = v.data instanceof Uint8Array ? v.data : new Uint8Array(v.data.buffer, v.data.byteOffset, v.data.byteLength);
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, bytes);
+            }
+        }
     } else {
+        gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+        gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE);
+        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, v.canvas || v.image || v);
     }
+    g.uploads++;
 }
 
 function applyPluginGL(id, pg, src, params, info, override) {
@@ -974,10 +1112,13 @@ function applyPluginGL(id, pg, src, params, info, override) {
         for (const s of pg.samplers) {
             const v = values[s.name];
             if (v == null || pg.u[s.name] == null) continue;
-            uploadSampler(gl, s, v);
+            uploadSampler(g, s, v);
             gl.uniform1i(pg.u[s.name], s.unit);
         }
         gl.uniform2f(pg.u.u_size, W, H);
+        const full = info.full || [W, H], origin = info.full ? info.origin || [0, 0] : [0, 0];
+        if (pg.u.u_pictureSize != null) gl.uniform2f(pg.u.u_pictureSize, full[0], full[1]);
+        if (pg.u.u_pictureOrigin != null) gl.uniform2f(pg.u.u_pictureOrigin, origin[0], origin[1]);
         bindSource(g, src);
         return renderOut(g, pg.u.u_tile, pg.u.u_dstTop, W, H, id, info);
     } catch (err) {
@@ -1085,3 +1226,14 @@ export function compareFilterPaths(cpuApply, id, src, params, info = {}) {
     }
     return { id, gl: true, max, mean: +(sum / n).toFixed(4), over2: +(over2 / n * 100).toFixed(3) };
 }
+
+export const SAMPLE_GLSL = `float u16At(sampler2D t, ivec2 p) { vec2 v = texelFetch(t, clamp(p, ivec2(0), textureSize(t, 0) - 1), 0).rg * 255.0; return (v.x + 256.0 * v.y) / 65535.0; }
+float u16Bilinear(sampler2D t, vec2 px) { vec2 q = px - 0.5; ivec2 i = ivec2(floor(q)); vec2 f = q - floor(q); return mix(mix(u16At(t, i), u16At(t, i + ivec2(1, 0)), f.x), mix(u16At(t, i + ivec2(0, 1)), u16At(t, i + ivec2(1, 1)), f.x), f.y); }`;
+
+export function glTestLimits(limits) {
+    testLimits = limits ? { ...limits } : null;
+}
+
+export { G };
+export function glContext() { return context(); }
+

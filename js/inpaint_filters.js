@@ -467,7 +467,7 @@ function applyLut(src, p, info) {
 // vignette
 // ---------------------------------------------------------------------------
 
-function applyVignette(src, p) {
+function applyVignette(src, p, info = {}) {
     const W = src.width, H = src.height;
     const out = makeCanvas(W, H);
     const ctx = out.getContext("2d");
@@ -476,8 +476,10 @@ function applyVignette(src, p) {
     if (amount <= 0) return out;
     const size = (p.size ?? 60) / 100;          // where the darkening starts, as a fraction of the half diagonal
     const softness = Math.max(0.02, (p.softness ?? 50) / 100);
-    const cx = W / 2, cy = H / 2;
-    const rMax = Math.hypot(cx, cy);
+    // E3: the vignette belongs to the picture, not to the part of it a pass composites (`info.full`, `info.origin`)
+    const [FW, FH] = info.full || [W, H], [ox, oy] = info.full ? info.origin || [0, 0] : [0, 0];
+    const cx = FW / 2 - ox, cy = FH / 2 - oy;
+    const rMax = Math.hypot(FW / 2, FH / 2);
     const r0 = rMax * size * (1 - softness * 0.5);
     const r1 = Math.min(rMax * 1.15, r0 + rMax * softness);
     const g = ctx.createRadialGradient(cx, cy, r0, cx, cy, r1);
@@ -486,6 +488,91 @@ function applyVignette(src, p) {
     ctx.fillStyle = g;
     ctx.fillRect(0, 0, W, H);
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// fill layers (PLAN_0_1_31 §6 step 6): a colour or a gradient
+// ---------------------------------------------------------------------------
+
+/** `#rrggbb` (or `rrggbb`, `#rgb`) as [r, g, b]; `fallback` for anything else. */
+export function hexRgb(s, fallback = [128, 128, 128]) {
+    let m = /^#?([0-9a-f]{6})$/i.exec(String(s || "").trim());
+    if (!m) { const k = /^#?([0-9a-f])([0-9a-f])([0-9a-f])$/i.exec(String(s || "").trim()); if (k) m = [0, k[1] + k[1] + k[2] + k[2] + k[3] + k[3]]; }
+    if (!m) return fallback.slice();
+    const v = parseInt(m[1], 16);
+    return [(v >> 16) & 255, (v >> 8) & 255, v & 255];
+}
+
+/**
+ * A fill layer's own pixels (RGBA8, not premultiplied) for the `w` x `h` part at `origin` of a picture of `full`
+ * ([FW, FH], in the same pixels). A pixel's value is a function of where it sits in the picture only, so every pass
+ * (the screen's region, a band of an export, the whole flatten) gives the same bytes. Colour fill: the colour, opaque.
+ * Gradient: the colour and the opacity each mixed straight between the two ends; linear runs along `angle` (0° left
+ * to right, 90° top to bottom) across the picture's extent in that direction, reflected mirrors it at the centre,
+ * radial runs from the centre to the half diagonal; `scale` stretches it, `x` / `y` move its centre.
+ */
+export function fillPixels(id, p, full, origin, w, h) {
+    const out = new Uint8ClampedArray(w * h * 4);
+    const u32 = new Uint32Array(out.buffer);
+    const pack = (r, g, b, a) => ((a << 24) | (b << 16) | (g << 8) | r) >>> 0;   // little endian: RGBA in memory
+    if (id === "fill") { const [r, g, b] = hexRgb(p.color); u32.fill(pack(r, g, b, 255)); return out; }
+    const N = 1024;
+    const lut = new Uint32Array(N);
+    const c0 = hexRgb(p.from, [0, 0, 0]), c1 = hexRgb(p.to, [255, 255, 255]);
+    const a0 = Math.max(0, Math.min(100, p.from_opacity ?? 100)) / 100 * 255, a1 = Math.max(0, Math.min(100, p.to_opacity ?? 100)) / 100 * 255;
+    for (let k = 0; k < N; k++) {
+        const t = k / (N - 1), m = (x, y) => Math.round(x + (y - x) * t);
+        lut[k] = pack(m(c0[0], c1[0]), m(c0[1], c1[1]), m(c0[2], c1[2]), m(a0, a1));
+    }
+    const [FW, FH] = full, [ox, oy] = origin;
+    const cx = ((p.x ?? 50) / 100) * FW - ox, cy = ((p.y ?? 50) / 100) * FH - oy;   // the centre, in this part's pixels
+    const scale = Math.max(0.01, (p.scale ?? 100) / 100);
+    const shape = p.shape || "linear";
+    const K = N - 1;
+    if (shape === "radial") {
+        const R = (Math.hypot(FW, FH) / 2) * scale;
+        const inv = K / Math.max(1e-6, R);
+        for (let j = 0, i4 = 0; j < h; j++) {
+            const dy = j + 0.5 - cy, dy2 = dy * dy;
+            for (let i = 0; i < w; i++, i4++) {
+                const dx = i + 0.5 - cx;
+                const k = Math.round(Math.sqrt(dx * dx + dy2) * inv);
+                u32[i4] = lut[k < K ? k : K];
+            }
+        }
+        return out;
+    }
+    const th = ((p.angle ?? 90) * Math.PI) / 180, ux = Math.cos(th), uy = Math.sin(th);
+    const L = ((Math.abs(FW * ux) + Math.abs(FH * uy)) / 2) * scale;   // half the length: the picture's extent along the direction
+    const inv = K / Math.max(1e-6, L);
+    const reflected = shape === "reflected";
+    for (let j = 0, i4 = 0; j < h; j++) {
+        const row = (j + 0.5 - cy) * uy;
+        for (let i = 0; i < w; i++, i4++) {
+            const u = (i + 0.5 - cx) * ux + row;   // along the direction, from the centre
+            let k = reflected ? Math.round(Math.abs(u) * inv) : Math.round((u + L) * inv * 0.5);
+            k = k < 0 ? 0 : k > K ? K : k;
+            u32[i4] = lut[k];
+        }
+    }
+    return out;
+}
+
+/** The filter's apply(): the fill as a canvas of the input's size. It never reads the input, only its size; kept in `info.cache` until the parameters or the part change. */
+function fillApply(id) {
+    return (src, p, info = {}) => {
+        const W = src.width, H = src.height;
+        const full = info.full || [W, H], origin = info.full ? info.origin || [0, 0] : [0, 0];
+        const key = JSON.stringify([id, p, W, H, full, origin]);
+        const cache = info.cache;
+        if (cache && cache.fill && cache.fill.key === key) return cache.fill.canvas;
+        const out = makeCanvas(W, H);
+        const ctx = out.getContext("2d");
+        if (id === "fill") { const [r, g, b] = hexRgb(p.color); ctx.fillStyle = `rgb(${r},${g},${b})`; ctx.fillRect(0, 0, W, H); }
+        else ctx.putImageData(new ImageData(fillPixels(id, p, full, origin, W, H), W, H), 0, 0);
+        if (cache) cache.fill = { key, canvas: out };
+        return out;
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -536,6 +623,7 @@ export function colourStats(src) {
     ctx.drawImage(src, 0, 0, w, h);
     const px = ctx.getImageData(0, 0, w, h).data;
     const hist = [new Float64Array(256), new Float64Array(256), new Float64Array(256)];
+    const lumaHist = new Float64Array(256);
     const sum = [0, 0, 0];
     let wsum = 0;
     for (let i = 0; i < px.length; i += 4) {
@@ -543,12 +631,15 @@ export function colourStats(src) {
         if (!a) continue;
         wsum += a;
         for (let ch = 0; ch < 3; ch++) { const v = px[i + ch]; sum[ch] += v * a; hist[ch][v] += a; }
+        const lum = Math.min(255, Math.max(0, (LR * px[i] + LG * px[i + 1] + LB * px[i + 2] + 0.5) | 0));
+        lumaHist[lum] += a;
     }
-    if (!wsum) return { mean: [128, 128, 128], lo: [0, 0, 0], hi: [255, 255, 255] };
+    const hists = { r: hist[0], g: hist[1], b: hist[2], luma: lumaHist };
+    if (!wsum) return { mean: [128, 128, 128], lo: [0, 0, 0], hi: [255, 255, 255], hist: hists, bytes: px, w, h };
     const mean = sum.map((v) => v / wsum);
     const level = (ch, frac) => { let acc = 0; for (let v = 0; v < 256; v++) { acc += hist[ch][v]; if (acc >= wsum * frac) return v; } return 255; };
     const lo = [0, 1, 2].map((ch) => level(ch, 0.01)), hi = [0, 1, 2].map((ch) => Math.max(level(ch, 0.99), 0));
-    return { mean, lo, hi: hi.map((v, i) => Math.max(v, lo[i] + 1)) };
+    return { mean, lo, hi: hi.map((v, i) => Math.max(v, lo[i] + 1)), hist: hists, bytes: px, w, h };
 }
 
 /**
@@ -557,10 +648,10 @@ export function colourStats(src) {
  * towards the mean; "levels": each channel stretched from its 1 % to its 99 % level.
  * `amount` mixes the result in.
  */
-function applyNormalize(src, p) {
+function applyNormalize(src, p, info = {}) {
     const k = Math.max(0, Math.min(1, (p.amount ?? 50) / 100));
     if (!k) return copyCanvas(src);
-    const st = colourStats(src);
+    const st = info.stats || colourStats(src);   // E3: the statistics of the whole picture, whatever part a pass composites
     const mode = p.mode || "colour";
     const { out, octx, img, px } = openPixels(src);
     const ym = LR * st.mean[0] + LG * st.mean[1] + LB * st.mean[2];
@@ -826,6 +917,16 @@ function applyInvert(src) { return applyTables(src, INVERT_TABLE); }
 // registry
 // ---------------------------------------------------------------------------
 
+// `reach` (C6 c1): how many image pixels around a pixel (at full resolution) the filter's result there reads, as a
+// number or a function of the params and the picture (`reach(params, { width, height })`). 0 for a filter that works
+// pixel by pixel. Left out for a filter no margin can serve: a read of a box then takes the whole flatten
+// (InpaintEditor.boxReach / readBox), and an export cannot be written in bands.
+//
+// E3: a filter that depends on the picture as a whole still has a reach when it takes what it needs from `info`
+// instead of from its input: `info.full` ([w, h], the whole picture in the input's pixels) and `info.origin` (where
+// the input sits in it) for a filter with a geometry of its own (vignette), `info.stats` (`colourStats` of the whole
+// picture below the layer, asked for with `wholeStats: true`) for one that reads statistics (normalise).
+
 export const FILTERS = {
     grain: {
         label: "Film / Grain",
@@ -840,6 +941,7 @@ export const FILTERS = {
         ],
         presets: GRAIN_PRESETS,
         plate: true,
+        reach: 0,   // the grain field is anchored at the image's origin: a pixel's grain does not depend on the pass
         apply: applyGrain,
     },
     sharpen: {
@@ -849,6 +951,7 @@ export const FILTERS = {
             { key: "radius", label: "Radius", min: 0.3, max: 12, step: 0.1, default: 1.5, unit: "px" },
             { key: "threshold", label: "Threshold", min: 0, max: 64, step: 1, default: 0 },
         ],
+        reach: (p) => Math.ceil(3 * Math.max(0.3, p.radius ?? 1.5)) + 4,   // its blur's three sigma, measured against a whole flatten
         apply: applySharpen,
     },
     blur: {
@@ -856,6 +959,7 @@ export const FILTERS = {
         params: [
             { key: "radius", label: "Radius", min: 0, max: 64, step: 0.5, default: 4, unit: "px" },
         ],
+        reach: (p) => ((p.radius ?? 4) < 0.05 ? 0 : Math.ceil(3 * (p.radius ?? 4)) + 4),
         apply: applyBlur,
     },
     levels: {
@@ -867,6 +971,7 @@ export const FILTERS = {
             { key: "outBlack", label: "Out black", min: 0, max: 255, step: 1, default: 0 },
             { key: "outWhite", label: "Out white", min: 0, max: 255, step: 1, default: 255 },
         ],
+        reach: 0,
         apply: applyLevels,
     },
     curves: {
@@ -875,6 +980,7 @@ export const FILTERS = {
             { key: "curves", label: "Curves", type: "custom", default: curveDefaults() },
         ],
         control: curvesControl,
+        reach: 0,
         apply: applyCurves,
     },
     brightness_contrast: {
@@ -883,6 +989,7 @@ export const FILTERS = {
             { key: "brightness", label: "Brightness", min: -100, max: 100, step: 1, default: 0 },
             { key: "contrast", label: "Contrast", min: -100, max: 100, step: 1, default: 0 },
         ],
+        reach: 0,
         apply: applyBrightnessContrast,
     },
     hue_sat: {
@@ -892,6 +999,7 @@ export const FILTERS = {
             { key: "saturation", label: "Saturation", min: -100, max: 100, step: 1, default: 0, unit: "%" },
             { key: "lightness", label: "Lightness", min: -100, max: 100, step: 1, default: 0, unit: "%" },
         ],
+        reach: 0,
         apply: applyHueSat,
     },
     color_balance: {
@@ -908,6 +1016,7 @@ export const FILTERS = {
             { key: "high_yb", label: "High Y–B", min: -100, max: 100, step: 1, default: 0 },
             { key: "preserve", label: "Preserve luminosity", type: "bool", default: true },
         ],
+        reach: 0,
         apply: applyColorBalance,
     },
     bw: {
@@ -919,11 +1028,13 @@ export const FILTERS = {
             { key: "tint_hue", label: "Tint hue", min: 0, max: 360, step: 1, default: 35, unit: "°" },
             { key: "tint_strength", label: "Tint", min: 0, max: 100, step: 1, default: 0, unit: "%" },
         ],
+        reach: 0,
         apply: applyBlackWhite,
     },
     invert: {
         label: "Invert",
         params: [],
+        reach: 0,
         apply: applyInvert,
     },
     normalize: {
@@ -933,6 +1044,8 @@ export const FILTERS = {
                 options: [{ id: "colour", label: "Colours towards the mean" }, { id: "all", label: "Everything towards the mean" }, { id: "levels", label: "Stretch levels" }] },
             { key: "amount", label: "Amount", min: 0, max: 100, step: 1, default: 50, unit: "%" },
         ],
+        wholeStats: true,
+        reach: 0,
         apply: applyNormalize,
     },
     lut: {
@@ -941,6 +1054,7 @@ export const FILTERS = {
             { key: "strength", label: "Strength", min: 0, max: 100, step: 1, default: 100, unit: "%" },
         ],
         needsLut: true,
+        reach: 0,
         apply: applyLut,
     },
     vignette: {
@@ -950,7 +1064,40 @@ export const FILTERS = {
             { key: "size", label: "Size", min: 10, max: 100, step: 1, default: 60, unit: "%" },
             { key: "softness", label: "Softness", min: 2, max: 100, step: 1, default: 50, unit: "%" },
         ],
+        reach: 0,
         apply: applyVignette,
+    },
+    // fill layers: `over` - the result goes over the picture below as a layer would (its own alpha, the layer's blend
+    // mode, opacity and mask), it does not stand for that picture; `chain` - apply() takes a GPU surface as it is (it
+    // reads only the input's size, so nothing is read back)
+    fill: {
+        label: "Colour fill",
+        params: [
+            { key: "color", label: "Colour", type: "color", default: "#808080" },
+        ],
+        over: true,
+        chain: true,
+        reach: 0,
+        apply: fillApply("fill"),
+    },
+    gradient: {
+        label: "Gradient fill",
+        params: [
+            { key: "shape", label: "Shape", type: "select", default: "linear", title: "Linear: along the angle across the picture. Reflected: from the centre out both ways. Radial: from the centre out to the corners.",
+                options: [{ id: "linear", label: "Linear" }, { id: "reflected", label: "Reflected" }, { id: "radial", label: "Radial" }] },
+            { key: "from", label: "From", type: "color", default: "#000000" },
+            { key: "from_opacity", label: "From opacity", min: 0, max: 100, step: 1, default: 100, unit: "%" },
+            { key: "to", label: "To", type: "color", default: "#ffffff" },
+            { key: "to_opacity", label: "To opacity", min: 0, max: 100, step: 1, default: 100, unit: "%" },
+            { key: "angle", label: "Angle", min: -180, max: 180, step: 1, default: 90, unit: "°" },
+            { key: "scale", label: "Scale", min: 10, max: 300, step: 1, default: 100, unit: "%" },
+            { key: "x", label: "Centre X", min: 0, max: 100, step: 1, default: 50, unit: "%" },
+            { key: "y", label: "Centre Y", min: 0, max: 100, step: 1, default: 50, unit: "%" },
+        ],
+        over: true,
+        chain: true,
+        reach: 0,
+        apply: fillApply("gradient"),
     },
 };
 
@@ -965,6 +1112,16 @@ export function filterDefaults(id) {
     return out;
 }
 
+let limitStage = null;
+
+/**
+ * Register the limit stage processor (R1-S7 inpaint_limit.js).
+ * @param {(src: any, out: any, limit: any, info: any, def: any) => any} fn
+ */
+export function setLimitStage(fn) {
+    limitStage = fn;
+}
+
 /**
  * Apply filter `id` to `src` (a canvas). `info`: {scale (1 = full resolution,
  * <1 for previews so radii shrink with the image), seed, lut}.
@@ -972,8 +1129,11 @@ export function filterDefaults(id) {
 export function applyFilter(id, src, params, info = {}) {
     const f = FILTERS[id];
     if (!f) return src;
-    if (!info.cpu) { const gl = applyFilterGL(id, src, params || {}, info); if (gl) return gl; }
+    let out = null;
+    if (!info.cpu) { const gl = applyFilterGL(id, src, params || {}, info); if (gl) out = gl; }
     // A plugin filter that runs its own shader stages (def.chain) takes the texture as it is;
     // every other apply() is a pixel loop and needs a canvas.
-    return f.apply(f.chain ? src : glToCanvas(src), params || {}, info);
+    if (!out) out = f.apply(f.chain ? src : glToCanvas(src), params || {}, info);
+    if (params && params.limit && limitStage) out = limitStage(src, out, params.limit, info, f);
+    return out;
 }

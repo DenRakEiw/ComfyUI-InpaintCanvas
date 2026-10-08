@@ -168,6 +168,12 @@ export const host = {
     removeModel() { return null; },
     async removeInApp() { throw new Error("Remove is a Scumble feature"); },
     async warmRemove() { return null; },
+    depthSupported: false,
+    depthModel() { return null; },
+    async depthInput() { return null; },
+    async computeDepth() { throw new Error("depth maps are a Scumble feature"); },
+    async pictureInput() { return null; },
+    async depthInApp() { throw new Error("depth is a Scumble feature"); },
     async freeHelpers() {},
     upsampleInstruction: null,   // the built-in upsample instruction (Scumble hands out its templates)
     generateNewAvailable() { return false; },

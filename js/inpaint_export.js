@@ -2,10 +2,12 @@
 /**
  * Layered export: PSD (Photoshop, 8-bit RGB, PackBits) and ORA (OpenRaster, the native
  * layered format of Krita and GIMP: a zip of PNGs plus stack.xml). Both take the same
- * description: { width, height, layers: [{ name, x, y, canvas, opacity, visible, blend }],
+ * description: { width, height, layers: [{ name, x, y, canvas, opacity, visible, blend, clip }],
  * composite }. `layers` are bottom first, each canvas holds the layer's pixels at image
  * resolution (canvas.width × canvas.height placed at x, y); `composite` is the flattened
- * image. Filter layers cannot be represented and are left out by the caller.
+ * image. Filter layers cannot be represented and are left out by the caller. A layer may carry `mask: { canvas,
+ * disabled }` (its alpha the mask, at the layer's size): PSD writes it as the layer's user mask (channel -2), ORA has
+ * no place for one and ignores the field (the caller bakes masks into the pixels for ORA).
  */
 
 /** A 2D canvas in the window or in a worker. */
@@ -18,8 +20,8 @@ function makeExportCanvas(w, h) {
     return c;
 }
 
-const PSD_BLEND = { normal: "norm", multiply: "mul ", screen: "scrn", overlay: "over", darken: "dark", lighten: "lite", "soft-light": "sLit", "hard-light": "hLit", difference: "diff" };
-const ORA_BLEND = { normal: "svg:src-over", multiply: "svg:multiply", screen: "svg:screen", overlay: "svg:overlay", darken: "svg:darken", lighten: "svg:lighten", "soft-light": "svg:soft-light", "hard-light": "svg:hard-light", difference: "svg:difference" };
+const PSD_BLEND = { normal: "norm", multiply: "mul ", screen: "scrn", overlay: "over", darken: "dark", lighten: "lite", "soft-light": "sLit", "hard-light": "hLit", "linear-light": "lLit", difference: "diff" };
+const ORA_BLEND = { normal: "svg:src-over", multiply: "svg:multiply", screen: "svg:screen", overlay: "svg:overlay", darken: "svg:darken", lighten: "svg:lighten", "soft-light": "svg:soft-light", "hard-light": "svg:hard-light", "linear-light": "scumble:linear-light", difference: "svg:difference" };
 
 class ByteWriter {
     constructor() { this.chunks = []; this.size = 0; }
@@ -34,7 +36,7 @@ class ByteWriter {
 }
 
 /** PackBits (RLE) of one row. */
-function packBits(row) {
+export function packBits(row) {
     const out = [];
     const n = row.length;
     let i = 0;
@@ -66,6 +68,27 @@ function planes(canvas) {
     return [r, g, b, a];
 }
 
+/** The alpha channel of an RGBA canvas alone, w*h bytes (a layer mask: alpha = visible). */
+function alphaPlane(canvas) {
+    const w = canvas.width, h = canvas.height;
+    const d = canvas.getContext("2d").getImageData(0, 0, w, h).data;
+    const a = new Uint8Array(w * h);
+    for (let p = 0, i = 3; p < w * h; p++, i += 4) a[p] = d[i];
+    return a;
+}
+
+/**
+ * The layer mask of a layer description, checked: `L.mask` = `{ canvas, disabled }`, the canvas at the layer's size
+ * (its alpha is the mask), or null when the layer has none.
+ */
+function maskOf(L, lw, lh) {
+    if (!L.mask) return null;
+    const c = L.mask.canvas;
+    if (!c) throw new Error(`the mask of layer "${L.name}" has no pixels`);
+    if (c.width !== lw || c.height !== lh) throw new Error(`the mask of layer "${L.name}" is ${c.width} x ${c.height}, its pixels ${lw} x ${lh}`);
+    return c;
+}
+
 /** PackBits-compressed channel: [rowLengths (2 bytes each), data] */
 function packPlane(plane, w, h) {
     const rows = [];
@@ -85,6 +108,35 @@ function pascal(name, pad) {
 }
 
 /**
+ * The layer's full name as Photoshop reads it: an additional layer info block `luni` (a count, then UTF-16 code
+ * units, padded to 4 bytes). The Pascal name beside it holds ASCII only, so without this block every name with an
+ * umlaut came back as "___".
+ */
+function luni(name) {
+    const s = String(name || "Layer");
+    const len = 4 + 2 * s.length, padded = Math.ceil(len / 4) * 4;
+    const out = new Uint8Array(12 + padded);
+    const v = new DataView(out.buffer);
+    out.set([0x38, 0x42, 0x49, 0x4d, 0x6c, 0x75, 0x6e, 0x69], 0);   // "8BIM" "luni"
+    v.setUint32(8, padded);
+    v.setUint32(12, s.length);
+    for (let i = 0; i < s.length; i++) v.setUint16(16 + 2 * i, s.charCodeAt(i));
+    return out;
+}
+
+/** The `lsct` block of a group's record: the kind (1 / 2 folder, 3 divider), and for a folder its blend mode, pass through. */
+function lsctBlock(kind) {
+    const folder = kind !== 3;
+    const out = new Uint8Array(12 + (folder ? 12 : 4));
+    const v = new DataView(out.buffer);
+    out.set([0x38, 0x42, 0x49, 0x4d, 0x6c, 0x73, 0x63, 0x74], 0);   // "8BIM" "lsct"
+    v.setUint32(8, folder ? 12 : 4);
+    v.setUint32(12, kind);
+    if (folder) out.set([0x38, 0x42, 0x49, 0x4d, 0x70, 0x61, 0x73, 0x73], 16);   // "8BIM" "pass"
+    return out;
+}
+
+/**
  * PSD writer that takes its layers one at a time (bottom first), so a worker can pack a
  * layer as soon as its pixels arrive and never holds the whole document at once.
  */
@@ -97,30 +149,74 @@ export class PsdWriter {
         this.count = 0;
     }
 
-    /** One layer: `L` is the description, `canvas` its pixels. */
+    /**
+     * One layer: `L` is the description, `canvas` its pixels. `L.mask` (optional) = `{ canvas, disabled }`: a layer
+     * mask at the layer's size whose alpha is the mask (255 = visible), written as the user mask channel -2 over the
+     * layer's own rectangle (default colour 255, flags 2 when `disabled`), the pixels themselves left as they are.
+     */
     layer(L, canvas = L.canvas) {
+        if (L.section) return this.section(L);
         const records = this.records, channelData = this.channelData;
         const lw = canvas.width, lh = canvas.height;
+        const maskCanvas = maskOf(L, lw, lh);
         const [r, g, b, a] = planes(canvas);
         const packed = [[-1, packPlane(a, lw, lh)], [0, packPlane(r, lw, lh)], [1, packPlane(g, lw, lh)], [2, packPlane(b, lw, lh)]];
+        if (maskCanvas) packed.push([-2, packPlane(alphaPlane(maskCanvas), lw, lh)]);
         records.i32(L.y); records.i32(L.x); records.i32(L.y + lh); records.i32(L.x + lw);
-        records.u16(4);
+        records.u16(packed.length);
         for (const [id, pk] of packed) { records.i16(id); records.u32(2 + 2 * lh + pk.total); }
         records.ascii("8BIM");
         records.ascii(PSD_BLEND[L.blend] || "norm");
         records.u8(Math.round(Math.max(0, Math.min(1, L.opacity ?? 1)) * 255));
-        records.u8(0);
+        records.u8(L.clip ? 1 : 0);   // clipping: 1 = clipped to the layer below (PLAN_0_1_31 §6 step 3)
         records.u8(L.visible === false ? 2 : 0);
         records.u8(0);
-        const name = pascal(L.name, 4);
-        records.u32(4 + 4 + name.length);
-        records.u32(0); records.u32(0);
+        const name = pascal(L.name, 4), uni = luni(L.name);
+        records.u32(4 + (maskCanvas ? 20 : 0) + 4 + name.length + uni.length);
+        if (maskCanvas) {
+            // layer mask data: its rectangle (the layer's), default colour, flags (bit 1: disabled), 2 bytes of padding
+            records.u32(20);
+            records.i32(L.y); records.i32(L.x); records.i32(L.y + lh); records.i32(L.x + lw);
+            records.u8(255);
+            records.u8(L.mask.disabled ? 2 : 0);
+            records.u16(0);
+        } else records.u32(0);
+        records.u32(0);   // blending ranges
         records.push(name);
+        records.push(uni);
         for (const [, pk] of packed) {
             channelData.u16(1);
             for (const row of pk.rows) channelData.u16(row.length);
             for (const row of pk.rows) channelData.push(row);
         }
+        this.count++;
+    }
+
+    /**
+     * A group's record (PLAN_0_1_31 §6.5): `S.section` 1 / 2 (the folder, above its layers; 2 = folded) or 3 (the
+     * bounding divider below them), as Photoshop writes them: no pixels (four channels of no rows), the folder in blend
+     * mode pass through, flags 24 (bit 4 "pixels irrelevant", bit 3 "bit 4 is set") plus 2 when hidden, the kind in an
+     * `lsct` block.
+     */
+    section(S) {
+        const records = this.records;
+        records.i32(0); records.i32(0); records.i32(0); records.i32(0);
+        records.u16(4);
+        for (const id of [-1, 0, 1, 2]) { records.i16(id); records.u32(2); }
+        records.ascii("8BIM");
+        records.ascii(S.section === 3 ? "norm" : "pass");
+        records.u8(255);
+        records.u8(0);
+        records.u8(24 | (S.visible === false ? 2 : 0));
+        records.u8(0);
+        const name = pascal(S.name, 4), uni = luni(S.name), lsct = lsctBlock(S.section);
+        records.u32(4 + 4 + name.length + uni.length + lsct.length);
+        records.u32(0);   // no mask
+        records.u32(0);   // blending ranges
+        records.push(name);
+        records.push(uni);
+        records.push(lsct);
+        for (let i = 0; i < 4; i++) this.channelData.u16(1);   // PackBits of no rows
         this.count++;
     }
 
