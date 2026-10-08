@@ -176,7 +176,7 @@ export function limitStageCPU(srcCanvas, outCanvas, limit, info = {}, over = fal
 
 /**
  * Bake limit weights into fill layer row alpha in place.
- * (Full implementation in R1-S7b).
+ * Evaluates the depth limit over map (or other limit sources) and multiplies alpha: alpha = round(alpha * w).
  * @param {Uint8Array|Uint8ClampedArray} rgba
  * @param {number} x0
  * @param {number} y0
@@ -186,7 +186,37 @@ export function limitStageCPU(srcCanvas, outCanvas, limit, info = {}, over = fal
  * @param {any} map
  */
 export function limitAlphaRows(rgba, x0, y0, w, h, limit, map) {
-    // Stub for R1-S7a, full implementation in R1-S7b
+    if (!rgba || !limit || w <= 0 || h <= 0) return;
+    const lim = normalizeLimit(limit);
+    if (!lim) return;
+
+    // Shortcut: full range and not inverted leaves alpha untouched
+    if (lim.lo <= 0 && lim.hi >= 1 && !lim.invert) return;
+
+    // If depth limit but map or map.data is missing, effect is zero -> alpha becomes 0
+    if (lim.source === "depth" && (!map || !map.data)) {
+        for (let i = 3; i < rgba.length; i += 4) rgba[i] = 0;
+        return;
+    }
+
+    const m = (map && map.data) ? passToMap(map, 1) : null;
+    let ptr = 0;
+    for (let y = 0; y < h; y++) {
+        const py = y0 + y + 0.5;
+        for (let x = 0; x < w; x++, ptr += 4) {
+            let mapVal = 0;
+            if (map && map.data && m) {
+                const px = x0 + x + 0.5;
+                const mx = m[0] * px + m[2] * py + m[4];
+                const my = m[1] * px + m[3] * py + m[5];
+                mapVal = u16Bilinear(map.data, map.w, map.h, mx, my);
+            }
+            const wVal = (lim.source === "depth" && (!map || !map.data))
+                ? 0
+                : limitWeight(lim, rgba[ptr] / 255, rgba[ptr + 1] / 255, rgba[ptr + 2] / 255, mapVal);
+            rgba[ptr + 3] = Math.max(0, Math.min(255, Math.round(rgba[ptr + 3] * wVal)));
+        }
+    }
 }
 
 setLimitStage(limitStage);

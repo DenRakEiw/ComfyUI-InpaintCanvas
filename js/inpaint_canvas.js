@@ -45,7 +45,7 @@ import { fitLayerRGBA, workScale } from "./edgefit.js";
 import { STALE_DIFF, GUIDE, RANGE_BAND_ROWS, WORK_MAX, modelSize, workSize, disparityRange } from "./inpaint_depth.js";
 import { packRG16, mapToJSON, mapFromJSON, fingerprint, fingerprintDiff, passToMap, makeMap } from "./inpaint_maps.js";
 import { normalizeLimit, u16Bilinear, rangeWeight, opp, colourSimilarity, hexToRgb as hexToRgb01, WEIGHTS_GLSL } from "./inpaint_weights.js";
-import "./inpaint_limit.js";
+import { limitAlphaRows } from "./inpaint_limit.js";
 
 /**
  * The pixel backend a new editor takes (docs/PLAN_BCE.md §C2 step b): the host's choice when it made
@@ -13270,7 +13270,11 @@ class InpaintEditor {
     fillLayerCanvas(l, bake) {
         const W = this.width, H = this.height;
         const c = makeCanvas(W, H), ctx = c.getContext("2d");
-        ctx.putImageData(new ImageData(fillPixels(l.filter, l.params || {}, [W, H], [0, 0], W, H), W, H), 0, 0);
+        const rows = fillPixels(l.filter, l.params || {}, [W, H], [0, 0], W, H);
+        if (l.params && l.params.limit) {
+            limitAlphaRows(rows, 0, 0, W, H, l.params.limit, this.maps && this.maps.depth);
+        }
+        ctx.putImageData(new ImageData(rows, W, H), 0, 0);
         const m = bake ? this.liveMask(l) : null;
         if (m) { ctx.globalCompositeOperation = "destination-in"; m.drawTo(ctx, 0, 0, W, H); ctx.globalCompositeOperation = "source-over"; }
         return c;
@@ -13280,7 +13284,12 @@ class InpaintEditor {
     fillLayerRows(l, bake) {
         const W = this.width, H = this.height, id = l.filter, p = JSON.parse(JSON.stringify(l.params || {}));
         if (bake && this.liveMask(l)) return () => { const c = this.fillLayerCanvas(l, true); return { source: canvasRows(c), close() { c.width = 1; c.height = 1; } }; };
-        return () => ({ source: bandRows(W, H, (y0, y1) => fillPixels(id, p, [W, H], [0, y0], W, y1 - y0)), close() {} });
+        const depthMap = this.maps && this.maps.depth;
+        return () => ({ source: bandRows(W, H, (y0, y1) => {
+            const rows = fillPixels(id, p, [W, H], [0, y0], W, y1 - y0);
+            if (p.limit) limitAlphaRows(rows, 0, y0, W, y1 - y0, p.limit, depthMap);
+            return rows;
+        }), close() {} });
     }
 
     markFilterChanged(layer, { soon = false } = {}) {
