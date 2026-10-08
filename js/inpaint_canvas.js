@@ -19,7 +19,7 @@ import { isGLSurface, glChainUsable, beginScope, endScope, releaseSurface, surfa
 import { TEXT_DEFAULTS, FONT_CATEGORIES, loadFontList, fontList, addUserFont, renderText, textAngle, textFrame, fontCss } from "./inpaint_text.js";
 import { readAbr, tipCanvas } from "./inpaint_brushes.js";
 import { setKernels, kernelsMode, OPS, deflate, smudgeDab as smudgeDabKernel, SMUDGE_ALPHA_LOCK, SMUDGE_PICKUP, compositeTile, poissonBlend as poissonBlendKernel, distTransform } from "./px/kernels.js";
-import { floodMask, maskToColorCanvas, clipMaskToSelection, rgbToHex, hexToRgb, growMask, invertMask, maskBounds, selModeOf, selectionGco, tilesSource } from "./inpaint_raster.js";
+import { floodMask, maskToColorCanvas, clipMaskToSelection, rgbToHex, hexToRgb, growMask, invertMask, maskBounds, selModeOf, selectionGco, tilesSource, bytesSource } from "./inpaint_raster.js";
 import { GLCompositor } from "./inpaint_compositor.js";
 import { LayerPixels, MaskPixels, canvasOf, displayCanvasIfMade, installLayerAliases, deprecatedPixels, pixelsOptions, BLIT_MARGIN, resetContext } from "./inpaint_pixels.js";
 import { INTERACTIVE, EXPORT } from "./inpaint_pool.js";
@@ -42,8 +42,9 @@ import { removeCrop, toModelImage, toModelMask, fromModel } from "./inpaint_remo
 import { LiquifyField, gridStep, previewBlock, liquifyFalloff } from "./inpaint_liquify.js";
 import { labelMap, sameLabels, remap, mapOffset, namesFor, parse, normalize, compare, checkNote, referencesText, referencesRule } from "./reftokens.js";
 import { fitLayerRGBA, workScale } from "./edgefit.js";
-import { STALE_DIFF, GUIDE } from "./inpaint_depth.js";
-import { packRG16, mapToJSON, mapFromJSON, fingerprint, fingerprintDiff } from "./inpaint_maps.js";
+import { STALE_DIFF, GUIDE, RANGE_BAND_ROWS } from "./inpaint_depth.js";
+import { packRG16, mapToJSON, mapFromJSON, fingerprint, fingerprintDiff, passToMap } from "./inpaint_maps.js";
+import { normalizeLimit, u16Bilinear, rangeWeight } from "./inpaint_weights.js";
 
 /**
  * The pixel backend a new editor takes (docs/PLAN_BCE.md §C2 step b): the host's choice when it made
@@ -1969,6 +1970,7 @@ class InpaintEditor {
         this.hoverObjectId = 0;
         this.hoverObjectCanvas = null;
         this.depthPending = null;
+        this.rangePending = null;
         this.showDepthMap = false;
         this.maps = {};
         this.mapsVersion = 0;
@@ -3058,7 +3060,7 @@ class InpaintEditor {
         // character it types, never a Ctrl shortcut (AltGr+8 moved the layer down instead of making the brush smaller)
         const altGr = !!(e.getModifierState && e.getModifierState("AltGraph"));
         const ctrl = (e.ctrlKey || e.metaKey) && !(altGr && e.altKey);   // Windows' AltGr is Ctrl+Alt; a real Ctrl with Linux's AltGr stays Ctrl
-        if (e.key === "Escape") { e.preventDefault(); if (this.pending) this.cancelPending(); else host.onEscape(this); return; }
+        if (e.key === "Escape") { e.preventDefault(); if (this.rangePending) this.cancelRange(); else if (this.pending) this.cancelPending(); else host.onEscape(this); return; }
         if (ctrl && e.key === "Enter") { e.preventDefault(); this.generate(); return; }
         if (e.key === "Enter" && this.pending) { e.preventDefault(); this.applyPending(); return; }
         if (e.key === "Enter" && this.polyPoints) { e.preventDefault(); this.closePolygon(); this.draw(); return; }
@@ -6362,6 +6364,221 @@ class InpaintEditor {
         const touched = old ? [Math.min(old[0], rect[0]), Math.min(old[1], rect[1]), Math.max(old[2], rect[2]), Math.max(old[3], rect[3])] : rect;
         this.markSelectionChanged(hint, touched);
         this.draw();
+    }
+
+    /**
+     * Select by range (depth, luma or color) using the banded combine rule.
+     * @param {object} limitIn - Limit parameters (source, lo, hi, fLo, fHi, invert, color, tol)
+     * @param {string} [mode="replace"] - Selection mode ("replace", "add", "subtract", "intersect")
+     * @param {object} [opts={}]
+     * @returns {Promise<{ bounds: number[] | null, seconds: number, tiles: number }>}
+     */
+    async selectRange(limitIn, mode = "replace", { label = "Select by range" } = {}) {
+        const limit = normalizeLimit(limitIn);
+        if (!limit) throw new Error("invalid limit descriptor");
+        if (limit.source === "depth" && (!this.maps || !this.maps.depth)) {
+            throw new Error("no depth map: compute it first (Selection › Depth)");
+        }
+        if (this.rangePending) throw new Error("range selection in progress");
+
+        const t0 = performance.now();
+        const W = this.width, H = this.height;
+        if (W <= 0 || H <= 0) return { bounds: null, seconds: 0, tiles: 0 };
+
+        const seq = nextPartsSeq();
+        const group = "range" + seq;
+
+        const oldBounds = (mode === "replace" || mode === "intersect" || mode === "subtract") ? this.getBounds() : null;
+        const snap = this.snapshot({ kind: "selection", label });
+        this.pushUndoSnapshot(snap);
+        if (mode === "replace") {
+            this.selectionLabel = "";
+            this.sel.clear();
+        }
+
+        const pendingRecord = { group, seq, snap, limit, mode };
+        this.rangePending = pendingRecord;
+
+        const jobInvert = (mode === "intersect") ? !limit.invert : limit.invert;
+        const bandMode = (mode === "replace") ? "add" : ((mode === "intersect") ? "subtract" : mode);
+
+        let unionBounds = null;
+        let totalTiles = 0;
+        let totalAlpha = 0;
+
+        try {
+            if (this.tileMode && !editorPool().off) {
+                // Tiles backend: pool jobs over bands
+                const map = this.maps.depth;
+                const m = passToMap(map, 1);
+
+                const bandPromises = [];
+                for (let y0 = 0; y0 < H; y0 += RANGE_BAND_ROWS) {
+                    const y1 = Math.min(y0 + RANGE_BAND_ROWS, H);
+                    const msg = {
+                        op: "range_select",
+                        W, H, y0, y1,
+                        source: limit.source,
+                        limit,
+                        invert: jobInvert,
+                        map: { w: map.w, h: map.h, data: map.data, m },
+                    };
+                    bandPromises.push(
+                        editorPool().run("range_select", msg, [], { priority: INTERACTIVE, group })
+                            .then((res) => ({ y0, y1, res }))
+                    );
+                }
+
+                for (const p of bandPromises) {
+                    const { y0, y1, res } = await p;
+                    if (this.rangePending !== pendingRecord) return { bounds: null, seconds: 0, tiles: 0 };
+
+                    totalAlpha += res.alphaSum || 0;
+                    if (res.tiles && res.tiles.length > 0) {
+                        totalTiles += res.tiles.length;
+                        const src = tilesSource(res.tiles, [0, 0], [0, y0, W, y1]);
+                        this.sel.combine(src, bandMode);
+                    }
+                    if (res.bounds) {
+                        if (!unionBounds) {
+                            unionBounds = [...res.bounds];
+                        } else {
+                            unionBounds[0] = Math.min(unionBounds[0], res.bounds[0]);
+                            unionBounds[1] = Math.min(unionBounds[1], res.bounds[1]);
+                            unionBounds[2] = Math.max(unionBounds[2], res.bounds[2]);
+                            unionBounds[3] = Math.max(unionBounds[3], res.bounds[3]);
+                        }
+                    }
+                }
+            } else {
+                // Canvas backend (or pool worker off): main-thread loop over bands
+                const map = this.maps.depth;
+                const m = passToMap(map, 1);
+                const mapData = map.data;
+                const mapW = map.w, mapH = map.h;
+
+                for (let y0 = 0; y0 < H; y0 += RANGE_BAND_ROWS) {
+                    if (this.rangePending !== pendingRecord) return { bounds: null, seconds: 0, tiles: 0 };
+                    const y1 = Math.min(y0 + RANGE_BAND_ROWS, H);
+                    const bh = y1 - y0;
+                    const alpha = new Uint8Array(W * bh);
+
+                    let bX0 = Infinity, bY0 = Infinity, bX1 = -Infinity, bY1 = -Infinity;
+
+                    for (let py = 0; py < bh; py++) {
+                        const y = y0 + py;
+                        const pyOffset = py * W;
+                        const pyCentre = y + 0.5;
+                        for (let px = 0; px < W; px++) {
+                            const pxCentre = px + 0.5;
+                            const mx = m[0] * pxCentre + m[2] * pyCentre + m[4];
+                            const my = m[1] * pxCentre + m[3] * pyCentre + m[5];
+                            const v = u16Bilinear(mapData, mapW, mapH, mx, my);
+                            const w = rangeWeight(v, limit);
+                            const a = Math.round(255 * (jobInvert ? 1 - w : w));
+                            alpha[pyOffset + px] = a;
+                            totalAlpha += a;
+                            if (a > 0) {
+                                if (px < bX0) bX0 = px;
+                                if (px > bX1) bX1 = px;
+                                if (y < bY0) bY0 = y;
+                                if (y > bY1) bY1 = y;
+                            }
+                        }
+                    }
+
+                    if (Number.isFinite(bX0)) {
+                        const bandBounds = [bX0, bY0, bX1 + 1, bY1 + 1];
+                        if (!unionBounds) {
+                            unionBounds = [...bandBounds];
+                        } else {
+                            unionBounds[0] = Math.min(unionBounds[0], bandBounds[0]);
+                            unionBounds[1] = Math.min(unionBounds[1], bandBounds[1]);
+                            unionBounds[2] = Math.max(unionBounds[2], bandBounds[2]);
+                            unionBounds[3] = Math.max(unionBounds[3], bandBounds[3]);
+                        }
+                    }
+
+                    const src = bytesSource(alpha, 0, y0, W, bh);
+                    this.sel.combine(src, bandMode);
+                    totalTiles += Math.ceil(W / 256) * Math.ceil(bh / 256);
+                }
+            }
+
+            if (this.rangePending !== pendingRecord) return { bounds: null, seconds: 0, tiles: 0 };
+
+            let hint;
+            if (mode === "replace") {
+                hint = unionBounds;
+            } else if (mode === "add") {
+                hint = this.boundsAfter("add", unionBounds || [0, 0, W, H]);
+            } else {
+                hint = oldBounds ? { within: oldBounds } : null;
+            }
+
+            const touched = oldBounds && unionBounds
+                ? [Math.min(oldBounds[0], unionBounds[0]), Math.min(oldBounds[1], unionBounds[1]),
+                   Math.max(oldBounds[2], unionBounds[2]), Math.max(oldBounds[3], unionBounds[3])]
+                : (oldBounds || unionBounds || [0, 0, W, H]);
+
+            this.markSelectionChanged(hint, touched);
+            this.draw();
+
+            const pct = Math.round(100 * totalAlpha / (Math.max(1, W * H) * 255));
+            const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+            this.setStatus(`Selected ${pct} % of the picture by ${limit.source} (near ${limit.lo.toFixed(2)} – far ${limit.hi.toFixed(2)}) in ${elapsed} s`);
+
+            return {
+                bounds: this.getBounds(),
+                seconds: +elapsed,
+                tiles: totalTiles,
+            };
+        } catch (err) {
+            if (this.rangePending === pendingRecord) {
+                this.rangePending = null;
+                const popped = this.undo.pop();
+                if (popped) {
+                    this.undoBytes -= popped.bytes || 0;
+                    this.applySnapshot(popped);
+                    this.releaseSnapshot(popped);
+                    this.historyChanged();
+                    this.markSelectionChanged();
+                    this.draw();
+                }
+            }
+            throw err;
+        } finally {
+            if (this.rangePending === pendingRecord) {
+                this.rangePending = null;
+            }
+        }
+    }
+
+    /**
+     * Cancel an ongoing selectRange operation.
+     */
+    cancelRange() {
+        if (!this.rangePending) return false;
+        const pending = this.rangePending;
+        this.rangePending = null;
+        try {
+            editorPool().cancel(pending.group);
+        } catch {}
+
+        const popped = this.undo.pop();
+        if (popped) {
+            this.undoBytes -= popped.bytes || 0;
+            this.applySnapshot(popped);
+            this.releaseSnapshot(popped);
+        } else if (pending.snap) {
+            this.applySnapshot(pending.snap);
+            this.releaseSnapshot(pending.snap);
+        }
+        this.historyChanged();
+        this.markSelectionChanged();
+        this.draw();
+        this.setStatus("Selection by range cancelled");
+        return true;
     }
 
     /**

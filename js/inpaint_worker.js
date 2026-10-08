@@ -51,6 +51,7 @@ import { readTiff, tiffPart } from "./inpaint_tiff.js";
 import { resampleStore } from "./inpaint_resample.js";
 import { liquifyStore } from "./inpaint_liquify.js";
 import { guidedFar } from "./inpaint_depth.js";
+import { u16Bilinear, rangeWeight, LUMA, opp, colourSimilarity } from "./inpaint_weights.js";
 import { mipChain, mipChainBytes, clampExtend, compositeTile, matchPixels, psdPackRows, kernelsReady, setKernels, rustPx, kernelsInUse, releaseIfLarge, deflate, resampleBlock, poissonBlend, boxBlurs } from "./px/kernels.js";
 
 const TILE = 256, LEVELS = 5, TILE_BYTES = TILE * TILE * 4;
@@ -802,9 +803,115 @@ function depthGuide(msg) {
     return { u16: u16.buffer, transfer: [u16.buffer], timing: { op: "depth_guide", total: now() - t0 } };
 }
 
+export function rangeSelectJob(msg) {
+    const t0 = now();
+    const W = msg.W | 0, H = msg.H | 0;
+    const y0 = msg.y0 | 0, y1 = msg.y1 | 0;
+    const source = msg.source || "depth";
+    const limit = msg.limit;
+    const invert = !!msg.invert;
+    const tiles = [];
+    const transfer = [];
+    let bX0 = Infinity, bY0 = Infinity, bX1 = -Infinity, bY1 = -Infinity;
+    let alphaSum = 0;
+
+    if (source === "depth") {
+        const map = msg.map;
+        if (!map || !map.data) throw new Error("range_select: missing depth map data");
+        const mapData = map.data instanceof Uint16Array ? map.data : new Uint16Array(map.data);
+        const mapW = map.w | 0, mapH = map.h | 0;
+        const m = map.m;
+
+        const tileCols = Math.ceil(W / TILE);
+        const startTileY = Math.floor(y0 / TILE);
+        const endTileY = Math.ceil(y1 / TILE);
+
+        for (let ty = startTileY; ty < endTileY; ty++) {
+            const tileY0 = ty * TILE;
+            const tileY1 = Math.min(tileY0 + TILE, H);
+            for (let tx = 0; tx < tileCols; tx++) {
+                const tileX0 = tx * TILE;
+                const tileX1 = Math.min(tileX0 + TILE, W);
+
+                const alpha = new Uint8Array(TILE * TILE);
+                let zeros = 0, fulls = 0;
+                let tMinX = TILE, tMinY = TILE, tMaxX = -1, tMaxY = -1;
+
+                for (let py = 0; py < TILE; py++) {
+                    const y = tileY0 + py;
+                    if (y < y0 || y >= y1 || y >= H) {
+                        zeros += TILE;
+                        continue;
+                    }
+                    const pyOffset = py * TILE;
+                    const pyCentre = y + 0.5;
+
+                    for (let px = 0; px < TILE; px++) {
+                        const x = tileX0 + px;
+                        if (x >= W) {
+                            zeros++;
+                            continue;
+                        }
+                        const pxCentre = x + 0.5;
+                        const mx = m[0] * pxCentre + m[2] * pyCentre + m[4];
+                        const my = m[1] * pxCentre + m[3] * pyCentre + m[5];
+                        const v = u16Bilinear(mapData, mapW, mapH, mx, my);
+                        const w = rangeWeight(v, limit);
+                        const a = Math.round(255 * (invert ? 1 - w : w));
+
+                        alpha[pyOffset + px] = a;
+                        alphaSum += a;
+                        if (a === 0) {
+                            zeros++;
+                        } else {
+                            if (a === 255) fulls++;
+                            if (px < tMinX) tMinX = px;
+                            if (px > tMaxX) tMaxX = px;
+                            if (py < tMinY) tMinY = py;
+                            if (py > tMaxY) tMaxY = py;
+                        }
+                    }
+                }
+
+                if (zeros === TILE * TILE) {
+                    continue;
+                }
+                if (fulls === TILE * TILE && (tileX1 - tileX0) === TILE && (tileY1 - tileY0) === TILE) {
+                    tiles.push({ tx, ty, full: true });
+                    bX0 = Math.min(bX0, tileX0);
+                    bY0 = Math.min(bY0, tileY0);
+                    bX1 = Math.max(bX1, tileX0 + TILE);
+                    bY1 = Math.max(bY1, tileY0 + TILE);
+                } else {
+                    tiles.push({ tx, ty, alpha: alpha.buffer });
+                    transfer.push(alpha.buffer);
+                    bX0 = Math.min(bX0, tileX0 + tMinX);
+                    bY0 = Math.min(bY0, tileY0 + tMinY);
+                    bX1 = Math.max(bX1, tileX0 + tMaxX + 1);
+                    bY1 = Math.max(bY1, tileY0 + tMaxY + 1);
+                }
+            }
+        }
+    } else if (source === "luma" || source === "color") {
+        throw new Error(`source "${source}" not supported in R1-S5a`);
+    } else {
+        throw new Error(`unknown source "${source}"`);
+    }
+
+    const bounds = Number.isFinite(bX0) ? [bX0, bY0, bX1, bY1] : null;
+    return {
+        tiles,
+        bounds,
+        alphaSum,
+        timing: { op: "range_select", source, ms: now() - t0, tiles: tiles.length },
+        transfer,
+    };
+}
+
 async function run(msg) {
     setKernels(msg.kernels);
     await kernelsReady();
+    if (msg.op === "range_select") return rangeSelectJob(msg);
     if (msg.op === "depth_guide") return depthGuide(msg);
     if (msg.op === "resample") return resampleJob(msg);
     if (msg.op === "liquify") return liquifyJob(msg);
