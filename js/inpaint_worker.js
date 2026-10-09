@@ -52,6 +52,7 @@ import { resampleStore } from "./inpaint_resample.js";
 import { liquifyStore } from "./inpaint_liquify.js";
 import { guidedFar } from "./inpaint_depth.js";
 import { u16Bilinear, rangeWeight, LUMA, opp, colourSimilarity, hexToRgb as hexToRgb01 } from "./inpaint_weights.js";
+import { snapField } from "./inpaint_edges.js";
 import { mipChain, mipChainBytes, clampExtend, compositeTile, matchPixels, psdPackRows, kernelsReady, setKernels, rustPx, kernelsInUse, releaseIfLarge, deflate, resampleBlock, poissonBlend, boxBlurs } from "./px/kernels.js";
 
 const TILE = 256, LEVELS = 5, TILE_BYTES = TILE * TILE * 4;
@@ -822,6 +823,38 @@ export function rangeSelectJob(msg) {
         const mapW = map.w | 0, mapH = map.h | 0;
         const m = map.m;
 
+        const snap = msg.snap;
+        const sigmaR = (Array.isArray(snap) && snap.length >= 2) ? snap[0] : 0;
+        const tau = (Array.isArray(snap) && snap.length >= 2) ? snap[1] : 0;
+
+        let guideObj = null;
+        if (msg.guide && (msg.guide.sab || msg.guide.data)) {
+            const gBytes = msg.guide.sab
+                ? new Uint8Array(msg.guide.sab)
+                : (msg.guide.data instanceof Uint8Array
+                    ? msg.guide.data
+                    : new Uint8Array(msg.guide.data.buffer, msg.guide.data.byteOffset, msg.guide.data.byteLength));
+            guideObj = { data: gBytes, w: msg.guide.w | 0, h: msg.guide.h | 0 };
+        }
+
+        const mapObj = { data: mapData, w: mapW, h: mapH };
+
+        const pic = msg.picture;
+        let picData = null, picX0 = 0, picY0 = 0, picX1 = 0, picY1 = 0, picW = 0;
+        if (pic && (pic.sab || pic.data)) {
+            picData = pic.sab
+                ? new Uint8Array(pic.sab)
+                : (pic.data instanceof Uint8Array
+                    ? pic.data
+                    : new Uint8Array(pic.data.buffer, pic.data.byteOffset, pic.data.byteLength));
+            picX0 = pic.x0 | 0;
+            picY0 = pic.y0 | 0;
+            picW = pic.w | 0;
+            const picH = pic.h | 0;
+            picX1 = picX0 + picW;
+            picY1 = picY0 + picH;
+        }
+
         const tileCols = Math.ceil(W / TILE);
         const startTileY = Math.floor(y0 / TILE);
         const endTileY = Math.ceil(y1 / TILE);
@@ -855,7 +888,16 @@ export function rangeSelectJob(msg) {
                         const pxCentre = x + 0.5;
                         const mx = m[0] * pxCentre + m[2] * pyCentre + m[4];
                         const my = m[1] * pxCentre + m[3] * pyCentre + m[5];
-                        const v = u16Bilinear(mapData, mapW, mapH, mx, my);
+                        let v;
+                        if (sigmaR > 0 && guideObj && picData && x >= picX0 && x < picX1 && y >= picY0 && y < picY1) {
+                            const pOffset = ((y - picY0) * picW + (x - picX0)) * 4;
+                            const pr = picData[pOffset] / 255;
+                            const pg = picData[pOffset + 1] / 255;
+                            const pb = picData[pOffset + 2] / 255;
+                            v = snapField(mapObj, guideObj, mx, my, pr, pg, pb, sigmaR, tau);
+                        } else {
+                            v = u16Bilinear(mapData, mapW, mapH, mx, my);
+                        }
                         const w = rangeWeight(v, limit);
                         const a = Math.round(255 * (invert ? 1 - w : w));
 

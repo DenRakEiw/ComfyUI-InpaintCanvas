@@ -44,7 +44,7 @@ import { labelMap, sameLabels, remap, mapOffset, namesFor, parse, normalize, com
 import { fitLayerRGBA, workScale } from "./edgefit.js";
 import { STALE_DIFF, GUIDE, RANGE_BAND_ROWS, WORK_MAX, modelSize, workSize, disparityRange } from "./inpaint_depth.js";
 import { packRG16, mapToJSON, mapFromJSON, fingerprint, fingerprintDiff, passToMap, makeMap, sampleMap, deriveMap } from "./inpaint_maps.js";
-import { SNAP_DEFAULT } from "./inpaint_edges.js";
+import { SNAP_DEFAULT, SNAP_TAU, snapParams, snapField, rangeMax, edgeTiles } from "./inpaint_edges.js";
 import { normalizeLimit, u16Bilinear, rangeWeight, opp, colourSimilarity, hexToRgb as hexToRgb01, WEIGHTS_GLSL } from "./inpaint_weights.js";
 import { limitAlphaRows } from "./inpaint_limit.js";
 import { buildRangeBar } from "./inpaint_rangebar.js";
@@ -1691,6 +1691,9 @@ const STROKE_SCRATCH_KEEP_PX = 16 * 1024 * 1024;
 // copy of itself at the layer's resolution, two canvases of 561 MB, and one drawInto of the
 // whole box (a 561 MB scratch read back in blocks, 1.3 s on tiles).
 const STROKE_BAND = 1024;
+
+// WeakMap caching rangeMax(map) keyed by map.data (immutable Uint16Array) for selectRange depth edge tiles (R2-S6)
+const RMAX_CACHE = new WeakMap();
 
 /**
  * What an editor has uploaded, by hash. Setting `baseHash` to null (the base or a layer that is
@@ -6554,22 +6557,125 @@ class InpaintEditor {
                 if (limit.source === "depth") {
                     const map = this.maps.depth;
                     const m = passToMap(map, 1);
+                    const strength = (map.meta?.snap?.strength != null) ? map.meta.snap.strength : SNAP_DEFAULT;
+                    const snap = (map.guide && strength > 0) ? snapParams(strength) : null;
+                    const sigmaR = snap ? snap[0] : 0;
+                    const tau = snap ? snap[1] : SNAP_TAU;
 
+                    let edgeFlags = null;
+                    if (sigmaR > 0 && map.guide) {
+                        let rmax = RMAX_CACHE.get(map.data);
+                        if (!rmax) {
+                            rmax = rangeMax(map);
+                            RMAX_CACHE.set(map.data, rmax);
+                        }
+                        edgeFlags = edgeTiles(map, rmax, m, W, H, tau, 256);
+                    }
+
+                    const tileCols = Math.ceil(W / 256);
+                    const tileRows = Math.ceil(H / 256);
+
+                    const guideMsg = (map.guide && sigmaR > 0) ? {
+                        sab: (typeof SharedArrayBuffer !== "undefined" && map.guide.buffer instanceof SharedArrayBuffer) ? map.guide.buffer : null,
+                        data: (typeof SharedArrayBuffer !== "undefined" && map.guide.buffer instanceof SharedArrayBuffer) ? null : map.guide,
+                        w: map.w,
+                        h: map.h,
+                    } : null;
+
+                    const mapMsg = {
+                        w: map.w,
+                        h: map.h,
+                        data: map.data,
+                        m,
+                    };
+
+                    let scratchCanvas = null;
+                    let scratchCtx = null;
                     const bandPromises = [];
-                    for (let y0 = 0; y0 < H; y0 += RANGE_BAND_ROWS) {
-                        const y1 = Math.min(y0 + RANGE_BAND_ROWS, H);
-                        const msg = {
-                            op: "range_select",
-                            W, H, y0, y1,
-                            source: limit.source,
-                            limit,
-                            invert: jobInvert,
-                            map: { w: map.w, h: map.h, data: map.data, m },
-                        };
-                        bandPromises.push(
-                            editorPool().run("range_select", msg, [], { priority: INTERACTIVE, group })
-                                .then((res) => ({ y0, y1, res }))
-                        );
+
+                    try {
+                        for (let ty = 0; ty < tileRows; ty++) {
+                            if (this.rangePending !== pendingRecord) break;
+                            const y0 = ty * 256;
+                            const y1 = Math.min(y0 + 256, H);
+                            const bh = y1 - y0;
+
+                            let minTx = -1, maxTx = -1;
+                            if (edgeFlags) {
+                                const rowOffset = ty * tileCols;
+                                for (let tx = 0; tx < tileCols; tx++) {
+                                    if (edgeFlags[rowOffset + tx] === 1) {
+                                        if (minTx === -1) minTx = tx;
+                                        maxTx = tx;
+                                    }
+                                }
+                            }
+
+                            let picture = null;
+                            if (minTx !== -1) {
+                                const minX = minTx * 256;
+                                const maxX = Math.min(W, (maxTx + 1) * 256);
+                                const bw = maxX - minX;
+                                const box = [minX, y0, maxX, y1];
+                                const regCanvas = await this.sampleRegionSettled("image", box, 1, { forRun: true, skipFilters: true });
+                                if (this.rangePending !== pendingRecord) break;
+
+                                if (!scratchCanvas) {
+                                    scratchCanvas = document.createElement("canvas");
+                                    this._rangeScratchCreated = (this._rangeScratchCreated || 0) + 1;
+                                    scratchCtx = scratchCanvas.getContext("2d", { willReadFrequently: true });
+                                }
+                                if (scratchCanvas.width !== bw || scratchCanvas.height !== bh) {
+                                    scratchCanvas.width = bw;
+                                    scratchCanvas.height = bh;
+                                }
+                                scratchCtx.drawImage(regCanvas, 0, 0);
+                                const imgData = scratchCtx.getImageData(0, 0, bw, bh);
+
+                                let picSab = null;
+                                if (typeof SharedArrayBuffer !== "undefined") {
+                                    picSab = new SharedArrayBuffer(bw * bh * 4);
+                                    new Uint8Array(picSab).set(imgData.data);
+                                }
+                                picture = picSab ? {
+                                    sab: picSab,
+                                    x0: minX,
+                                    y0,
+                                    w: bw,
+                                    h: bh,
+                                } : {
+                                    data: imgData.data,
+                                    x0: minX,
+                                    y0,
+                                    w: bw,
+                                    h: bh,
+                                };
+                            }
+
+                            const msg = {
+                                op: "range_select",
+                                W, H, y0, y1,
+                                source: limit.source,
+                                limit,
+                                invert: jobInvert,
+                                map: mapMsg,
+                                snap: snap ? [sigmaR, tau] : null,
+                                guide: guideMsg,
+                                picture,
+                            };
+
+                            bandPromises.push(
+                                editorPool().run("range_select", msg, [], { priority: INTERACTIVE, group })
+                                    .then((res) => ({ y0, y1, res }))
+                            );
+                        }
+                    } finally {
+                        if (scratchCanvas) {
+                            scratchCanvas.width = 1;
+                            scratchCanvas.height = 1;
+                            scratchCanvas = null;
+                            scratchCtx = null;
+                        }
                     }
 
                     for (const p of bandPromises) {
@@ -6673,57 +6779,148 @@ class InpaintEditor {
                 }
             } else {
                 // Canvas backend (or pool worker off): main-thread loop over bands
-                let flatCtx = null;
-                if (limit.source !== "depth") {
-                    const flat = this.flattenToCanvas({ forRun: true });
-                    flatCtx = flat.getContext("2d");
-                }
-                let map = null, m = null, mapData = null, mapW = 0, mapH = 0;
                 if (limit.source === "depth") {
-                    map = this.maps.depth;
-                    m = passToMap(map, 1);
-                    mapData = map.data;
-                    mapW = map.w;
-                    mapH = map.h;
-                }
-                let colorRef = null, colorTol = 30;
-                if (limit.source === "color") {
-                    const rgbRef = hexToRgb01(limit.color || "#ffffff");
-                    colorRef = opp(rgbRef[0], rgbRef[1], rgbRef[2]);
-                    colorTol = limit.tol ?? 30;
-                }
+                    const map = this.maps.depth;
+                    const m = passToMap(map, 1);
+                    const mapData = map.data;
+                    const mapW = map.w, mapH = map.h;
+                    const mapObj = { data: mapData, w: mapW, h: mapH };
 
-                for (let y0 = 0; y0 < H; y0 += RANGE_BAND_ROWS) {
-                    if (this.rangePending !== pendingRecord) return { bounds: null, seconds: 0, tiles: 0 };
-                    const y1 = Math.min(y0 + RANGE_BAND_ROWS, H);
-                    const bh = y1 - y0;
-                    const alpha = new Uint8Array(W * bh);
+                    const strength = (map.meta?.snap?.strength != null) ? map.meta.snap.strength : SNAP_DEFAULT;
+                    const snap = (map.guide && strength > 0) ? snapParams(strength) : null;
+                    const sigmaR = snap ? snap[0] : 0;
+                    const tau = snap ? snap[1] : SNAP_TAU;
 
-                    let bX0 = Infinity, bY0 = Infinity, bX1 = -Infinity, bY1 = -Infinity;
+                    let edgeFlags = null;
+                    if (sigmaR > 0 && map.guide) {
+                        let rmax = RMAX_CACHE.get(map.data);
+                        if (!rmax) {
+                            rmax = rangeMax(map);
+                            RMAX_CACHE.set(map.data, rmax);
+                        }
+                        edgeFlags = edgeTiles(map, rmax, m, W, H, tau, 256);
+                    }
 
-                    if (limit.source === "depth") {
-                        for (let py = 0; py < bh; py++) {
-                            const y = y0 + py;
-                            const pyOffset = py * W;
-                            const pyCentre = y + 0.5;
-                            for (let px = 0; px < W; px++) {
-                                const pxCentre = px + 0.5;
-                                const mx = m[0] * pxCentre + m[2] * pyCentre + m[4];
-                                const my = m[1] * pxCentre + m[3] * pyCentre + m[5];
-                                const v = u16Bilinear(mapData, mapW, mapH, mx, my);
-                                const w = rangeWeight(v, limit);
-                                const a = Math.round(255 * (jobInvert ? 1 - w : w));
-                                alpha[pyOffset + px] = a;
-                                totalAlpha += a;
-                                if (a > 0) {
-                                    if (px < bX0) bX0 = px;
-                                    if (px > bX1) bX1 = px;
-                                    if (y < bY0) bY0 = y;
-                                    if (y > bY1) bY1 = y;
+                    const tileCols = Math.ceil(W / 256);
+                    const tileRows = Math.ceil(H / 256);
+
+                    let scratchCanvas = null;
+                    let scratchCtx = null;
+
+                    try {
+                        for (let ty = 0; ty < tileRows; ty++) {
+                            if (this.rangePending !== pendingRecord) return { bounds: null, seconds: 0, tiles: 0 };
+                            const y0 = ty * 256;
+                            const y1 = Math.min(y0 + 256, H);
+                            const bh = y1 - y0;
+                            const alpha = new Uint8Array(W * bh);
+
+                            let minTx = -1, maxTx = -1;
+                            if (edgeFlags) {
+                                const rowOffset = ty * tileCols;
+                                for (let tx = 0; tx < tileCols; tx++) {
+                                    if (edgeFlags[rowOffset + tx] === 1) {
+                                        if (minTx === -1) minTx = tx;
+                                        maxTx = tx;
+                                    }
                                 }
                             }
+
+                            let picData = null, picX0 = 0, picX1 = 0, picW = 0;
+                            if (minTx !== -1) {
+                                picX0 = minTx * 256;
+                                picX1 = Math.min(W, (maxTx + 1) * 256);
+                                picW = picX1 - picX0;
+                                const box = [picX0, y0, picX1, y1];
+                                const regCanvas = await this.sampleRegionSettled("image", box, 1, { forRun: true, skipFilters: true });
+                                if (this.rangePending !== pendingRecord) return { bounds: null, seconds: 0, tiles: 0 };
+
+                                if (!scratchCanvas) {
+                                    scratchCanvas = document.createElement("canvas");
+                                    this._rangeScratchCreated = (this._rangeScratchCreated || 0) + 1;
+                                    scratchCtx = scratchCanvas.getContext("2d", { willReadFrequently: true });
+                                }
+                                if (scratchCanvas.width !== picW || scratchCanvas.height !== bh) {
+                                    scratchCanvas.width = picW;
+                                    scratchCanvas.height = bh;
+                                }
+                                scratchCtx.drawImage(regCanvas, 0, 0);
+                                picData = scratchCtx.getImageData(0, 0, picW, bh).data;
+                            }
+
+                            let bX0 = Infinity, bY0 = Infinity, bX1 = -Infinity, bY1 = -Infinity;
+                            for (let py = 0; py < bh; py++) {
+                                const y = y0 + py;
+                                const pyOffset = py * W;
+                                const pyCentre = y + 0.5;
+                                for (let px = 0; px < W; px++) {
+                                    const pxCentre = px + 0.5;
+                                    const mx = m[0] * pxCentre + m[2] * pyCentre + m[4];
+                                    const my = m[1] * pxCentre + m[3] * pyCentre + m[5];
+                                    let v;
+                                    if (picData && px >= picX0 && px < picX1) {
+                                        const pOffset = (py * picW + (px - picX0)) * 4;
+                                        const pr = picData[pOffset] / 255;
+                                        const pg = picData[pOffset + 1] / 255;
+                                        const pb = picData[pOffset + 2] / 255;
+                                        v = snapField(mapObj, map.guide, mx, my, pr, pg, pb, sigmaR, tau);
+                                    } else {
+                                        v = u16Bilinear(mapData, mapW, mapH, mx, my);
+                                    }
+                                    const w = rangeWeight(v, limit);
+                                    const a = Math.round(255 * (jobInvert ? 1 - w : w));
+                                    alpha[pyOffset + px] = a;
+                                    totalAlpha += a;
+                                    if (a > 0) {
+                                        if (px < bX0) bX0 = px;
+                                        if (px > bX1) bX1 = px;
+                                        if (y < bY0) bY0 = y;
+                                        if (y > bY1) bY1 = y;
+                                    }
+                                }
+                            }
+
+                            if (Number.isFinite(bX0)) {
+                                const bandBounds = [bX0, bY0, bX1 + 1, bY1 + 1];
+                                if (!unionBounds) {
+                                    unionBounds = [...bandBounds];
+                                } else {
+                                    unionBounds[0] = Math.min(unionBounds[0], bandBounds[0]);
+                                    unionBounds[1] = Math.min(unionBounds[1], bandBounds[1]);
+                                    unionBounds[2] = Math.max(unionBounds[2], bandBounds[2]);
+                                    unionBounds[3] = Math.max(unionBounds[3], bandBounds[3]);
+                                }
+                            }
+
+                            const src = bytesSource(alpha, 0, y0, W, bh);
+                            this.sel.combine(src, bandMode);
+                            totalTiles += Math.ceil(W / 256) * Math.ceil(bh / 256);
                         }
-                    } else {
+                    } finally {
+                        if (scratchCanvas) {
+                            scratchCanvas.width = 1;
+                            scratchCanvas.height = 1;
+                            scratchCanvas = null;
+                            scratchCtx = null;
+                        }
+                    }
+                } else {
+                    const flat = this.flattenToCanvas({ forRun: true });
+                    const flatCtx = flat.getContext("2d");
+                    let colorRef = null, colorTol = 30;
+                    if (limit.source === "color") {
+                        const rgbRef = hexToRgb01(limit.color || "#ffffff");
+                        colorRef = opp(rgbRef[0], rgbRef[1], rgbRef[2]);
+                        colorTol = limit.tol ?? 30;
+                    }
+
+                    for (let y0 = 0; y0 < H; y0 += RANGE_BAND_ROWS) {
+                        if (this.rangePending !== pendingRecord) return { bounds: null, seconds: 0, tiles: 0 };
+                        const y1 = Math.min(y0 + RANGE_BAND_ROWS, H);
+                        const bh = y1 - y0;
+                        const alpha = new Uint8Array(W * bh);
+
+                        let bX0 = Infinity, bY0 = Infinity, bX1 = -Infinity, bY1 = -Infinity;
                         const imgData = flatCtx.getImageData(0, y0, W, bh);
                         const d = imgData.data;
                         const isLuma = limit.source === "luma";
@@ -6750,23 +6947,23 @@ class InpaintEditor {
                                 }
                             }
                         }
-                    }
 
-                    if (Number.isFinite(bX0)) {
-                        const bandBounds = [bX0, bY0, bX1 + 1, bY1 + 1];
-                        if (!unionBounds) {
-                            unionBounds = [...bandBounds];
-                        } else {
-                            unionBounds[0] = Math.min(unionBounds[0], bandBounds[0]);
-                            unionBounds[1] = Math.min(unionBounds[1], bandBounds[1]);
-                            unionBounds[2] = Math.max(unionBounds[2], bandBounds[2]);
-                            unionBounds[3] = Math.max(unionBounds[3], bandBounds[3]);
+                        if (Number.isFinite(bX0)) {
+                            const bandBounds = [bX0, bY0, bX1 + 1, bY1 + 1];
+                            if (!unionBounds) {
+                                unionBounds = [...bandBounds];
+                            } else {
+                                unionBounds[0] = Math.min(unionBounds[0], bandBounds[0]);
+                                unionBounds[1] = Math.min(unionBounds[1], bandBounds[1]);
+                                unionBounds[2] = Math.max(unionBounds[2], bandBounds[2]);
+                                unionBounds[3] = Math.max(unionBounds[3], bandBounds[3]);
+                            }
                         }
-                    }
 
-                    const src = bytesSource(alpha, 0, y0, W, bh);
-                    this.sel.combine(src, bandMode);
-                    totalTiles += Math.ceil(W / 256) * Math.ceil(bh / 256);
+                        const src = bytesSource(alpha, 0, y0, W, bh);
+                        this.sel.combine(src, bandMode);
+                        totalTiles += Math.ceil(W / 256) * Math.ceil(bh / 256);
+                    }
                 }
             }
 
