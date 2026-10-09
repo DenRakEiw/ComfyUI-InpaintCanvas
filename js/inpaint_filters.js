@@ -14,7 +14,7 @@
 
 import { curveDefaults, curvesToTables, buildCurvesControl } from "./inpaint_curves.js";
 import { applyFilterGL, applyMatchGL, glToCanvas } from "./inpaint_filters_gl.js";
-import { hazeStats, applyHaze } from "./inpaint_depthfx.js";
+import { hazeStats, applyHaze, dehazeStats, applyDehaze } from "./inpaint_depthfx.js";
 
 function makeCanvas(w, h) {
     const c = document.createElement("canvas");
@@ -1083,6 +1083,20 @@ export const FILTERS = {
         wholeStatsSize: 256,
         reach: 0,
         apply: applyHaze,
+    },
+    dehaze: {
+        label: "Dehaze",
+        params: [
+            { key: "amount", label: "Amount", min: 0, max: 100, step: 1, default: 50, unit: "%" },
+            { key: "mode", label: "Haze from", type: "select", default: "auto", options: [{ id: "auto", label: "The picture" }, { id: "depth", label: "The depth map", needs: "depth" }] },
+            { key: "density", label: "Density", min: 0, max: 200, step: 1, default: 100, unit: "%", when: { mode: "depth" } },
+            { key: "protect", label: "Protect sky", min: 0, max: 100, step: 1, default: 40, unit: "%" },
+        ],
+        maps: (p) => (p && p.mode === "depth" ? ["depth"] : []),
+        wholeStats: dehazeStats,
+        wholeStatsSize: 768,
+        reach: 0,
+        apply: applyDehaze,
     },
     // fill layers: `over` - the result goes over the picture below as a layer would (its own alpha, the layer's blend
     // mode, opacity and mask), it does not stand for that picture; `chain` - apply() takes a GPU surface as it is (it

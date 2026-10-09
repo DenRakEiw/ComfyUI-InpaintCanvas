@@ -17669,6 +17669,7 @@ class InpaintEditor {
                 sel.title = p.title || (p.key !== "preset" ? p.label : hostText("filmPresetTip", "Film stock: sets amount, grain size and colour share (grain character only, the colour look is a LUT's job). Values assume a picture of about 2000 px. Film names are trademarks of their owners; the looks are Scumble's own approximations, not licensed products."));
                 let group = null;
                 for (const o of p.options) {
+                    if (o.needs === "depth" && !host.depthSupported && cur !== o.id) continue;
                     const opt = document.createElement("option"); opt.value = o.id; opt.textContent = o.label;
                     if (o.group) {
                         if (!group || group.label !== o.group) { group = document.createElement("optgroup"); group.label = o.group; sel.appendChild(group); }
