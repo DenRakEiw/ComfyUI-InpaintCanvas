@@ -12125,16 +12125,17 @@ class InpaintEditor {
         else delete this.maps.depth;
     }
 
-    async ensureDepthMap({ force = false, edges = null } = {}) {
-        return this.computeDepthMap({ recompute: force, edges });
+    async ensureDepthMap({ force = false, edges = null, detail = null } = {}) {
+        return this.computeDepthMap({ recompute: force, edges, detail });
     }
 
     /**
      * Compute or refresh the document's depth map:
      * Samples document without filter layers via host.depthInput, runs Depth Anything V2 Small,
-     * refines edges using guided filter in a worker, and stores result in this.maps.depth via setMap.
+     * optionally computes detail tiles pass (R2-S7), refines edges using guided filter in a worker,
+     * and stores result in this.maps.depth via setMap.
      */
-    async computeDepthMap({ recompute = false, edges = null } = {}) {
+    async computeDepthMap({ recompute = false, edges = null, detail = null } = {}) {
         if (!this.base) throw new Error("No image loaded in document");
         if (this.depthPending) return this.depthPending;
         const model = host.depthModel();
@@ -12153,21 +12154,73 @@ class InpaintEditor {
                 const fpInp = await host.pictureInput(this, 64, 64, { skipFilters: true, background: "#808080" });
                 const fp = fingerprint(fpInp.image, 64, 64);
 
+                const chosenDetail = detail || (host.getDepthDetail ? host.getDepthDetail() : (host.depthDetailSetting || "standard"));
                 const existing = this.maps && this.maps.depth;
-                if (!recompute && existing && existing.meta && existing.meta.fp === fp) {
+                const existingDetail = existing && existing.meta && existing.meta.detail
+                    ? (existing.meta.detail.route === "large" ? "large" : (existing.meta.detail.grid === 3 ? "finest" : "fine"))
+                    : "standard";
+                if (!recompute && existing && existing.meta && existing.meta.fp === fp && existingDetail === chosenDetail) {
                     if (edges !== null && edges !== undefined) {
                         this.setMapMeta("depth", { snap: { ...(existing.meta.snap || {}), strength: Math.max(0, Math.min(100, Math.round(+edges))) } });
                     }
                     this.renderDepthRow();
                     return this.maps.depth;
                 }
-                this.setStatus(`Estimating depth with ${model.label} ...`);
+                this.setStatus("Estimating depth with " + model.label + " ...");
                 const res = await host.computeDepth(this, {
                     image: input.image,
                     width: mw,
                     height: mh,
                 });
-                const { lo, hi } = disparityRange(res.depth, 0.005, 0.995);
+
+                let rawDepth = res.depth;
+                let rw = mw;
+                let rh = mh;
+                let detailMeta = null;
+
+                if (chosenDetail !== "standard") {
+                    const grid = chosenDetail === "finest" ? 3 : 2;
+                    this._depthAbort = new AbortController();
+                    this._depthStatusText = `Depth: tile 1 of ${grid * grid}`;
+                    this.renderDepthRow();
+                    let detailRes = null;
+                    try {
+                        detailRes = await host.depthDetail(this, {
+                            grid,
+                            route: "tiles",
+                            global: { data: res.depth, w: mw, h: mh },
+                            signal: this._depthAbort.signal,
+                            onProgress: (i, n) => {
+                                this._depthStatusText = `Depth: tile ${i} of ${n}`;
+                                this.setStatus(this._depthStatusText);
+                                this.renderDepthRow();
+                            },
+                        });
+                    } catch (err) {
+                        console.error("Depth detail failed:", err);
+                        this.setStatus("Depth detail failed: " + (err.message || err));
+                        return existing || null;
+                    } finally {
+                        this._depthAbort = null;
+                        this._depthStatusText = null;
+                    }
+                    if (!detailRes) {
+                        this.setStatus("Depth estimation cancelled.");
+                        return existing || null;
+                    }
+                    rawDepth = detailRes.data;
+                    rw = detailRes.w;
+                    rh = detailRes.h;
+                    detailMeta = {
+                        route: detailRes.route,
+                        grid: detailRes.grid,
+                        size: [detailRes.w, detailRes.h],
+                        tiles: detailRes.fits ? detailRes.fits.length : (detailRes.grid * detailRes.grid),
+                        dropped: detailRes.fits ? detailRes.fits.filter((f) => f.dropped).length : 0,
+                    };
+                }
+
+                const { lo, hi } = disparityRange(rawDepth, 0.005, 0.995);
                 const [gw, gh] = workSize(W, H, WORK_MAX);
                 const guide = await host.depthInput(this, gw, gh);
                 const grey = new Uint8Array(gw * gh);
@@ -12177,9 +12230,9 @@ class InpaintEditor {
                 }
                 this.setStatus("Refining depth map with guided filter ...");
                 const poolRes = await editorPool().run("depth_guide", {
-                    raw: res.depth,
-                    rw: mw,
-                    rh: mh,
+                    raw: rawDepth,
+                    rw,
+                    rh,
                     grey,
                     gw,
                     gh,
@@ -12200,10 +12253,11 @@ class InpaintEditor {
                     provider: res.provider,
                     ms: modelMs,
                     totalMs: modelMs + (poolRes.timing && poolRes.timing.total ? poolRes.timing.total : 0),
-                    raw: res.depth,
-                    rw: mw,
-                    rh: mh,
+                    raw: rawDepth,
+                    rw,
+                    rh,
                     snap: { strength: snapStrength },
+                    ...(detailMeta ? { detail: detailMeta } : {}),
                 };
                 const map = makeMap("depth", gw, gh, u16, [W, 0, 0, H, 0, 0], meta, gd);
                 const ok = await this.setMap("depth", map, { label: recompute ? "Recompute depth map" : "Depth map", token });
@@ -12213,7 +12267,8 @@ class InpaintEditor {
                 }
                 this._depthOverlayCanvas = null;
                 this._depthStale = false;
-                this.setStatus(`Depth map ${mw}×${mh} → ${gw}×${gh} with ${model.label} in ${(meta.totalMs / 1000).toFixed(2)} s (${res.provider}).`);
+                const detailSuffix = detailMeta ? (" (" + chosenDetail + ")") : "";
+                this.setStatus("Depth map " + rw + "x" + rh + " -> " + gw + "x" + gh + detailSuffix + " with " + model.label + " in " + (meta.totalMs / 1000).toFixed(2) + " s (" + res.provider + ").");
                 return map;
             } catch (err) {
                 console.error("Depth estimation failed:", err);
@@ -12309,7 +12364,15 @@ class InpaintEditor {
         }
         if (this.depthPending) {
             const row = el("div", "ipc-sec");
-            row.appendChild(el("span", null, "Estimating depth map ..."));
+            row.appendChild(el("span", null, this._depthStatusText || "Estimating depth map ..."));
+            if (this._depthAbort) {
+                const cancelBtn = el("button", "ipc-small", "Cancel");
+                cancelBtn.addEventListener("click", () => {
+                    if (this._depthAbort) this._depthAbort.abort();
+                    this.setStatus("Depth estimation cancelled.");
+                });
+                row.appendChild(cancelBtn);
+            }
             con.appendChild(row);
             return;
         }
@@ -12319,18 +12382,52 @@ class InpaintEditor {
             const btn = iconButton("magic", "Compute 16-bit depth map with Depth Anything V2 Small", () => this.ensureDepthMap(), "Compute depth map");
             btn.classList.add("ipc-small", "ipc-primary");
             row.appendChild(btn);
+
+            const detailLab = el("label", "ipc-depth-detail-label", "Detail");
+            const detailSel = el("select", "ipc-select ipc-depth-detail-select");
+            const curDetail = host.getDepthDetail ? host.getDepthDetail() : (host.depthDetailSetting || "standard");
+            for (const [val, lbl] of [["standard", "Standard"], ["fine", "Fine (2x2)"], ["finest", "Finest (3x3)"]]) {
+                const opt = el("option", null, lbl);
+                opt.value = val;
+                if (val === curDetail) opt.selected = true;
+                detailSel.appendChild(opt);
+            }
+            detailSel.addEventListener("change", () => {
+                if (host.setDepthDetail) host.setDepthDetail(detailSel.value);
+                else host.depthDetailSetting = detailSel.value;
+            });
+            detailLab.appendChild(detailSel);
+            row.appendChild(detailLab);
+
             con.appendChild(row);
             return;
         }
         const stale = this.isDepthStale();
         const row = el("div", "ipc-sec");
-        const info = el("span", null, `${depthMap.w} × ${depthMap.h}` + (stale ? " (stale)" : ""));
+        const info = el("span", null, `${depthMap.w} x ${depthMap.h}` + (stale ? " (stale)" : ""));
         if (stale) info.classList.add("ipc-warn");
         row.appendChild(info);
         const recomputeBtn = iconButton("refresh", "Recompute depth map for the current picture", () => this.ensureDepthMap({ force: true }), "Recompute");
         recomputeBtn.classList.add("ipc-small");
         if (stale) recomputeBtn.classList.add("ipc-primary");
         row.appendChild(recomputeBtn);
+
+        const detailLab = el("label", "ipc-depth-detail-label", "Detail");
+        const detailSel = el("select", "ipc-select ipc-depth-detail-select");
+        const curDetail = host.getDepthDetail ? host.getDepthDetail() : (host.depthDetailSetting || "standard");
+        for (const [val, lbl] of [["standard", "Standard"], ["fine", "Fine (2x2)"], ["finest", "Finest (3x3)"]]) {
+            const opt = el("option", null, lbl);
+            opt.value = val;
+            if (val === curDetail) opt.selected = true;
+            detailSel.appendChild(opt);
+        }
+        detailSel.addEventListener("change", () => {
+            if (host.setDepthDetail) host.setDepthDetail(detailSel.value);
+            else host.depthDetailSetting = detailSel.value;
+        });
+        detailLab.appendChild(detailSel);
+        row.appendChild(detailLab);
+
         const viewBtn = iconButton("eye", "Show depth map on canvas", () => {
             this.mapView = this.mapView === "depth" ? null : "depth";
             viewBtn.classList.toggle("ipc-toggle-on", this.mapView === "depth");

@@ -9,6 +9,7 @@ export const WORK_MAX = 4096;   // the map follows the picture up to this long s
 export const STALE_DIFF = 6;
 export const GUIDE = { r: 2, eps: 1e-3 };
 export const LONG_CAP = 2058;
+export const DEPTH_LARGE = 1568;   // 14 * 112, the large route long side (PLAN_NIK9_BUILD.md R2-S7)
 export const RANGE_BAND_ROWS = 1024;
 
 /**

@@ -174,7 +174,12 @@ export const host = {
     async depthInput() { return null; },
     async computeDepth() { throw new Error("depth maps are a Scumble feature"); },
     async pictureInput() { return null; },
+    async pictureInputBox() { return null; },
     async depthInApp() { throw new Error("depth is a Scumble feature"); },
+    async depthDetail() { return null; },
+    depthDetailSetting: "standard",
+    getDepthDetail() { return "standard"; },
+    setDepthDetail() {},
     async freeHelpers() {},
     upsampleInstruction: null,   // the built-in upsample instruction (Scumble hands out its templates)
     generateNewAvailable() { return false; },

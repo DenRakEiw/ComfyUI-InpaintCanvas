@@ -52,7 +52,7 @@ import { resampleStore } from "./inpaint_resample.js";
 import { liquifyStore } from "./inpaint_liquify.js";
 import { guidedFar } from "./inpaint_depth.js";
 import { u16Bilinear, rangeWeight, LUMA, opp, colourSimilarity, hexToRgb as hexToRgb01 } from "./inpaint_weights.js";
-import { snapField } from "./inpaint_edges.js";
+import { snapField, fuseTiles } from "./inpaint_edges.js";
 import { mipChain, mipChainBytes, clampExtend, compositeTile, matchPixels, psdPackRows, kernelsReady, setKernels, rustPx, kernelsInUse, releaseIfLarge, deflate, resampleBlock, poissonBlend, boxBlurs } from "./px/kernels.js";
 
 const TILE = 256, LEVELS = 5, TILE_BYTES = TILE * TILE * 4;
@@ -804,6 +804,27 @@ function depthGuide(msg) {
     return { u16: u16.buffer, transfer: [u16.buffer], timing: { op: "depth_guide", total: now() - t0 } };
 }
 
+function depthFuse(msg) {
+    const t0 = now();
+    const globalData = msg.global.data instanceof Float32Array ? msg.global.data : new Float32Array(msg.global.data);
+    const global = { data: globalData, w: msg.global.w, h: msg.global.h };
+    const tiles = (msg.tiles || []).map((t) => ({
+        box: t.box,
+        w: t.w,
+        h: t.h,
+        data: t.data instanceof Float32Array ? t.data : new Float32Array(t.data),
+    }));
+    const res = fuseTiles(global, tiles, msg.W, msg.H, msg.wf, msg.hf, { sigmaLow: msg.sigmaLow });
+    return {
+        data: res.data.buffer,
+        w: msg.wf,
+        h: msg.hf,
+        fits: res.fits,
+        transfer: [res.data.buffer],
+        timing: { op: "depth_fuse", total: now() - t0 },
+    };
+}
+
 export function rangeSelectJob(msg) {
     const t0 = now();
     const W = msg.W | 0, H = msg.H | 0;
@@ -1130,6 +1151,7 @@ async function run(msg) {
     await kernelsReady();
     if (msg.op === "range_select") return rangeSelectJob(msg);
     if (msg.op === "depth_guide") return depthGuide(msg);
+    if (msg.op === "depth_fuse") return depthFuse(msg);
     if (msg.op === "resample") return resampleJob(msg);
     if (msg.op === "liquify") return liquifyJob(msg);
     if (msg.op === "png") return png(msg.bitmap, !!msg.hash);
