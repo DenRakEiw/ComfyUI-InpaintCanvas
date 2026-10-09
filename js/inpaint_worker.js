@@ -1031,10 +1031,10 @@ export function rangeSelectJob(msg) {
                         const v = (logits[r0 + ix] * (1 - txFrac) + logits[r0 + ix1] * txFrac) * (1 - tyFrac)
                                 + (logits[r1 + ix] * (1 - txFrac) + logits[r1 + ix1] * txFrac) * tyFrac;
 
-                        let a = v > 0 ? (invert ? 0 : 255) : (invert ? 255 : 0);
-                        if (clipBuf && a > 0) {
-                            if (!clipBuf[clipRowOffset + x]) a = 0;
-                        }
+                        // The layer clip belongs to the object (inside = logit and clip); the inversion for
+                        // intersect comes after it, or Shift+Alt keeps the layer's transparent pixels.
+                        const inside = v > 0 && !(clipBuf && !clipBuf[clipRowOffset + x]);
+                        const a = inside ? (invert ? 0 : 255) : (invert ? 255 : 0);
 
                         alpha[pyOffset + px] = a;
                         alphaSum += a;

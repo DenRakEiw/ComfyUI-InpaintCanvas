@@ -726,6 +726,11 @@ function buildRangeSelect(ed, d) {
     const barWrap = el("div", "ipc-rangebar-container");
     block.appendChild(barWrap);
 
+    // The button and Enter: a refused run (no depth map yet, no picture) lands in the status line, not
+    // as an unhandled rejection.
+    const runRange = () => Promise.resolve(ed.selectRange(ed.rangeLimit, ed.rangeMode))
+        .catch((err) => ed.setStatus(err && err.message ? err.message : String(err)));
+
     const mountRangeBar = () => {
         barWrap.innerHTML = "";
         const source = ed.rangeLimit.source;
@@ -746,7 +751,7 @@ function buildRangeSelect(ed, d) {
             pick: () => ed.pickOnce(source),
             hover: (on) => ed.setRangePreview(on ? ed.rangeLimit : null),
             title: "Range",
-            onEnter: () => ed.selectRange(ed.rangeLimit, ed.rangeMode),
+            onEnter: runRange,
         });
         barWrap.appendChild(ed.rangeBar.el);
     };
@@ -784,9 +789,22 @@ function buildRangeSelect(ed, d) {
 
     // Select button row
     const actRow = el("div", "ipc-row");
-    ed.rangeSelectBtn = iconButton("magic", "Select pixels matching the range", () => ed.selectRange(ed.rangeLimit, ed.rangeMode), "Select");
+    ed.rangeSelectBtn = iconButton("magic", "Select pixels matching the range", runRange, "Select");
     ed.rangeSelectBtn.classList.add("ipc-small", "ipc-primary");
     actRow.appendChild(ed.rangeSelectBtn);
+    // Invert: what lies outside the range instead (the preview tint follows it)
+    const invLab = el("label", null);
+    ed.rangeInvertInput = document.createElement("input");
+    ed.rangeInvertInput.type = "checkbox";
+    ed.rangeInvertInput.checked = !!ed.rangeLimit.invert;
+    ed.rangeInvertInput.title = "Select what lies outside the range";
+    ed.rangeInvertInput.addEventListener("change", () => {
+        ed.rangeLimit.invert = ed.rangeInvertInput.checked;
+        if (ed.rangeBar) ed.rangeBar.refresh();
+        if (ed._rangeTint) ed.setRangePreview(ed.rangeLimit);
+    });
+    invLab.appendChild(ed.rangeInvertInput); invLab.appendChild(el("span", null, "Invert"));
+    actRow.appendChild(invLab);
     block.appendChild(actRow);
 
     d.appendChild(block);

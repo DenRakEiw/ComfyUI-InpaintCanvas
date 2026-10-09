@@ -58,6 +58,11 @@ export function limitStage(src, out, limitIn, info = {}, def = null) {
         return src;
     }
 
+    // Fills always carry the weight in their alpha (`def.over`); a filter does so whenever its result is
+    // drawn over the picture rather than becoming the chain's surface (`info.limitOver`, set by the
+    // caller): with `mix(in, out, w)` under a blend mode the picture would be blended with itself where
+    // the limit is 0 (multiply darkens, screen lightens), while the painted mask leaves it alone there.
+    const over = !!(def && def.over) || !!info.limitOver;
     if (!info.cpu) {
         try {
             const map = limit.source === "depth" ? (info.maps && info.maps.depth) : null;
@@ -76,7 +81,7 @@ export function limitStage(src, out, limitIn, info = {}, def = null) {
                 u_tol: limit.tol ?? 30,
                 u_m0: [m[0], m[2], m[1], m[3]],
                 u_m1: [m[4], m[5]],
-                u_over: (def && def.over) ? 1 : 0,
+                u_over: over ? 1 : 0,
                 u_view: (info && info.limitView) ? 1 : 0,
             };
             const res = runShader(LIMIT_SHADER, out, values, info);
@@ -86,7 +91,7 @@ export function limitStage(src, out, limitIn, info = {}, def = null) {
         }
     }
 
-    return limitStageCPU(glToCanvas(src), glToCanvas(out), limit, info, def && def.over);
+    return limitStageCPU(glToCanvas(src), glToCanvas(out), limit, info, over);
 }
 
 /**

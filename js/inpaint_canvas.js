@@ -43,7 +43,7 @@ import { LiquifyField, gridStep, previewBlock, liquifyFalloff } from "./inpaint_
 import { labelMap, sameLabels, remap, mapOffset, namesFor, parse, normalize, compare, checkNote, referencesText, referencesRule } from "./reftokens.js";
 import { fitLayerRGBA, workScale } from "./edgefit.js";
 import { STALE_DIFF, GUIDE, RANGE_BAND_ROWS, WORK_MAX, modelSize, workSize, disparityRange } from "./inpaint_depth.js";
-import { packRG16, mapToJSON, mapFromJSON, fingerprint, fingerprintDiff, passToMap, makeMap } from "./inpaint_maps.js";
+import { packRG16, mapToJSON, mapFromJSON, fingerprint, fingerprintDiff, passToMap, makeMap, sampleMap } from "./inpaint_maps.js";
 import { normalizeLimit, u16Bilinear, rangeWeight, opp, colourSimilarity, hexToRgb as hexToRgb01, WEIGHTS_GLSL } from "./inpaint_weights.js";
 import { limitAlphaRows } from "./inpaint_limit.js";
 import { buildRangeBar } from "./inpaint_rangebar.js";
@@ -1650,7 +1650,8 @@ const STYLE = `
   border-radius:var(--sc-radius, 4px); border:1px solid var(--sc-line, #3a3a3a); background:var(--sc-field, #161616); color:var(--sc-fg-2, #aaa); cursor:pointer; }
 .ipc-rangebar-btn:hover { background:var(--sc-btn-hover, #333); color:var(--sc-fg, #ddd); }
 .ipc-rangebar-btn.ipc-active { background:var(--sc-selected, #2b3a4f); color:var(--sc-active, #7cc7ff); border-color:var(--sc-active, #4a90d9); }
-.ipc-rangebar-canvas { width:100%; height:26px; border:1px solid var(--sc-line, #3a3a3a); border-radius:var(--sc-radius-sm, 3px);
+.ipc-rangebar-container { width:100%; flex-basis:100%; min-width:0; }
+.ipc-rangebar-canvas { width:100%; height:38px; border:1px solid var(--sc-line, #3a3a3a); border-radius:var(--sc-radius-sm, 3px);
   background:var(--sc-well, #161616); display:block; cursor:crosshair; touch-action:none; box-sizing:border-box; }
 .ipc-limit-block { grid-column:1 / -1; display:flex; flex-direction:column; gap:4px; margin-top:4px; padding-top:4px; border-top:1px solid var(--sc-line, #333); }
 .ipc-limit-head { display:flex; align-items:center; gap:6px; font-size:11px; }
@@ -6076,8 +6077,8 @@ class InpaintEditor {
                     Math.min(this.height, Math.max(start[1], cur[1])),
                 ];
                 host.selectBox(this, box, { mode: p.mode || "add" });
-            } else {
-                this.toggleObjectAt(...this.toImage(e), p);
+            } else if (!p.moved || (dx < 4 && dy < 4)) {
+                this.toggleObjectAt(...this.toImage(e), p);   // a click; a pointer that moved along one axis only does nothing
             }
             this.draw();
         } else if (p.kind === "layerpaint") {
@@ -6531,7 +6532,9 @@ class InpaintEditor {
         const pendingRecord = { group, seq, snap, limit, mode };
         this.rangePending = pendingRecord;
 
-        const jobInvert = (mode === "intersect") ? !limit.invert : limit.invert;
+        // rangeWeight already honours limit.invert; the job inverts once more only for intersect, which
+        // subtracts the complement (the same rule as the logit path below).
+        const jobInvert = (mode === "intersect");
         const bandMode = (mode === "replace") ? "add" : ((mode === "intersect") ? "subtract" : mode);
 
         let unionBounds = null;
@@ -6795,7 +6798,7 @@ class InpaintEditor {
         } catch (err) {
             if (this.rangePending === pendingRecord) {
                 this.rangePending = null;
-                const popped = this.undo.pop();
+                const popped = this.takeUndoEntry(snap);
                 if (popped) {
                     this.undoBytes -= popped.bytes || 0;
                     this.applySnapshot(popped);
@@ -6820,6 +6823,16 @@ class InpaintEditor {
     /**
      * Cancel an ongoing selectRange operation.
      */
+    /**
+     * Take the range selection's own undo entry out of the list, wherever it sits: a stroke pushed
+     * while the bands ran keeps its place (the pointer tools do not wait for `rangePending`).
+     */
+    takeUndoEntry(snap) {
+        if (!snap) return null;
+        const i = this.undo.lastIndexOf(snap);
+        return i < 0 ? null : this.undo.splice(i, 1)[0];
+    }
+
     cancelRange() {
         if (!this.rangePending) return false;
         const pending = this.rangePending;
@@ -6828,7 +6841,7 @@ class InpaintEditor {
             editorPool().cancel(pending.group);
         } catch {}
 
-        const popped = this.undo.pop();
+        const popped = this.takeUndoEntry(pending.snap);
         if (popped) {
             this.undoBytes -= popped.bytes || 0;
             this.applySnapshot(popped);
@@ -11896,7 +11909,7 @@ class InpaintEditor {
         if (!m) return null;
         return {
             ...m,
-            u16: m.data,
+            u16: m.data || m.u16,   // a store entry keeps its bytes in `data`; a legacy object set through the setter in `u16`
             ...m.meta,
             origW: this.width,
             origH: this.height,
@@ -11970,14 +11983,16 @@ class InpaintEditor {
                     hi,
                 }, [grey.buffer], { priority: INTERACTIVE });
                 const u16 = new Uint16Array(poolRes.u16);
+                // main answers the model's own time as runMs (and the whole call as seconds)
+                const modelMs = res.runMs != null ? res.runMs : (res.seconds != null ? res.seconds * 1000 : 0);
                 const meta = {
                     fp,
                     lo,
                     hi,
                     rawBounds: [res.min, res.max],
                     provider: res.provider,
-                    ms: res.ms,
-                    totalMs: res.ms + (poolRes.timing && poolRes.timing.total ? poolRes.timing.total : 0),
+                    ms: modelMs,
+                    totalMs: modelMs + (poolRes.timing && poolRes.timing.total ? poolRes.timing.total : 0),
                     raw: res.depth,
                     rw: mw,
                     rh: mh,
@@ -12006,12 +12021,37 @@ class InpaintEditor {
         return p;
     }
 
-    /** Check if document changed significantly compared to cached depth map. */
+    /**
+     * Is this filter layer's effect shown instead of the picture in the pass being drawn? Only the
+     * screen pass (`viewPass.screen`): a sample pass (the wand's fine pass, the bucket's probe, the
+     * Limit row's histograms), a thumbnail or an export reads the picture whatever the view shows.
+     */
+    effectViewOf(layer, forRun = false) {
+        const vp = this.viewPass;
+        return !forRun && !!vp && !!vp.screen && !vp.sample
+            && !!this.maskView && this.maskView.mode === "effect" && this.maskView.id === layer.id;
+    }
+
+    /**
+     * Has the picture changed enough since the depth map was computed? Answers from the last check and,
+     * when the composite moved since then, runs one more check in the background (a 64 x 64 flatten,
+     * no model) and redraws the row when its answer differs; a map just computed is never stale.
+     */
     isDepthStale() {
         const m = this.maps && this.maps.depth;
         if (!m) return false;
-        if (m.version === this.compositeVersion) return false;
-        return this._depthStale ?? false;
+        if (this._depthStaleAt !== this.compositeVersion && !this._depthStaleCheck) {
+            const at = this.compositeVersion;
+            this._depthStaleCheck = this.checkDepthStale().then((stale) => {
+                this._depthStaleAt = at;
+                this._depthStaleCheck = null;
+                // the picture moved on while the check ran: once more, for the picture as it is now
+                if (this.compositeVersion !== at) this.isDepthStale();
+                else if (stale !== this._depthStaleShown) this.renderDepthRow();
+            }, () => { this._depthStaleCheck = null; });
+        }
+        this._depthStaleShown = this._depthStale ?? false;
+        return this._depthStaleShown;
     }
 
     async checkDepthStale() {
@@ -12139,13 +12179,51 @@ class InpaintEditor {
         this.mapsVersion++;
 
         for (const l of this.layers) {
-            if (l.kind === "filter" && l.params?.limit?.source === (kind || "depth")) {
+            if (l.kind === "filter" && (l.params?.limit?.source === (kind || "depth") || this.mapsOf(l).includes(kind || "depth"))) {
                 this.markFilterChanged(l);
             }
         }
         this.renderHistory();
         this.draw();
         this.notifyChanged();
+        return true;
+    }
+
+    /**
+     * The map kinds a filter layer depends on (R2-S12, F10):
+     * union of def.maps(params) and limit.source === "depth" ? ["depth"] : [].
+     * @param {any} layer
+     * @returns {string[]}
+     */
+    mapsOf(layer) {
+        if (!layer || layer.kind !== "filter") return [];
+        const def = FILTERS[layer.filter];
+        const res = new Set();
+        if (def && typeof def.maps === "function") {
+            try {
+                const list = def.maps(layer.params || {});
+                if (Array.isArray(list)) for (const k of list) if (k) res.add(k);
+            } catch (_) { /* ignore */ }
+        }
+        if (layer.params && layer.params.limit && (layer.params.limit.source === "depth" || layer.params.limit.source === "map")) {
+            res.add("depth");
+        }
+        return Array.from(res);
+    }
+
+    /**
+     * Cancel pending filter parameter preview (e.g. from slider drag or preset hover).
+     * Restores params to the snapshot taken before preview began and clears pending state.
+     * @param {any} layer
+     * @returns {boolean}
+     */
+    cancelFilterParams(layer) {
+        if (!layer || layer.kind !== "filter" || !layer._undoPending) return false;
+        layer.params = { ...(layer._undoPending.params || {}) };
+        layer._undoPending = null;
+        this.filterPreview = null;
+        this.markFilterChanged(layer, { soon: true });
+        this.draw();
         return true;
     }
 
@@ -13624,10 +13702,10 @@ class InpaintEditor {
             below.height,
             vp ? [vp.x, vp.y, vp.w, vp.h, vp.sx, vp.sy, !!(vp.screen || vp.display)] : 0,
         ];
-        if (layer.params && layer.params.limit && (layer.params.limit.source === "depth" || layer.params.limit.source === "map")) {
+        if (this.mapsOf(layer).length > 0) {
             baseKey.push(this.mapsVersion || 0);
         }
-        const isEffectView = !forRun && !!vp && !!this.maskView && this.maskView.mode === "effect" && this.maskView.id === layer.id;
+        const isEffectView = this.effectViewOf(layer, forRun);
         if (isEffectView) baseKey.push(true);
         return JSON.stringify(baseKey);
     }
@@ -13657,7 +13735,7 @@ class InpaintEditor {
             chain: pass.chain,
             maps: this.maps || null,
         };
-        if (!pass.forRun && this.viewPass && this.maskView && this.maskView.mode === "effect" && this.maskView.id === layer.id) {
+        if (this.effectViewOf(layer, pass.forRun)) {
             info.limitView = true;
         }
         if (pass.site) {
@@ -13712,10 +13790,20 @@ class InpaintEditor {
             chain,
             site: "filteredCanvas",
         });
+        // A limit's weight goes into the result's alpha whenever the result is drawn over the picture (a
+        // blend mode, an opacity, a mask, or source-over): where the limit is 0 the layer then shows
+        // nothing, like its painted mask. Only a result that becomes the chain's own surface (the next
+        // filter layer reads it as the picture) has to stay opaque and mixes the input back in instead.
+        info.limitOver = !keepSurface;
         beginScope();
         try { canvas = applyFilter(layer.filter, input, layer.params, info); }
         catch (err) { console.error(err); }
         canvas = endScope(canvas);
+        // A depth limit without a map: the layer shows nothing (the limit stage hands the input back and
+        // says so; the Limit row reads the flag). Drawn over the picture that is nothing; only as the
+        // chain's surface it is the picture.
+        layer.limitMissing = !!info.limitMissing;
+        if (info.limitMissing && canvas === input && !keepSurface) canvas = null;
         if (isGLSurface(canvas)) {
             if (keepSurface) return canvas;                    // the next filter layer reads the texture
             const flat = surfaceToCanvas(canvas);
@@ -13727,23 +13815,35 @@ class InpaintEditor {
     }
 
     /**
-     * `colourStats` of the whole picture below a filter layer (E3), for a filter that asks for them (`wholeStats`):
-     * from a 256 px sampled pass of the layers below it, kept per composite version. Every pass (the screen's region,
-     * a band of an export, the whole flatten) gives the filter the same numbers, so they all show the same picture;
-     * before, each pass took them from whatever part it composited.
+     * `colourStats` or custom `wholeStats` of the whole picture below a filter layer (E3, F10):
+     * from a sampled pass of the layers below it (size chosen by def.wholeStatsSize, 64..1024, default 256),
+     * kept per composite version and map version.
      */
     belowStats(layer, forRun) {
         if (!layer || !this.layers || !this.width || !this.height) return null;
+        const def = FILTERS[layer.filter];
+        const n = Math.max(64, Math.min(1024, (def && def.wholeStatsSize) || 256));
+        const readsMap = this.mapsOf(layer).length > 0;
+        const vKey = `${this.compositeVersion}:${readsMap ? (this.mapsVersion || 0) : 0}:${n}`;
         const slot = forRun ? "_bstatsRun" : "_bstats";
         const c = layer[slot];
-        if (c && c.version === this.compositeVersion) return c.stats;
+        if (c && c.version === vKey) return c.stats;
         const index = this.layers.indexOf(layer);
-        const s = Math.min(1, 256 / Math.max(this.width, this.height));
-        // an entry first: the sampled pass below must not ask for this layer's statistics again
-        const entry = { version: this.compositeVersion, stats: null };
+        const s = Math.min(1, n / Math.max(this.width, this.height));
+        const entry = { version: vKey, stats: null };
         layer[slot] = entry;
         const small = this.sampleRegion("image", [0, 0, this.width, this.height], s, { forRun: !!forRun, upTo: Math.max(0, index) });
-        entry.stats = colourStats(small);
+        if (def && typeof def.wholeStats === "function") {
+            try {
+                entry.stats = def.wholeStats(small, { width: this.width, height: this.height }, { maps: this.maps || {}, sampleMap });
+            } catch (err) {
+                console.warn(`filter ${def.label || layer.filter} wholeStats failed:`, err);
+                if (host.pluginReport && def.plugin) host.pluginReport(def.plugin, `filter ${layer.filter} wholeStats`, err);
+                entry.stats = null;
+            }
+        } else {
+            entry.stats = colourStats(small);
+        }
         return entry.stats;
     }
 
@@ -13802,11 +13902,13 @@ class InpaintEditor {
      */
     mapHistogram(kind) {
         if (kind === "depth") {
-            const depth = (this.maps && this.maps.depth) || this.depth;
+            // The map store's entry keeps its bytes in `data`; the `depth` getter presents them as `u16`.
+            const depth = this.depth;
             if (!depth || !depth.u16) return null;
             if (!this._mapHistCache) this._mapHistCache = new Map();
             const key = `depth:${depth.hash ?? depth.dataVersion ?? depth.version ?? "default"}`;
             if (this._mapHistCache.has(key)) return this._mapHistCache.get(key);
+            if (this._mapHistCache.size >= 8) this._mapHistCache.clear();   // a few versions, not every recompute
             const u16 = depth.u16;
             const hist = new Float64Array(256);
             for (let i = 0; i < u16.length; i++) hist[u16[i] >> 8]++;
@@ -14238,7 +14340,7 @@ class InpaintEditor {
         // A filter layer that covers its input one to one can leave its result on the GPU; a
         // mask, an opacity or a blend mode has to composite it onto the canvas.
         // a fill layer (`over`) goes over the picture as a layer does: its result never stands for the picture
-        const limitView = !forRun && this.viewPass && this.maskView && this.maskView.mode === "effect" && this.maskView.id === layer.id;
+        const limitView = this.effectViewOf(layer, forRun);
         const plain = !limitView && !this.liveMask(layer) && layer.opacity >= 1 && (!layer.blend || layer.blend === "normal") && !preview && !clip && !this.isFillLayer(layer);
         const keepSurface = plain && more && !this.filterChainOff && glChainUsable(ctx.canvas.width, ctx.canvas.height);
         const out = this.filteredCanvas(layer, chain ? chain.surface : ctx.canvas, forRun, preview, keepSurface);
@@ -16183,6 +16285,9 @@ class InpaintEditor {
         // the recipe, the selection, the fill and the Original all change what the references go as
         this.refreshRefLayout();
         this.renderInfoRows();
+        // the depth row follows the picture: a load, a crop or a resize changes what it says (it was
+        // rendered only on a document's setValue and after a compute, so a loaded picture kept "No image loaded")
+        this.renderDepthRow();
     }
 
     /** The Info panel's rows (renderInfo, and again when the references' layout has answered: refreshRefLayout). */
@@ -17149,6 +17254,7 @@ class InpaintEditor {
         const fmt = (p, v) => (p.type === "bool" ? (v ? "on" : "off") : (Number.isInteger(p.step) ? Math.round(v) : (+v).toFixed(p.step < 0.1 ? 2 : 1)) + (p.unit || ""));
         let presetSel = null;
         for (const p of def.params) {
+            if (p.hidden) continue;
             if (p.onlyWithPlate && !layer.plate) continue;
             if (p.notWithPlate && layer.plate) continue;
             if (p.type === "custom") {
@@ -17339,7 +17445,7 @@ class InpaintEditor {
             // Depth map check
             if (source === "depth") {
                 const hasDepth = !!((this.maps && this.maps.depth) || this.depth);
-                const limitMissing = !hasDepth || !!(this._lastFilterInfoBySite && this._lastFilterInfoBySite[layer.id]?.limitMissing);
+                const limitMissing = !hasDepth || !!layer.limitMissing;
                 if (limitMissing || !hasDepth) {
                     const noteRow = el("div", "ipc-limit-note");
                     noteRow.appendChild(el("span", null, "needs a depth map: compute it first"));
@@ -18887,7 +18993,7 @@ class InpaintEditor {
      * and the layer's own pixels (`out0`), cached per composite version.
      */
     matchStats(layer, below, vp, out0, opts = {}) {
-        if (vp) return this.sampledMatchStats(layer, !!vp.forRun, !!(vp.screen || vp.display));
+        if (vp) return this.sampledMatchStats(layer, !!vp.forRun, !!(vp.screen || vp.display), !!opts.skipFilters);
         const m = layer.match || {};
         const skip = !!opts.skipFilters;
         const key = JSON.stringify([m.strength, m.source, layer.x, layer.y, layer.w, layer.h, skip]);
@@ -18969,9 +19075,11 @@ class InpaintEditor {
      * again with the entry made then), and a reader that wants exact levels makes it again at once. Read with every chain
      * there, display and exact levels are the same bytes.
      */
-    sampledMatchStats(layer, forRun, display = false) {
+    sampledMatchStats(layer, forRun, display = false, skipFilters = false) {
         const m = layer.match || {};
-        const key = JSON.stringify([m.source, layer.x, layer.y, layer.w, layer.h]);
+        // a filter-free pass (`pictureInput` for the depth model) reads the picture below without its filter
+        // layers, so its statistics are its own entry, never the screen's or a run's
+        const key = JSON.stringify([m.source, layer.x, layer.y, layer.w, layer.h, !!skipFilters]);
         const slot = forRun ? "_mstatsSampleRun" : "_mstatsSample";
         const c = layer[slot];
         const valid = c && c.version === this.compositeVersion && c.key === key;
@@ -18980,7 +19088,7 @@ class InpaintEditor {
         const { lay, ld, pad, pw, ph, fx, fy, box } = this.matchLayerPicture(layer, display);
         // the composite of the layers below it over the same box, at the same scale
         const idx = this.layers.indexOf(layer);
-        const under = this.sampleRegion("image", box, Math.min(fx, fy), { forRun, upTo: Math.max(0, idx), display });
+        const under = this.sampleRegion("image", box, Math.min(fx, fy), { forRun, upTo: Math.max(0, idx), display, skipFilters: !!skipFilters });
         const bel = makeCanvas(pw, ph);
         const bctx = bel.getContext("2d", { willReadFrequently: true });
         bctx.drawImage(under, 0, 0, pw, ph);

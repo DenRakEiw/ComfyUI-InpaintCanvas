@@ -5,7 +5,7 @@
 // far conversion, bilinear upsampling, and the guided filter (He et al.).
 // No DOM references here: runs under plain Node, in Web Workers, and in the renderer.
 
-export const WORK_MAX = 2048;
+export const WORK_MAX = 4096;   // the map follows the picture up to this long side (the user, 2026-10-09: larger pictures, larger maps)
 export const STALE_DIFF = 6;
 export const GUIDE = { r: 2, eps: 1e-3 };
 export const LONG_CAP = 2058;

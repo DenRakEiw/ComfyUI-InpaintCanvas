@@ -28,7 +28,7 @@ export const RANGE_DEFAULTS = Object.freeze({
  * @param {number} [tol01=0.03] - Hit tolerance in 0..1
  * @returns {"fLo" | "lo" | "hi" | "fHi" | "box" | null}
  */
-export function hitTest(range, x01, tol01 = 0.03) {
+export function hitTest(range, x01, tol01 = 0.03, y01 = null) {
     if (!range) return null;
     const lo = range.lo ?? 0;
     const hi = range.hi ?? 1;
@@ -37,15 +37,32 @@ export function hitTest(range, x01, tol01 = 0.03) {
 
     const fLoPos = lo - fLo;
     const fHiPos = hi + fHi;
+    const inBox = x01 >= Math.min(lo, hi) && x01 <= Math.max(lo, hi);
 
-    // Hit order: feather handle wins over box edge within tol01
+    // With a vertical position the bar has two zones: the upper part holds the box and its edges, the
+    // strip at the bottom (below FEATHER_ZONE) the feather handles. Without one (the pure tests and
+    // older callers) the feather handle wins over the edge, which left the edge unreachable while the
+    // feather was 0 (both handles on one spot).
+    if (y01 != null) {
+        if (y01 >= FEATHER_ZONE) {
+            if (Math.abs(x01 - fLoPos) <= tol01) return "fLo";
+            if (Math.abs(x01 - fHiPos) <= tol01) return "fHi";
+            return inBox ? "box" : null;
+        }
+        if (Math.abs(x01 - lo) <= tol01) return "lo";
+        if (Math.abs(x01 - hi) <= tol01) return "hi";
+        return inBox ? "box" : null;
+    }
     if (Math.abs(x01 - fLoPos) <= tol01) return "fLo";
     if (Math.abs(x01 - fHiPos) <= tol01) return "fHi";
     if (Math.abs(x01 - lo) <= tol01) return "lo";
     if (Math.abs(x01 - hi) <= tol01) return "hi";
-    if (x01 >= Math.min(lo, hi) && x01 <= Math.max(lo, hi)) return "box";
+    if (inBox) return "box";
     return null;
 }
+
+/** The bar's lower strip, from this fraction of its height down, carries the feather handles. */
+export const FEATHER_ZONE = 0.64;
 
 /**
  * Pure drag mapping: returns a new Range preserving lo <= hi, feathers >= 0,
@@ -362,42 +379,68 @@ export function buildRangeBar(range, {
         ctx.lineTo(xHi, h - 0.5);
         ctx.stroke();
 
-        // 5. Handles: lo & hi vertical lines with arrows
+        // 5. Handles: lo & hi vertical lines through the upper zone, the feather strip below them
+        const zoneY = Math.round(h * FEATHER_ZONE);
         ctx.strokeStyle = "#fff";
         ctx.lineWidth = 1.5;
         ctx.beginPath();
         ctx.moveTo(xLo, 0);
-        ctx.lineTo(xLo, h);
+        ctx.lineTo(xLo, zoneY);
         ctx.moveTo(xHi, 0);
-        ctx.lineTo(xHi, h);
+        ctx.lineTo(xHi, zoneY);
         ctx.stroke();
 
-        // 6. Feather boundary markers (dashed lines)
+        // the strip's floor line, so the two zones read as two
+        ctx.strokeStyle = "rgba(255, 255, 255, 0.18)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(0, zoneY + 0.5);
+        ctx.lineTo(w, zoneY + 0.5);
+        ctx.stroke();
+
+        // 6. Feather boundary markers (dashed lines through the upper zone)
         ctx.strokeStyle = "rgba(255, 255, 255, 0.6)";
         ctx.lineWidth = 1;
         ctx.setLineDash([2, 2]);
         ctx.beginPath();
         ctx.moveTo(xfLo, 0);
-        ctx.lineTo(xfLo, h);
+        ctx.lineTo(xfLo, zoneY);
         ctx.moveTo(xfHi, 0);
-        ctx.lineTo(xfHi, h);
+        ctx.lineTo(xfHi, zoneY);
         ctx.stroke();
         ctx.setLineDash([]);
 
-        // Small triangle handle indicators
+        // The feather handles: hollow triangles in the strip, pointing up at the feather's end (they sit on the
+        // edge while the feather is 0 and are dragged outwards from there)
+        const sy = zoneY + (h - zoneY) / 2;
+        const tri = (x) => {
+            ctx.beginPath();
+            ctx.moveTo(x, sy - 5);
+            ctx.lineTo(x + 5, sy + 4);
+            ctx.lineTo(x - 5, sy + 4);
+            ctx.closePath();
+        };
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = "rgba(255, 255, 255, 0.9)";
+        ctx.fillStyle = "rgba(255, 255, 255, 0.25)";
+        tri(xfLo); ctx.fill(); ctx.stroke();
+        tri(xfHi); ctx.fill(); ctx.stroke();
+
+        // The edge grips: solid triangles at the middle of the upper zone
         ctx.fillStyle = "#fff";
+        const gy = zoneY / 2;
         // lo handle grip
         ctx.beginPath();
-        ctx.moveTo(xLo, h / 2 - 4);
-        ctx.lineTo(xLo + 4, h / 2);
-        ctx.lineTo(xLo, h / 2 + 4);
+        ctx.moveTo(xLo, gy - 5);
+        ctx.lineTo(xLo + 5, gy);
+        ctx.lineTo(xLo, gy + 5);
         ctx.closePath();
         ctx.fill();
         // hi handle grip
         ctx.beginPath();
-        ctx.moveTo(xHi, h / 2 - 4);
-        ctx.lineTo(xHi - 4, h / 2);
-        ctx.lineTo(xHi, h / 2 + 4);
+        ctx.moveTo(xHi, gy - 5);
+        ctx.lineTo(xHi - 5, gy);
+        ctx.lineTo(xHi, gy + 5);
         ctx.closePath();
         ctx.fill();
         // fLo handle grip
@@ -425,15 +468,20 @@ export function buildRangeBar(range, {
         return Math.max(0, Math.min(1, (e.clientX - rect.left) / (rect.width || 1)));
     };
 
+    const getY01 = (e) => {
+        const rect = canvas.getBoundingClientRect();
+        return Math.max(0, Math.min(1, (e.clientY - rect.top) / (rect.height || 1)));
+    };
+
     const getTol01 = () => {
         const rect = canvas.getBoundingClientRect();
-        return Math.max(0.03, 10 / (rect.width || 200));
+        return Math.max(0.03, 12 / (rect.width || 200));
     };
 
     canvas.addEventListener("pointerdown", (e) => {
         const x01 = getX01(e);
         const tol01 = getTol01();
-        const handle = hitTest(curRange, x01, tol01);
+        const handle = hitTest(curRange, x01, tol01, getY01(e));
         if (!handle) return;
 
         if (typeof histogram === "function") {
@@ -481,7 +529,7 @@ export function buildRangeBar(range, {
         // Hover cursor
         const x01 = getX01(e);
         const tol01 = getTol01();
-        const handle = hitTest(curRange, x01, tol01);
+        const handle = hitTest(curRange, x01, tol01, getY01(e));
         if (handle === "box") {
             canvas.style.cursor = "grab";
         } else if (handle === "lo" || handle === "hi" || handle === "fLo" || handle === "fHi") {

@@ -184,4 +184,5 @@ export const host = {
     pluginPointer() { return false; },
     pluginKey() { return false; },
     pluginOverlay() {},
+    pluginReport() {},
 };
