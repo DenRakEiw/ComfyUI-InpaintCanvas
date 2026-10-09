@@ -43,7 +43,7 @@ import { LiquifyField, gridStep, previewBlock, liquifyFalloff } from "./inpaint_
 import { labelMap, sameLabels, remap, mapOffset, namesFor, parse, normalize, compare, checkNote, referencesText, referencesRule } from "./reftokens.js";
 import { fitLayerRGBA, workScale } from "./edgefit.js";
 import { STALE_DIFF, GUIDE, RANGE_BAND_ROWS, WORK_MAX, modelSize, workSize, disparityRange } from "./inpaint_depth.js";
-import { packRG16, mapToJSON, mapFromJSON, fingerprint, fingerprintDiff, passToMap, makeMap, sampleMap, deriveMap } from "./inpaint_maps.js";
+import { packRG16, mapToJSON, mapFromJSON, fingerprint, fingerprintDiff, passToMap, makeMap, sampleMap, deriveMap, selectionOnMap, editMap } from "./inpaint_maps.js";
 import { SNAP_DEFAULT, SNAP_TAU, snapParams, snapField, rangeMax, edgeTiles } from "./inpaint_edges.js";
 import { normalizeLimit, u16Bilinear, rangeWeight, opp, colourSimilarity, hexToRgb as hexToRgb01, WEIGHTS_GLSL } from "./inpaint_weights.js";
 import { limitAlphaRows } from "./inpaint_limit.js";
@@ -12382,6 +12382,35 @@ class InpaintEditor {
         edgesLab.appendChild(edgesVal);
         edgesRow.appendChild(edgesLab);
         con.appendChild(edgesRow);
+
+        const editRow = el("div", "ipc-sec ipc-depth-edit-row");
+        const hasSel = !!this.getBounds();
+
+        const btnFlatten = el("button", "ipc-small ipc-depth-flatten-btn", "Flatten");
+        btnFlatten.title = "Flatten depth inside selection to median";
+        btnFlatten.disabled = !hasSel;
+        btnFlatten.addEventListener("click", () => this.editDepth("flatten", null, { label: "Depth: Flatten" }));
+        editRow.appendChild(btnFlatten);
+
+        const btnNearer = el("button", "ipc-small ipc-depth-nearer-btn", "Nearer");
+        btnNearer.title = "Step depth inside selection nearer (-0.05)";
+        btnNearer.disabled = !hasSel;
+        btnNearer.addEventListener("click", () => this.editDepth("offset", -0.05, { label: "Depth: Nearer" }));
+        editRow.appendChild(btnNearer);
+
+        const btnFarther = el("button", "ipc-small ipc-depth-farther-btn", "Farther");
+        btnFarther.title = "Step depth inside selection farther (+0.05)";
+        btnFarther.disabled = !hasSel;
+        btnFarther.addEventListener("click", () => this.editDepth("offset", 0.05, { label: "Depth: Farther" }));
+        editRow.appendChild(btnFarther);
+
+        const btnSmooth = el("button", "ipc-small ipc-depth-smooth-btn", "Smooth");
+        btnSmooth.title = "Smooth depth inside selection";
+        btnSmooth.disabled = !hasSel;
+        btnSmooth.addEventListener("click", () => this.editDepth("smooth", 1, { label: "Depth: Smooth" }));
+        editRow.appendChild(btnSmooth);
+
+        con.appendChild(editRow);
     }
 
     /** The sequence counter bumped whenever whole-document geometry changes (PLAN_NIK9_BUILD.md §F8). */
@@ -12521,6 +12550,68 @@ class InpaintEditor {
         }
         this.draw();
         return true;
+    }
+
+    /**
+     * Edit the document's depth map inside the current selection (R2-S8).
+     * @param {"flatten" | "offset" | "smooth"} op
+     * @param {number | null} [value]
+     * @param {{ label?: string }} [opts]
+     * @returns {Promise<{ op: string, median?: number, texels_changed: number, map: { w: number, h: number, version: number } } | null>}
+     */
+    async editDepth(op, value = null, { label } = {}) {
+        if (!this.maps || !this.maps.depth) {
+            this.setStatus("Compute a depth map first.");
+            return null;
+        }
+        if (!this.getBounds()) {
+            this.setStatus("Select what to change first.");
+            return null;
+        }
+
+        const map = this.maps.depth;
+        const W = this.width;
+        const H = this.height;
+        const s = Math.min(1, (2 * Math.max(map.w, map.h)) / Math.max(W, H));
+        const sw = Math.max(1, Math.round(W * s));
+        const sh = Math.max(1, Math.round(H * s));
+
+        let selCanvas = await this.selectionCanvasSettled([0, 0, W, H], s, sw, sh);
+        let allocated = false;
+        if (!selCanvas) {
+            selCanvas = makeCanvas(sw, sh);
+            allocated = true;
+            const sctx = selCanvas.getContext("2d");
+            sctx.imageSmoothingEnabled = true;
+            this.sel.drawTo(sctx, 0, 0, sw, sh);
+        }
+
+        let weight;
+        try {
+            weight = selectionOnMap(selCanvas, s, map);
+        } finally {
+            if (allocated || selCanvas) {
+                selCanvas.width = 1;
+                selCanvas.height = 1;
+            }
+        }
+
+        const data = editMap(map, weight, op, value);
+        const edits = ((map.meta && map.meta.edits) || 0) + 1;
+        const nextMeta = { ...(map.meta || {}), edits };
+        const nextMap = deriveMap(map, { data, meta: nextMeta });
+        const undoLabel = label || ("Depth: " + (op.charAt(0).toUpperCase() + op.slice(1)));
+        await this.setMap("depth", nextMap, { label: undoLabel });
+
+        const res = {
+            op,
+            texels_changed: data.texelsChanged || 0,
+            map: { w: nextMap.w, h: nextMap.h, version: nextMap.version },
+        };
+        if (data.median !== undefined) {
+            res.median = data.median;
+        }
+        return res;
     }
 
     /**
