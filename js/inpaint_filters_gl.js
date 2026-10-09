@@ -16,6 +16,7 @@
 
 import { curvesToTables } from "./inpaint_curves.js";
 import { levelsTable, brightnessContrastTable, hueSatMatrix, lightnessTable, colorBalanceTables, hueToRgb, LOOK_DEFAULT, grainNoiseCanvas, colourStats } from "./inpaint_filters.js";
+import { registerHazeGL } from "./inpaint_depthfx.js";
 
 const VS = `#version 300 es
 in vec2 a_pos;
@@ -954,6 +955,8 @@ export function registerGLFilter(id, def) {
     PLUGIN_GL.set(id, { def, prog: null, u: null, failed: false });
 }
 
+try { registerHazeGL(); } catch (_) {}
+
 export function unregisterGLFilter(id) {
     const pg = PLUGIN_GL.get(id);
     if (pg && pg.prog && G && !G.lost) { try { G.gl.deleteProgram(pg.prog); } catch (_) { /* ignore */ } }
@@ -1092,6 +1095,7 @@ function applyPluginGL(id, pg, src, params, info, override) {
     const W = src.width, H = src.height;
     if (!W || !H || W > g.max || H > g.max) return null;
     if (isGLSurface(src) && src.gen !== g.gen) return null;
+    if (pg.def.skip && pg.def.skip(params || {}, info)) return isGLSurface(src) ? src : copyCanvas(src);
     const { gl } = g;
     try {
         const prog = pluginProgram(g, pg);
@@ -1153,6 +1157,7 @@ export function runShader(def, src, values, info = {}) {
  * filter or this machine is not covered (the caller then runs the CPU code).
  */
 export function applyFilterGL(id, src, params, info = {}) {
+    if (id === "haze") { try { registerHazeGL(); } catch (_) {} }
     if (!SUPPORTED.has(id)) { const pg = PLUGIN_GL.get(id); return pg ? applyPluginGL(id, pg, src, params, info) : null; }
     const g = context();
     if (!g) return null;
@@ -1227,8 +1232,7 @@ export function compareFilterPaths(cpuApply, id, src, params, info = {}) {
     return { id, gl: true, max, mean: +(sum / n).toFixed(4), over2: +(over2 / n * 100).toFixed(3) };
 }
 
-export const SAMPLE_GLSL = `float u16At(sampler2D t, ivec2 p) { vec2 v = texelFetch(t, clamp(p, ivec2(0), textureSize(t, 0) - 1), 0).rg * 255.0; return (v.x + 256.0 * v.y) / 65535.0; }
-float u16Bilinear(sampler2D t, vec2 px) { vec2 q = px - 0.5; ivec2 i = ivec2(floor(q)); vec2 f = q - floor(q); return mix(mix(u16At(t, i), u16At(t, i + ivec2(1, 0)), f.x), mix(u16At(t, i + ivec2(0, 1)), u16At(t, i + ivec2(1, 1)), f.x), f.y); }`;
+export { SAMPLE_GLSL } from "./inpaint_maps.js";
 
 export function glTestLimits(limits) {
     testLimits = limits ? { ...limits } : null;

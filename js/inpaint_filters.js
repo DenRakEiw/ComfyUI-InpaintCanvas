@@ -14,6 +14,7 @@
 
 import { curveDefaults, curvesToTables, buildCurvesControl } from "./inpaint_curves.js";
 import { applyFilterGL, applyMatchGL, glToCanvas } from "./inpaint_filters_gl.js";
+import { hazeStats, applyHaze } from "./inpaint_depthfx.js";
 
 function makeCanvas(w, h) {
     const c = document.createElement("canvas");
@@ -1066,6 +1067,22 @@ export const FILTERS = {
         ],
         reach: 0,
         apply: applyVignette,
+    },
+    haze: {
+        label: "Haze by depth",
+        params: [
+            { key: "amount", label: "Density", min: 0, max: 100, step: 1, default: 50, unit: "%" },
+            { key: "start", label: "Start", min: 0, max: 100, step: 1, default: 20, unit: "%" },
+            { key: "curve", label: "Falloff", min: 0.3, max: 3, step: 0.05, default: 1 },
+            { key: "color_mode", label: "Colour", type: "select", default: "auto", options: [{ id: "auto", label: "From the far distance" }, { id: "custom", label: "Custom" }] },
+            { key: "color", label: "Haze colour", type: "color", default: "#c9d3dd", when: { color_mode: "custom" } },
+            { key: "desaturate", label: "Fade colours", min: 0, max: 100, step: 1, default: 30, unit: "%" },
+        ],
+        maps: () => ["depth"],
+        wholeStats: hazeStats,
+        wholeStatsSize: 256,
+        reach: 0,
+        apply: applyHaze,
     },
     // fill layers: `over` - the result goes over the picture below as a layer would (its own alpha, the layer's blend
     // mode, opacity and mask), it does not stand for that picture; `chain` - apply() takes a GPU surface as it is (it

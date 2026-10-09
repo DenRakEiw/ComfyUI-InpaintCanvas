@@ -409,3 +409,6 @@ export function fingerprintDiff(a, b) {
     }
     return +(sum / len).toFixed(4);
 }
+
+export const SAMPLE_GLSL = `float u16At(sampler2D t, ivec2 p) { vec2 v = texelFetch(t, clamp(p, ivec2(0), textureSize(t, 0) - 1), 0).rg * 255.0; return (v.x + 256.0 * v.y) / 65535.0; }
+float u16Bilinear(sampler2D t, vec2 px) { vec2 q = px - 0.5; ivec2 i = ivec2(floor(q)); vec2 f = q - floor(q); return mix(mix(u16At(t, i), u16At(t, i + ivec2(1, 0)), f.x), mix(u16At(t, i + ivec2(0, 1)), u16At(t, i + ivec2(1, 1)), f.x), f.y); }`;

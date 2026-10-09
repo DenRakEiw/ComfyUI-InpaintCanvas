@@ -14074,6 +14074,7 @@ class InpaintEditor {
             origin: pass.origin,
             full: pass.full,
             stats,
+            wholeStats: stats,
             seed: layer.id,
             lut: layer._lutData,
             plate: layer._plateImg || null,
@@ -17573,7 +17574,15 @@ class InpaintEditor {
         // a fill layer picks among the fills, a filter layer among the filters
         const fill = !!(FILTERS[layer.filter] && FILTERS[layer.filter].over);
         typeSel.title = fill ? "Fill type" : "Filter type";
-        for (const id of FILTER_IDS) { if (!!FILTERS[id].over !== fill) continue; const o = document.createElement("option"); o.value = id; o.textContent = FILTERS[id].label; typeSel.appendChild(o); }
+        for (const id of FILTER_IDS) {
+            if (!!FILTERS[id].over !== fill) continue;
+            const fdef = FILTERS[id];
+            if (id !== layer.filter && !host.depthSupported) {
+                const needsDepth = (typeof fdef.maps === "function" && fdef.maps({}).includes("depth")) || (Array.isArray(fdef.maps) && fdef.maps.includes("depth"));
+                if (needsDepth) continue;
+            }
+            const o = document.createElement("option"); o.value = id; o.textContent = fdef.label; typeSel.appendChild(o);
+        }
         // a filter whose plugin is off or missing keeps its id and settings and passes the picture through; picking a
         // type replaces it
         const missing = !FILTERS[layer.filter];
@@ -17586,6 +17595,9 @@ class InpaintEditor {
         if (missing) {
             box.appendChild(el("div", "ipc-hint", `The filter "${layer.filter}" is not installed (its plugin is off or missing). The layer passes the picture through and keeps its settings.`));
             return box;
+        }
+        if (this.mapsOf(layer).includes("depth") && !(this.maps && this.maps.depth)) {
+            box.appendChild(el("div", "ipc-hint", "Needs a depth map: compute it under Selection \u203A Depth"));
         }
         const def = FILTERS[layer.filter];
         const stepLabel = (p) => (p.label ? `${def.label}: ${p.label}` : def.label);   // the Undo history's name of a control's step
@@ -17626,6 +17638,14 @@ class InpaintEditor {
             if (p.hidden) continue;
             if (p.onlyWithPlate && !layer.plate) continue;
             if (p.notWithPlate && layer.plate) continue;
+            if (p.when) {
+                let match = true;
+                for (const [wk, wv] of Object.entries(p.when)) {
+                    const actual = (layer.params && layer.params[wk] !== undefined) ? layer.params[wk] : def.params.find((dp) => dp.key === wk)?.default;
+                    if (actual !== wv) { match = false; break; }
+                }
+                if (!match) continue;
+            }
             if (p.type === "custom") {
                 // a control the filter module builds itself (e.g. the curves editor), full row; it reports edits through the callbacks
                 if (typeof def.control !== "function") continue;
@@ -17663,7 +17683,13 @@ class InpaintEditor {
                     if (!preset) return;
                     this.pushUndo({ kind: "filter", id: layer.id, label: stepLabel(p) });
                     layer.params[p.key] = preset.id;
-                    if (p.key !== "preset") { this.markFilterChanged(layer); return; }
+                    const whenNames = new Set();
+                    for (const dp of def.params) if (dp.when) for (const wk of Object.keys(dp.when)) whenNames.add(wk);
+                    if (p.key !== "preset") {
+                        this.markFilterChanged(layer);
+                        if (whenNames.has(p.key)) this.renderLayers();
+                        return;
+                    }
                     for (const [k, v] of Object.entries(preset)) if (k !== "id" && k !== "label" && k !== "group") layer.params[k] = v;
                     if (!("look" in preset)) layer.params.look = null;
                     // layer names are not editable, so the preset may name the layer
