@@ -12197,14 +12197,18 @@ class InpaintEditor {
      * @returns {string[]}
      */
     mapsOf(layer) {
-        if (!layer || layer.kind !== "filter") return [];
+        if (!layer || (layer.kind ? layer.kind !== "filter" : !layer.filter)) return [];
         const def = FILTERS[layer.filter];
         const res = new Set();
-        if (def && typeof def.maps === "function") {
-            try {
-                const list = def.maps(layer.params || {});
-                if (Array.isArray(list)) for (const k of list) if (k) res.add(k);
-            } catch (_) { /* ignore */ }
+        if (def) {
+            if (typeof def.maps === "function") {
+                try {
+                    const list = def.maps(layer.params || {});
+                    if (Array.isArray(list)) for (const k of list) if (k) res.add(k);
+                } catch (_) { /* ignore */ }
+            } else if (Array.isArray(def.maps)) {
+                for (const k of def.maps) if (k) res.add(k);
+            }
         }
         if (layer.params && layer.params.limit && (layer.params.limit.source === "depth" || layer.params.limit.source === "map")) {
             res.add("depth");
@@ -13704,7 +13708,8 @@ class InpaintEditor {
             below.height,
             vp ? [vp.x, vp.y, vp.w, vp.h, vp.sx, vp.sy, !!(vp.screen || vp.display)] : 0,
         ];
-        if (this.mapsOf(layer).length > 0) {
+        const readsMap = typeof this.mapsOf === "function" ? this.mapsOf(layer).length > 0 : (layer.params && layer.params.limit && (layer.params.limit.source === "depth" || layer.params.limit.source === "map"));
+        if (readsMap) {
             baseKey.push(this.mapsVersion || 0);
         }
         const isEffectView = this.effectViewOf(layer, forRun);
@@ -13850,11 +13855,29 @@ class InpaintEditor {
     }
 
     /**
+     * `colourStats` below a filter layer, used as fallback for histogram / color sample when a filter defines custom `wholeStats`.
+     */
+    belowColourStats(layer, forRun = false) {
+        if (!layer || !this.layers || !this.width || !this.height) return null;
+        const slot = forRun ? "_bcstatsRun" : "_bcstats";
+        const c = layer[slot];
+        if (c && c.version === this.compositeVersion) return c.stats;
+        const index = this.layers.indexOf(layer);
+        const s = Math.min(1, 256 / Math.max(this.width, this.height));
+        const small = this.sampleRegion("image", [0, 0, this.width, this.height], s, { forRun: !!forRun, upTo: Math.max(0, index) });
+        const entry = { version: this.compositeVersion, stats: colourStats(small) };
+        layer[slot] = entry;
+        return entry.stats;
+    }
+
+    /**
      * The histogram `{ r, g, b, luma }` of the composite below a filter layer (R1-S4).
      */
     belowHistogram(layer, forRun = false) {
         const st = this.belowStats(layer, forRun);
-        return (st && st.hist) || null;
+        if (st && st.hist) return st.hist;
+        const cs = this.belowColourStats(layer, forRun);
+        return (cs && cs.hist) || null;
     }
 
     /**
@@ -13862,7 +13885,9 @@ class InpaintEditor {
      */
     belowSample(layer, forRun = false) {
         const st = this.belowStats(layer, forRun);
-        return (st && st.bytes) ? { bytes: st.bytes, w: st.w, h: st.h } : null;
+        if (st && st.bytes) return { bytes: st.bytes, w: st.w, h: st.h };
+        const cs = this.belowColourStats(layer, forRun);
+        return (cs && cs.bytes) ? { bytes: cs.bytes, w: cs.w, h: cs.h } : null;
     }
 
     /**
