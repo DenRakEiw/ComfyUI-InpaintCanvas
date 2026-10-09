@@ -60,7 +60,7 @@ function snapRgb(guideData, gw, gh, x, y) {
  * Joint bilateral snap of a depth sample guided by full-resolution colour.
  * The JS twin of SNAP_GLSL.
  *
- * @param {{ data: Uint16Array, w: number, h: number } | Uint16Array} map
+ * @param {{ data: Uint16Array, w: number, h: number }} map
  * @param {{ data: Uint8Array|Uint8ClampedArray, w?: number, h?: number } | Uint8Array|Uint8ClampedArray | null} guide
  * @param {number} mx - Continuous map X pixel coordinate (centre at +0.5)
  * @param {number} my - Continuous map Y pixel coordinate (centre at +0.5)
