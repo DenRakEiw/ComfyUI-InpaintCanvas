@@ -43,7 +43,7 @@ import { LiquifyField, gridStep, previewBlock, liquifyFalloff } from "./inpaint_
 import { labelMap, sameLabels, remap, mapOffset, namesFor, parse, normalize, compare, checkNote, referencesText, referencesRule } from "./reftokens.js";
 import { fitLayerRGBA, workScale } from "./edgefit.js";
 import { STALE_DIFF, GUIDE, RANGE_BAND_ROWS, WORK_MAX, modelSize, workSize, disparityRange } from "./inpaint_depth.js";
-import { packRG16, mapToJSON, mapFromJSON, fingerprint, fingerprintDiff, passToMap, makeMap, sampleMap, deriveMap, guideView } from "./inpaint_maps.js";
+import { packRG16, mapToJSON, mapFromJSON, fingerprint, fingerprintDiff, passToMap, makeMap, sampleMap, deriveMap } from "./inpaint_maps.js";
 import { SNAP_DEFAULT } from "./inpaint_edges.js";
 import { normalizeLimit, u16Bilinear, rangeWeight, opp, colourSimilarity, hexToRgb as hexToRgb01, WEIGHTS_GLSL } from "./inpaint_weights.js";
 import { limitAlphaRows } from "./inpaint_limit.js";

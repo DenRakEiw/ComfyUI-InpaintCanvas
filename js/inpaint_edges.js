@@ -72,8 +72,7 @@ function snapRgb(guideData, gw, gh, x, y) {
  * @returns {number} Normalized depth value in 0..1
  */
 export function snapField(map, guide, mx, my, r, g, b, sigmaR, tau) {
-    // @ts-ignore
-    const mData = map.data || map;
+    const mData = /** @type {Uint16Array} */ (map && map.data ? map.data : map);
     // @ts-ignore
     const mw = map.w, mh = map.h;
     const bil = u16Bilinear(mData, mw, mh, mx, my);
@@ -96,13 +95,12 @@ export function snapField(map, guide, mx, my, r, g, b, sigmaR, tau) {
     const k = sstep(tau, 2.0 * tau, hi - lo);
     if (k <= 0) return bil;
 
-    // @ts-ignore
-    const gData = guide ? (guide.data || guide) : null;
+    const gData = /** @type {Uint8Array|Uint8ClampedArray|null} */ (guide ? (/** @type {any} */ (guide).data || guide) : null);
     if (!gData) return bil;
     // @ts-ignore
-    const gw = (guide && guide.w) || mw;
+    const gw = (guide && /** @type {any} */ (guide).w) || mw;
     // @ts-ignore
-    const gh = (guide && guide.h) || mh;
+    const gh = (guide && /** @type {any} */ (guide).h) || mh;
 
     let sw = 0.0, sd = 0.0;
     const inv = 0.5 / (sigmaR * sigmaR);
@@ -319,7 +317,10 @@ export function gaussRadii(sigma) {
     const wu = wl + 2;
     const mIdeal = (12 * sigma * sigma - 3 * wl * wl - 12 * wl - 9) / (-4 * wl - 4);
     const mm = Math.round(mIdeal);
-    return [0, 1, 2].map((i) => ((i < mm ? wl : wu) - 1) / 2);
+    const r0 = ((0 < mm ? wl : wu) - 1) / 2;
+    const r1 = ((1 < mm ? wl : wu) - 1) / 2;
+    const r2 = ((2 < mm ? wl : wu) - 1) / 2;
+    return [r0, r1, r2];
 }
 
 /**
