@@ -12261,6 +12261,27 @@ class InpaintEditor {
     }
 
     /**
+     * Cancel an in-flight metadata preview on a document map (R2-S5).
+     * @param {string} [kind]
+     * @returns {boolean}
+     */
+    cancelMapMeta(kind = "depth") {
+        if (!this._mapUndoPending) return false;
+        const prev = this._mapUndoPending;
+        this._mapUndoPending = null;
+        if (!this.maps) this.maps = {};
+        this.maps[kind] = prev;
+        this.mapsVersion++;
+        for (const l of this.layers) {
+            if (l.kind === "filter" && (l.params?.limit?.source === (kind || "depth") || this.mapsOf(l).includes(kind || "depth"))) {
+                this.markFilterChanged(l);
+            }
+        }
+        this.draw();
+        return true;
+    }
+
+    /**
      * The map kinds a filter layer depends on (R2-S12, F10):
      * union of def.maps(params) and limit.source === "depth" ? ["depth"] : [].
      * @param {any} layer
@@ -21158,9 +21179,9 @@ class InpaintEditor {
         if (this.maps) {
             for (const [k, m] of Object.entries(this.maps)) {
                 if (!m) continue;
-                const b = m.data ? m.data.byteLength : 0;
+                const b = (m.data ? m.data.byteLength : 0) + (m.guide ? m.guide.byteLength : 0);
                 mapsBytes += b;
-                mapsReport[k] = { w: m.w, h: m.h, bytes: b, version: m.version, dataVersion: m.dataVersion };
+                mapsReport[k] = { w: m.w, h: m.h, bytes: b, version: m.version, dataVersion: m.dataVersion, guide: !!m.guide };
             }
         }
         return {
@@ -21181,6 +21202,7 @@ class InpaintEditor {
 
     destroy() {
         this._destroyed = true;
+        this._mapUndoPending = null;
         clearTimeout(this._refLayTimer);
         if (this._compositor) { try { this._compositor.dispose(); } catch (_) { /* context gone */ } this._compositor = null; }
         this.close();
