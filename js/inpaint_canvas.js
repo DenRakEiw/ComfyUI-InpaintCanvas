@@ -12183,6 +12183,7 @@ class InpaintEditor {
                 this.markFilterChanged(l);
             }
         }
+        this.sceneSig = null;
         this.renderHistory();
         this.draw();
         this.notifyChanged();
@@ -13626,6 +13627,7 @@ class InpaintEditor {
     }
 
     markFilterChanged(layer, { soon = false } = {}) {
+        this.sceneSig = null;
         layer._fcache = null;
         layer._fcacheView = null; layer._fcacheSample = null; layer._fxCacheSample = null;
         this.uploaded.baseHash = null;
@@ -19675,7 +19677,7 @@ class InpaintEditor {
             this.maskView ? `${this.maskView.id}:${this.maskView.mode}` : ""];
         for (const l of this.layers) {
             parts.push(l.id, this.shown(l) ? 1 : 0, l.opacity, l.blend, l.role, l.x, l.y, l.w, l.h,
-                l.kind === "filter" ? l.filter + JSON.stringify(l.params || {}) : "",
+                l.kind === "filter" ? l.filter + JSON.stringify(l.params || {}) + (this.mapsOf(l).length ? `:${this.mapsVersion || 0}` : "") : "",
                 l.match ? `${l.match.strength}:${l.match.source}` : "", l.maskPx ? (l.maskOff ? 2 : 1) : 0, l.maskEdit ? 1 : 0);
         }
         if (p) parts.push("p", p.kind, p.layer ? p.layer.id : "");
