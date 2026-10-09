@@ -2023,6 +2023,7 @@ class InpaintEditor {
         this.rangeMode = "replace";
         this._rangeTint = null;
         this.mapView = null;
+        this.maskView = null;   // null | { id: string, mode: "overlay" | "alone" | "effect" }
         this._pendingPick = null;
         this._pendingPickTarget = null;
         this.geometrySeq = 0;
@@ -2181,6 +2182,33 @@ class InpaintEditor {
         const sh = Math.min(rc.canvas.height, (this.height - rc.y) / rc.f);
         if (!(sw > 0) || !(sh > 0)) return;
         ctx.drawImage(rc.canvas, 0, 0, sw, sh, rc.x, rc.y, sw * rc.f, sh * rc.f);
+    }
+
+    /**
+     * Draw a layer's mask over the layer's rectangle or region, into a context that already carries
+     * the transform from image to screen coordinates. Modelled on drawSelectionInto.
+     */
+    drawMaskInto(ctx, layer, scale, region = null, display = true) {
+        if (!layer || !layer.maskPx) return;
+        const maskPx = layer.maskPx;
+        const isFilter = layer.kind === "filter";
+        const lx = isFilter ? 0 : layer.x;
+        const ly = isFilter ? 0 : layer.y;
+        const lw = isFilter ? this.width : layer.w;
+        const lh = isFilter ? this.height : layer.h;
+        const fx = lw / maskPx.width, fy = lh / maskPx.height;
+        if (!isTilePixels(maskPx)) {
+            ctx.drawImage(this.displaySource(maskPx, scale * fx, display), lx, ly, lw, lh);
+            return;
+        }
+        const level = this.tileLevel(scale * fx);
+        const r = region || { x: lx, y: ly, w: lw, h: lh };
+        const rc = maskPx.regionCanvas([(r.x - lx) / fx, (r.y - ly) / fy, (r.x + r.w - lx) / fx, (r.y + r.h - ly) / fy], level, display);
+        if (!rc) return;
+        const sw = Math.min(rc.canvas.width, (maskPx.width - rc.x) / rc.f);
+        const sh = Math.min(rc.canvas.height, (maskPx.height - rc.y) / rc.f);
+        if (!(sw > 0) || !(sh > 0)) return;
+        ctx.drawImage(rc.canvas, 0, 0, sw, sh, lx + rc.x * fx, ly + rc.y * fy, sw * rc.f * fx, sh * rc.f * fy);
     }
 
     // ---- modal -------------------------------------------------------------
@@ -13599,6 +13627,8 @@ class InpaintEditor {
         if (layer.params && layer.params.limit && (layer.params.limit.source === "depth" || layer.params.limit.source === "map")) {
             baseKey.push(this.mapsVersion || 0);
         }
+        const isEffectView = !forRun && !!vp && !!this.maskView && this.maskView.mode === "effect" && this.maskView.id === layer.id;
+        if (isEffectView) baseKey.push(true);
         return JSON.stringify(baseKey);
     }
 
@@ -13627,6 +13657,9 @@ class InpaintEditor {
             chain: pass.chain,
             maps: this.maps || null,
         };
+        if (!pass.forRun && this.viewPass && this.maskView && this.maskView.mode === "effect" && this.maskView.id === layer.id) {
+            info.limitView = true;
+        }
         if (pass.site) {
             if (!this._lastFilterInfoBySite) this._lastFilterInfoBySite = {};
             this._lastFilterInfoBySite[pass.site] = info;
@@ -14205,7 +14238,8 @@ class InpaintEditor {
         // A filter layer that covers its input one to one can leave its result on the GPU; a
         // mask, an opacity or a blend mode has to composite it onto the canvas.
         // a fill layer (`over`) goes over the picture as a layer does: its result never stands for the picture
-        const plain = !this.liveMask(layer) && layer.opacity >= 1 && (!layer.blend || layer.blend === "normal") && !preview && !clip && !this.isFillLayer(layer);
+        const limitView = !forRun && this.viewPass && this.maskView && this.maskView.mode === "effect" && this.maskView.id === layer.id;
+        const plain = !limitView && !this.liveMask(layer) && layer.opacity >= 1 && (!layer.blend || layer.blend === "normal") && !preview && !clip && !this.isFillLayer(layer);
         const keepSurface = plain && more && !this.filterChainOff && glChainUsable(ctx.canvas.width, ctx.canvas.height);
         const out = this.filteredCanvas(layer, chain ? chain.surface : ctx.canvas, forRun, preview, keepSurface);
         const rx = vp ? vp.x : 0, ry = vp ? vp.y : 0;
@@ -14269,12 +14303,18 @@ class InpaintEditor {
             mctx.globalCompositeOperation = "source-over";
             src = m;
         }
-        if (clip || EMULATED_BLENDS.has(layer.blend)) {
+        if (limitView) {
+            ctx.save();
+            ctx.fillStyle = "#000000";
+            ctx.fillRect(rx, ry, rw, rh);
+            ctx.restore();
+        }
+        if (!limitView && (clip || EMULATED_BLENDS.has(layer.blend))) {
             this.blendEmulated(ctx, layer.blend, (c) => { c.drawImage(src, rx, ry, rw, rh); }, layer.opacity, clip ? clip() : null);
             return null;
         }
-        ctx.globalAlpha = layer.opacity;
-        ctx.globalCompositeOperation = (layer.blend && layer.blend !== "normal") ? layer.blend : "source-over";
+        ctx.globalAlpha = limitView ? 1 : layer.opacity;
+        ctx.globalCompositeOperation = limitView ? "source-over" : ((layer.blend && layer.blend !== "normal") ? layer.blend : "source-over");
         ctx.drawImage(src, rx, ry, rw, rh);
         ctx.globalAlpha = 1;
         ctx.globalCompositeOperation = "source-over";
@@ -14311,7 +14351,10 @@ class InpaintEditor {
         this.scheduleAutosave();
         layer._refAvatar = null;
         if (pixels) layer.maskDirty = !!layer.maskPx;
-        if (!layer.maskPx) layer.maskRef = null;
+        if (!layer.maskPx) {
+            layer.maskRef = null;
+            if (this.maskView && this.maskView.id === layer.id && this.maskView.mode !== "effect") this.maskView = null;
+        }
         layer._maskedValid = false;
         layer._mcache = null;
         layer._mcacheView = null; layer._mcacheSample = null;
@@ -14557,6 +14600,8 @@ class InpaintEditor {
     openMaskMenu(layer, anchor) {
         if (this.flyout && this.flyout.group.btn === anchor) { this.closeFlyout(); return; }
         const has = !!layer.maskPx, id = layer.id;
+        const viewing = !!(this.maskView && this.maskView.id === id);
+        const isFilterWithLimit = layer.kind === "filter" && !!(layer.params && layer.params.limit);
         // the layer looked up at the click: an undo while the menu is open puts copies of the layers back
         const act = (icon, label, op, title, disabled = false) => ({ icon, label, title, disabled, onClick: () => {
             const l = this.layers.find((x) => x.id === id);
@@ -14572,6 +14617,27 @@ class InpaintEditor {
                 act("mask", "Hide selection", "hide_selection", "A mask from the selection, inverted: the selected part is hidden"),
                 { sep: true },
                 act("invert", "Invert mask", "invert", "What the mask shows is hidden and the other way round", !has),
+                { sep: true },
+                { icon: "eye", label: "Show as overlay", disabled: !has, title: "Show the mask as a red overlay where it hides", onClick: () => {
+                    this.maskView = { id, mode: "overlay" };
+                    this.renderLayers();
+                    this.draw();
+                } },
+                { icon: "eye", label: "Show alone", key: "Alt+click", disabled: !has, title: "Show the mask alone in black and white (Alt+click on mask label)", onClick: () => {
+                    this.maskView = { id, mode: "alone" };
+                    this.renderLayers();
+                    this.draw();
+                } },
+                ...(isFilterWithLimit ? [{ icon: "eye", label: "Show the effect", title: "Show where the filter acts (mask × limit weight)", onClick: () => {
+                    this.maskView = { id, mode: "effect" };
+                    this.renderLayers();
+                    this.draw();
+                } }] : []),
+                { icon: "eyeOff", label: "Hide the view", disabled: !viewing, title: "End the mask view", onClick: () => {
+                    this.maskView = null;
+                    this.renderLayers();
+                    this.draw();
+                } },
             ],
         }, anchor);
     }
@@ -14691,6 +14757,7 @@ class InpaintEditor {
         layer.maskRef = null;
         layer.maskDirty = false;
         layer.maskEdit = false;
+        if (this.maskView && this.maskView.id === layer.id) this.maskView = null;
         this.markLayerChanged(layer);
         if (!silent) { this.renderLayers(); this.draw(); this.setStatus(`${layer.name}: mask applied to the pixels.`); }
     }
@@ -14717,6 +14784,7 @@ class InpaintEditor {
         layer.maskPx = null;
         layer.maskOff = false;
         layer.maskEdit = false;
+        if (this.maskView && this.maskView.id === layer.id) this.maskView = null;
         this.markMaskChanged(layer);
         this.renderLayers();
         this.draw();
@@ -16244,6 +16312,7 @@ class InpaintEditor {
         this.height = px.height;
         this._rangeTint = null;
         this.mapView = null;
+        this.maskView = null;
         this._pendingPick = null;
         this._pendingPickTarget = null;
         if (this.depthViewBtn) this.depthViewBtn.classList.remove("ipc-toggle-on");
@@ -16504,6 +16573,7 @@ class InpaintEditor {
         this.pushUndo({ kind: "layers", label: "Delete layer" });
         this.layers = this.layers.filter((l) => l.id !== id);
         if (this.activeLayerId === id) this.activeLayerId = null;
+        if (this.maskView && this.maskView.id === id) this.maskView = null;
         this.uploaded.baseHash = null;
         this.uploaded.controlHash = null;
         this.refsMutated();
@@ -16524,6 +16594,7 @@ class InpaintEditor {
         this.pushUndo({ kind: "layers", label: gone.length > 1 ? `Delete ${gone.length} layers` : "Delete layer" });
         this.layers = this.layers.filter((l) => !gone.includes(l));
         if (gone.some((l) => l.id === this.activeLayerId)) this.activeLayerId = locked.length ? locked[locked.length - 1].id : null;
+        if (this.maskView && ids.includes(this.maskView.id)) this.maskView = null;
         this.layerSel = new Set(locked.length > 1 ? locked.map((l) => l.id) : []);
         this.uploaded.baseHash = null;
         this.uploaded.controlHash = null;
@@ -16919,10 +16990,28 @@ class InpaintEditor {
         const more = miniButton("more", "More mask operations: reveal all, hide all, hide the selection, invert (right-click on the mask label opens them too)", () => this.openMaskMenu(layer, more), "ipc-mask-more");
         maskRow.appendChild(more);
         maskRow.appendChild(el("span", "ipc-grow"));
-        const maskLabel = el("span", layer.maskOff ? "ipc-mask-off" : null, layer.maskPx ? (layer.maskOff ? "mask off" : layer.maskEdit ? "mask ✎" : "mask") : "no mask");
+        const isViewed = !!(this.maskView && this.maskView.id === layer.id);
+        const labelText = isViewed ? "mask ◐" : !layer.maskPx ? "no mask" : layer.maskOff ? "mask off" : layer.maskEdit ? "mask ✎" : "mask";
+        const maskLabel = el("span", layer.maskOff ? "ipc-mask-off" : null, labelText);
         if (layer.maskPx) {
-            maskLabel.title = "Shift+click switches the mask off and on (it stays with the layer); right-click for the mask operations";
-            maskLabel.addEventListener("click", (e) => { if (!e.shiftKey) return; e.preventDefault(); e.stopPropagation(); this.setMaskOff(layer); });
+            maskLabel.title = "Alt+click toggles black and white view; Shift+click switches the mask off and on; right-click for more operations";
+            maskLabel.addEventListener("click", (e) => {
+                if (e.altKey) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const active = this.maskView && this.maskView.id === layer.id && this.maskView.mode === "alone";
+                    this.maskView = active ? null : { id: layer.id, mode: "alone" };
+                    this.renderLayers();
+                    this.draw();
+                    return;
+                }
+                if (e.shiftKey) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    this.setMaskOff(layer);
+                    return;
+                }
+            });
         }
         maskLabel.addEventListener("contextmenu", (e) => { e.preventDefault(); e.stopPropagation(); this.openMaskMenu(layer, more); });
         maskRow.appendChild(maskLabel);
@@ -19474,7 +19563,8 @@ class InpaintEditor {
         const parts = [this.pixelVersion, this.compositeVersion, this.width, this.height,
             this.canvas.width, this.canvas.height, Math.round(v.x * 8), Math.round(v.y * 8), v.scale, v.angle || 0,
             this.peekBase ? 1 : 0, this.compare ? `${this.compare.a}:${this.compare.b}:${this.compare.split}` : 0,
-            this.compareShow || 0, this.filterPreview || 0, this.viewTilt() || 0];
+            this.compareShow || 0, this.filterPreview || 0, this.viewTilt() || 0,
+            this.maskView ? `${this.maskView.id}:${this.maskView.mode}` : ""];
         for (const l of this.layers) {
             parts.push(l.id, this.shown(l) ? 1 : 0, l.opacity, l.blend, l.role, l.x, l.y, l.w, l.h,
                 l.kind === "filter" ? l.filter + JSON.stringify(l.params || {}) : "",
@@ -19559,6 +19649,14 @@ class InpaintEditor {
         this.drawViewComposite(ctx);
     }
 
+    cleanMaskView() {
+        if (!this.maskView) return;
+        const l = this.layers.find((x) => x.id === this.maskView.id);
+        if (!l) { this.maskView = null; return; }
+        if (this.maskView.mode !== "effect" && !l.maskPx) { this.maskView = null; return; }
+        if (this.maskView.mode === "effect" && (l.kind !== "filter" || !(l.params && l.params.limit))) { this.maskView = null; return; }
+    }
+
     /** Selection, crop frame, layer handles and the tool cursors, on top of the scene. */
     drawSceneOverlays(ctx) {
         const s = this.view.scale;
@@ -19625,6 +19723,74 @@ class InpaintEditor {
                 ctx.drawImage(this._rangeTint.canvas, 0, 0, this.width, this.height);
             }
             ctx.restore();
+        }
+
+        this.cleanMaskView();
+        if (this.maskView && (this.maskView.mode === "overlay" || this.maskView.mode === "alone")) {
+            const vl = this.layers.find((l) => l.id === this.maskView.id);
+            if (vl && vl.maskPx) {
+                const vw = this.canvas.width, vh = this.canvas.height;
+                const region = this.viewportRegion();
+                if (this.maskView.mode === "overlay") {
+                    const sc = this.passScratch("maskOverlay", vw, vh);
+                    const sctx = sc.getContext("2d");
+                    sctx.save();
+                    try {
+                        sctx.setTransform(1, 0, 0, 1, 0, 0);
+                        sctx.globalCompositeOperation = "source-over";
+                        sctx.globalAlpha = 1;
+                        sctx.clearRect(0, 0, vw, vh);
+                        sctx.fillStyle = "#ff0000";
+                        sctx.fillRect(0, 0, vw, vh);
+                        sctx.globalCompositeOperation = "destination-out";
+                        this.applyViewTransform(sctx);
+                        if (tilt) this.applyTilt(sctx);
+                        this.drawMaskInto(sctx, vl, s, region, true);
+                    } finally {
+                        sctx.restore();
+                    }
+                    ctx.save();
+                    ctx.setTransform(1, 0, 0, 1, 0, 0);
+                    ctx.globalCompositeOperation = "source-over";
+                    ctx.globalAlpha = 0.5;
+                    ctx.drawImage(sc, 0, 0);
+                    ctx.restore();
+                } else if (this.maskView.mode === "alone") {
+                    const lx = vl.kind === "filter" ? 0 : vl.x;
+                    const ly = vl.kind === "filter" ? 0 : vl.y;
+                    const lw = vl.kind === "filter" ? this.width : vl.w;
+                    const lh = vl.kind === "filter" ? this.height : vl.h;
+                    ctx.save();
+                    ctx.fillStyle = "#000000";
+                    ctx.globalAlpha = 1;
+                    ctx.globalCompositeOperation = "source-over";
+                    ctx.fillRect(lx, ly, lw, lh);
+                    ctx.restore();
+                    const sc = this.passScratch("maskAlone", vw, vh);
+                    const sctx = sc.getContext("2d");
+                    sctx.save();
+                    try {
+                        sctx.setTransform(1, 0, 0, 1, 0, 0);
+                        sctx.globalCompositeOperation = "source-over";
+                        sctx.globalAlpha = 1;
+                        sctx.clearRect(0, 0, vw, vh);
+                        sctx.fillStyle = "#ffffff";
+                        sctx.fillRect(0, 0, vw, vh);
+                        sctx.globalCompositeOperation = "destination-in";
+                        this.applyViewTransform(sctx);
+                        if (tilt) this.applyTilt(sctx);
+                        this.drawMaskInto(sctx, vl, s, region, true);
+                    } finally {
+                        sctx.restore();
+                    }
+                    ctx.save();
+                    ctx.setTransform(1, 0, 0, 1, 0, 0);
+                    ctx.globalCompositeOperation = "source-over";
+                    ctx.globalAlpha = 1;
+                    ctx.drawImage(sc, 0, 0);
+                    ctx.restore();
+                }
+            }
         }
 
         if (this.getBounds()) {
@@ -20340,6 +20506,7 @@ class InpaintEditor {
             }
             this._rangeTint = null;
             this.mapView = null;
+            this.maskView = null;
             this._pendingPick = null;
             this._pendingPickTarget = null;
             if (this.depthViewBtn) this.depthViewBtn.classList.remove("ipc-toggle-on");
