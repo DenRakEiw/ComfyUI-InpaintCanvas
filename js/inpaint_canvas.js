@@ -12750,6 +12750,7 @@ class InpaintEditor {
         if (step.kind === "turn") return this.turnSnapshot();
         // the plugins' per-document data alone (scumble.documents.data(doc).set(patch, { undo })): a plugin's own change
         // of what it keeps with the document, no pixels; a canvas or turn step carries the same copy beside its pixels
+        if (step.kind === "data") return { kind: "data", pluginData: this.pluginDataCopy() };
         if (step.kind === "maps") {
             const prev = (this.maps && this.maps[step.map]) || null;
             const target = step.prev;
@@ -12760,6 +12761,7 @@ class InpaintEditor {
             }
             return { kind: "maps", map: step.map, prev, bytes: snapBytes };
         }
+        if (step.kind === "layers") return { kind: "layers", layers: this.layers.map((l) => this.snapshotLayer(l)), groups: this.groupsCopy(), activeLayerId: this.activeLayerId };
         if (step.kind === "transforms") {
             // the places of several layers moved or scaled together (a multi-selection): one step, no pixels
             const ids = step.ids || step.items.map((i) => i.id);
