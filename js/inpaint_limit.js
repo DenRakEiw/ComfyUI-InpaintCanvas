@@ -1,19 +1,24 @@
 // Generated from DenRakEiw/scumble renderer/editor/inpaint_limit.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // @ts-check
-// Post-stage for filter layers: params.limit (F6 / R1-S7).
+// Post-stage for filter layers: params.limit (F6 / R1-S7 / R2-S5).
 // Runs on the GPU via LIMIT_SHADER or on the CPU via limitStageCPU.
+// The colour is the filter's input (the picture below the layer, lower filter layers included);
+// the guide is the picture without filters.
 // No DOM at import.
 
 import { WEIGHTS_GLSL, normalizeLimit, limitWeight, u16Bilinear, opp, hexToRgb } from "./inpaint_weights.js";
 import { SAMPLE_GLSL, runShader, glToCanvas } from "./inpaint_filters_gl.js";
-import { passToMap, rg8View } from "./inpaint_maps.js";
+import { passToMap, rg8View, guideView } from "./inpaint_maps.js";
 import { setLimitStage } from "./inpaint_filters.js";
+import { SNAP_GLSL, snapParams, snapField } from "./inpaint_edges.js";
 
 export const LIMIT_SHADER = {
     label: "limit",
     uniforms: {
         u_in: "sampler2D",
         u_map: "sampler2D",
+        u_guide: "sampler2D",
+        u_snap: "vec2",
         u_hasMap: "int",
         u_source: "int",
         u_r: "vec4",
@@ -25,12 +30,12 @@ export const LIMIT_SHADER = {
         u_over: "int",
         u_view: "int",
     },
-    code: WEIGHTS_GLSL + "\n" + SAMPLE_GLSL + `
+    code: WEIGHTS_GLSL + "\n" + SAMPLE_GLSL + "\n" + SNAP_GLSL + `
 vec4 shade(vec4 c, vec2 uv) {
     vec4 i = texture(u_in, uv);
     vec2 pp = pictureUv(uv) * u_pictureSize;
     vec2 mp = vec2(dot(u_m0.xy, pp) + u_m1.x, dot(u_m0.zw, pp) + u_m1.y);
-    float mv = u_hasMap == 1 ? u16Bilinear(u_map, mp) : 0.0;
+    float mv = u_hasMap == 1 ? snapField(u_map, u_guide, mp, i.rgb, u_snap) : 0.0;
     float w = (u_source == 0 && u_hasMap == 0) ? 0.0 : w_limit(u_source, i.rgb, mv, u_r, u_inv == 1, u_ref, u_tol);
     if (u_view == 1) return vec4(vec3(w), 1.0);
     return u_over == 1 ? vec4(c.rgb, c.a * w) : mix(i, c, w);
@@ -58,9 +63,9 @@ export function limitStage(src, out, limitIn, info = {}, def = null) {
         return src;
     }
 
-    // Fills always carry the weight in their alpha (`def.over`); a filter does so whenever its result is
-    // drawn over the picture rather than becoming the chain's surface (`info.limitOver`, set by the
-    // caller): with `mix(in, out, w)` under a blend mode the picture would be blended with itself where
+    // Fills always carry the weight in their alpha (\`def.over\`); a filter does so whenever its result is
+    // drawn over the picture rather than becoming the chain's surface (\`info.limitOver\`, set by the
+    // caller): with \`mix(in, out, w)\` under a blend mode the picture would be blended with itself where
     // the limit is 0 (multiply darkens, screen lightens), while the painted mask leaves it alone there.
     const over = !!(def && def.over) || !!info.limitOver;
     if (!info.cpu) {
@@ -70,9 +75,12 @@ export function limitStage(src, out, limitIn, info = {}, def = null) {
             const rgb = hexToRgb(limit.color || "#ffffff");
             const ref = opp(rgb[0], rgb[1], rgb[2]);
             const sourceInt = limit.source === "depth" ? 0 : (limit.source === "luma" ? 1 : 2);
+            const snap = (map && map.guide) ? (snapParams(map.meta?.snap?.strength) || [0, 0]) : [0, 0];
             const values = {
                 u_in: src,
                 u_map: map ? rg8View(map) : null,
+                u_guide: (map && map.guide) ? guideView(map) : null,
+                u_snap: snap,
                 u_hasMap: map ? 1 : 0,
                 u_source: sourceInt,
                 u_r: [limit.lo, limit.hi, limit.fLo, limit.fHi],
@@ -129,6 +137,9 @@ export function limitStageCPU(srcCanvas, outCanvas, limit, info = {}, over = fal
     const ox = (info && info.origin && info.origin[0]) || 0;
     const oy = (info && info.origin && info.origin[1]) || 0;
     const isView = !!(info && info.limitView);
+    const snap = (map && map.guide) ? snapParams(map.meta?.snap?.strength) : null;
+    const sigmaR = snap ? snap[0] : 0;
+    const tau = snap ? snap[1] : 0;
 
     let ptr = 0;
     for (let y = 0; y < H; y++) {
@@ -149,7 +160,9 @@ export function limitStageCPU(srcCanvas, outCanvas, limit, info = {}, over = fal
                 const px = ox + x + 0.5;
                 const mx = m[0] * px + m[2] * py + m[4];
                 const my = m[1] * px + m[3] * py + m[5];
-                mapVal = u16Bilinear(map.data, map.w, map.h, mx, my);
+                mapVal = (sigmaR > 0)
+                    ? snapField(map, map.guide, mx, my, iR / 255, iG / 255, iB / 255, sigmaR, tau)
+                    : u16Bilinear(map.data, map.w, map.h, mx, my);
             }
 
             const w = (limit.source === "depth" && !map)
@@ -205,6 +218,9 @@ export function limitAlphaRows(rgba, x0, y0, w, h, limit, map) {
     }
 
     const m = (map && map.data) ? passToMap(map, 1) : null;
+    const snap = (map && map.guide) ? snapParams(map.meta?.snap?.strength) : null;
+    const sigmaR = snap ? snap[0] : 0;
+    const tau = snap ? snap[1] : 0;
     let ptr = 0;
     for (let y = 0; y < h; y++) {
         const py = y0 + y + 0.5;
@@ -214,7 +230,9 @@ export function limitAlphaRows(rgba, x0, y0, w, h, limit, map) {
                 const px = x0 + x + 0.5;
                 const mx = m[0] * px + m[2] * py + m[4];
                 const my = m[1] * px + m[3] * py + m[5];
-                mapVal = u16Bilinear(map.data, map.w, map.h, mx, my);
+                mapVal = (sigmaR > 0)
+                    ? snapField(map, map.guide, mx, my, rgba[ptr] / 255, rgba[ptr + 1] / 255, rgba[ptr + 2] / 255, sigmaR, tau)
+                    : u16Bilinear(map.data, map.w, map.h, mx, my);
             }
             const wVal = (lim.source === "depth" && (!map || !map.data))
                 ? 0

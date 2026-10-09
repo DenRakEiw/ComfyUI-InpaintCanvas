@@ -1662,6 +1662,10 @@ const STYLE = `
 .ipc-limit-color-row label { display:flex; align-items:center; gap:4px; }
 .ipc-limit-note { font-size:11px; color:var(--sc-warn, #e5a040); display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
 .ipc-limit-bar-wrap { width:100%; min-width:0; }
+.ipc-depth-edges-row { display:flex; align-items:center; gap:6px; margin-top:4px; font-size:11px; }
+.ipc-depth-edges-label { display:flex; align-items:center; gap:6px; width:100%; font-size:11px; color:var(--sc-fg-2, #aaa); cursor:pointer; }
+.ipc-depth-edges-slider { flex:1; height:4px; accent-color:var(--sc-active, #7cc7ff); cursor:pointer; }
+.ipc-depth-edges-val { font-variant-numeric:tabular-nums; min-width:24px; text-align:right; color:var(--sc-fg, #ddd); }
 `;
 
 function injectStyle() {
@@ -12140,6 +12144,47 @@ class InpaintEditor {
         this.depthViewBtn = viewBtn;
         row.appendChild(viewBtn);
         con.appendChild(row);
+
+        const edgesRow = el("div", "ipc-sec ipc-depth-edges-row");
+        const edgesLab = el("label", "ipc-depth-edges-label", "Edges");
+        edgesLab.title = "How closely depth follows the picture's edges; 0 is the smooth map";
+        const edgesSlider = document.createElement("input");
+        edgesSlider.type = "range";
+        edgesSlider.min = "0";
+        edgesSlider.max = "100";
+        edgesSlider.step = "1";
+        const curStrength = (depthMap.meta?.snap?.strength != null) ? depthMap.meta.snap.strength : SNAP_DEFAULT;
+        edgesSlider.value = String(curStrength);
+        edgesSlider.title = "How closely depth follows the picture's edges; 0 is the smooth map";
+        edgesSlider.className = "ipc-range-slider ipc-depth-edges-slider";
+        const edgesVal = el("span", "ipc-depth-edges-val", String(curStrength));
+        edgesSlider.addEventListener("input", () => {
+            const str = parseInt(edgesSlider.value, 10) || 0;
+            edgesVal.textContent = String(str);
+            this.setMapMeta("depth", { snap: { strength: str } }, { preview: true });
+            this.drawSoon();
+        });
+        edgesSlider.addEventListener("change", () => {
+            const str = parseInt(edgesSlider.value, 10) || 0;
+            edgesVal.textContent = String(str);
+            this.setMapMeta("depth", { snap: { strength: str } }, { preview: false });
+            this.draw();
+        });
+        edgesSlider.addEventListener("keydown", (e) => {
+            if (e.key === "Escape") {
+                e.stopPropagation();
+                this.cancelMapMeta("depth");
+                const reverted = (this.maps?.depth?.meta?.snap?.strength != null) ? this.maps.depth.meta.snap.strength : SNAP_DEFAULT;
+                edgesSlider.value = String(reverted);
+                edgesVal.textContent = String(reverted);
+                this.drawSoon();
+            }
+        });
+        this.depthEdgesInput = edgesSlider;
+        edgesLab.appendChild(edgesSlider);
+        edgesLab.appendChild(edgesVal);
+        edgesRow.appendChild(edgesLab);
+        con.appendChild(edgesRow);
     }
 
     /** The sequence counter bumped whenever whole-document geometry changes (PLAN_NIK9_BUILD.md §F8). */
