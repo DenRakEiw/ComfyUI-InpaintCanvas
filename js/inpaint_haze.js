@@ -125,7 +125,7 @@ export function darkChannel(rgba, w, h, r, A = [1, 1, 1]) {
  */
 export function airlight(rgba, dark, w, h, frac = 0.001) {
     const n = w * h;
-    if (n === 0) return [0.78, 0.82, 0.86];
+    if (n <= 0) return [0.78, 0.82, 0.86];
     const k = Math.min(n, Math.max(16, Math.ceil(frac * n)));
 
     const heap = new Int32Array(k);
