@@ -17,11 +17,14 @@ let seq = 0;
  *   w: number,
  *   h: number,
  *   data: Uint16Array,
+ *   guide: Uint8Array | null,
  *   xf: number[],
  *   meta: object,
  *   ref: { filename: string, subfolder: string, type: string } | null,
+ *   guideRef: { filename: string, subfolder: string, type: string } | null,
  *   version: number,
- *   dataVersion: number
+ *   dataVersion: number,
+ *   guideVersion: number
  * }} DocMap
  */
 
@@ -34,9 +37,10 @@ let seq = 0;
  * @param {ArrayLike<number>} data
  * @param {number[]} [xf]
  * @param {object} [meta]
+ * @param {ArrayLike<number>} [guide]
  * @returns {DocMap}
  */
-export function makeMap(kind, w, h, data, xf, meta = {}) {
+export function makeMap(kind, w, h, data, xf, meta = {}, guide = null) {
     const len = (w | 0) * (h | 0);
     let u16;
     if (typeof crossOriginIsolated !== "undefined" && crossOriginIsolated && typeof SharedArrayBuffer !== "undefined") {
@@ -51,6 +55,24 @@ export function makeMap(kind, w, h, data, xf, meta = {}) {
         u16 = new Uint16Array(len);
         if (data) u16.set(data.subarray ? data.subarray(0, len) : data);
     }
+
+    let u8Guide = null;
+    if (guide) {
+        const glen = len * 4;
+        if (typeof crossOriginIsolated !== "undefined" && crossOriginIsolated && typeof SharedArrayBuffer !== "undefined") {
+            if (guide.buffer instanceof SharedArrayBuffer) {
+                u8Guide = guide;
+            } else {
+                const sab = new SharedArrayBuffer(glen);
+                u8Guide = new Uint8Array(sab);
+                u8Guide.set(guide.subarray ? guide.subarray(0, glen) : guide);
+            }
+        } else {
+            u8Guide = new Uint8Array(glen);
+            u8Guide.set(guide.subarray ? guide.subarray(0, glen) : guide);
+        }
+    }
+
     const defaultXf = [w, 0, 0, h, 0, 0];
     const mapXf = Array.isArray(xf) && xf.length === 6 ? Array.from(xf) : defaultXf;
     const v = ++seq;
@@ -59,11 +81,14 @@ export function makeMap(kind, w, h, data, xf, meta = {}) {
         w: w | 0,
         h: h | 0,
         data: u16,
+        guide: u8Guide || null,
         xf: mapXf,
         meta: meta ? { ...meta } : {},
         ref: null,
+        guideRef: null,
         version: v,
         dataVersion: v,
+        guideVersion: v,
     };
 }
 
@@ -113,6 +138,73 @@ export function unpackRG16(rgba, w, h) {
 }
 
 /**
+ * Create a new DocMap derived from an existing one, sharing unchanged buffers.
+ * Inherits ref/dataVersion if data is unchanged, guideRef/guideVersion if guide is unchanged.
+ * @param {DocMap} map
+ * @param {object} [patch]
+ * @returns {DocMap}
+ */
+export function deriveMap(map, patch = {}) {
+    if (!map) return null;
+    const v = ++seq;
+    const w = patch.w !== undefined ? (patch.w | 0) : map.w;
+    const h = patch.h !== undefined ? (patch.h | 0) : map.h;
+    const dataChanged = patch.data !== undefined && patch.data !== map.data;
+    const guideChanged = patch.guide !== undefined && patch.guide !== map.guide;
+
+    let data = map.data;
+    let dataVersion = map.dataVersion;
+    let ref = map.ref;
+    if (dataChanged) {
+        data = patch.data;
+        if (data && typeof crossOriginIsolated !== "undefined" && crossOriginIsolated && typeof SharedArrayBuffer !== "undefined" && !(data.buffer instanceof SharedArrayBuffer)) {
+            const len = w * h;
+            const sab = new SharedArrayBuffer(len * 2);
+            const u16 = new Uint16Array(sab);
+            u16.set(data.subarray ? data.subarray(0, len) : data);
+            data = u16;
+        }
+        dataVersion = v;
+        ref = patch.ref !== undefined ? patch.ref : null;
+    } else if (patch.ref !== undefined) {
+        ref = patch.ref;
+    }
+
+    let guide = map.guide;
+    let guideVersion = map.guideVersion;
+    let guideRef = map.guideRef;
+    if (guideChanged) {
+        guide = patch.guide;
+        if (guide && typeof crossOriginIsolated !== "undefined" && crossOriginIsolated && typeof SharedArrayBuffer !== "undefined" && !(guide.buffer instanceof SharedArrayBuffer)) {
+            const glen = w * h * 4;
+            const sab = new SharedArrayBuffer(glen);
+            const u8 = new Uint8Array(sab);
+            u8.set(guide.subarray ? guide.subarray(0, glen) : guide);
+            guide = u8;
+        }
+        guideVersion = v;
+        guideRef = patch.guideRef !== undefined ? patch.guideRef : null;
+    } else if (patch.guideRef !== undefined) {
+        guideRef = patch.guideRef;
+    }
+
+    return {
+        kind: patch.kind || map.kind,
+        w,
+        h,
+        data,
+        guide,
+        xf: patch.xf ? Array.from(patch.xf) : map.xf,
+        meta: patch.meta ? { ...patch.meta } : { ...map.meta },
+        ref,
+        guideRef,
+        version: v,
+        dataVersion,
+        guideVersion,
+    };
+}
+
+/**
  * Returns a sampler value compatible with F7 WebGL upload:
  * Uint8Array viewing map.data's bytes (little-endian: R low byte, G high byte).
  * @param {DocMap} map
@@ -129,19 +221,41 @@ export function rg8View(map) {
 }
 
 /**
+ * Returns a sampler value compatible with F7 WebGL upload:
+ * Uint8Array viewing map.guide's RGBA bytes.
+ * @param {DocMap} map
+ */
+export function guideView(map) {
+    if (!map || !map.guide) return null;
+    return {
+        data: map.guide,
+        width: map.w,
+        height: map.h,
+        channels: 4,
+        static: true,
+        key: `${map.kind}:${map.guideVersion}:guide`,
+    };
+}
+
+/**
  * Serialize map metadata and reference for persistence.
  * @param {DocMap} map
  */
 export function mapToJSON(map) {
     if (!map) return null;
-    return {
+    const out = {
         ref: map.ref || null,
+        guide: map.guideRef || null,
         w: map.w,
         h: map.h,
         xf: Array.from(map.xf),
         enc: "u16rg",
         meta: map.meta ? JSON.parse(JSON.stringify(map.meta)) : {},
     };
+    if (map.guide || map.guideRef) {
+        out.genc = "rgba8";
+    }
+    return out;
 }
 
 /**
@@ -163,8 +277,31 @@ export async function mapFromJSON(kind, j, loadImage) {
         ctx.drawImage(img, 0, 0, j.w, j.h);
         const imgData = ctx.getImageData(0, 0, j.w, j.h);
         const data = unpackRG16(imgData.data, j.w, j.h);
-        const map = makeMap(kind, j.w, j.h, data, j.xf, j.meta);
+
+        let guide = null;
+        if (j.guide) {
+            try {
+                const gimg = await loadImage(j.guide);
+                if (gimg) {
+                    const gcanvas = document.createElement("canvas");
+                    gcanvas.width = j.w;
+                    gcanvas.height = j.h;
+                    const gctx = gcanvas.getContext("2d");
+                    gctx.drawImage(gimg, 0, 0, j.w, j.h);
+                    const gimgData = gctx.getImageData(0, 0, j.w, j.h);
+                    guide = new Uint8Array(gimgData.data.buffer, gimgData.data.byteOffset, gimgData.data.byteLength);
+                }
+            } catch (gerr) {
+                console.warn("mapFromJSON guide load failed:", gerr);
+                guide = null;
+            }
+        }
+
+        const map = makeMap(kind, j.w, j.h, data, j.xf, j.meta, guide);
         map.ref = j.ref;
+        if (guide) {
+            map.guideRef = j.guide;
+        }
         return map;
     } catch (err) {
         console.warn("mapFromJSON failed:", err);

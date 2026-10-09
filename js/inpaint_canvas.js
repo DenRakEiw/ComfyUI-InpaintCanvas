@@ -43,7 +43,8 @@ import { LiquifyField, gridStep, previewBlock, liquifyFalloff } from "./inpaint_
 import { labelMap, sameLabels, remap, mapOffset, namesFor, parse, normalize, compare, checkNote, referencesText, referencesRule } from "./reftokens.js";
 import { fitLayerRGBA, workScale } from "./edgefit.js";
 import { STALE_DIFF, GUIDE, RANGE_BAND_ROWS, WORK_MAX, modelSize, workSize, disparityRange } from "./inpaint_depth.js";
-import { packRG16, mapToJSON, mapFromJSON, fingerprint, fingerprintDiff, passToMap, makeMap, sampleMap } from "./inpaint_maps.js";
+import { packRG16, mapToJSON, mapFromJSON, fingerprint, fingerprintDiff, passToMap, makeMap, sampleMap, deriveMap, guideView } from "./inpaint_maps.js";
+import { SNAP_DEFAULT } from "./inpaint_edges.js";
 import { normalizeLimit, u16Bilinear, rangeWeight, opp, colourSimilarity, hexToRgb as hexToRgb01, WEIGHTS_GLSL } from "./inpaint_weights.js";
 import { limitAlphaRows } from "./inpaint_limit.js";
 import { buildRangeBar } from "./inpaint_rangebar.js";
@@ -2011,6 +2012,7 @@ class InpaintEditor {
         this.showDepthMap = false;
         this.maps = {};
         this.mapsVersion = 0;
+        this._mapUndoPending = null;
         this.rangeLimit = {
             source: host.depthSupported !== false ? "depth" : "luma",
             lo: 0,
@@ -11922,8 +11924,8 @@ class InpaintEditor {
         else delete this.maps.depth;
     }
 
-    async ensureDepthMap({ force = false } = {}) {
-        return this.computeDepthMap({ recompute: force });
+    async ensureDepthMap({ force = false, edges = null } = {}) {
+        return this.computeDepthMap({ recompute: force, edges });
     }
 
     /**
@@ -11931,7 +11933,7 @@ class InpaintEditor {
      * Samples document without filter layers via host.depthInput, runs Depth Anything V2 Small,
      * refines edges using guided filter in a worker, and stores result in this.maps.depth via setMap.
      */
-    async computeDepthMap({ recompute = false } = {}) {
+    async computeDepthMap({ recompute = false, edges = null } = {}) {
         if (!this.base) throw new Error("No image loaded in document");
         if (this.depthPending) return this.depthPending;
         const model = host.depthModel();
@@ -11952,8 +11954,11 @@ class InpaintEditor {
 
                 const existing = this.maps && this.maps.depth;
                 if (!recompute && existing && existing.meta && existing.meta.fp === fp) {
+                    if (edges !== null && edges !== undefined) {
+                        this.setMapMeta("depth", { snap: { ...(existing.meta.snap || {}), strength: Math.max(0, Math.min(100, Math.round(+edges))) } });
+                    }
                     this.renderDepthRow();
-                    return existing;
+                    return this.maps.depth;
                 }
                 this.setStatus(`Estimating depth with ${model.label} ...`);
                 const res = await host.computeDepth(this, {
@@ -11985,6 +11990,7 @@ class InpaintEditor {
                 const u16 = new Uint16Array(poolRes.u16);
                 // main answers the model's own time as runMs (and the whole call as seconds)
                 const modelMs = res.runMs != null ? res.runMs : (res.seconds != null ? res.seconds * 1000 : 0);
+                const snapStrength = edges != null ? Math.max(0, Math.min(100, Math.round(+edges))) : SNAP_DEFAULT;
                 const meta = {
                     fp,
                     lo,
@@ -11996,8 +12002,9 @@ class InpaintEditor {
                     raw: res.depth,
                     rw: mw,
                     rh: mh,
+                    snap: { strength: snapStrength },
                 };
-                const map = makeMap("depth", gw, gh, u16, [W, 0, 0, H, 0, 0], meta);
+                const map = makeMap("depth", gw, gh, u16, [W, 0, 0, H, 0, 0], meta, gd);
                 const ok = await this.setMap("depth", map, { label: recompute ? "Recompute depth map" : "Depth map", token });
                 if (!ok) {
                     this.setStatus("The depth map was dropped: the picture was turned or cropped meanwhile.");
@@ -12155,12 +12162,27 @@ class InpaintEditor {
         if (token !== null && token !== this.geometryToken()) return false;
         if (this._destroyed) return false;
 
+        const nodeId = (this.node && this.node.id != null) ? this.node.id : "0";
         if (map && !map.ref) {
             try {
-                const nodeId = (this.node && this.node.id != null) ? this.node.id : "0";
                 const c = packRG16(map);
                 const { ref } = await uploadCanvas(c, `n${nodeId}_${kind || "depth"}`);
                 map.ref = ref;
+            } catch (_) {
+                // Standalone / offline / test mode
+            }
+        }
+        if (map && map.guide && !map.guideRef) {
+            try {
+                const gc = document.createElement("canvas");
+                gc.width = map.w;
+                gc.height = map.h;
+                const gctx = gc.getContext("2d");
+                const imgData = gctx.createImageData(map.w, map.h);
+                imgData.data.set(map.guide);
+                gctx.putImageData(imgData, 0, 0);
+                const { ref } = await uploadCanvas(gc, `n${nodeId}_${kind || "depth"}guide`);
+                map.guideRef = ref;
             } catch (_) {
                 // Standalone / offline / test mode
             }
@@ -12169,7 +12191,12 @@ class InpaintEditor {
         if (this._destroyed) return false;
 
         const prev = (this.maps && this.maps[kind]) || null;
-        this.pushUndoSnapshot({ kind: "maps", map: kind, prev }, { label });
+        let snapBytes = 0;
+        if (prev) {
+            if (!map || prev.data !== map.data) snapBytes += prev.data ? prev.data.byteLength : 0;
+            if (!map || prev.guide !== map.guide) snapBytes += prev.guide ? prev.guide.byteLength : 0;
+        }
+        this.pushUndoSnapshot({ kind: "maps", map: kind, prev, bytes: snapBytes }, { label });
         if (!this.maps) this.maps = {};
         if (map) {
             this.maps[kind] = map;
@@ -12178,6 +12205,49 @@ class InpaintEditor {
         }
         this.mapsVersion++;
 
+        for (const l of this.layers) {
+            if (l.kind === "filter" && (l.params?.limit?.source === (kind || "depth") || this.mapsOf(l).includes(kind || "depth"))) {
+                this.markFilterChanged(l);
+            }
+        }
+        this.sceneSig = null;
+        this.renderHistory();
+        this.draw();
+        this.notifyChanged();
+        return true;
+    }
+
+    /**
+     * Update metadata of a document map (R2-S4).
+     * @param {string} kind
+     * @param {object} patch
+     * @param {{ preview?: boolean, label?: string }} [opts]
+     * @returns {boolean}
+     */
+    setMapMeta(kind, patch, { preview = false, label = "Depth map edges" } = {}) {
+        const cur = (this.maps && this.maps[kind]) || null;
+        if (!cur) return false;
+        const newMeta = { ...(cur.meta || {}), ...patch };
+        const updated = deriveMap(cur, { meta: newMeta });
+        if (preview) {
+            if (!this._mapUndoPending) {
+                this._mapUndoPending = cur;
+            }
+            this.maps[kind] = updated;
+            this.mapsVersion++;
+            for (const l of this.layers) {
+                if (l.kind === "filter" && (l.params?.limit?.source === (kind || "depth") || this.mapsOf(l).includes(kind || "depth"))) {
+                    this.markFilterChanged(l);
+                }
+            }
+            this.draw();
+            return true;
+        }
+        const prev = this._mapUndoPending || cur;
+        this._mapUndoPending = null;
+        this.pushUndoSnapshot({ kind: "maps", map: kind, prev, bytes: 0 }, { label });
+        this.maps[kind] = updated;
+        this.mapsVersion++;
         for (const l of this.layers) {
             if (l.kind === "filter" && (l.params?.limit?.source === (kind || "depth") || this.mapsOf(l).includes(kind || "depth"))) {
                 this.markFilterChanged(l);
@@ -12680,9 +12750,16 @@ class InpaintEditor {
         if (step.kind === "turn") return this.turnSnapshot();
         // the plugins' per-document data alone (scumble.documents.data(doc).set(patch, { undo })): a plugin's own change
         // of what it keeps with the document, no pixels; a canvas or turn step carries the same copy beside its pixels
-        if (step.kind === "data") return { kind: "data", pluginData: this.pluginDataCopy() };
-        if (step.kind === "maps") return { kind: "maps", map: step.map, prev: (this.maps && this.maps[step.map]) || null };
-        if (step.kind === "layers") return { kind: "layers", layers: this.layers.map((l) => this.snapshotLayer(l)), groups: this.groupsCopy(), activeLayerId: this.activeLayerId };
+        if (step.kind === "maps") {
+            const prev = (this.maps && this.maps[step.map]) || null;
+            const target = step.prev;
+            let snapBytes = 0;
+            if (prev) {
+                if (!target || prev.data !== target.data) snapBytes += prev.data ? prev.data.byteLength : 0;
+                if (!target || prev.guide !== target.guide) snapBytes += prev.guide ? prev.guide.byteLength : 0;
+            }
+            return { kind: "maps", map: step.map, prev, bytes: snapBytes };
+        }
         if (step.kind === "transforms") {
             // the places of several layers moved or scaled together (a multi-selection): one step, no pixels
             const ids = step.ids || step.items.map((i) => i.id);
@@ -12916,7 +12993,7 @@ class InpaintEditor {
             }
             this.mapsVersion++;
             for (const l of this.layers) {
-                if (l.kind === "filter" && l.params?.limit?.source === (kind || "depth")) {
+                if (l.kind === "filter" && (l.params?.limit?.source === (kind || "depth") || this.mapsOf(l).includes(kind || "depth"))) {
                     this.markFilterChanged(l);
                 }
             }
@@ -20814,6 +20891,9 @@ class InpaintEditor {
                         if (stale()) return;
                         if (map) {
                             this.maps[kind] = map;
+                            if (kind === "depth" && j.guide && !map.guide) {
+                                this.setStatus("the depth map's guide is missing; Recompute restores the edges");
+                            }
                         } else {
                             this.setStatus(`Map "${kind}" could not be loaded.`);
                         }
