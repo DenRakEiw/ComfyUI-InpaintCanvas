@@ -491,6 +491,7 @@ export function registerDehazeGL() {
             const amount = p.amount !== undefined ? Number(p.amount) : 50;
             if (amount <= 0) return true;
             if (p.mode === "depth" && !(info && info.maps && info.maps.depth)) return true;
+            if ((!p.mode || p.mode === "auto") && !(info && info.wholeStats && info.wholeStats.t)) return true;
             return false;
         },
     });
