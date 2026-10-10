@@ -48,7 +48,7 @@ import { SNAP_DEFAULT, SNAP_TAU, snapParams, snapField, rangeMax, edgeTiles } fr
 import { normalizeLimit, u16Bilinear, rangeWeight, opp, colourSimilarity, hexToRgb as hexToRgb01, WEIGHTS_GLSL } from "./inpaint_weights.js";
 import { limitAlphaRows } from "./inpaint_limit.js";
 import { buildRangeBar } from "./inpaint_rangebar.js";
-import { BLEND_MODES, EMULATED_BLENDS, BLEND_OPS, canvasOp, normalBlend } from "./blend_modes.js";
+import { BLENDS, BLEND_GROUPS, BLEND_MODES, EMULATED_BLENDS, BLEND_OPS, canvasOp, normalBlend } from "./blend_modes.js";
 
 /**
  * The pixel backend a new editor takes (docs/PLAN_BCE.md §C2 step b): the host's choice when it made
@@ -806,6 +806,37 @@ function selectInput(options, value, title) {
             opt.textContent = o;
         }
         s.appendChild(opt);
+    }
+    s.value = value;
+    s.addEventListener("click", (e) => e.stopPropagation());
+    s.addEventListener("keydown", (e) => e.stopPropagation());
+    return s;
+}
+
+function selectGrouped(groups, rows, value, title, opts = {}) {
+    const s = document.createElement("select");
+    s.className = "ipc-sel";
+    if (opts && opts.className) s.classList.add(opts.className);
+    s.title = title;
+    for (const g of groups) {
+        const gid = typeof g === "object" && g !== null ? (g.id ?? g.value) : g;
+        const glabel = typeof g === "object" && g !== null ? (g.label ?? g.title ?? gid) : g;
+        const grp = document.createElement("optgroup");
+        grp.label = glabel;
+        for (const r of rows) {
+            const rgrp = typeof r === "object" && r !== null ? r.group : null;
+            if (rgrp !== gid) continue;
+            const opt = document.createElement("option");
+            if (typeof r === "object" && r !== null) {
+                opt.value = r.value ?? r.id;
+                opt.textContent = r.label ?? r.title ?? opt.value;
+            } else {
+                opt.value = r;
+                opt.textContent = r;
+            }
+            grp.appendChild(opt);
+        }
+        s.appendChild(grp);
     }
     s.value = value;
     s.addEventListener("click", (e) => e.stopPropagation());
@@ -17756,7 +17787,7 @@ class InpaintEditor {
 
             const modeRow = el("div", "ipc-op");
             const blendLab = el("label", null, "Blend");
-            const blend = selectInput(BLEND_MODES, layer.blend || "normal", "Blend mode");
+            const blend = selectGrouped(BLEND_GROUPS, BLENDS, layer.blend || "normal", "Blend mode");
             blend.addEventListener("change", () => { layer.blend = blend.value; this.uploaded.baseHash = null; this.draw(); this.drawThumb(); this.notifyChanged(); });
             blendLab.appendChild(blend);
             modeRow.appendChild(blendLab);
@@ -22113,4 +22144,4 @@ class InpaintEditor {
 }
 
 // everything the hosts use: Scumble's shell, commands and plugins, the node's extension (js/inpaint_node.js)
-export { InpaintEditor, BLEND_MODES, viewUrl, loadImageEl, makeCanvas, uploadBlob, uploadCanvas, CROP_DEFAULTS, GEN_DEFAULTS, FIXED_OUTPUTS, SETTING_SLOTS, TAIL_OUTPUTS, NODE_CLASS, STITCH_CLASS, isSettingOutput, settingIndex, linkOf, el, icon, iconButton, miniButton, selectInput, numberInput , hostText, REF_FITS, REF_DEFAULTS, UPSAMPLE_CASES, randomSeed, STYLE };
+export { InpaintEditor, BLEND_MODES, viewUrl, loadImageEl, makeCanvas, uploadBlob, uploadCanvas, CROP_DEFAULTS, GEN_DEFAULTS, FIXED_OUTPUTS, SETTING_SLOTS, TAIL_OUTPUTS, NODE_CLASS, STITCH_CLASS, isSettingOutput, settingIndex, linkOf, el, icon, iconButton, miniButton, selectInput, selectGrouped, numberInput, hostText, REF_FITS, REF_DEFAULTS, UPSAMPLE_CASES, randomSeed, STYLE };

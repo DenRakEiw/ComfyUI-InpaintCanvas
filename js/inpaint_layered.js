@@ -342,7 +342,7 @@ export async function readPsd(input, { inflate = null } = {}) {
     const layers = [], groups = [];
     const stack = [];   // the groups open at this record, innermost last: { id, parent, from }
     const adjust = [], empty = [], clipped = [], blends = [], groupBlends = [];
-    let masks = 0, masksOff = 0, clips = 0, faded = 0;
+    let masks = 0, masksOff = 0, clips = 0, faded = 0, fillOpa = 0;
     // a clipped record is clipped to the nearest record below it that is not clipped (PLAN_0_1_31 §6 step 3): kept when
     // that base became a layer here; a group (flattened into its layers) or a left-out layer as the base drops the clip
     let baseKept = false;
@@ -366,6 +366,7 @@ export async function readPsd(input, { inflate = null } = {}) {
         const w = L.right - L.left, h = L.bottom - L.top;
         if (Object.keys(L.info).some((k) => ADJUSTMENTS.has(k))) { adjust.push(L.name); if (!L.clipping) baseKept = false; continue; }
         if (!(w > 0 && h > 0) || !L.ch[0]) { if (L.name) empty.push(L.name); if (!L.clipping) baseKept = false; continue; }
+        if (L.info && L.info.iOpa && L.info.iOpa.length > 0 && L.info.iOpa[0] < 255) fillOpa++;
         const rgba = interleave(L.ch, w, h, gray);
         const mask = layerMask(L, w, h);
         if (mask) { masks++; if (mask.disabled) masksOff++; }
@@ -389,6 +390,7 @@ export async function readPsd(input, { inflate = null } = {}) {
     if (groups.length) notes.push(`${groups.length} group${groups.length > 1 ? "s" : ""} kept as folder${groups.length > 1 ? "s" : ""}`);
     if (faded) notes.push(`the opacity of ${faded} group${faded > 1 ? "s" : ""} went into ${faded > 1 ? "their" : "its"} layers`);
     if (groupBlends.length) notes.push(`groups are folders here, their blend modes became pass through: ${listNames(groupBlends)}`);
+    if (fillOpa) notes.push(`fill opacity below 100 % read as 100 % (${fillOpa} layer${fillOpa > 1 ? "s" : ""})`);
     if (depth === 16) notes.push("16 bits per channel rounded to 8");
     if (empty.length && !layers.length && !composite) notes.push("no layer has pixels");
     return { width, height, layers, groups, composite, notes };

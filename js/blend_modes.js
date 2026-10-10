@@ -19,32 +19,38 @@
 
 /** @type {readonly BlendRow[]} */
 export const BLENDS = Object.freeze([
+    // Normal
     Object.freeze({ id: "normal", label: "Normal", group: "normal", op: 0, canvas: "source-over", psd: "norm", ora: "svg:src-over", oraRead: [], reader: 1 }),
-    Object.freeze({ id: "multiply", label: "Multiply", group: "darken", op: 5, canvas: "multiply", psd: "mul ", ora: "svg:multiply", oraRead: [], reader: 1 }),
-    Object.freeze({ id: "screen", label: "Screen", group: "lighten", op: 6, canvas: "screen", psd: "scrn", ora: "svg:screen", oraRead: [], reader: 1 }),
-    Object.freeze({ id: "overlay", label: "Overlay", group: "contrast", op: 7, canvas: "overlay", psd: "over", ora: "svg:overlay", oraRead: [], reader: 1 }),
+    // Darken
     Object.freeze({ id: "darken", label: "Darken", group: "darken", op: 8, canvas: "darken", psd: "dark", ora: "svg:darken", oraRead: [], reader: 1 }),
+    Object.freeze({ id: "multiply", label: "Multiply", group: "darken", op: 5, canvas: "multiply", psd: "mul ", ora: "svg:multiply", oraRead: [], reader: 1 }),
+    Object.freeze({ id: "color-burn", label: "Colour burn", group: "darken", op: 21, canvas: null, psd: "idiv", ora: "svg:color-burn", oraRead: [], reader: 5 }),
+    Object.freeze({ id: "linear-burn", label: "Linear burn", group: "darken", op: 16, canvas: null, psd: "lbrn", ora: "scumble:linear-burn", oraRead: ["krita:linear_burn"], reader: 5 }),
+    Object.freeze({ id: "darker-color", label: "Darker colour", group: "darken", op: 28, canvas: null, psd: "dkCl", ora: "scumble:darker-color", oraRead: ["krita:darker color"], reader: 5 }),
+    // Lighten
     Object.freeze({ id: "lighten", label: "Lighten", group: "lighten", op: 9, canvas: "lighten", psd: "lite", ora: "svg:lighten", oraRead: [], reader: 1 }),
+    Object.freeze({ id: "screen", label: "Screen", group: "lighten", op: 6, canvas: "screen", psd: "scrn", ora: "svg:screen", oraRead: [], reader: 1 }),
+    Object.freeze({ id: "color-dodge", label: "Colour dodge", group: "lighten", op: 20, canvas: null, psd: "div ", ora: "svg:color-dodge", oraRead: [], reader: 5 }),
+    Object.freeze({ id: "linear-dodge", label: "Linear dodge (add)", group: "lighten", op: 15, canvas: null, psd: "lddg", ora: "scumble:linear-dodge", oraRead: ["krita:linear_dodge", "krita:add"], reader: 5 }),
+    Object.freeze({ id: "lighter-color", label: "Lighter colour", group: "lighten", op: 29, canvas: null, psd: "lgCl", ora: "scumble:lighter-color", oraRead: ["krita:lighter color"], reader: 5 }),
+    // Contrast
+    Object.freeze({ id: "overlay", label: "Overlay", group: "contrast", op: 7, canvas: "overlay", psd: "over", ora: "svg:overlay", oraRead: [], reader: 1 }),
     Object.freeze({ id: "soft-light", label: "Soft light", group: "contrast", op: 10, canvas: "soft-light", psd: "sLit", ora: "svg:soft-light", oraRead: [], reader: 1 }),
     Object.freeze({ id: "hard-light", label: "Hard light", group: "contrast", op: 11, canvas: "hard-light", psd: "hLit", ora: "svg:hard-light", oraRead: [], reader: 1 }),
+    Object.freeze({ id: "vivid-light", label: "Vivid light", group: "contrast", op: 22, canvas: null, psd: "vLit", ora: "scumble:vivid-light", oraRead: ["krita:vivid_light"], reader: 5 }),
     Object.freeze({ id: "linear-light", label: "Linear light", group: "contrast", op: 13, canvas: null, psd: "lLit", ora: "scumble:linear-light", oraRead: ["krita:linear_light", "krita:linear light"], reader: 2 }),
-    Object.freeze({ id: "difference", label: "Difference", group: "inversion", op: 12, canvas: "difference", psd: "diff", ora: "svg:difference", oraRead: [], reader: 1 }),
-    Object.freeze({ id: "exclusion", label: "Exclusion", group: "inversion", op: 14, canvas: null, psd: "smud", ora: "scumble:exclusion", oraRead: ["svg:exclusion", "krita:exclusion"], reader: 5 }),
-    Object.freeze({ id: "linear-dodge", label: "Linear dodge (add)", group: "lighten", op: 15, canvas: null, psd: "lddg", ora: "scumble:linear-dodge", oraRead: ["krita:linear_dodge", "krita:add"], reader: 5 }),
-    Object.freeze({ id: "linear-burn", label: "Linear burn", group: "darken", op: 16, canvas: null, psd: "lbrn", ora: "scumble:linear-burn", oraRead: ["krita:linear_burn"], reader: 5 }),
-    Object.freeze({ id: "subtract", label: "Subtract", group: "inversion", op: 17, canvas: null, psd: "fsub", ora: "scumble:subtract", oraRead: ["krita:subtract"], reader: 5 }),
     Object.freeze({ id: "pin-light", label: "Pin light", group: "contrast", op: 18, canvas: null, psd: "pLit", ora: "scumble:pin-light", oraRead: ["krita:pin_light"], reader: 5 }),
     Object.freeze({ id: "hard-mix", label: "Hard mix", group: "contrast", op: 19, canvas: null, psd: "hMix", ora: "scumble:hard-mix", oraRead: ["krita:hard mix", "krita:hard_mix_photoshop"], reader: 5 }),
-    Object.freeze({ id: "color-dodge", label: "Colour dodge", group: "lighten", op: 20, canvas: null, psd: "div ", ora: "svg:color-dodge", oraRead: [], reader: 5 }),
-    Object.freeze({ id: "color-burn", label: "Colour burn", group: "darken", op: 21, canvas: null, psd: "idiv", ora: "svg:color-burn", oraRead: [], reader: 5 }),
-    Object.freeze({ id: "vivid-light", label: "Vivid light", group: "contrast", op: 22, canvas: null, psd: "vLit", ora: "scumble:vivid-light", oraRead: ["krita:vivid_light"], reader: 5 }),
+    // Inversion
+    Object.freeze({ id: "difference", label: "Difference", group: "inversion", op: 12, canvas: "difference", psd: "diff", ora: "svg:difference", oraRead: [], reader: 1 }),
+    Object.freeze({ id: "exclusion", label: "Exclusion", group: "inversion", op: 14, canvas: null, psd: "smud", ora: "scumble:exclusion", oraRead: ["svg:exclusion", "krita:exclusion"], reader: 5 }),
+    Object.freeze({ id: "subtract", label: "Subtract", group: "inversion", op: 17, canvas: null, psd: "fsub", ora: "scumble:subtract", oraRead: ["krita:subtract"], reader: 5 }),
     Object.freeze({ id: "divide", label: "Divide", group: "inversion", op: 23, canvas: null, psd: "fdiv", ora: "scumble:divide", oraRead: ["krita:divide"], reader: 5 }),
+    // Component
     Object.freeze({ id: "hue", label: "Hue", group: "component", op: 24, canvas: null, psd: "hue ", ora: "svg:hue", oraRead: [], reader: 5 }),
     Object.freeze({ id: "saturation", label: "Saturation", group: "component", op: 25, canvas: null, psd: "sat ", ora: "svg:saturation", oraRead: [], reader: 5 }),
     Object.freeze({ id: "color", label: "Colour", group: "component", op: 26, canvas: null, psd: "colr", ora: "svg:color", oraRead: [], reader: 5 }),
     Object.freeze({ id: "luminosity", label: "Luminosity", group: "component", op: 27, canvas: null, psd: "lum ", ora: "svg:luminosity", oraRead: [], reader: 5 }),
-    Object.freeze({ id: "darker-color", label: "Darker colour", group: "darken", op: 28, canvas: null, psd: "dkCl", ora: "scumble:darker-color", oraRead: ["krita:darker color"], reader: 5 }),
-    Object.freeze({ id: "lighter-color", label: "Lighter colour", group: "lighten", op: 29, canvas: null, psd: "lgCl", ora: "scumble:lighter-color", oraRead: ["krita:lighter color"], reader: 5 }),
 ]);
 
 /** @type {string[]} */
