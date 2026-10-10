@@ -21213,8 +21213,18 @@ class InpaintEditor {
             let control;
             const commit = (v) => { entry.value = v; if (t.widget) { try { t.widget.value = v; } catch (_) { /* read-only */ } } this.notifyChanged(); this.refreshRefLayout(); };
             if (k.kind === "combo") {
-                control = selectInput(k.options.map(String), String(entry.value), entry.label);
-                if (!k.options.map(String).includes(String(entry.value)) && k.options.length) { entry.value = k.options[0]; control.value = String(entry.value); }
+                // a file the server's list lacks stays the recipe's choice, marked in the select (issue #4: until 0.1.45
+                // the row silently became the folder's first file, a Flux file on most installs); the app's host refuses
+                // the run with the file and its download link (missingFilesRefusal). An empty value still takes the first.
+                const options = k.options.map(String), value = String(entry.value ?? "");
+                const known = options.includes(value);
+                const missing = !known && options.length > 0 && value !== "";
+                control = selectInput(missing ? [...options, { value, label: `${value} (not on the server)` }] : options, value, entry.label);
+                if (!known && !missing && options.length) { entry.value = k.options[0]; control.value = String(entry.value); }
+                if (missing) {
+                    control.classList.add("ipc-sel-missing");
+                    control.title = `${entry.label}: ${value} is not on the server. Put the file in its models folder (Generate names the download link), or pick one of the server's files here.`;
+                }
                 control.addEventListener("change", () => commit(control.value));
             } else if (k.kind === "number") {
                 const o = k.opts || {};
