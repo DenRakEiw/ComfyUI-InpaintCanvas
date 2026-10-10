@@ -47,6 +47,33 @@ float bm_softLight(float b, float s) {
 }
 float bm_dodge(float b, float s) { return b <= 0.0 ? 0.0 : s >= 1.0 ? 1.0 : min(1.0, b / (1.0 - s)); }
 float bm_burn(float b, float s) { return b >= 1.0 ? 1.0 : s <= 0.0 ? 0.0 : 1.0 - min(1.0, (1.0 - b) / s); }
+float bm_lum(vec3 c) {
+    return dot(c, vec3(0.3, 0.59, 0.11));
+}
+vec3 bm_clip(vec3 c) {
+    float l = bm_lum(c);
+    float n = min(min(c.r, c.g), c.b);
+    float x = max(max(c.r, c.g), c.b);
+    if (n < 0.0) {
+        c = l + (((c - l) * l) / (l - n));
+    }
+    if (x > 1.0) {
+        c = l + (((c - l) * (1.0 - l)) / (x - l));
+    }
+    return c;
+}
+vec3 bm_setLum(vec3 c, float l) {
+    float d = l - bm_lum(c);
+    return bm_clip(c + d);
+}
+float bm_sat(vec3 c) {
+    return max(max(c.r, c.g), c.b) - min(min(c.r, c.g), c.b);
+}
+vec3 bm_setSat(vec3 c, float s) {
+    float mn = min(min(c.r, c.g), c.b);
+    float mx = max(max(c.r, c.g), c.b);
+    return mx > mn ? (c - mn) * (s / (mx - mn)) : vec3(0.0);
+}
 float blend1(int mode, float b, float s) {
     if (mode == 5) return b * s;
     if (mode == 6) return bm_screen(b, s);
@@ -70,6 +97,28 @@ float blend1(int mode, float b, float s) {
     return s;
 }
 vec3 blendRGB(int mode, vec3 b, vec3 s) {
+    if (mode == 24) { // hue
+        return bm_setLum(bm_setSat(s, bm_sat(b)), bm_lum(b));
+    }
+    if (mode == 25) { // saturation
+        return bm_setLum(bm_setSat(b, bm_sat(s)), bm_lum(b));
+    }
+    if (mode == 26) { // color
+        return bm_setLum(s, bm_lum(b));
+    }
+    if (mode == 27) { // luminosity
+        return bm_setLum(b, bm_lum(s));
+    }
+    if (mode == 28) { // darker-color
+        vec3 b8 = floor(b * 255.0 + 0.5);
+        vec3 s8 = floor(s * 255.0 + 0.5);
+        return (s8.r + s8.g + s8.b) < (b8.r + b8.g + b8.b) ? s : b;
+    }
+    if (mode == 29) { // lighter-color
+        vec3 b8 = floor(b * 255.0 + 0.5);
+        vec3 s8 = floor(s * 255.0 + 0.5);
+        return (s8.r + s8.g + s8.b) > (b8.r + b8.g + b8.b) ? s : b;
+    }
     return vec3(blend1(mode, b.r, s.r), blend1(mode, b.g, s.g), blend1(mode, b.b, s.b));
 }
 `;

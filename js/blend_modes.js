@@ -39,6 +39,12 @@ export const BLENDS = Object.freeze([
     Object.freeze({ id: "color-burn", label: "Colour burn", group: "darken", op: 21, canvas: null, psd: "idiv", ora: "svg:color-burn", oraRead: [], reader: 5 }),
     Object.freeze({ id: "vivid-light", label: "Vivid light", group: "contrast", op: 22, canvas: null, psd: "vLit", ora: "scumble:vivid-light", oraRead: ["krita:vivid_light"], reader: 5 }),
     Object.freeze({ id: "divide", label: "Divide", group: "inversion", op: 23, canvas: null, psd: "fdiv", ora: "scumble:divide", oraRead: ["krita:divide"], reader: 5 }),
+    Object.freeze({ id: "hue", label: "Hue", group: "component", op: 24, canvas: null, psd: "hue ", ora: "svg:hue", oraRead: [], reader: 5 }),
+    Object.freeze({ id: "saturation", label: "Saturation", group: "component", op: 25, canvas: null, psd: "sat ", ora: "svg:saturation", oraRead: [], reader: 5 }),
+    Object.freeze({ id: "color", label: "Colour", group: "component", op: 26, canvas: null, psd: "colr", ora: "svg:color", oraRead: [], reader: 5 }),
+    Object.freeze({ id: "luminosity", label: "Luminosity", group: "component", op: 27, canvas: null, psd: "lum ", ora: "svg:luminosity", oraRead: [], reader: 5 }),
+    Object.freeze({ id: "darker-color", label: "Darker colour", group: "darken", op: 28, canvas: null, psd: "dkCl", ora: "scumble:darker-color", oraRead: ["krita:darker color"], reader: 5 }),
+    Object.freeze({ id: "lighter-color", label: "Lighter colour", group: "lighten", op: 29, canvas: null, psd: "lgCl", ora: "scumble:lighter-color", oraRead: ["krita:lighter color"], reader: 5 }),
 ]);
 
 /** @type {string[]} */
