@@ -1291,6 +1291,7 @@ const ICONS = {
     download: '<path d="M12 4v11"/><path d="M7 10l5 5 5-5"/><path d="M4 20h16"/>',
     broom: '<path d="M14 3l7 7"/><path d="M17.5 6.5L9 15"/><path d="M9 15l-5 5"/><path d="M6 12l6 6"/><path d="M11 13l-4 8"/>',
     extend: '<rect x="8" y="8" width="8" height="8"/><path d="M12 2v4"/><path d="M12 18v4"/><path d="M2 12h4"/><path d="M18 12h4"/><path d="M10 4l2-2 2 2"/><path d="M10 20l2 2 2-2"/><path d="M4 10l-2 2 2 2"/><path d="M20 10l2 2-2 2"/>',
+    list: '<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>',
 };
 
 function icon(name, size = 18) {
@@ -1379,6 +1380,11 @@ const STYLE = `
 .ipc-flyout .ipc-key { margin-left:auto; padding-left:14px; color:var(--sc-muted, #8a8a8a); font-size:11px; }
 .ipc-flyout .ipc-sep { height:1px; background:var(--sc-line, #3a3a3a); margin:3px 2px; }
 .ipc-flyout .ipc-ib:disabled, .ipc-flyout .ipc-ib:disabled:hover { opacity:.4; cursor:default; background:var(--sc-btn, #333); color:var(--sc-fg, #ddd); }
+.ipc-choices { max-height:60vh; overflow-y:auto; overflow-x:hidden; min-width:180px; }
+.ipc-choices-group { font-size:10px; font-weight:600; color:var(--sc-muted, #8a8a8a); padding:6px 10px 2px 10px; text-transform:uppercase; letter-spacing:0.5px; }
+.ipc-choice-item { display:flex; align-items:center; justify-content:flex-start; padding:5px 10px; border-radius:var(--sc-radius-sm, 4px); cursor:pointer; font-size:12px; color:var(--sc-fg, #ddd); white-space:nowrap; text-align:left; background:transparent; border:none; width:100%; box-sizing:border-box; }
+.ipc-choice-item:hover, .ipc-choice-item.ipc-active { background:var(--sc-hover, #333); color:var(--sc-fg-bright, #fff); }
+.ipc-choice-item.ipc-current { font-weight:600; color:var(--sc-accent, #4a90d9); }
 .ipc-view { flex:1; position:relative; overflow:hidden; min-width:0; cursor:crosshair;
   background-color:#2b2b2b;
   background-image: linear-gradient(45deg,#333 25%,transparent 25%),linear-gradient(-45deg,#333 25%,transparent 25%),
@@ -4081,7 +4087,7 @@ class InpaintEditor {
         fly.style.top = `${Math.max(4, top)}px`;
         this.flyout = { el: fly, group: g };
         if (!this._flyDocDown) {
-            this._flyDocDown = (e) => { if (this.flyout && !this.flyout.el.contains(e.target) && !(this.flyout.group.btn && this.flyout.group.btn.contains(e.target))) this.closeFlyout(); };
+            this._flyDocDown = (e) => { if (this.flyout && !this.flyout.el.contains(e.target) && !(this.flyout.group && this.flyout.group.btn && this.flyout.group.btn.contains(e.target))) this.closeFlyout(); };
             window.addEventListener("pointerdown", this._flyDocDown, true);
         }
     }
@@ -4094,8 +4100,12 @@ class InpaintEditor {
     closeFlyout() {
         clearTimeout(this._flyClose);
         if (!this.flyout) return;
-        this.flyout.el.remove();
+        const cur = this.flyout;
         this.flyout = null;
+        if (typeof cur.onClose === "function") {
+            try { cur.onClose(); } catch (e) { console.error("flyout onClose failed", e); }
+        }
+        cur.el.remove();
     }
 
     // ---- view: rulers, grid, guides, before/after, compare, on-canvas text ----------------------
@@ -13828,9 +13838,9 @@ class InpaintEditor {
      */
     // `historyGen` is read when the key is pressed, not when the queued step runs: an edit made after
     // that stops it, and so a held Ctrl+Z that is still queued never takes back a stroke made meanwhile
-    undoStep() { const gen = this.historyGen; return this.queueHistory(() => this.historyStepNow(false, gen)); }
+    undoStep() { this.closeFlyout(); const gen = this.historyGen; return this.queueHistory(() => this.historyStepNow(false, gen)); }
 
-    redoStep() { const gen = this.historyGen; return this.queueHistory(() => this.historyStepNow(true, gen)); }
+    redoStep() { this.closeFlyout(); const gen = this.historyGen; return this.queueHistory(() => this.historyStepNow(true, gen)); }
 
     queueHistory(fn) {
         const prev = this._historyQueue;
@@ -17899,6 +17909,184 @@ class InpaintEditor {
         if (this.promptField) this.promptField.refresh();
     }
 
+    /**
+     * Apply a select choice to a filter layer.
+     * @param {any} layer
+     * @param {any} p
+     * @param {string} id
+     * @param {{ rename?: boolean }} [opts]
+     */
+    applyChoice(layer, p, id, { rename = true } = {}) {
+        const choice = p.options && p.options.find((o) => o.id === id);
+        if (!choice) return;
+        layer.params[p.key] = choice.id;
+        if (p.key === "preset") {
+            for (const [k, v] of Object.entries(choice)) {
+                if (k !== "id" && k !== "label" && k !== "group") layer.params[k] = v;
+            }
+            if (!("look" in choice)) layer.params.look = null;
+            if (rename) {
+                const flabel = (FILTERS[layer.filter] && FILTERS[layer.filter].label) || "Filter";
+                layer.name = choice.id === "custom" ? `${flabel} ${this.filterCounter}` : choice.label.replace(/ \(.*\)$/, "");
+            }
+        }
+        if (rename) {
+            const def = FILTERS[layer.filter];
+            const whenNames = new Set();
+            if (def && def.params) for (const dp of def.params) if (dp.when) for (const wk of Object.keys(dp.when)) whenNames.add(wk);
+            this.markFilterChanged(layer);
+            if (p.key === "preset" || whenNames.has(p.key)) {
+                this.renderLayers();
+            } else {
+                const row = this.root && this.root.querySelector(`.ipc-layer[data-id="${layer.id}"]`);
+                if (row) {
+                    const sel = row.querySelector(`select.ipc-sel[data-param="${p.key}"]`);
+                    if (sel && sel.value !== choice.id) sel.value = choice.id;
+                }
+            }
+        }
+    }
+
+    /**
+     * Preview a select choice on a filter layer (stores pre-hover snapshot on first call).
+     * @param {any} layer
+     * @param {any} p
+     * @param {string} id
+     */
+    previewChoice(layer, p, id) {
+        if (!layer) return;
+        if (!layer._hoverSnap) layer._hoverSnap = this.snapshot({ kind: "filter", id: layer.id });
+        this.applyChoice(layer, p, id, { rename: false });
+        this.filterPreview = layer.id;
+        this.markFilterChanged(layer, { soon: true });
+    }
+
+    /**
+     * Cancel an active select choice preview, restoring the pre-hover snapshot.
+     * @param {any} [layer]
+     */
+    cancelChoicePreview(layer) {
+        if (!layer) {
+            for (const l of this.layers) if (l._hoverSnap) this.cancelChoicePreview(l);
+            return;
+        }
+        if (!layer._hoverSnap) return;
+        const snap = layer._hoverSnap;
+        layer.params = { ...(snap.params || {}) };
+        if (snap.name) layer.name = snap.name;
+        layer._hoverSnap = null;
+        this.filterPreview = null;
+        this.markFilterChanged(layer, { soon: true });
+        this.draw();
+    }
+
+    /**
+     * Commit a choice: cancels preview (restoring pre-hover snapshot), records undo step, then applies.
+     * @param {any} layer
+     * @param {any} p
+     * @param {string} id
+     */
+    commitChoice(layer, p, id) {
+        this.cancelChoicePreview(layer);
+        const def = FILTERS[layer.filter];
+        const step = p.label ? `${def ? def.label : "Filter"}: ${p.label}` : (def ? def.label : "Filter");
+        this.pushUndo({ kind: "filter", id: layer.id, label: step });
+        this.applyChoice(layer, p, id, { rename: true });
+    }
+
+    /**
+     * Flyout list of choices for a select parameter, previewing each entry on hover.
+     * @param {any} layer
+     * @param {any} p
+     * @param {HTMLElement} anchor
+     */
+    openChoiceList(layer, p, anchor) {
+        if (this.flyout && this.flyout.group && this.flyout.group.btn === anchor) {
+            this.closeFlyout();
+            return;
+        }
+        this.closeFlyout();
+
+        const fly = el("div", "ipc-flyout ipc-choices");
+        const cur = (layer.params && layer.params[p.key] !== undefined) ? layer.params[p.key] : p.default;
+
+        let hoverTimer = null;
+        const curLayer = layer;
+        const curParam = p;
+
+        let currentGroup = null;
+        for (const o of p.options) {
+            if (o.needs === "depth" && !host.depthSupported && cur !== o.id) continue;
+            if (o.group && o.group !== currentGroup) {
+                currentGroup = o.group;
+                const grp = el("div", "ipc-choices-group", currentGroup);
+                fly.appendChild(grp);
+            }
+            const row = el("button", "ipc-choice-item ipc-choice-row" + (o.id === cur ? " ipc-current" : ""));
+            row.type = "button";
+            row.setAttribute("data-id", o.id);
+            row.textContent = o.label;
+            row.title = o.label;
+
+            row.addEventListener("pointerenter", () => {
+                clearTimeout(hoverTimer);
+                hoverTimer = setTimeout(() => {
+                    this.previewChoice(curLayer, curParam, o.id);
+                }, 120);
+            });
+            row.addEventListener("pointerleave", () => {
+                clearTimeout(hoverTimer);
+            });
+            row.addEventListener("click", (e) => {
+                e.stopPropagation();
+                clearTimeout(hoverTimer);
+                this.commitChoice(curLayer, curParam, o.id);
+                this.closeFlyout();
+            });
+            fly.appendChild(row);
+        }
+
+        fly.addEventListener("pointerleave", (e) => {
+            if (e.relatedTarget && fly.contains(/** @type {Node} */ (e.relatedTarget))) return;
+            clearTimeout(hoverTimer);
+            this.cancelChoicePreview(curLayer);
+        });
+
+        for (const type of ["pointerdown", "pointerup", "click", "wheel", "contextmenu"]) {
+            fly.addEventListener(type, (e) => e.stopPropagation());
+        }
+
+        this.root.appendChild(fly);
+
+        const r = anchor.getBoundingClientRect(), rr = this.root.getBoundingClientRect();
+        let left = r.right - rr.left + 6;
+        if (left + fly.offsetWidth > rr.width - 4) {
+            left = Math.max(4, r.left - rr.left - fly.offsetWidth - 6);
+        }
+        fly.style.left = `${left}px`;
+        const top = Math.min(r.top - rr.top, rr.height - fly.offsetHeight - 8);
+        fly.style.top = `${Math.max(4, top)}px`;
+
+        this.flyout = {
+            el: fly,
+            group: { btn: anchor },
+            onClose: () => {
+                clearTimeout(hoverTimer);
+                this.cancelChoicePreview(curLayer);
+            },
+        };
+
+        if (!this._flyDocDown) {
+            this._flyDocDown = (e) => {
+                const t = e.target instanceof Node ? e.target : null;
+                if (this.flyout && (!t || (!this.flyout.el.contains(t) && !(this.flyout.group && this.flyout.group.btn && this.flyout.group.btn.contains(t))))) {
+                    this.closeFlyout();
+                }
+            };
+            window.addEventListener("pointerdown", this._flyDocDown, true);
+        }
+    }
+
     /** Type select, one slider per parameter, LUT loader: the controls of a filter layer row. */
     buildFilterControls(layer) {
         const box = el("div", "ipc-fx");
@@ -17999,7 +18187,8 @@ class InpaintEditor {
                 // a preset fills the other parameters; touching a slider turns it back to "custom"
                 const sel = document.createElement("select");
                 sel.className = "ipc-sel";
-                sel.style.gridColumn = "2 / -1";
+                sel.style.gridColumn = "2 / 3";
+                sel.setAttribute("data-param", p.key);
                 sel.title = p.title || (p.key !== "preset" ? p.label : hostText("filmPresetTip", "Film stock: sets amount, grain size and colour share (grain character only, the colour look is a LUT's job). Values assume a picture of about 2000 px. Film names are trademarks of their owners; the looks are Scumble's own approximations, not licensed products."));
                 let group = null;
                 for (const o of p.options) {
@@ -18014,26 +18203,17 @@ class InpaintEditor {
                 sel.addEventListener("click", stop);
                 sel.addEventListener("keydown", stop);
                 sel.addEventListener("change", () => {
-                    const preset = p.options.find((o) => o.id === sel.value);
-                    if (!preset) return;
-                    this.pushUndo({ kind: "filter", id: layer.id, label: stepLabel(p) });
-                    layer.params[p.key] = preset.id;
-                    const whenNames = new Set();
-                    for (const dp of def.params) if (dp.when) for (const wk of Object.keys(dp.when)) whenNames.add(wk);
-                    if (p.key !== "preset") {
-                        this.markFilterChanged(layer);
-                        if (whenNames.has(p.key)) this.renderLayers();
-                        return;
-                    }
-                    for (const [k, v] of Object.entries(preset)) if (k !== "id" && k !== "label" && k !== "group") layer.params[k] = v;
-                    if (!("look" in preset)) layer.params.look = null;
-                    // layer names are not editable, so the preset may name the layer
-                    layer.name = preset.id === "custom" ? `${FILTERS[layer.filter].label} ${this.filterCounter}` : preset.label.replace(/ \(.*\)$/, "");
-                    this.markFilterChanged(layer);
-                    this.renderLayers();
+                    this.commitChoice(layer, p, sel.value);
                 });
                 if (p.key === "preset") presetSel = sel;
                 box.appendChild(sel);
+
+                const listBtn = miniButton("list", "Preview the entries on the picture", () => {
+                    this.openChoiceList(layer, p, listBtn);
+                });
+                listBtn.style.gridColumn = "3 / 4";
+                listBtn.setAttribute("data-param", p.key);
+                box.appendChild(listBtn);
                 continue;
             }
             const val = el("b", null, fmt(p, cur));
