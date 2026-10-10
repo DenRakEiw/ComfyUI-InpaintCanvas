@@ -18,6 +18,12 @@ import { curvesToTables } from "./inpaint_curves.js";
 import { levelsTable, brightnessContrastTable, hueSatMatrix, lightnessTable, colorBalanceTables, hueToRgb, LOOK_DEFAULT, grainNoiseCanvas, colourStats } from "./inpaint_filters.js";
 import { registerHazeGL, registerDehazeGL } from "./inpaint_depthfx.js";
 import { colorGradeTables, gradeIdentity, HSL_GLSL, HSL_UNIFORMS, hslUniforms, hslIdentity } from "./inpaint_grade.js";
+import {
+    VIBRANCE_GLSL, VIBRANCE_UNIFORMS, vibranceUniforms, vibranceIdentity,
+    GRADIENT_MAP_GLSL, GRADIENT_MAP_UNIFORMS, gradientMapUniforms, gradientMapIdentity,
+    THRESHOLD_GLSL, THRESHOLD_UNIFORMS, thresholdUniforms,
+    POSTERIZE_GLSL, POSTERIZE_UNIFORMS, posterizeUniforms,
+} from "./inpaint_adjustments.js";
 
 
 const VS = `#version 300 es
@@ -1261,5 +1267,32 @@ registerGLFilter("hsl", {
     values: (p) => hslUniforms(p),
     skip: (p) => hslIdentity(p),
 });
+
+registerGLFilter("vibrance", {
+    code: VIBRANCE_GLSL,
+    uniforms: VIBRANCE_UNIFORMS,
+    values: (p) => vibranceUniforms(p),
+    skip: (p) => vibranceIdentity(p),
+});
+
+registerGLFilter("gradient_map", {
+    code: GRADIENT_MAP_GLSL,
+    uniforms: GRADIENT_MAP_UNIFORMS,
+    values: (p) => gradientMapUniforms(p),
+    skip: (p) => gradientMapIdentity(p),
+});
+
+registerGLFilter("threshold", {
+    code: THRESHOLD_GLSL,
+    uniforms: THRESHOLD_UNIFORMS,
+    values: (p) => thresholdUniforms(p),
+});
+
+registerGLFilter("posterize", {
+    code: POSTERIZE_GLSL,
+    uniforms: POSTERIZE_UNIFORMS,
+    values: (p) => posterizeUniforms(p),
+});
+
 
 

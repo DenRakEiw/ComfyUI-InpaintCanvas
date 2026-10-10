@@ -17,6 +17,7 @@ import { applyFilterGL, applyMatchGL, glToCanvas } from "./inpaint_filters_gl.js
 import { hazeStats, applyHaze, dehazeStats, applyDehaze } from "./inpaint_depthfx.js";
 import { colorGradeTables, gradeIdentity, hslPixel, hslIdentity } from "./inpaint_grade.js";
 import { buildWheelsControl, buildHslControl } from "./inpaint_wheels.js";
+import { applyVibrance, applyGradientMap, applyThreshold, applyPosterize } from "./inpaint_adjustments.js";
 
 
 function makeCanvas(w, h) {
@@ -1182,6 +1183,51 @@ export const FILTERS = {
         reach: 0,
         apply: applyDehaze,
     },
+    vibrance: {
+        label: "Vibrance",
+        params: [
+            { key: "vibrance", label: "Vibrance", min: -100, max: 100, step: 1, default: 0, unit: "%" },
+            { key: "saturation", label: "Saturation", min: -100, max: 100, step: 1, default: 0, unit: "%" },
+        ],
+        reach: 0,
+        apply: applyVibrance,
+    },
+    gradient_map: {
+        label: "Gradient map",
+        params: [
+            { key: "preset", label: "Preset", type: "select", default: "cyberpunk", options: [
+                { id: "cyberpunk", label: "Cyberpunk" },
+                { id: "sunset", label: "Sunset" },
+                { id: "teal_orange", label: "Teal / Orange" },
+                { id: "sepia", label: "Sepia" },
+                { id: "infrared", label: "Infrared" },
+                { id: "bw_contrast", label: "B&W contrast" },
+                { id: "custom", label: "Custom" },
+            ] },
+            { key: "shadow", label: "Shadow", type: "color", default: "#000000", when: { preset: "custom" } },
+            { key: "highlight", label: "Highlight", type: "color", default: "#ffffff", when: { preset: "custom" } },
+            { key: "reverse", label: "Reverse", type: "bool", default: false },
+            { key: "opacity", label: "Opacity", min: 0, max: 100, step: 1, default: 100, unit: "%" },
+        ],
+        reach: 0,
+        apply: applyGradientMap,
+    },
+    threshold: {
+        label: "Threshold",
+        params: [
+            { key: "level", label: "Level", min: 1, max: 254, step: 1, default: 128 },
+        ],
+        reach: 0,
+        apply: applyThreshold,
+    },
+    posterize: {
+        label: "Posterize",
+        params: [
+            { key: "levels", label: "Levels", min: 2, max: 32, step: 1, default: 4 },
+        ],
+        reach: 0,
+        apply: applyPosterize,
+    },
     // fill layers: `over` - the result goes over the picture below as a layer would (its own alpha, the layer's blend
     // mode, opacity and mask), it does not stand for that picture; `chain` - apply() takes a GPU surface as it is (it
     // reads only the input's size, so nothing is read back)
@@ -1220,6 +1266,7 @@ export const FILTER_IDS = Object.keys(FILTERS);
 
 // table builders shared with the WebGL2 path
 export { levelsTable, brightnessContrastTable, hueSatMatrix, lightnessTable, colorBalanceTables, colorGradeTables, hueToRgb, LOOK_DEFAULT };
+export { applyVibrance, applyGradientMap, applyThreshold, applyPosterize };
 
 export function filterDefaults(id) {
     const out = {};
