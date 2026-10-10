@@ -16,6 +16,7 @@
  */
 import { compositeTile, matchPixels } from "./px/kernels.js";
 import { clipCoverage } from "./inpaint_raster.js";
+import { hash32, mul255 } from "./blend_modes.js";
 
 const TILE = 256;
 
@@ -92,7 +93,32 @@ export function compositeBox(stack, X0, Y0, W, H, pw = Infinity, ph = Infinity) 
             if (c.mask) { bm = buffer(slot++, n); storeBox(c.mask, c.x | 0, c.y | 0, X0, Y0, W, H, bm, true, pw, ph); }
             mask = clipCoverage(cov, bm, c.alpha, mask);
         }
-        srcs.push(src); alphas.push(l.alpha); masks.push(mask); ops.push(l.op | 0);
+        if (l.dissolve != null) {
+            for (let y = 0; y < H; y++) {
+                const imgY = Y0 + y;
+                for (let x = 0; x < W; x++) {
+                    const imgX = X0 + x;
+                    const o = y * W + x;
+                    const idx = o * 4;
+                    const srcA = src[idx + 3];
+                    if (srcA === 0) continue;
+                    const m = mask ? mask[o] : 255;
+                    const cVal = mul255(mul255(srcA, l.alpha), m);
+                    const keep = (cVal === 255) || ((hash32(imgX, imgY, l.dissolve) >>> 24) < cVal);
+                    if (keep) {
+                        src[idx + 3] = 255;
+                    } else {
+                        src[idx] = 0;
+                        src[idx + 1] = 0;
+                        src[idx + 2] = 0;
+                        src[idx + 3] = 0;
+                    }
+                }
+            }
+            srcs.push(src); alphas.push(255); masks.push(null); ops.push(0);
+        } else {
+            srcs.push(src); alphas.push(l.alpha); masks.push(mask); ops.push(l.op | 0);
+        }
     }
     if (srcs.length) compositeTile(dst, srcs, ops, alphas, masks);
     return dst;

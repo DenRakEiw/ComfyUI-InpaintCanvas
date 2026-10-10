@@ -9,6 +9,7 @@
  *   label: string,
  *   group: "normal"|"darken"|"lighten"|"contrast"|"inversion"|"component",
  *   op: number,
+ *   dither?: boolean,
  *   canvas: string|null,
  *   psd: string,
  *   ora: string,
@@ -21,6 +22,7 @@
 export const BLENDS = Object.freeze([
     // Normal
     Object.freeze({ id: "normal", label: "Normal", group: "normal", op: 0, canvas: "source-over", psd: "norm", ora: "svg:src-over", oraRead: [], reader: 1 }),
+    Object.freeze({ id: "dissolve", label: "Dissolve", group: "normal", op: 0, dither: true, canvas: null, psd: "diss", ora: "scumble:dissolve", oraRead: ["krita:dissolve"], reader: 5 }),
     // Darken
     Object.freeze({ id: "darken", label: "Darken", group: "darken", op: 8, canvas: "darken", psd: "dark", ora: "svg:darken", oraRead: [], reader: 1 }),
     Object.freeze({ id: "multiply", label: "Multiply", group: "darken", op: 5, canvas: "multiply", psd: "mul ", ora: "svg:multiply", oraRead: [], reader: 1 }),
@@ -129,3 +131,54 @@ const LABELS = new Map(BLENDS.map((r) => [r.id, r.label]));
 export function blendLabel(id) {
     return LABELS.get(id) || id;
 }
+
+/**
+ * 32-bit integer finalizer hash (lowbias32 / hash32).
+ * @param {number} x
+ * @returns {number}
+ */
+export function lowbias32(x) {
+    x ^= x >>> 16;
+    x = Math.imul(x, 0x7feb352d) >>> 0;
+    x ^= x >>> 15;
+    x = Math.imul(x, 0x846ca68b) >>> 0;
+    x ^= x >>> 16;
+    return x >>> 0;
+}
+
+/**
+ * Spatial 32-bit hash for coordinate (x, y) with a 32-bit seed.
+ * @param {number} x
+ * @param {number} y
+ * @param {number} seed
+ * @returns {number}
+ */
+export function hash32(x, y, seed) {
+    return lowbias32(((Math.imul(x >>> 0, 0x9E3779B1) ^ Math.imul(y >>> 0, 0x85EBCA77) ^ (seed >>> 0))) >>> 0);
+}
+
+/**
+ * Deterministic 32-bit seed from layer id via 32-bit FNV-1a.
+ * @param {string|number} id
+ * @returns {number}
+ */
+export function seedOfLayer(id) {
+    const s = String(id);
+    let h = 2166136261;
+    for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+    }
+    return h >>> 0;
+}
+
+/**
+ * 8-bit integer multiply with rounding, matching compositing kernels.
+ * @param {number} x
+ * @param {number} y
+ * @returns {number}
+ */
+export const mul255 = (x, y) => {
+    const t = x * y + 128;
+    return (t + (t >> 8)) >> 8;
+};

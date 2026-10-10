@@ -48,7 +48,7 @@ import { SNAP_DEFAULT, SNAP_TAU, snapParams, snapField, rangeMax, edgeTiles } fr
 import { normalizeLimit, u16Bilinear, rangeWeight, opp, colourSimilarity, hexToRgb as hexToRgb01, WEIGHTS_GLSL } from "./inpaint_weights.js";
 import { limitAlphaRows } from "./inpaint_limit.js";
 import { buildRangeBar } from "./inpaint_rangebar.js";
-import { BLENDS, BLEND_GROUPS, BLEND_MODES, EMULATED_BLENDS, BLEND_OPS, canvasOp, normalBlend } from "./blend_modes.js";
+import { BLENDS, BLEND_GROUPS, BLEND_MODES, EMULATED_BLENDS, BLEND_OPS, canvasOp, normalBlend, seedOfLayer, hash32, mul255 } from "./blend_modes.js";
 
 /**
  * The pixel backend a new editor takes (docs/PLAN_BCE.md §C2 step b): the host's choice when it made
@@ -337,6 +337,52 @@ const EMULATED_BLEND_CLIP_SHADER = {
     label: "emulated blend, clipped",
     uniforms: { u_layer: "sampler2D", u_clip: "sampler2D", u_opacity: "float", u_mode: "int" },
     code: EMULATED_BLEND_SHADER.code.replace("float as = S.a * u_opacity,", "float as = S.a * u_opacity * texture(u_clip, uv).a,"),
+};
+
+const DISSOLVE_SHADER = {
+    label: "dissolve",
+    uniforms: { u_layer: "sampler2D", u_opacity: "float", u_seed_hi: "float", u_seed_lo: "float", u_invX: "vec3", u_invY: "vec3" },
+    code: `
+uint lowbias32(uint x) {
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+uint hash32(uint x, uint y, uint seed) {
+    return lowbias32((x * 0x9E3779B1u) ^ (y * 0x85EBCA77u) ^ seed);
+}
+
+int mul255(int x, int y) {
+    int t = x * y + 128;
+    return (t + (t >> 8)) >> 8;
+}
+
+vec4 shade(vec4 B, vec2 uv) {
+    vec4 S = texture(u_layer, uv);
+    vec2 fragPx = uv * u_size;
+    int imgX = int(floor(dot(u_invX, vec3(fragPx, 1.0))));
+    int imgY = int(floor(dot(u_invY, vec3(fragPx, 1.0))));
+    uint seed = uint(u_seed_lo) | (uint(u_seed_hi) << 16u);
+    int srcA = int(round(S.a * 255.0));
+    int alpha255 = int(round(u_opacity * 255.0));
+    int c = mul255(srcA, alpha255);
+    bool keep = (c == 255) || ((hash32(uint(imgX), uint(imgY), seed) >> 24u) < uint(c));
+    return keep ? vec4(S.rgb, 1.0) : B;
+}
+`,
+};
+
+const DISSOLVE_CLIP_SHADER = {
+    label: "dissolve, clipped",
+    uniforms: { u_layer: "sampler2D", u_clip: "sampler2D", u_opacity: "float", u_seed_hi: "float", u_seed_lo: "float", u_invX: "vec3", u_invY: "vec3" },
+    code: DISSOLVE_SHADER.code.replace(
+        "int c = mul255(srcA, alpha255);",
+        "int mask = int(round(texture(u_clip, uv).a * 255.0));\n    int c = mul255(mul255(srcA, alpha255), mask);"
+    ),
 };
 
 /** Red range preview tint shader (R1-S6). */
@@ -7727,8 +7773,15 @@ class InpaintEditor {
                 continue;
             }
             if (forRun && (this.isControl(l) || this.isReference(l))) continue;
-            const op = l.blend && l.blend !== "normal" ? OPS[l.blend] : 0;
-            if (!(op >= 0) || (op && InpaintEditor.stackBlends === false)) return null;
+            let op = 0;
+            let dissolve = null;
+            if (l.blend === "dissolve") {
+                dissolve = seedOfLayer(l.id);
+                op = 0;
+            } else {
+                op = l.blend && l.blend !== "normal" ? OPS[l.blend] : 0;
+                if (!(op >= 0) || (op && InpaintEditor.stackBlends === false)) return null;
+            }
             const matched = this.matchActive(l);
             if (matched && (InpaintEditor.stackMatch === false || sawFilter)) return null;
             if ((this.pending && this.pending.layer === l) || this.liveStrokeOn(l)) return null;
@@ -7738,6 +7791,7 @@ class InpaintEditor {
             if (this.liveMask(l) && !mask) return null;
             const alpha = Math.round(Math.max(0, Math.min(1, l.opacity ?? 1)) * 255);
             const entry = { px, mask, x: l.x, y: l.y, alpha, op, match: matched ? l : null, clip };
+            if (dissolve !== null) entry.dissolve = dissolve;
             entryOf.set(l, entry);
             out.push(entry);
         }
@@ -7778,7 +7832,7 @@ class InpaintEditor {
         const heldOf = new Map();
         const hold = (s) => {
             if (!s) return s;
-            const h = { snap: s.px.clone(), mask: s.mask ? s.mask.clone() : null, x: s.x, y: s.y, alpha: s.alpha, op: s.op | 0, layer: s.match || null, match: null, clip: s.clip ? heldOf.get(s.clip) || null : null };
+            const h = { snap: s.px.clone(), mask: s.mask ? s.mask.clone() : null, x: s.x, y: s.y, alpha: s.alpha, op: s.op | 0, layer: s.match || null, match: null, clip: s.clip ? heldOf.get(s.clip) || null : null, dissolve: s.dissolve ?? null };
             heldOf.set(s, h);
             return h;
         };
@@ -14072,7 +14126,7 @@ class InpaintEditor {
      * its pixels): the scratch keeps the layer only where the base is (`destination-in`), and then goes over the canvas
      * in any blend mode, the ones Canvas 2D has as well.
      */
-    blendEmulated(ctx, mode, draw, opacity = 1, clip = null) {
+    blendEmulated(ctx, mode, draw, opacity = 1, clip = null, seed = null) {
         const cv = ctx.canvas, W = cv.width, H = cv.height;
         if (!W || !H) return;
         const screen = !!(this.viewPass && this.viewPass.screen);
@@ -14110,13 +14164,34 @@ class InpaintEditor {
         }
         if (screen && EMULATED_BLENDS.has(mode)) {
             let out = null;
-            const uMode = BLEND_OPS[mode];
-            try {
-                out = clip
-                    ? runShader(EMULATED_BLEND_CLIP_SHADER, cv, { u_layer: s, u_clip: clip, u_opacity: Math.max(0, Math.min(1, opacity)), u_mode: uMode })
-                    : runShader(EMULATED_BLEND_SHADER, cv, { u_layer: s, u_opacity: Math.max(0, Math.min(1, opacity)), u_mode: uMode });
-            } catch (err) {
-                console.warn("Inpaint Canvas: the blend shader failed, blending on the CPU:", err);
+            if (mode === "dissolve") {
+                const inv = ctx.getTransform().inverse();
+                const seedVal = seed !== null ? (seed >>> 0) : 0;
+                const uniforms = {
+                    u_layer: s,
+                    u_opacity: Math.max(0, Math.min(1, opacity)),
+                    u_seed_hi: (seedVal >>> 16) & 0xffff,
+                    u_seed_lo: seedVal & 0xffff,
+                    u_invX: [inv.a, inv.c, inv.e],
+                    u_invY: [inv.b, inv.d, inv.f],
+                };
+                if (clip) uniforms.u_clip = clip;
+                try {
+                    out = clip
+                        ? runShader(DISSOLVE_CLIP_SHADER, cv, uniforms)
+                        : runShader(DISSOLVE_SHADER, cv, uniforms);
+                } catch (err) {
+                    console.warn("Inpaint Canvas: the dissolve blend shader failed, blending on the CPU:", err);
+                }
+            } else {
+                const uMode = BLEND_OPS[mode];
+                try {
+                    out = clip
+                        ? runShader(EMULATED_BLEND_CLIP_SHADER, cv, { u_layer: s, u_clip: clip, u_opacity: Math.max(0, Math.min(1, opacity)), u_mode: uMode })
+                        : runShader(EMULATED_BLEND_SHADER, cv, { u_layer: s, u_opacity: Math.max(0, Math.min(1, opacity)), u_mode: uMode });
+                } catch (err) {
+                    console.warn("Inpaint Canvas: the blend shader failed, blending on the CPU:", err);
+                }
             }
             if (out) {
                 const img = isGLSurface(out) ? surfaceToCanvas(out) : out;
@@ -14138,6 +14213,35 @@ class InpaintEditor {
             const ca = clip._clipAlpha ?? 255;
             if (ca === 255) for (let i = 0; i < mask.length; i++) mask[i] = cd[i * 4 + 3];
             else for (let i = 0; i < mask.length; i++) { const t = cd[i * 4 + 3] * ca + 128; mask[i] = (t + (t >> 8)) >> 8; }
+        }
+        if (mode === "dissolve") {
+            const inv = ctx.getTransform().inverse();
+            const td = t.data;
+            const alpha255 = Math.round(Math.max(0, Math.min(1, opacity)) * 255);
+            const seedVal = seed !== null ? (seed >>> 0) : 0;
+            for (let y = 0; y < H; y++) {
+                for (let x = 0; x < W; x++) {
+                    const idx = (y * W + x) * 4;
+                    const srcA = td[idx + 3];
+                    if (srcA === 0) continue;
+                    const m = mask ? mask[y * W + x] : 255;
+                    const c = mul255(mul255(srcA, alpha255), m);
+                    const imgX = Math.floor(inv.a * (x + 0.5) + inv.c * (y + 0.5) + inv.e);
+                    const imgY = Math.floor(inv.b * (x + 0.5) + inv.d * (y + 0.5) + inv.f);
+                    const keep = c === 255 || ((hash32(imgX, imgY, seedVal) >>> 24) < c);
+                    if (keep) {
+                        td[idx + 3] = 255;
+                    } else {
+                        td[idx] = 0;
+                        td[idx + 1] = 0;
+                        td[idx + 2] = 0;
+                        td[idx + 3] = 0;
+                    }
+                }
+            }
+            compositeTile(new Uint8Array(b.data.buffer, b.data.byteOffset, W * H * 4), [new Uint8Array(td.buffer, td.byteOffset, W * H * 4)], [0], [255], [null]);
+            ctx.putImageData(b, 0, 0);
+            return;
         }
         compositeTile(new Uint8Array(b.data.buffer, b.data.byteOffset, W * H * 4), [new Uint8Array(t.data.buffer, t.data.byteOffset, W * H * 4)], [op], [Math.round(Math.max(0, Math.min(1, opacity)) * 255)], [mask]);
         ctx.putImageData(b, 0, 0);
@@ -15176,7 +15280,7 @@ class InpaintEditor {
         if (clipDoc) { ctx.save(); ctx.beginPath(); ctx.rect(0, 0, this.width, this.height); ctx.clip(); }
         try {
             if (!limitView && (clip || EMULATED_BLENDS.has(layer.blend))) {
-                this.blendEmulated(ctx, layer.blend, (c) => { c.drawImage(src, rx, ry, rw, rh); }, layer.opacity, clip ? clip() : null);
+                this.blendEmulated(ctx, layer.blend, (c) => { c.drawImage(src, rx, ry, rw, rh); }, layer.opacity, clip ? clip() : null, seedOfLayer(layer.id));
                 return null;
             }
             ctx.globalAlpha = limitView ? 1 : layer.opacity;
@@ -16095,7 +16199,7 @@ class InpaintEditor {
                 const c = makeCanvas(this.width, this.height);
                 const ctx = c.getContext("2d");
                 this.drawBaseInto(ctx, 0, 0, this.width, this.height);
-                if (EMULATED_BLENDS.has(layer.blend)) this.blendEmulated(ctx, layer.blend, (lc) => { this.drawLayer(lc, layer); }, layer.opacity);
+                if (EMULATED_BLENDS.has(layer.blend)) this.blendEmulated(ctx, layer.blend, (lc) => { this.drawLayer(lc, layer); }, layer.opacity, null, seedOfLayer(layer.id));
                 else {
                     ctx.globalAlpha = layer.opacity;
                     ctx.globalCompositeOperation = canvasOp(layer.blend);
@@ -16196,7 +16300,7 @@ class InpaintEditor {
             // the layer's pixels where `below` (all the canvas holds yet) is; in a blend mode the base's alpha is put back after
             const cov = clipTo ? cpuDab(null, c.width, c.height) : null;
             if (cov) cov.getContext("2d").drawImage(c, 0, 0);
-            this.blendEmulated(ctx, layer.blend, (lc) => { lc.imageSmoothingEnabled = true; lc.imageSmoothingQuality = "high"; lc.drawImage(this.layerPixels(layer), (layer.x - x0) * res, (layer.y - y0) * res, layer.w * res, layer.h * res); }, layer.opacity, cov);
+            this.blendEmulated(ctx, layer.blend, (lc) => { lc.imageSmoothingEnabled = true; lc.imageSmoothingQuality = "high"; lc.drawImage(this.layerPixels(layer), (layer.x - x0) * res, (layer.y - y0) * res, layer.w * res, layer.h * res); }, layer.opacity, cov, seedOfLayer(layer.id));
             if (cov) {
                 const a = cov.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, c.width, c.height).data;
                 const img = ctx.getImageData(0, 0, c.width, c.height), d = img.data;
@@ -19435,7 +19539,7 @@ class InpaintEditor {
                 if (forRun && (ctrl || this.isReference(layer))) continue;
                 chain = this.flushFilterChain(ctx, chain);
                 drawn.add(layer);
-                if (cb || (!controlOnly && EMULATED_BLENDS.has(layer.blend))) { this.blendEmulated(ctx, layer.blend, (lc) => { this.drawLayer(lc, layer, { skipFilters: skip }); }, layer.opacity, cb ? coverage(cb) : null); continue; }
+                if (cb || (!controlOnly && EMULATED_BLENDS.has(layer.blend))) { this.blendEmulated(ctx, layer.blend, (lc) => { this.drawLayer(lc, layer, { skipFilters: skip }); }, layer.opacity, cb ? coverage(cb) : null, seedOfLayer(layer.id)); continue; }
                 ctx.globalAlpha = layer.opacity;
                 ctx.globalCompositeOperation = controlOnly ? "source-over" : canvasOp(layer.blend);
                 this.drawLayer(ctx, layer, { skipFilters: skip });
@@ -22144,4 +22248,4 @@ class InpaintEditor {
 }
 
 // everything the hosts use: Scumble's shell, commands and plugins, the node's extension (js/inpaint_node.js)
-export { InpaintEditor, BLEND_MODES, viewUrl, loadImageEl, makeCanvas, uploadBlob, uploadCanvas, CROP_DEFAULTS, GEN_DEFAULTS, FIXED_OUTPUTS, SETTING_SLOTS, TAIL_OUTPUTS, NODE_CLASS, STITCH_CLASS, isSettingOutput, settingIndex, linkOf, el, icon, iconButton, miniButton, selectInput, selectGrouped, numberInput, hostText, REF_FITS, REF_DEFAULTS, UPSAMPLE_CASES, randomSeed, STYLE };
+export { InpaintEditor, BLEND_MODES, DISSOLVE_SHADER, DISSOLVE_CLIP_SHADER, viewUrl, loadImageEl, makeCanvas, uploadBlob, uploadCanvas, CROP_DEFAULTS, GEN_DEFAULTS, FIXED_OUTPUTS, SETTING_SLOTS, TAIL_OUTPUTS, NODE_CLASS, STITCH_CLASS, isSettingOutput, settingIndex, linkOf, el, icon, iconButton, miniButton, selectInput, selectGrouped, numberInput, hostText, REF_FITS, REF_DEFAULTS, UPSAMPLE_CASES, randomSeed, STYLE };

@@ -54,6 +54,7 @@ import { guidedFar } from "./inpaint_depth.js";
 import { u16Bilinear, rangeWeight, LUMA, opp, colourSimilarity, hexToRgb as hexToRgb01 } from "./inpaint_weights.js";
 import { snapField, fuseTiles } from "./inpaint_edges.js";
 import { mipChain, mipChainBytes, clampExtend, compositeTile, matchPixels, psdPackRows, kernelsReady, setKernels, rustPx, kernelsInUse, releaseIfLarge, deflate, resampleBlock, poissonBlend, boxBlurs } from "./px/kernels.js";
+import { hash32, mul255 } from "./blend_modes.js";
 
 const TILE = 256, LEVELS = 5, TILE_BYTES = TILE * TILE * 4;
 const now = () => performance.now();
@@ -260,7 +261,32 @@ function rowsOfStack(msg, above = false, into = null) {
             if (c.mask) { bm = new Uint8Array(W * n); storeRows({ x: c.x, y: c.y, w: c.w, h: c.h, tiles: c.mask }, X0, W, Y0, n, bm, true); }
             mask = clipCoverage(cov, bm, c.alpha, mask);
         }
-        srcs.push(src); alphas.push(l.alpha); masks.push(mask); ops.push(l.op | 0);
+        if (l.dissolve != null) {
+            const rowSrc = l.sab ? new Uint8Array(src) : src;
+            for (let r = 0; r < n; r++) {
+                const imgY = Y0 + r;
+                for (let c = 0; c < W; c++) {
+                    const imgX = X0 + c;
+                    const idx = (r * W + c) * 4;
+                    const srcA = rowSrc[idx + 3];
+                    if (srcA === 0) continue;
+                    const m = mask ? mask[r * W + c] : 255;
+                    const cVal = mul255(mul255(srcA, l.alpha), m);
+                    const keep = (cVal === 255) || ((hash32(imgX, imgY, l.dissolve) >>> 24) < cVal);
+                    if (keep) {
+                        rowSrc[idx + 3] = 255;
+                    } else {
+                        rowSrc[idx] = 0;
+                        rowSrc[idx + 1] = 0;
+                        rowSrc[idx + 2] = 0;
+                        rowSrc[idx + 3] = 0;
+                    }
+                }
+            }
+            srcs.push(rowSrc); alphas.push(255); masks.push(null); ops.push(0);
+        } else {
+            srcs.push(src); alphas.push(l.alpha); masks.push(mask); ops.push(l.op | 0);
+        }
     }
     if (srcs.length) compositeTile(dst, srcs, ops, alphas, masks);
     return dst;
@@ -342,7 +368,32 @@ async function stackPoints(msg) {
             if (c.mask) { bm = new Uint8Array(n); gatherStore({ x: c.x, y: c.y, w: c.w, h: c.h, tiles: c.mask }, xs, ys, bm, true, clip); }
             mask = clipCoverage(cov, bm, c.alpha, mask);
         }
-        srcs.push(src); alphas.push(l.alpha); masks.push(mask); ops.push(l.op | 0);
+        if (l.dissolve != null) {
+            for (let j = 0; j < ny; j++) {
+                const imgY = ys[j];
+                for (let i = 0; i < nx; i++) {
+                    const imgX = xs[i];
+                    const o = j * nx + i;
+                    const idx = o * 4;
+                    const srcA = src[idx + 3];
+                    if (srcA === 0) continue;
+                    const m = mask ? mask[o] : 255;
+                    const cVal = mul255(mul255(srcA, l.alpha), m);
+                    const keep = (cVal === 255) || ((hash32(imgX, imgY, l.dissolve) >>> 24) < cVal);
+                    if (keep) {
+                        src[idx + 3] = 255;
+                    } else {
+                        src[idx] = 0;
+                        src[idx + 1] = 0;
+                        src[idx + 2] = 0;
+                        src[idx + 3] = 0;
+                    }
+                }
+            }
+            srcs.push(src); alphas.push(255); masks.push(null); ops.push(0);
+        } else {
+            srcs.push(src); alphas.push(l.alpha); masks.push(mask); ops.push(l.op | 0);
+        }
     }
     if (srcs.length) compositeTile(bel, srcs, ops, alphas, masks);
     const lay = new Uint8Array(n * 4);

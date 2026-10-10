@@ -127,12 +127,12 @@ export function stackArgs(stores) {
             const clip = s.clip ? clipOf(s.clip, a, b) : null;
             if (clip === false) continue;
             if (s.sab) {   // a filtered band over the band it was made from (B item 7 part 2): bytes of the job's own box
-                layers.push({ x: s.x, y: s.y, w: s.w, h: s.h, alpha: s.alpha, op: s.op | 0, sab: s.sab, mask: s.mask ? rowsOf(s.mask, s.y, a, b) || {} : null, clip });
+                layers.push({ x: s.x, y: s.y, w: s.w, h: s.h, alpha: s.alpha, op: s.op | 0, sab: s.sab, mask: s.mask ? rowsOf(s.mask, s.y, a, b) || {} : null, clip, dissolve: s.dissolve ?? null });
                 continue;
             }
             const tiles = rowsOf(s.snap, s.y, a, b);
             if (!tiles || !(s.alpha > 0)) continue;
-            layers.push({ x: s.x, y: s.y, w: s.snap.width, h: s.snap.height, alpha: s.alpha, op: s.op | 0, tiles, mask: s.mask ? rowsOf(s.mask, s.y, a, b) || {} : null, match: s.match || null, clip });
+            layers.push({ x: s.x, y: s.y, w: s.snap.width, h: s.snap.height, alpha: s.alpha, op: s.op | 0, tiles, mask: s.mask ? rowsOf(s.mask, s.y, a, b) || {} : null, match: s.match || null, clip, dissolve: s.dissolve ?? null });
         }
         return { base: base ? { x: 0, y: 0, w: base.snap.width, h: base.snap.height, tiles: rowsOf(base.snap, 0, a, b) || {} } : null, layers };
     };
