@@ -15131,16 +15131,26 @@ class InpaintEditor {
             ctx.fillRect(rx, ry, rw, rh);
             ctx.restore();
         }
-        if (!limitView && (clip || EMULATED_BLENDS.has(layer.blend))) {
-            this.blendEmulated(ctx, layer.blend, (c) => { c.drawImage(src, rx, ry, rw, rh); }, layer.opacity, clip ? clip() : null);
+        // A fill layer covers the picture, not the view: the screen's region pass reaches past the document when the
+        // view is zoomed out (viewportRegion pads the visible area and clamps nothing), and the fill's bytes there are
+        // its clamped ends, so a gradient painted the whole viewport (the user's screenshot, 2026-10-10). The draw is
+        // clipped to the document; a filter leaves the transparent outside transparent by itself.
+        const clipDoc = vp && this.isFillLayer(layer) && (rx < 0 || ry < 0 || rx + rw > this.width || ry + rh > this.height);
+        if (clipDoc) { ctx.save(); ctx.beginPath(); ctx.rect(0, 0, this.width, this.height); ctx.clip(); }
+        try {
+            if (!limitView && (clip || EMULATED_BLENDS.has(layer.blend))) {
+                this.blendEmulated(ctx, layer.blend, (c) => { c.drawImage(src, rx, ry, rw, rh); }, layer.opacity, clip ? clip() : null);
+                return null;
+            }
+            ctx.globalAlpha = limitView ? 1 : layer.opacity;
+            ctx.globalCompositeOperation = limitView ? "source-over" : ((layer.blend && layer.blend !== "normal") ? layer.blend : "source-over");
+            ctx.drawImage(src, rx, ry, rw, rh);
+            ctx.globalAlpha = 1;
+            ctx.globalCompositeOperation = "source-over";
             return null;
+        } finally {
+            if (clipDoc) ctx.restore();
         }
-        ctx.globalAlpha = limitView ? 1 : layer.opacity;
-        ctx.globalCompositeOperation = limitView ? "source-over" : ((layer.blend && layer.blend !== "normal") ? layer.blend : "source-over");
-        ctx.drawImage(src, rx, ry, rw, rh);
-        ctx.globalAlpha = 1;
-        ctx.globalCompositeOperation = "source-over";
-        return null;
     }
 
     /** Draw what the filter chain left on the GPU onto `ctx` and give the surface back. */
