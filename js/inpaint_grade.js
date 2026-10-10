@@ -342,10 +342,6 @@ export function hslPixel(r, g, b, p) {
 }
 
 export const HSL_GLSL = `
-float sstep(float e0, float e1, float x) {
-    return smoothstep(e0, e1, x);
-}
-
 float getHslCh(vec4 v0, vec4 v1, int idx) {
     if (idx == 0) return v0.x;
     if (idx == 1) return v0.y;
