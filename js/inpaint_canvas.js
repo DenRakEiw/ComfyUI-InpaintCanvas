@@ -1503,6 +1503,11 @@ const STYLE = `
 .ipc-wheels { display:grid; grid-template-columns:1fr 1fr; gap:6px; }
 .ipc-wheel { display:flex; flex-direction:column; align-items:center; gap:2px; }
 .ipc-wheel span { color:var(--sc-muted, #888); }
+.ipc-hsl { display:flex; flex-direction:column; gap:6px; }
+.ipc-hsl-head { display:flex; gap:4px; align-items:center; }
+.ipc-hsl-rows { display:flex; flex-direction:column; gap:3px; }
+.ipc-hsl-row { display:flex; align-items:center; gap:6px; }
+
 .ipc-layer .ipc-maskrow { display:flex; align-items:center; gap:2px; color:var(--sc-muted, #888); font-size:11px; }
 .ipc-layer .ipc-maskrow .ipc-sel { flex:0 1 auto; min-width:0; max-width:96px; }
 .ipc-layer .ipc-maskrow .ipc-grow { flex:1; }
@@ -17981,7 +17986,7 @@ class InpaintEditor {
                 const node = def.control(layer, p, {
                     begin: () => { if (!layer._undoPending) layer._undoPending = this.snapshot({ kind: "filter", id: layer.id }); },
                     preview: () => { this.filterPreview = layer.id; this.markFilterChanged(layer, { soon: true }); },
-                    commit: () => { this.filterPreview = null; if (layer._undoPending) { this.pushUndoSnapshot(layer._undoPending, { label: stepLabel(p) }); layer._undoPending = null; } this.markFilterChanged(layer); },
+                    commit: (opts) => { this.filterPreview = null; if (layer._undoPending) { this.pushUndoSnapshot(layer._undoPending, { label: (opts && opts.label) || stepLabel(p) }); layer._undoPending = null; } this.markFilterChanged(layer); },
                     stop,
                 });
                 if (node) { node.style.gridColumn = "1 / -1"; box.appendChild(node); }

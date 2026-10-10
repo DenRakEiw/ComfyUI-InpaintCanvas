@@ -17,7 +17,8 @@
 import { curvesToTables } from "./inpaint_curves.js";
 import { levelsTable, brightnessContrastTable, hueSatMatrix, lightnessTable, colorBalanceTables, hueToRgb, LOOK_DEFAULT, grainNoiseCanvas, colourStats } from "./inpaint_filters.js";
 import { registerHazeGL, registerDehazeGL } from "./inpaint_depthfx.js";
-import { colorGradeTables, gradeIdentity } from "./inpaint_grade.js";
+import { colorGradeTables, gradeIdentity, HSL_GLSL, HSL_UNIFORMS, hslUniforms, hslIdentity } from "./inpaint_grade.js";
+
 
 const VS = `#version 300 es
 in vec2 a_pos;
@@ -1253,4 +1254,12 @@ export function glTestLimits(limits) {
 
 export { G };
 export function glContext() { return context(); }
+
+registerGLFilter("hsl", {
+    code: HSL_GLSL,
+    uniforms: HSL_UNIFORMS,
+    values: (p) => hslUniforms(p),
+    skip: (p) => hslIdentity(p),
+});
+
 

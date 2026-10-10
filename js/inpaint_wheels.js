@@ -1,7 +1,8 @@
 // Generated from DenRakEiw/scumble renderer/editor/inpaint_wheels.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // @ts-check
 import { THEME } from "./inpaint_theme.js";
-import { hueRgb, GRADE_RANGES } from "./inpaint_grade.js";
+import { hueRgb, GRADE_RANGES, HSL_CHANNELS } from "./inpaint_grade.js";
+
 
 /** Size of the wheel canvas in CSS pixels. */
 export const WHEEL_SIZE = 72;
@@ -303,3 +304,175 @@ export function buildWheelsControl(layer, param, callbacks) {
 
     return wrap;
 }
+
+/**
+ * Modes for HSL control: Hue, Saturation, Luminance.
+ */
+const HSL_MODES = [
+    { id: "hue", label: "Hue", suffix: "_h", title: "Hue shift (-100..100)" },
+    { id: "sat", label: "Saturation", suffix: "_s", title: "Saturation shift (-100..100)" },
+    { id: "lum", label: "Luminance", suffix: "_l", title: "Luminance shift (-100..100)" },
+];
+
+/**
+ * Build the custom HSL control (mode switch, 8 swatched channel sliders, reset button).
+ *
+ * @param {any} layer
+ * @param {any} param
+ * @param {{ begin: () => void, preview: () => void, commit: (opts?: { label?: string }) => void }} callbacks
+ * @returns {HTMLElement}
+ */
+export function buildHslControl(layer, param, callbacks) {
+    const wrap = document.createElement("div");
+    wrap.className = "ipc-hsl";
+
+    const head = document.createElement("div");
+    head.className = "ipc-hsl-head";
+
+    let currentMode = "hue";
+
+    const stop = (e) => e.stopPropagation();
+
+    const mkButton = (text, title) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.textContent = text;
+        b.title = title;
+        b.style.cssText = "font:11px var(--sc-font,system-ui,sans-serif);padding:2px 8px;border-radius:var(--sc-radius,4px);border:1px solid var(--sc-line,#3a3a3a);background:var(--sc-field,#161616);color:var(--sc-fg-2,#aaa);cursor:pointer;";
+        return b;
+    };
+
+    /** @type {Record<string, HTMLButtonElement>} */
+    const modeBtns = {};
+    for (const m of HSL_MODES) {
+        const b = mkButton(m.label, m.title);
+        b.addEventListener("click", (e) => {
+            stop(e);
+            currentMode = m.id;
+            updateModeButtons();
+            syncSliders();
+        });
+        for (const ev of ["click", "pointerdown", "dblclick", "keydown"]) b.addEventListener(ev, stop);
+        modeBtns[m.id] = b;
+        head.appendChild(b);
+    }
+
+    const spacer = document.createElement("span");
+    spacer.style.flex = "1";
+    head.appendChild(spacer);
+
+    const reset = mkButton("Reset", "Reset this mode to 0 (Shift: all 3 modes)");
+    reset.addEventListener("click", (e) => {
+        stop(e);
+        const all = e.shiftKey;
+        callbacks.begin();
+        if (all) {
+            for (const ch of HSL_CHANNELS) {
+                layer.params[`${ch.id}_h`] = 0;
+                layer.params[`${ch.id}_s`] = 0;
+                layer.params[`${ch.id}_l`] = 0;
+            }
+            callbacks.commit({ label: "HSL: Reset all" });
+        } else {
+            const m = HSL_MODES.find((x) => x.id === currentMode) || HSL_MODES[0];
+            for (const ch of HSL_CHANNELS) {
+                layer.params[`${ch.id}${m.suffix}`] = 0;
+            }
+            callbacks.commit({ label: `HSL: Reset ${m.label}` });
+        }
+        syncSliders();
+    });
+    for (const ev of ["click", "pointerdown", "dblclick", "keydown"]) reset.addEventListener(ev, stop);
+    head.appendChild(reset);
+    wrap.appendChild(head);
+
+    const updateModeButtons = () => {
+        for (const m of HSL_MODES) {
+            const b = modeBtns[m.id];
+            const on = m.id === currentMode;
+            b.style.background = on ? "var(--sc-selected,#2b3a4f)" : "var(--sc-field,#161616)";
+            b.style.color = on ? "var(--sc-active,#7cc7ff)" : "var(--sc-fg-2,#aaa)";
+        }
+    };
+
+    const rowsBox = document.createElement("div");
+    rowsBox.className = "ipc-hsl-rows";
+
+    /** @type {HTMLInputElement[]} */
+    const sliders = [];
+    /** @type {HTMLElement[]} */
+    const valSpans = [];
+
+    const formatVal = (v) => (v > 0 ? `+${v}` : `${v}`);
+
+    for (const ch of HSL_CHANNELS) {
+        const row = document.createElement("div");
+        row.className = "ipc-hsl-row";
+
+        const swatch = document.createElement("span");
+        swatch.className = "ipc-hsl-swatch";
+        const rgb = hueRgb(ch.hue);
+        const r255 = Math.round(rgb[0] * 255);
+        const g255 = Math.round(rgb[1] * 255);
+        const b255 = Math.round(rgb[2] * 255);
+        swatch.style.cssText = `width:12px;height:12px;border-radius:2px;background:rgb(${r255},${g255},${b255});border:1px solid rgba(255,255,255,0.2);flex-shrink:0;`;
+        swatch.title = ch.label;
+        row.appendChild(swatch);
+
+        const slider = document.createElement("input");
+        slider.type = "range";
+        slider.className = "ipc-hsl-slider";
+        slider.min = "-100";
+        slider.max = "100";
+        slider.step = "1";
+        slider.title = `${ch.label} channel`;
+        row.appendChild(slider);
+        sliders.push(slider);
+
+        const valSpan = document.createElement("span");
+        valSpan.className = "ipc-hsl-val";
+        valSpan.style.cssText = "width:32px;text-align:right;font:11px monospace;color:var(--sc-fg-2,#aaa);flex-shrink:0;";
+        row.appendChild(valSpan);
+        valSpans.push(valSpan);
+
+        for (const ev of ["click", "pointerdown", "dblclick", "keydown"]) slider.addEventListener(ev, stop);
+
+        slider.addEventListener("input", (e) => {
+            stop(e);
+            callbacks.begin();
+            const m = HSL_MODES.find((x) => x.id === currentMode) || HSL_MODES[0];
+            const key = `${ch.id}${m.suffix}`;
+            const v = Math.round(+slider.value);
+            layer.params[key] = v;
+            valSpan.textContent = formatVal(v);
+            callbacks.preview();
+        });
+
+        slider.addEventListener("change", (e) => {
+            stop(e);
+            const m = HSL_MODES.find((x) => x.id === currentMode) || HSL_MODES[0];
+            callbacks.commit({ label: `HSL: ${ch.label} ${m.label}` });
+        });
+
+        rowsBox.appendChild(row);
+    }
+
+    wrap.appendChild(rowsBox);
+
+    const syncSliders = () => {
+        const m = HSL_MODES.find((x) => x.id === currentMode) || HSL_MODES[0];
+        for (let i = 0; i < HSL_CHANNELS.length; i++) {
+            const ch = HSL_CHANNELS[i];
+            const key = `${ch.id}${m.suffix}`;
+            const v = layer.params[key] != null ? Math.round(+layer.params[key]) : 0;
+            sliders[i].value = String(v);
+            valSpans[i].textContent = formatVal(v);
+        }
+    };
+
+    updateModeButtons();
+    syncSliders();
+
+    return wrap;
+}
+

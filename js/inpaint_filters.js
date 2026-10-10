@@ -15,8 +15,9 @@
 import { curveDefaults, curvesToTables, buildCurvesControl } from "./inpaint_curves.js";
 import { applyFilterGL, applyMatchGL, glToCanvas } from "./inpaint_filters_gl.js";
 import { hazeStats, applyHaze, dehazeStats, applyDehaze } from "./inpaint_depthfx.js";
-import { colorGradeTables, gradeIdentity } from "./inpaint_grade.js";
-import { buildWheelsControl } from "./inpaint_wheels.js";
+import { colorGradeTables, gradeIdentity, hslPixel, hslIdentity } from "./inpaint_grade.js";
+import { buildWheelsControl, buildHslControl } from "./inpaint_wheels.js";
+
 
 function makeCanvas(w, h) {
     const c = document.createElement("canvas");
@@ -823,6 +824,20 @@ function applyColorGrade(src, p) {
     return applyOffsets(src, dR, dG, dB);
 }
 
+export function applyHsl(src, p) {
+    if (hslIdentity(p)) return copyCanvas(src);
+    const { out, octx, img, px } = openPixels(src);
+    for (let i = 0; i < px.length; i += 4) {
+        const [r, g, b] = hslPixel(px[i], px[i + 1], px[i + 2], p);
+        px[i] = Math.round(r);
+        px[i + 1] = Math.round(g);
+        px[i + 2] = Math.round(b);
+    }
+    octx.putImageData(img, 0, 0);
+    return out;
+}
+
+
 // ---------------------------------------------------------------------------
 // curves
 // ---------------------------------------------------------------------------
@@ -1015,6 +1030,40 @@ export const FILTERS = {
         reach: 0,
         apply: applyHueSat,
     },
+    hsl: {
+        label: "HSL",
+        params: [
+            { key: "channels", label: "Channels", type: "custom", default: null },
+            { key: "red_h", label: "Red hue", min: -100, max: 100, step: 1, default: 0, hidden: true },
+            { key: "red_s", label: "Red saturation", min: -100, max: 100, step: 1, default: 0, hidden: true },
+            { key: "red_l", label: "Red luminance", min: -100, max: 100, step: 1, default: 0, hidden: true },
+            { key: "orange_h", label: "Orange hue", min: -100, max: 100, step: 1, default: 0, hidden: true },
+            { key: "orange_s", label: "Orange saturation", min: -100, max: 100, step: 1, default: 0, hidden: true },
+            { key: "orange_l", label: "Orange luminance", min: -100, max: 100, step: 1, default: 0, hidden: true },
+            { key: "yellow_h", label: "Yellow hue", min: -100, max: 100, step: 1, default: 0, hidden: true },
+            { key: "yellow_s", label: "Yellow saturation", min: -100, max: 100, step: 1, default: 0, hidden: true },
+            { key: "yellow_l", label: "Yellow luminance", min: -100, max: 100, step: 1, default: 0, hidden: true },
+            { key: "green_h", label: "Green hue", min: -100, max: 100, step: 1, default: 0, hidden: true },
+            { key: "green_s", label: "Green saturation", min: -100, max: 100, step: 1, default: 0, hidden: true },
+            { key: "green_l", label: "Green luminance", min: -100, max: 100, step: 1, default: 0, hidden: true },
+            { key: "aqua_h", label: "Aqua hue", min: -100, max: 100, step: 1, default: 0, hidden: true },
+            { key: "aqua_s", label: "Aqua saturation", min: -100, max: 100, step: 1, default: 0, hidden: true },
+            { key: "aqua_l", label: "Aqua luminance", min: -100, max: 100, step: 1, default: 0, hidden: true },
+            { key: "blue_h", label: "Blue hue", min: -100, max: 100, step: 1, default: 0, hidden: true },
+            { key: "blue_s", label: "Blue saturation", min: -100, max: 100, step: 1, default: 0, hidden: true },
+            { key: "blue_l", label: "Blue luminance", min: -100, max: 100, step: 1, default: 0, hidden: true },
+            { key: "purple_h", label: "Purple hue", min: -100, max: 100, step: 1, default: 0, hidden: true },
+            { key: "purple_s", label: "Purple saturation", min: -100, max: 100, step: 1, default: 0, hidden: true },
+            { key: "purple_l", label: "Purple luminance", min: -100, max: 100, step: 1, default: 0, hidden: true },
+            { key: "magenta_h", label: "Magenta hue", min: -100, max: 100, step: 1, default: 0, hidden: true },
+            { key: "magenta_s", label: "Magenta saturation", min: -100, max: 100, step: 1, default: 0, hidden: true },
+            { key: "magenta_l", label: "Magenta luminance", min: -100, max: 100, step: 1, default: 0, hidden: true },
+        ],
+        control: (layer, param, callbacks) => buildHslControl(layer, param, callbacks),
+        reach: 0,
+        apply: applyHsl,
+    },
+
     color_balance: {
         label: "Colour balance",
         params: [
