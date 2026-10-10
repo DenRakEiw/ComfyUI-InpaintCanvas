@@ -48,7 +48,7 @@ import { SNAP_DEFAULT, SNAP_TAU, snapParams, snapField, rangeMax, edgeTiles } fr
 import { normalizeLimit, u16Bilinear, rangeWeight, opp, colourSimilarity, hexToRgb as hexToRgb01, WEIGHTS_GLSL } from "./inpaint_weights.js";
 import { limitAlphaRows } from "./inpaint_limit.js";
 import { buildRangeBar } from "./inpaint_rangebar.js";
-import { BLENDS, BLEND_MODES, EMULATED_BLENDS, BLEND_OPS, canvasOp, normalBlend, blendLabel } from "./blend_modes.js";
+import { BLEND_MODES, EMULATED_BLENDS, BLEND_OPS, canvasOp, normalBlend } from "./blend_modes.js";
 
 /**
  * The pixel backend a new editor takes (docs/PLAN_BCE.md §C2 step b): the host's choice when it made

@@ -17,6 +17,7 @@
  * }} BlendRow
  */
 
+/** @type {readonly BlendRow[]} */
 export const BLENDS = Object.freeze([
     Object.freeze({ id: "normal", label: "Normal", group: "normal", op: 0, canvas: "source-over", psd: "norm", ora: "svg:src-over", oraRead: [], reader: 1 }),
     Object.freeze({ id: "multiply", label: "Multiply", group: "darken", op: 5, canvas: "multiply", psd: "mul ", ora: "svg:multiply", oraRead: [], reader: 1 }),
@@ -30,8 +31,10 @@ export const BLENDS = Object.freeze([
     Object.freeze({ id: "difference", label: "Difference", group: "inversion", op: 12, canvas: "difference", psd: "diff", ora: "svg:difference", oraRead: [], reader: 1 }),
 ]);
 
-export const BLEND_MODES = Object.freeze(BLENDS.map((r) => r.id));
+/** @type {string[]} */
+export const BLEND_MODES = /** @type {string[]} */ (/** @type {unknown} */ (Object.freeze(BLENDS.map((r) => r.id))));
 
+/** @type {Set<string>} */
 export const EMULATED_BLENDS = new Set(BLENDS.filter((r) => r.canvas === null).map((r) => r.id));
 
 export const BLEND_OPS = Object.freeze(Object.fromEntries(BLENDS.filter((r) => r.op > 0).map((r) => [r.id, r.op])));
@@ -65,7 +68,8 @@ export const ORA_BLENDS = Object.freeze(oraMap);
 
 export const READER_OF_BLEND = Object.freeze(Object.fromEntries(BLENDS.filter((r) => r.reader > 1).map((r) => [r.id, r.reader])));
 
-const CANVAS_OPS = new Map(BLENDS.filter((r) => r.canvas !== null).map((r) => [r.id, r.canvas]));
+/** @type {Map<string, string>} */
+const CANVAS_OPS = new Map(/** @type {[string, string][]} */ (BLENDS.filter((r) => r.canvas !== null).map((r) => [r.id, /** @type {string} */ (r.canvas)])));
 
 /**
  * Returns a valid Canvas 2D globalCompositeOperation string for `id`, or "source-over"
@@ -78,6 +82,7 @@ export function canvasOp(id) {
     return CANVAS_OPS.get(id) || "source-over";
 }
 
+/** @type {Set<string>} */
 const KNOWN_IDS = new Set(BLENDS.map((r) => r.id));
 
 /**
@@ -91,6 +96,7 @@ export function normalBlend(id) {
     return "normal";
 }
 
+/** @type {Map<string, string>} */
 const LABELS = new Map(BLENDS.map((r) => [r.id, r.label]));
 
 /**
