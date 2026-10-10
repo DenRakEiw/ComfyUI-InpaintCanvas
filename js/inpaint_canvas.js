@@ -12285,6 +12285,134 @@ class InpaintEditor {
     }
 
     /**
+     * Create the document's depth map from an existing layer (white is near, black is far).
+     * The layer must cover the whole picture.
+     * @param {any} layer - Layer object, name, or id
+     * @param {{ invert?: boolean }} [opts]
+     * @returns {Promise<any>} The created DocMap
+     */
+    async depthFromLayer(layer, { invert = false } = {}) {
+        if (!this.base) throw new Error("No image loaded in document");
+        const l = typeof layer === "object" && layer ? layer : (this.layers.find((x) => x.id === layer || x.name === layer) || null);
+        if (!l) {
+            this.setStatus("Layer not found");
+            throw new Error("Layer not found");
+        }
+        if (l.kind === "filter" || l.kind === "group" || !l.px || l.x > 0 || l.y > 0 || (l.x + l.w) < this.width || (l.y + l.h) < this.height) {
+            this.setStatus("The layer must cover the whole picture");
+            throw new Error("the layer must cover the whole picture");
+        }
+
+        const token = this.geometryToken();
+        const W = this.width, H = this.height;
+        const [gw, gh] = workSize(W, H, WORK_MAX);
+        const s = Math.min(1, WORK_MAX / Math.max(W, H));
+
+        const prevActiveId = this.activeLayerId;
+        this.activeLayerId = l.id;
+        let layerCanvas = null;
+        try {
+            layerCanvas = await this.sampleRegionSettled("layer", [0, 0, W, H], s);
+        } finally {
+            this.activeLayerId = prevActiveId;
+        }
+
+        if (!layerCanvas) {
+            this.setStatus("Failed to read layer pixels");
+            throw new Error("Failed to read layer pixels");
+        }
+
+        const lctx = layerCanvas.getContext("2d", { willReadFrequently: true });
+        const ldata = lctx.getImageData(0, 0, gw, gh).data;
+        const n = gw * gh;
+        const rawDepth = new Float32Array(n);
+        for (let i = 0, j = 0; i < ldata.length; i += 4, j++) {
+            const r = ldata[i], g = ldata[i + 1], b = ldata[i + 2], a = ldata[i + 3];
+            const luma = a === 0 ? 0 : (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+            const far = invert ? luma : (1 - luma);
+            rawDepth[j] = 1 - far;
+        }
+
+        const guide = await host.pictureInput(this, gw, gh, { skipFilters: true, background: "#808080" });
+        const gd = guide.image;
+        const grey = new Uint8Array(gw * gh);
+        for (let i = 0, j = 0; i < gd.length; i += 4, j++) {
+            grey[j] = Math.round(gd[i] * 0.299 + gd[i + 1] * 0.587 + gd[i + 2] * 0.114);
+        }
+
+        this.setStatus("Refining depth map with guided filter ...");
+        const poolRes = await editorPool().run("depth_guide", {
+            raw: rawDepth,
+            rw: gw,
+            rh: gh,
+            grey,
+            gw,
+            gh,
+            r: GUIDE.r,
+            eps: GUIDE.eps,
+            lo: 0,
+            hi: 1,
+        }, [grey.buffer], { priority: INTERACTIVE });
+        const u16 = new Uint16Array(poolRes.u16);
+
+        const fpInp = await host.pictureInput(this, 64, 64, { skipFilters: true, background: "#808080" });
+        const fp = fingerprint(fpInp.image, 64, 64);
+        const meta = {
+            source: "layer",
+            layer: l.name || `Layer ${l.id}`,
+            time: Date.now(),
+            fp,
+            lo: 0,
+            hi: 1,
+            raw: rawDepth,
+            rw: gw,
+            rh: gh,
+            snap: { strength: SNAP_DEFAULT },
+            invert: !!invert,
+        };
+
+        const map = makeMap("depth", gw, gh, u16, [W, 0, 0, H, 0, 0], meta, gd);
+        const ok = await this.setMap("depth", map, { label: "Depth from layer", token });
+        if (!ok) {
+            this.setStatus("The depth map was dropped: the picture was turned or cropped meanwhile.");
+            return null;
+        }
+        this._depthOverlayCanvas = null;
+        this._depthStale = false;
+        this.setStatus("Depth map " + gw + "x" + gh + " from layer \"" + (l.name || l.id) + "\".");
+        this.renderDepthRow();
+        return map;
+    }
+
+    /**
+     * Flyout menu to select a layer to generate depth from.
+     * @param {HTMLElement} anchor
+     */
+    openDepthFromLayerMenu(anchor) {
+        if (this.flyout && this.flyout.group && this.flyout.group.btn === anchor) { this.closeFlyout(); return; }
+        const candidateLayers = this.layers.filter((l) => l.kind !== "filter" && l.kind !== "group");
+        if (!candidateLayers.length) {
+            this.setStatus("No layers to create depth from.");
+            return;
+        }
+        const actions = [];
+        for (const l of candidateLayers) {
+            const name = l.name || `Layer ${l.id}`;
+            actions.push({
+                label: name,
+                title: "Make depth map from " + name + " (white is near, black is far)",
+                onClick: () => this.depthFromLayer(l, { invert: false }),
+            });
+            actions.push({
+                label: name + " (inverted)",
+                title: "Make depth map from " + name + " inverted (black is near, white is far)",
+                onClick: () => this.depthFromLayer(l, { invert: true }),
+            });
+        }
+        this.openFlyout({ btn: anchor, items: [], actions });
+    }
+
+    /**
      * Is this filter layer's effect shown instead of the picture in the pass being drawn? Only the
      * screen pass (`viewPass.screen`): a sample pass (the wand's fine pass, the bucket's probe, the
      * Limit row's histograms), a thumbnail or an export reads the picture whatever the view shows.
@@ -12383,6 +12511,11 @@ class InpaintEditor {
             btn.classList.add("ipc-small", "ipc-primary");
             row.appendChild(btn);
 
+            const fromLayerBtn = el("button", "ipc-small ipc-btn ipc-depth-from-layer-btn", "From layer...");
+            fromLayerBtn.title = "Make depth map from an existing layer";
+            fromLayerBtn.addEventListener("click", () => this.openDepthFromLayerMenu(fromLayerBtn));
+            row.appendChild(fromLayerBtn);
+
             const detailLab = el("label", "ipc-depth-detail-label", "Detail");
             const detailSel = el("select", "ipc-select ipc-depth-detail-select");
             const curDetail = host.getDepthDetail ? host.getDepthDetail() : (host.depthDetailSetting || "standard");
@@ -12411,6 +12544,11 @@ class InpaintEditor {
         recomputeBtn.classList.add("ipc-small");
         if (stale) recomputeBtn.classList.add("ipc-primary");
         row.appendChild(recomputeBtn);
+
+        const fromLayerBtn = el("button", "ipc-small ipc-btn ipc-depth-from-layer-btn", "From layer...");
+        fromLayerBtn.title = "Replace depth map from an existing layer";
+        fromLayerBtn.addEventListener("click", () => this.openDepthFromLayerMenu(fromLayerBtn));
+        row.appendChild(fromLayerBtn);
 
         const detailLab = el("label", "ipc-depth-detail-label", "Detail");
         const detailSel = el("select", "ipc-select ipc-depth-detail-select");
