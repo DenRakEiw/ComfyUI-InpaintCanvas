@@ -1500,6 +1500,9 @@ const STYLE = `
 .ipc-fx b { width:42px; text-align:right; font-weight:500; color:var(--sc-fg-2, #bbb); }
 .ipc-fx .ipc-lutrow { grid-column:1 / -1; display:flex; gap:6px; align-items:center; min-width:0; }
 .ipc-fx .ipc-lutrow span { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--sc-fg-2, #aaa); }
+.ipc-wheels { display:grid; grid-template-columns:1fr 1fr; gap:6px; }
+.ipc-wheel { display:flex; flex-direction:column; align-items:center; gap:2px; }
+.ipc-wheel span { color:var(--sc-muted, #888); }
 .ipc-layer .ipc-maskrow { display:flex; align-items:center; gap:2px; color:var(--sc-muted, #888); font-size:11px; }
 .ipc-layer .ipc-maskrow .ipc-sel { flex:0 1 auto; min-width:0; max-width:96px; }
 .ipc-layer .ipc-maskrow .ipc-grow { flex:1; }

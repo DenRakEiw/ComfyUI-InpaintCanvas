@@ -16,6 +16,7 @@ import { curveDefaults, curvesToTables, buildCurvesControl } from "./inpaint_cur
 import { applyFilterGL, applyMatchGL, glToCanvas } from "./inpaint_filters_gl.js";
 import { hazeStats, applyHaze, dehazeStats, applyDehaze } from "./inpaint_depthfx.js";
 import { colorGradeTables, gradeIdentity } from "./inpaint_grade.js";
+import { buildWheelsControl } from "./inpaint_wheels.js";
 
 function makeCanvas(w, h) {
     const c = document.createElement("canvas");
@@ -1034,21 +1035,23 @@ export const FILTERS = {
     color_grade: {
         label: "Colour grading",
         params: [
-            { key: "sh_hue", label: "Shadows hue", min: 0, max: 360, step: 1, default: 220, unit: "\u00B0" },
-            { key: "sh_sat", label: "Shadows saturation", min: 0, max: 100, step: 1, default: 0, unit: "%" },
-            { key: "sh_lum", label: "Shadows brightness", min: -100, max: 100, step: 1, default: 0 },
-            { key: "mid_hue", label: "Midtones hue", min: 0, max: 360, step: 1, default: 30, unit: "\u00B0" },
-            { key: "mid_sat", label: "Midtones saturation", min: 0, max: 100, step: 1, default: 0, unit: "%" },
-            { key: "mid_lum", label: "Midtones brightness", min: -100, max: 100, step: 1, default: 0 },
-            { key: "hi_hue", label: "Highlights hue", min: 0, max: 360, step: 1, default: 40, unit: "\u00B0" },
-            { key: "hi_sat", label: "Highlights saturation", min: 0, max: 100, step: 1, default: 0, unit: "%" },
-            { key: "hi_lum", label: "Highlights brightness", min: -100, max: 100, step: 1, default: 0 },
-            { key: "glob_hue", label: "Global hue", min: 0, max: 360, step: 1, default: 0, unit: "\u00B0" },
-            { key: "glob_sat", label: "Global saturation", min: 0, max: 100, step: 1, default: 0, unit: "%" },
-            { key: "glob_lum", label: "Global brightness", min: -100, max: 100, step: 1, default: 0 },
+            { key: "wheels", label: "Wheels", type: "custom", default: null },
+            { key: "sh_hue", label: "Shadows hue", min: 0, max: 360, step: 1, default: 220, unit: "\u00B0", hidden: true },
+            { key: "sh_sat", label: "Shadows saturation", min: 0, max: 100, step: 1, default: 0, unit: "%", hidden: true },
+            { key: "sh_lum", label: "Shadows brightness", min: -100, max: 100, step: 1, default: 0, hidden: true },
+            { key: "mid_hue", label: "Midtones hue", min: 0, max: 360, step: 1, default: 30, unit: "\u00B0", hidden: true },
+            { key: "mid_sat", label: "Midtones saturation", min: 0, max: 100, step: 1, default: 0, unit: "%", hidden: true },
+            { key: "mid_lum", label: "Midtones brightness", min: -100, max: 100, step: 1, default: 0, hidden: true },
+            { key: "hi_hue", label: "Highlights hue", min: 0, max: 360, step: 1, default: 40, unit: "\u00B0", hidden: true },
+            { key: "hi_sat", label: "Highlights saturation", min: 0, max: 100, step: 1, default: 0, unit: "%", hidden: true },
+            { key: "hi_lum", label: "Highlights brightness", min: -100, max: 100, step: 1, default: 0, hidden: true },
+            { key: "glob_hue", label: "Global hue", min: 0, max: 360, step: 1, default: 0, unit: "\u00B0", hidden: true },
+            { key: "glob_sat", label: "Global saturation", min: 0, max: 100, step: 1, default: 0, unit: "%", hidden: true },
+            { key: "glob_lum", label: "Global brightness", min: -100, max: 100, step: 1, default: 0, hidden: true },
             { key: "balance", label: "Balance", min: -100, max: 100, step: 1, default: 0 },
             { key: "blending", label: "Blending", min: 0, max: 100, step: 1, default: 50 },
         ],
+        control: (layer, p, cb) => buildWheelsControl(layer, p, cb),
         reach: 0,
         apply: applyColorGrade,
     },
