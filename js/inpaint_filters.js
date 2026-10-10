@@ -15,6 +15,7 @@
 import { curveDefaults, curvesToTables, buildCurvesControl } from "./inpaint_curves.js";
 import { applyFilterGL, applyMatchGL, glToCanvas } from "./inpaint_filters_gl.js";
 import { hazeStats, applyHaze, dehazeStats, applyDehaze } from "./inpaint_depthfx.js";
+import { colorGradeTables, gradeIdentity } from "./inpaint_grade.js";
 
 function makeCanvas(w, h) {
     const c = document.createElement("canvas");
@@ -797,10 +798,7 @@ function colorBalanceTables(p) {
     return { dR, dG, dB };
 }
 
-function applyColorBalance(src, p) {
-    const keys = ["shadows_cr", "shadows_mg", "shadows_yb", "mid_cr", "mid_mg", "mid_yb", "high_cr", "high_mg", "high_yb"];
-    if (keys.every((k) => !(p[k] ?? 0))) return copyCanvas(src);
-    const { dR, dG, dB } = colorBalanceTables(p);
+function applyOffsets(src, dR, dG, dB) {
     const { out, octx, img, px } = openPixels(src);
     for (let i = 0; i < px.length; i += 4) {
         const r = px[i], g = px[i + 1], b = px[i + 2];
@@ -809,6 +807,19 @@ function applyColorBalance(src, p) {
     }
     octx.putImageData(img, 0, 0);
     return out;
+}
+
+function applyColorBalance(src, p) {
+    const keys = ["shadows_cr", "shadows_mg", "shadows_yb", "mid_cr", "mid_mg", "mid_yb", "high_cr", "high_mg", "high_yb"];
+    if (keys.every((k) => !(p[k] ?? 0))) return copyCanvas(src);
+    const { dR, dG, dB } = colorBalanceTables(p);
+    return applyOffsets(src, dR, dG, dB);
+}
+
+function applyColorGrade(src, p) {
+    if (gradeIdentity(p)) return copyCanvas(src);
+    const { dR, dG, dB } = colorGradeTables(p);
+    return applyOffsets(src, dR, dG, dB);
 }
 
 // ---------------------------------------------------------------------------
@@ -1020,6 +1031,27 @@ export const FILTERS = {
         reach: 0,
         apply: applyColorBalance,
     },
+    color_grade: {
+        label: "Colour grading",
+        params: [
+            { key: "sh_hue", label: "Shadows hue", min: 0, max: 360, step: 1, default: 220, unit: "\u00B0" },
+            { key: "sh_sat", label: "Shadows saturation", min: 0, max: 100, step: 1, default: 0, unit: "%" },
+            { key: "sh_lum", label: "Shadows brightness", min: -100, max: 100, step: 1, default: 0 },
+            { key: "mid_hue", label: "Midtones hue", min: 0, max: 360, step: 1, default: 30, unit: "\u00B0" },
+            { key: "mid_sat", label: "Midtones saturation", min: 0, max: 100, step: 1, default: 0, unit: "%" },
+            { key: "mid_lum", label: "Midtones brightness", min: -100, max: 100, step: 1, default: 0 },
+            { key: "hi_hue", label: "Highlights hue", min: 0, max: 360, step: 1, default: 40, unit: "\u00B0" },
+            { key: "hi_sat", label: "Highlights saturation", min: 0, max: 100, step: 1, default: 0, unit: "%" },
+            { key: "hi_lum", label: "Highlights brightness", min: -100, max: 100, step: 1, default: 0 },
+            { key: "glob_hue", label: "Global hue", min: 0, max: 360, step: 1, default: 0, unit: "\u00B0" },
+            { key: "glob_sat", label: "Global saturation", min: 0, max: 100, step: 1, default: 0, unit: "%" },
+            { key: "glob_lum", label: "Global brightness", min: -100, max: 100, step: 1, default: 0 },
+            { key: "balance", label: "Balance", min: -100, max: 100, step: 1, default: 0 },
+            { key: "blending", label: "Blending", min: 0, max: 100, step: 1, default: 50 },
+        ],
+        reach: 0,
+        apply: applyColorGrade,
+    },
     bw: {
         label: "Black & white",
         params: [
@@ -1135,7 +1167,7 @@ export const FILTERS = {
 export const FILTER_IDS = Object.keys(FILTERS);
 
 // table builders shared with the WebGL2 path
-export { levelsTable, brightnessContrastTable, hueSatMatrix, lightnessTable, colorBalanceTables, hueToRgb, LOOK_DEFAULT };
+export { levelsTable, brightnessContrastTable, hueSatMatrix, lightnessTable, colorBalanceTables, colorGradeTables, hueToRgb, LOOK_DEFAULT };
 
 export function filterDefaults(id) {
     const out = {};

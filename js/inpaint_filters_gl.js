@@ -17,6 +17,7 @@
 import { curvesToTables } from "./inpaint_curves.js";
 import { levelsTable, brightnessContrastTable, hueSatMatrix, lightnessTable, colorBalanceTables, hueToRgb, LOOK_DEFAULT, grainNoiseCanvas, colourStats } from "./inpaint_filters.js";
 import { registerHazeGL, registerDehazeGL } from "./inpaint_depthfx.js";
+import { colorGradeTables, gradeIdentity } from "./inpaint_grade.js";
 
 const VS = `#version 300 es
 in vec2 a_pos;
@@ -131,7 +132,7 @@ void main() {
     o = vec4(clamp(c, 0.0, 1.0), s.a);
 }`;
 
-const SUPPORTED = new Set(["levels", "curves", "brightness_contrast", "hue_sat", "color_balance", "bw", "invert", "lut", "grain", "normalize"]);
+const SUPPORTED = new Set(["levels", "curves", "brightness_contrast", "hue_sat", "color_balance", "bw", "invert", "lut", "grain", "normalize", "color_grade"]);
 
 /**
  * Draw the full-screen triangle for a W x H result and return it as a 2D canvas.
@@ -725,6 +726,18 @@ function setTables(g, tr, tg = tr, tb = tr) {
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 256, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
 }
 
+/** Upload offset tables as a 256 x 1 RGBA32F texture (unit 2) and select mode 2. */
+function setOffsets(g, dR, dG, dB) {
+    const { gl, u } = g;
+    const data = new Float32Array(256 * 4);
+    for (let i = 0; i < 256; i++) { data[i * 4] = dR[i]; data[i * 4 + 1] = dG[i]; data[i * 4 + 2] = dB[i]; data[i * 4 + 3] = 1; }
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, g.texOffsets);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, 256, 1, 0, gl.RGBA, gl.FLOAT, data);
+    gl.uniform1i(u.u_mode, 2);
+    return true;
+}
+
 const IDENTITY = new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]);
 const INVERT_TABLE = (() => { const t = new Uint8ClampedArray(256); for (let i = 0; i < 256; i++) t[i] = 255 - i; return t; })();
 
@@ -816,17 +829,15 @@ const SETUP = {
         return true;
     },
     color_balance(g, p) {
-        const { gl, u } = g;
         const keys = ["shadows_cr", "shadows_mg", "shadows_yb", "mid_cr", "mid_mg", "mid_yb", "high_cr", "high_mg", "high_yb"];
         if (keys.every((k) => !(p[k] ?? 0))) return false;
         const { dR, dG, dB } = colorBalanceTables(p);
-        const data = new Float32Array(256 * 4);
-        for (let i = 0; i < 256; i++) { data[i * 4] = dR[i]; data[i * 4 + 1] = dG[i]; data[i * 4 + 2] = dB[i]; data[i * 4 + 3] = 1; }
-        gl.activeTexture(gl.TEXTURE2);
-        gl.bindTexture(gl.TEXTURE_2D, g.texOffsets);
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, 256, 1, 0, gl.RGBA, gl.FLOAT, data);
-        gl.uniform1i(u.u_mode, 2);
-        return true;
+        return setOffsets(g, dR, dG, dB);
+    },
+    color_grade(g, p) {
+        if (gradeIdentity(p)) return false;
+        const { dR, dG, dB } = colorGradeTables(p);
+        return setOffsets(g, dR, dG, dB);
     },
     bw(g, p) {
         const { gl, u } = g;
