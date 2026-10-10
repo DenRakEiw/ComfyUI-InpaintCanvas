@@ -35,6 +35,10 @@ export const BLENDS = Object.freeze([
     Object.freeze({ id: "subtract", label: "Subtract", group: "inversion", op: 17, canvas: null, psd: "fsub", ora: "scumble:subtract", oraRead: ["krita:subtract"], reader: 5 }),
     Object.freeze({ id: "pin-light", label: "Pin light", group: "contrast", op: 18, canvas: null, psd: "pLit", ora: "scumble:pin-light", oraRead: ["krita:pin_light"], reader: 5 }),
     Object.freeze({ id: "hard-mix", label: "Hard mix", group: "contrast", op: 19, canvas: null, psd: "hMix", ora: "scumble:hard-mix", oraRead: ["krita:hard mix", "krita:hard_mix_photoshop"], reader: 5 }),
+    Object.freeze({ id: "color-dodge", label: "Colour dodge", group: "lighten", op: 20, canvas: null, psd: "div ", ora: "svg:color-dodge", oraRead: [], reader: 5 }),
+    Object.freeze({ id: "color-burn", label: "Colour burn", group: "darken", op: 21, canvas: null, psd: "idiv", ora: "svg:color-burn", oraRead: [], reader: 5 }),
+    Object.freeze({ id: "vivid-light", label: "Vivid light", group: "contrast", op: 22, canvas: null, psd: "vLit", ora: "scumble:vivid-light", oraRead: ["krita:vivid_light"], reader: 5 }),
+    Object.freeze({ id: "divide", label: "Divide", group: "inversion", op: 23, canvas: null, psd: "fdiv", ora: "scumble:divide", oraRead: ["krita:divide"], reader: 5 }),
 ]);
 
 /** @type {string[]} */

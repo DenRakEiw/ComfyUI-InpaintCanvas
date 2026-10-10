@@ -45,6 +45,8 @@ float bm_softLight(float b, float s) {
     float d = b <= 0.25 ? ((16.0 * b - 12.0) * b + 4.0) * b : sqrt(b);
     return s <= 0.5 ? b - (1.0 - 2.0 * s) * b * (1.0 - b) : b + (2.0 * s - 1.0) * (d - b);
 }
+float bm_dodge(float b, float s) { return b <= 0.0 ? 0.0 : s >= 1.0 ? 1.0 : min(1.0, b / (1.0 - s)); }
+float bm_burn(float b, float s) { return b >= 1.0 ? 1.0 : s <= 0.0 ? 0.0 : 1.0 - min(1.0, (1.0 - b) / s); }
 float blend1(int mode, float b, float s) {
     if (mode == 5) return b * s;
     if (mode == 6) return bm_screen(b, s);
@@ -61,6 +63,10 @@ float blend1(int mode, float b, float s) {
     if (mode == 17) return max(0.0, b - s);
     if (mode == 18) return s <= 0.5 ? min(b, 2.0 * s) : max(b, 2.0 * s - 1.0);
     if (mode == 19) return floor(b * 255.0 + 0.5) + floor(s * 255.0 + 0.5) >= 255.0 ? 1.0 : 0.0;
+    if (mode == 20) return bm_dodge(b, s);
+    if (mode == 21) return bm_burn(b, s);
+    if (mode == 22) return s <= 0.5 ? bm_burn(b, 2.0 * s) : bm_dodge(b, 2.0 * s - 1.0);
+    if (mode == 23) return s <= 0.0 ? (b <= 0.0 ? 0.0 : 1.0) : min(1.0, b / s);
     return s;
 }
 vec3 blendRGB(int mode, vec3 b, vec3 s) {

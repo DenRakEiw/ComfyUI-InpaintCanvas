@@ -346,8 +346,9 @@ function similarAt(d, i, r0, g0, b0, a0, tol) {
  * The operator is chosen once per layer, not per pixel, and the common case (no mask, full
  * opacity) has loops of its own.
  *
- * The fifteen blend modes (ops 5 to 12, docs/PLAN_BCE.md section 3b B item 7; linear light, op 13, docs/PLAN_0_1_31.md section 4 step 8;
- * ops 14 to 19 exclusion, linear dodge, linear burn, subtract, pin light, hard mix, docs/PLAN_NIK9_BUILD.md R4-S4)
+ * The nineteen blend modes (ops 5 to 12, docs/PLAN_BCE.md section 3b B item 7; linear light, op 13, docs/PLAN_0_1_31.md section 4 step 8;
+ * ops 14 to 19 exclusion, linear dodge, linear burn, subtract, pin light, hard mix, docs/PLAN_NIK9_BUILD.md R4-S4;
+ * ops 20 to 23 colour dodge, colour burn, vivid light, divide, docs/PLAN_NIK9_BUILD.md R4-S5)
  * are the W3C formula rounded ONCE per channel (three rounded products were up to 1.45 levels from the exact value; this
  * is within half a level). Linear light is not a W3C mode; B = clamp(cb + 2*cs - 1, 0, 1) as Photoshop has it:
  *
@@ -364,6 +365,10 @@ function similarAt(d, i, r0, g0, b0, a0, tol) {
  *     subtract    255 * (max(b, s) - s)
  *     pin-light   s <= 127 ? 255 * min(b, 2s) : 255 * max(b, 2s - 255)
  *     hard-mix    b + s >= 255 ? 65025 : 0
+ *     color-dodge   b === 0 ? 0 : s >= 255 ? 65025 : min(65025, floor((130050*b + (255-s)) / (2*(255-s))))
+ *     color-burn    b >= 255 ? 65025 : s === 0 ? 0 : 65025 - min(65025, floor((130050*(255-b) + s) / (2*s)))
+ *     vivid-light   s <= 127 ? burn(b, 2s) : dodge(b, 2s - 255)
+ *     divide        s === 0 ? (b === 0 ? 0 : 65025) : min(65025, floor((130050*b + s) / (2*s)))
  *   over an opaque backdrop:  r = floor((dp*inv*255 + sa*B16 + 32512) / 65025)
  *   else, with cb = dp unpremultiplied as at the end and ra = sa + mul255(da, inv):
  *     r = min(ra, floor((s.c*sa*(255 - da)*255 + dp*inv*65025 + sa*da*B16 + 8290687) / 16581375))
@@ -558,7 +563,20 @@ function hardLight(b, s) {
     return s <= 127 ? 2 * b * s : 65025 - (255 - b) * (510 - 2 * s);
 }
 
-/** 255 · B(cb, cs) of a blend mode, both straight 0..255: 0..65025. */
+function dodge16(b, s) {
+    if (b === 0) return 0;
+    if (s >= 255) return 65025;
+    const d = 255 - s;
+    return Math.min(65025, Math.floor((130050 * b + d) / (2 * d)));
+}
+
+function burn16(b, s) {
+    if (b >= 255) return 65025;
+    if (s === 0) return 0;
+    return 65025 - Math.min(65025, Math.floor((130050 * (255 - b) + s) / (2 * s)));
+}
+
+/** 255 * B(cb, cs) of a blend mode, both straight 0..255: 0..65025. */
 function blendOf(op, b, s) {
     switch (op) {
         case 5: return b * s;
@@ -578,6 +596,13 @@ function blendOf(op, b, s) {
         case 17: return 255 * Math.max(0, b - s);
         case 18: return s <= 127 ? 255 * Math.min(b, 2 * s) : 255 * Math.max(b, 2 * s - 255);
         case 19: return b + s >= 255 ? 65025 : 0;
+        case 20: return dodge16(b, s);
+        case 21: return burn16(b, s);
+        case 22: return s <= 127 ? burn16(b, 2 * s) : dodge16(b, 2 * s - 255);
+        case 23: {
+            if (s === 0) return b === 0 ? 0 : 65025;
+            return Math.min(65025, Math.floor((130050 * b + s) / (2 * s)));
+        }
         default: return 255 * (b > s ? b - s : s - b);
     }
 }
