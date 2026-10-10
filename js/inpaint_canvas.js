@@ -20,7 +20,7 @@ import { TEXT_DEFAULTS, FONT_CATEGORIES, loadFontList, fontList, addUserFont, re
 import { readAbr, tipCanvas } from "./inpaint_brushes.js";
 import { setKernels, kernelsMode, OPS, deflate, smudgeDab as smudgeDabKernel, SMUDGE_ALPHA_LOCK, SMUDGE_PICKUP, compositeTile, poissonBlend as poissonBlendKernel, distTransform } from "./px/kernels.js";
 import { floodMask, maskToColorCanvas, clipMaskToSelection, rgbToHex, hexToRgb, growMask, invertMask, maskBounds, selModeOf, selectionGco, tilesSource, bytesSource, rectSource } from "./inpaint_raster.js";
-import { GLCompositor } from "./inpaint_compositor.js";
+import { GLCompositor, BLEND_FN_GLSL } from "./inpaint_compositor.js";
 import { LayerPixels, MaskPixels, canvasOf, displayCanvasIfMade, installLayerAliases, deprecatedPixels, pixelsOptions, BLIT_MARGIN, resetContext } from "./inpaint_pixels.js";
 import { INTERACTIVE, EXPORT } from "./inpaint_pool.js";
 import { pngHeader, asciiJson, pngWithChunks, SRGB_CHUNK } from "./inpaint_png.js";
@@ -318,14 +318,14 @@ const CURSOR_CLASSES = ["ipc-scale", "ipc-scale-ne", "ipc-scale-x", "ipc-scale-y
 const TONE_DAB = Object.freeze({ strength: 100, length: 0 });
 // the largest box frequency separation takes at once (two float copies of it are 32 bytes a pixel)
 const FREQ_MAX_PX = 16e6;
-// linear light over the backdrop (the input), the W3C source-over-with-blend of inpaint_compositor.js, straight alpha
-const LINEAR_LIGHT_SHADER = {
-    label: "linear light",
-    uniforms: { u_layer: "sampler2D", u_opacity: "float" },
-    code: `vec4 shade(vec4 B, vec2 uv) {
+// emulated blend modes over the backdrop (the input), the W3C source-over-with-blend of inpaint_compositor.js, straight alpha
+const EMULATED_BLEND_SHADER = {
+    label: "emulated blend",
+    uniforms: { u_layer: "sampler2D", u_opacity: "float", u_mode: "int" },
+    code: BLEND_FN_GLSL + `vec4 shade(vec4 B, vec2 uv) {
     vec4 S = texture(u_layer, uv);
     float as = S.a * u_opacity, ab = B.a;
-    vec3 bl = clamp(B.rgb + 2.0 * S.rgb - 1.0, 0.0, 1.0);
+    vec3 bl = blendRGB(u_mode, B.rgb, S.rgb);
     vec3 cs = mix(S.rgb, bl, ab);
     float ao = as + ab * (1.0 - as);
     vec3 co = cs * as + B.rgb * ab * (1.0 - as);
@@ -333,10 +333,10 @@ const LINEAR_LIGHT_SHADER = {
 }`,
 };
 // the same, clipped (PLAN_0_1_31 §6 step 3): the base's coverage scales the layer's alpha, as the compositor's u_clip does
-const LINEAR_LIGHT_CLIP_SHADER = {
-    label: "linear light, clipped",
-    uniforms: { u_layer: "sampler2D", u_clip: "sampler2D", u_opacity: "float" },
-    code: LINEAR_LIGHT_SHADER.code.replace("float as = S.a * u_opacity,", "float as = S.a * u_opacity * texture(u_clip, uv).a,"),
+const EMULATED_BLEND_CLIP_SHADER = {
+    label: "emulated blend, clipped",
+    uniforms: { u_layer: "sampler2D", u_clip: "sampler2D", u_opacity: "float", u_mode: "int" },
+    code: EMULATED_BLEND_SHADER.code.replace("float as = S.a * u_opacity,", "float as = S.a * u_opacity * texture(u_clip, uv).a,"),
 };
 
 /** Red range preview tint shader (R1-S6). */
@@ -14077,9 +14077,16 @@ class InpaintEditor {
             ctx.restore();
             return;
         }
-        if (screen && mode === "linear-light") {
+        if (screen && EMULATED_BLENDS.has(mode)) {
             let out = null;
-            try { out = clip ? runShader(LINEAR_LIGHT_CLIP_SHADER, cv, { u_layer: s, u_clip: clip, u_opacity: Math.max(0, Math.min(1, opacity)) }) : runShader(LINEAR_LIGHT_SHADER, cv, { u_layer: s, u_opacity: Math.max(0, Math.min(1, opacity)) }); } catch (err) { console.warn("Inpaint Canvas: the linear light shader failed, blending on the CPU:", err); }
+            const uMode = BLEND_OPS[mode];
+            try {
+                out = clip
+                    ? runShader(EMULATED_BLEND_CLIP_SHADER, cv, { u_layer: s, u_clip: clip, u_opacity: Math.max(0, Math.min(1, opacity)), u_mode: uMode })
+                    : runShader(EMULATED_BLEND_SHADER, cv, { u_layer: s, u_opacity: Math.max(0, Math.min(1, opacity)), u_mode: uMode });
+            } catch (err) {
+                console.warn("Inpaint Canvas: the blend shader failed, blending on the CPU:", err);
+            }
             if (out) {
                 const img = isGLSurface(out) ? surfaceToCanvas(out) : out;
                 ctx.save();

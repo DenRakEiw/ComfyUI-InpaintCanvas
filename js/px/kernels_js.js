@@ -383,6 +383,7 @@ export function compositeTile(dst, srcs, ops, alphas, masks = null) {
         else if (op === 2) atop(d, src, o, mask, px);
         else if (op === 3) keepIn(d, src, o, mask, px);
         else if (op >= 5 && op <= LAST_BLEND) blendOp(d, src, o, mask, px, op);
+        else if (op > LAST_BLEND) over(d, src, o, mask, px);
         else copyOp(d, src, o, mask, px);
     }
     for (let i = 0, n = px * 4; i < n; i += 4) {
@@ -562,12 +563,23 @@ function blendOf(op, b, s) {
             if (s <= 127) return 255 * b - Math.floor(((255 - 2 * s) * b * (255 - b) + 127) / 255);
             return 255 * b + Math.floor(((2 * s - 255) * (SOFT_D[b] - b * 257) + 128) / 257);
         case 11: return hardLight(b, s);
+        case 12: return 255 * (b > s ? b - s : s - b);
         case 13: { const t = b + 2 * s - 255; return 255 * (t < 0 ? 0 : t > 255 ? 255 : t); }
         default: return 255 * (b > s ? b - s : s - b);
     }
 }
 
+export function blend3(op, b0, b1, b2, s0, s1, s2, out) {
+    out[0] = blendOf(op, b0, s0);
+    out[1] = blendOf(op, b1, s1);
+    out[2] = blendOf(op, b2, s2);
+    return out;
+}
+
+const BLEND_BUF = new Int32Array(3);
+
 function blendOp(d, s, o, mask, px, op) {
+    const bl = BLEND_BUF;
     for (let p = 0, i = 0; p < px; p++, i += 4) {
         const m = mask ? mask[p] : 255;
         if (m === 0) continue;
@@ -575,25 +587,30 @@ function blendOp(d, s, o, mask, px, op) {
         if (sa === 0) continue;
         const inv = 255 - sa, da = d[i + 3];
         if (da === 255) {
+            blend3(op, d[i], d[i + 1], d[i + 2], s[i], s[i + 1], s[i + 2], bl);
             const k = inv * 255;
-            const r = Math.floor((d[i] * k + sa * blendOf(op, d[i], s[i]) + 32512) / 65025);
-            const g = Math.floor((d[i + 1] * k + sa * blendOf(op, d[i + 1], s[i + 1]) + 32512) / 65025);
-            const b = Math.floor((d[i + 2] * k + sa * blendOf(op, d[i + 2], s[i + 2]) + 32512) / 65025);
+            const r = Math.floor((d[i] * k + sa * bl[0] + 32512) / 65025);
+            const g = Math.floor((d[i + 1] * k + sa * bl[1] + 32512) / 65025);
+            const b = Math.floor((d[i + 2] * k + sa * bl[2] + 32512) / 65025);
             lerpStore(d, i, r, g, b, 255, m);
             continue;
         }
         const t = da * inv + 128;
         const ra = sa + ((t + (t >> 8)) >> 8);
         const both = sa * da, only = sa * (255 - da) * 255, h = da >> 1, below = inv * 65025;
-        let r = 0, g = 0, b = 0;
-        for (let c = 0; c < 3; c++) {
-            const dp = d[i + c], sc = s[i + c];
-            let cb = 0;
-            if (da !== 0) { cb = ((dp * 255 + h) / da) | 0; if (cb > 255) cb = 255; }
-            let v = Math.floor((sc * only + dp * below + both * blendOf(op, cb, sc) + 8290687) / 16581375);
-            if (v > ra) v = ra;
-            if (c === 0) r = v; else if (c === 1) g = v; else b = v;
+        let cb0 = 0, cb1 = 0, cb2 = 0;
+        if (da !== 0) {
+            cb0 = ((d[i] * 255 + h) / da) | 0; if (cb0 > 255) cb0 = 255;
+            cb1 = ((d[i + 1] * 255 + h) / da) | 0; if (cb1 > 255) cb1 = 255;
+            cb2 = ((d[i + 2] * 255 + h) / da) | 0; if (cb2 > 255) cb2 = 255;
         }
+        blend3(op, cb0, cb1, cb2, s[i], s[i + 1], s[i + 2], bl);
+        let r = Math.floor((s[i] * only + d[i] * below + both * bl[0] + 8290687) / 16581375);
+        if (r > ra) r = ra;
+        let g = Math.floor((s[i + 1] * only + d[i + 1] * below + both * bl[1] + 8290687) / 16581375);
+        if (g > ra) g = ra;
+        let b = Math.floor((s[i + 2] * only + d[i + 2] * below + both * bl[2] + 8290687) / 16581375);
+        if (b > ra) b = ra;
         lerpStore(d, i, r, g, b, ra, m);
     }
 }

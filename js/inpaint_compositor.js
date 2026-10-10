@@ -38,6 +38,30 @@ void main() {
     gl_Position = vec4(p, 0.0, 1.0);
 }`;
 
+export const BLEND_FN_GLSL = `
+float bm_screen(float b, float s) { return b + s - b * s; }
+float bm_hardLight(float b, float s) { return s <= 0.5 ? b * (2.0 * s) : bm_screen(b, 2.0 * s - 1.0); }
+float bm_softLight(float b, float s) {
+    float d = b <= 0.25 ? ((16.0 * b - 12.0) * b + 4.0) * b : sqrt(b);
+    return s <= 0.5 ? b - (1.0 - 2.0 * s) * b * (1.0 - b) : b + (2.0 * s - 1.0) * (d - b);
+}
+float blend1(int mode, float b, float s) {
+    if (mode == 5) return b * s;
+    if (mode == 6) return bm_screen(b, s);
+    if (mode == 7) return bm_hardLight(s, b);   // overlay: hard-light with the arguments swapped
+    if (mode == 8) return min(b, s);
+    if (mode == 9) return max(b, s);
+    if (mode == 10) return bm_softLight(b, s);
+    if (mode == 11) return bm_hardLight(b, s);
+    if (mode == 12) return abs(b - s);
+    if (mode == 13) return clamp(b + 2.0 * s - 1.0, 0.0, 1.0);   // linear light (PLAN_0_1_31 section 4 step 8)
+    return s;
+}
+vec3 blendRGB(int mode, vec3 b, vec3 s) {
+    return vec3(blend1(mode, b.r, s.r), blend1(mode, b.g, s.g), blend1(mode, b.b, s.b));
+}
+`;
+
 // The blend maths and the compositing step, shared by the quad shader (one source canvas) and the
 // atlas shader (one instanced quad per tile).
 const BLEND_GLSL = `
@@ -48,26 +72,7 @@ uniform float u_opacity;
 uniform vec2 u_size;            // framebuffer size, to sample the backdrop by position
 uniform sampler2D u_clip;       // clipping (PLAN_0_1_31 6.3): the base's coverage in its alpha, by position
 uniform int u_hasClip;
-
-float bScreen(float b, float s) { return b + s - b * s; }
-float bHardLight(float b, float s) { return s <= 0.5 ? b * (2.0 * s) : bScreen(b, 2.0 * s - 1.0); }
-float bSoftLight(float b, float s) {
-    float d = b <= 0.25 ? ((16.0 * b - 12.0) * b + 4.0) * b : sqrt(b);
-    return s <= 0.5 ? b - (1.0 - 2.0 * s) * b * (1.0 - b) : b + (2.0 * s - 1.0) * (d - b);
-}
-float blend1(float b, float s) {
-    if (u_mode == 5) return b * s;
-    if (u_mode == 6) return bScreen(b, s);
-    if (u_mode == 7) return bHardLight(s, b);   // overlay: hard-light with the arguments swapped
-    if (u_mode == 8) return min(b, s);
-    if (u_mode == 9) return max(b, s);
-    if (u_mode == 10) return bSoftLight(b, s);
-    if (u_mode == 11) return bHardLight(b, s);
-    if (u_mode == 12) return abs(b - s);
-    if (u_mode == 13) return clamp(b + 2.0 * s - 1.0, 0.0, 1.0);   // linear light (PLAN_0_1_31 section 4 step 8)
-    return s;
-}
-
+` + BLEND_FN_GLSL + `
 vec4 blendOver(vec4 Sp) {
     // The backdrop is a framebuffer texture: same orientation as gl_FragCoord, no flip.
     vec2 fb = gl_FragCoord.xy / u_size;
@@ -80,7 +85,7 @@ vec4 blendOver(vec4 Sp) {
     vec4 S = vec4(Sp.a > 0.0 ? Sp.rgb / Sp.a : vec3(0.0), Sp.a);
     float as = S.a * u_opacity;
     float ab = B.a;
-    vec3 blended = vec3(blend1(B.r, S.r), blend1(B.g, S.g), blend1(B.b, S.b));
+    vec3 blended = blendRGB(u_mode, B.rgb, S.rgb);
     vec3 cs = mix(S.rgb, blended, ab);
     float ao = as + ab * (1.0 - as);
     vec3 co = cs * as + B.rgb * ab * (1.0 - as);
