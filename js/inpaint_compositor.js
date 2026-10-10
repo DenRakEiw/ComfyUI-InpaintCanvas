@@ -55,6 +55,12 @@ float blend1(int mode, float b, float s) {
     if (mode == 11) return bm_hardLight(b, s);
     if (mode == 12) return abs(b - s);
     if (mode == 13) return clamp(b + 2.0 * s - 1.0, 0.0, 1.0);   // linear light (PLAN_0_1_31 section 4 step 8)
+    if (mode == 14) return b + s - 2.0 * b * s;
+    if (mode == 15) return min(1.0, b + s);
+    if (mode == 16) return max(0.0, b + s - 1.0);
+    if (mode == 17) return max(0.0, b - s);
+    if (mode == 18) return s <= 0.5 ? min(b, 2.0 * s) : max(b, 2.0 * s - 1.0);
+    if (mode == 19) return floor(b * 255.0 + 0.5) + floor(s * 255.0 + 0.5) >= 255.0 ? 1.0 : 0.0;
     return s;
 }
 vec3 blendRGB(int mode, vec3 b, vec3 s) {

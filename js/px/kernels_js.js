@@ -346,21 +346,28 @@ function similarAt(d, i, r0, g0, b0, a0, tol) {
  * The operator is chosen once per layer, not per pixel, and the common case (no mask, full
  * opacity) has loops of its own.
  *
- * The nine blend modes (ops 5 to 12, docs/PLAN_BCE.md §3b B item 7; linear light, op 13, docs/PLAN_0_1_31.md §4 step 8)
+ * The fifteen blend modes (ops 5 to 12, docs/PLAN_BCE.md section 3b B item 7; linear light, op 13, docs/PLAN_0_1_31.md section 4 step 8;
+ * ops 14 to 19 exclusion, linear dodge, linear burn, subtract, pin light, hard mix, docs/PLAN_NIK9_BUILD.md R4-S4)
  * are the W3C formula rounded ONCE per channel (three rounded products were up to 1.45 levels from the exact value; this
- * is within half a level). Linear light is not a W3C mode; B = clamp(cb + 2·cs − 1, 0, 1) as Photoshop has it:
+ * is within half a level). Linear light is not a W3C mode; B = clamp(cb + 2*cs - 1, 0, 1) as Photoshop has it:
  *
- *   B16(cb, cs) = 255 · B, exact integers:
- *     multiply    b·s                          screen      65025 − (255 − b)(255 − s)
- *     hard-light  s ≤ 127 ? 2·b·s : 65025 − (255 − b)(510 − 2s)        overlay: b and s swapped
- *     darken, lighten, difference   255 · min, max, |b − s|
- *     linear-light  255 · clamp(b + 2s − 255, 0, 255)
- *     soft-light  s ≤ 127 ? 255·b − floor(((255 − 2s)·b·(255 − b) + 127) / 255)
- *                         : 255·b + floor(((2s − 255)·(SOFT_D[b] − 257·b) + 128) / 257)
- *   over an opaque backdrop:  r = floor((dp·inv·255 + sa·B16 + 32512) / 65025)
+ *   B16(cb, cs) = 255 * B, exact integers:
+ *     multiply    b*s                          screen      65025 - (255 - b)(255 - s)
+ *     hard-light  s <= 127 ? 2*b*s : 65025 - (255 - b)(510 - 2s)        overlay: b and s swapped
+ *     darken, lighten, difference   255 * min, max, |b - s|
+ *     linear-light  255 * clamp(b + 2s - 255, 0, 255)
+ *     soft-light  s <= 127 ? 255*b - floor(((255 - 2s)*b*(255 - b) + 127) / 255)
+ *                         : 255*b + floor(((2s - 255)*(SOFT_D[b] - 257*b) + 128) / 257)
+ *     exclusion   b*(255 - s) + s*(255 - b)
+ *     linear-dodge  255 * min(b + s, 255)
+ *     linear-burn   255 * (max(b + s, 255) - 255)
+ *     subtract    255 * (max(b, s) - s)
+ *     pin-light   s <= 127 ? 255 * min(b, 2s) : 255 * max(b, 2s - 255)
+ *     hard-mix    b + s >= 255 ? 65025 : 0
+ *   over an opaque backdrop:  r = floor((dp*inv*255 + sa*B16 + 32512) / 65025)
  *   else, with cb = dp unpremultiplied as at the end and ra = sa + mul255(da, inv):
- *     r = min(ra, floor((s.c·sa·(255 − da)·255 + dp·inv·65025 + sa·da·B16 + 8290687) / 16581375))
- *   The sums go up to 255⁴: plain numbers and Math.floor, no `| 0`.
+ *     r = min(ra, floor((s.c*sa*(255 - da)*255 + dp*inv*65025 + sa*da*B16 + 8290687) / 16581375))
+ *   The sums go up to 255^4: plain numbers and Math.floor, no `| 0`.
  */
 export function compositeTile(dst, srcs, ops, alphas, masks = null) {
     const d = bytesOf(dst);
@@ -565,6 +572,12 @@ function blendOf(op, b, s) {
         case 11: return hardLight(b, s);
         case 12: return 255 * (b > s ? b - s : s - b);
         case 13: { const t = b + 2 * s - 255; return 255 * (t < 0 ? 0 : t > 255 ? 255 : t); }
+        case 14: return b * (255 - s) + s * (255 - b);
+        case 15: return 255 * Math.min(255, b + s);
+        case 16: return 255 * Math.max(0, b + s - 255);
+        case 17: return 255 * Math.max(0, b - s);
+        case 18: return s <= 127 ? 255 * Math.min(b, 2 * s) : 255 * Math.max(b, 2 * s - 255);
+        case 19: return b + s >= 255 ? 65025 : 0;
         default: return 255 * (b > s ? b - s : s - b);
     }
 }

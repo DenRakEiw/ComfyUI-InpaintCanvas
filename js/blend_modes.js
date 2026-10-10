@@ -29,6 +29,12 @@ export const BLENDS = Object.freeze([
     Object.freeze({ id: "hard-light", label: "Hard light", group: "contrast", op: 11, canvas: "hard-light", psd: "hLit", ora: "svg:hard-light", oraRead: [], reader: 1 }),
     Object.freeze({ id: "linear-light", label: "Linear light", group: "contrast", op: 13, canvas: null, psd: "lLit", ora: "scumble:linear-light", oraRead: ["krita:linear_light", "krita:linear light"], reader: 2 }),
     Object.freeze({ id: "difference", label: "Difference", group: "inversion", op: 12, canvas: "difference", psd: "diff", ora: "svg:difference", oraRead: [], reader: 1 }),
+    Object.freeze({ id: "exclusion", label: "Exclusion", group: "inversion", op: 14, canvas: null, psd: "smud", ora: "scumble:exclusion", oraRead: ["svg:exclusion", "krita:exclusion"], reader: 5 }),
+    Object.freeze({ id: "linear-dodge", label: "Linear dodge (add)", group: "lighten", op: 15, canvas: null, psd: "lddg", ora: "scumble:linear-dodge", oraRead: ["krita:linear_dodge", "krita:add"], reader: 5 }),
+    Object.freeze({ id: "linear-burn", label: "Linear burn", group: "darken", op: 16, canvas: null, psd: "lbrn", ora: "scumble:linear-burn", oraRead: ["krita:linear_burn"], reader: 5 }),
+    Object.freeze({ id: "subtract", label: "Subtract", group: "inversion", op: 17, canvas: null, psd: "fsub", ora: "scumble:subtract", oraRead: ["krita:subtract"], reader: 5 }),
+    Object.freeze({ id: "pin-light", label: "Pin light", group: "contrast", op: 18, canvas: null, psd: "pLit", ora: "scumble:pin-light", oraRead: ["krita:pin_light"], reader: 5 }),
+    Object.freeze({ id: "hard-mix", label: "Hard mix", group: "contrast", op: 19, canvas: null, psd: "hMix", ora: "scumble:hard-mix", oraRead: ["krita:hard mix", "krita:hard_mix_photoshop"], reader: 5 }),
 ]);
 
 /** @type {string[]} */
