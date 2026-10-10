@@ -1383,7 +1383,7 @@ const STYLE = `
 .ipc-choices { max-height:60vh; overflow-y:auto; overflow-x:hidden; min-width:180px; }
 .ipc-choices-group { font-size:10px; font-weight:600; color:var(--sc-muted, #8a8a8a); padding:6px 10px 2px 10px; text-transform:uppercase; letter-spacing:0.5px; }
 .ipc-choice-item { display:flex; align-items:center; justify-content:flex-start; padding:5px 10px; border-radius:var(--sc-radius-sm, 4px); cursor:pointer; font-size:12px; color:var(--sc-fg, #ddd); white-space:nowrap; text-align:left; background:transparent; border:none; width:100%; box-sizing:border-box; }
-.ipc-choice-item:hover, .ipc-choice-item.ipc-active { background:var(--sc-hover, #333); color:var(--sc-fg-bright, #fff); }
+.ipc-choice-item:hover, .ipc-choice-item.ipc-active { background:var(--sc-btn-hover, #3a3a3a); color:var(--sc-fg-strong, #fff); }
 .ipc-choice-item.ipc-current { font-weight:600; color:var(--sc-accent, #4a90d9); }
 .ipc-view { flex:1; position:relative; overflow:hidden; min-width:0; cursor:crosshair;
   background-color:#2b2b2b;
@@ -2048,6 +2048,7 @@ class InpaintEditor {
         this._rangeTint = null;
         this.mapView = null;
         this.maskView = null;   // null | { id: string, mode: "overlay" | "alone" | "effect" }
+        this.maskClip = null;   // null | { id: string } (layer whose mask was copied in mask menu)
         this._pendingPick = null;
         this._pendingPickTarget = null;
         this.geometrySeq = 0;
@@ -4078,7 +4079,9 @@ class InpaintEditor {
         fly.addEventListener("pointerleave", (e) => { if (!(g.btn && g.btn.contains(e.relatedTarget))) this.scheduleFlyoutClose(); });
         for (const type of ["pointerdown", "pointerup", "click", "wheel", "contextmenu"]) fly.addEventListener(type, (e) => e.stopPropagation());
         this.root.appendChild(fly);
-        const r = anchor.getBoundingClientRect(), rr = this.root.getBoundingClientRect();
+        const an = anchor || (g && g.btn);
+        const r = an && typeof an.getBoundingClientRect === "function" ? an.getBoundingClientRect() : { right: 0, left: 0, top: 0, bottom: 0, width: 0, height: 0 };
+        const rr = this.root.getBoundingClientRect();
         let left = r.right - rr.left + 6;
         // an anchor at the right edge (a row of the side panel): the flyout opens to its left
         if (left + fly.offsetWidth > rr.width - 4) left = Math.max(4, r.left - rr.left - fly.offsetWidth - 6);
@@ -4087,7 +4090,10 @@ class InpaintEditor {
         fly.style.top = `${Math.max(4, top)}px`;
         this.flyout = { el: fly, group: g };
         if (!this._flyDocDown) {
-            this._flyDocDown = (e) => { if (this.flyout && !this.flyout.el.contains(e.target) && !(this.flyout.group && this.flyout.group.btn && this.flyout.group.btn.contains(e.target))) this.closeFlyout(); };
+            this._flyDocDown = (e) => {
+                const t = e.target instanceof Node ? e.target : null;
+                if (this.flyout && (!t || (!this.flyout.el.contains(t) && !(this.flyout.group && this.flyout.group.btn && this.flyout.group.btn.contains(t))))) this.closeFlyout();
+            };
             window.addEventListener("pointerdown", this._flyDocDown, true);
         }
     }
@@ -15387,11 +15393,69 @@ class InpaintEditor {
     }
 
     /**
+     * Copy the mask from `source` layer to `target` layer (R3-S8).
+     * If both layers share equal dimensions and position, clones the mask directly (copy-on-write on tiles).
+     * Otherwise, resamples source mask using transformedAsync mapping destination pixel positions to source pixel positions.
+     * Outside the source layer's area the target is hidden (edge: "transparent"). One undo step.
+     */
+    async maskFromLayer(target, source) {
+        if (!target || !target.px) return false;
+        if (!source) {
+            this.setStatus("from_layer needs source.");
+            return false;
+        }
+        if (target.id === source.id) {
+            this.setStatus(`${source.name}: the source layer cannot be the target layer.`);
+            return false;
+        }
+        if (!source.maskPx) {
+            this.setStatus(`${source.name} has no mask.`);
+            return false;
+        }
+        if (this.maskBlocked(target)) return false;
+
+        const token = (this._maskOpToken = (this._maskOpToken || 0) + 1);
+        const sm = source.maskPx;
+        const tw = target.px.width, th = target.px.height;
+        const same = sm.width === tw && sm.height === th
+            && source.x === target.x && source.y === target.y
+            && source.w === target.w && source.h === target.h;
+
+        let m;
+        if (same) {
+            m = sm.clone();
+        } else {
+            const srcToImg = [source.w / sm.width, 0, 0, source.h / sm.height, source.x, source.y];
+            const dstToImg = [target.w / tw, 0, 0, target.h / th, target.x, target.y];
+            const inv = xfMul(xfInv(srcToImg), dstToImg);
+            const map = pixelMap(inv);
+            m = await sm.transformedAsync(map, tw, th, { color: MASK_RGB, edge: "transparent" });
+        }
+
+        if (this._maskOpToken !== token) return false;
+        const curTarget = this.layers.find((l) => l.id === target.id);
+        if (!curTarget || curTarget.px !== target.px) {
+            this.setStatus("That layer is gone.");
+            return false;
+        }
+
+        this.pushUndo({ kind: "mask", id: target.id, label: "Mask from layer" });
+        target.maskPx = m;
+        target.maskOff = false;
+        target.maskEdit = false;
+        this.markMaskChanged(target);
+        this.renderLayers();
+        this.draw();
+        this.setStatus(`${target.name}: mask copied from ${source.name}.`);
+        return true;
+    }
+
+    /**
      * A mask operation by name, for the mask row's menu and `set_mask`: invert, reveal (all), hide (all), from_selection,
-     * hide_selection, enable, disable, apply, remove. True when it changed the layer; false with a status line when it
+     * hide_selection, from_layer, enable, disable, apply, remove. True when it changed the layer; false with a status line when it
      * could not (no mask, no selection, a pending transform) or when the switch already stood that way.
      */
-    maskOp(layer, op) {
+    maskOp(layer, op, opts = {}) {
         if (!layer) return false;
         const need = () => { if (!layer.maskPx) this.setStatus(`${layer.name} has no mask.`); return !!layer.maskPx; };
         switch (op) {
@@ -15400,6 +15464,7 @@ class InpaintEditor {
             case "hide": return this.fillLayerMask(layer, false);
             case "from_selection": return this.maskFromSelection(layer);
             case "hide_selection": return this.maskFromSelection(layer, { hide: true });
+            case "from_layer": return this.maskFromLayer(layer, opts.source);
             case "enable": case "disable": return need() && this.setMaskOff(layer, op === "disable");
             case "apply":
                 if (!need() || this.maskBlocked(layer)) return false;
@@ -15418,10 +15483,19 @@ class InpaintEditor {
         const has = !!layer.maskPx, id = layer.id;
         const viewing = !!(this.maskView && this.maskView.id === id);
         const isFilterWithLimit = layer.kind === "filter" && !!(layer.params && layer.params.limit);
+        const clipSrc = this.maskClip ? this.layers.find((l) => l.id === this.maskClip.id) : null;
+        const clipHasMask = !!(clipSrc && clipSrc.maskPx);
+        const canPaste = !!(clipSrc && clipHasMask && clipSrc.id !== layer.id);
+        const pasteLabel = clipSrc ? `Paste mask from ${clipSrc.name}` : "Paste mask";
         // the layer looked up at the click: an undo while the menu is open puts copies of the layers back
-        const act = (icon, label, op, title, disabled = false) => ({ icon, label, title, disabled, onClick: () => {
+        const act = (icon, label, op, title, disabled = false, opts = {}) => ({ icon, label, title, disabled, onClick: () => {
             const l = this.layers.find((x) => x.id === id);
-            if (l) this.maskOp(l, op); else this.setStatus("That layer is gone.");
+            if (l) {
+                const res = this.maskOp(l, op, opts);
+                if (res && typeof res.catch === "function") res.catch((err) => this.setStatus(String(err.message || err)));
+            } else {
+                this.setStatus("That layer is gone.");
+            }
         } });
         this.openFlyout({
             btn: anchor, items: [],
@@ -15431,6 +15505,18 @@ class InpaintEditor {
                 { sep: true },
                 act("mask", "Reveal selection", "from_selection", "A mask from the selection: only the selected part shows"),
                 act("mask", "Hide selection", "hide_selection", "A mask from the selection, inverted: the selected part is hidden"),
+                { sep: true },
+                { icon: "mask", label: "Copy mask", disabled: !has, title: "Copy this layer's mask to paste onto another layer", onClick: () => {
+                    this.maskClip = { id: layer.id };
+                    this.setStatus(`${layer.name}: mask copied.`);
+                } },
+                { icon: "mask", label: pasteLabel, disabled: !canPaste, title: clipSrc ? `Paste ${clipSrc.name}'s mask onto this layer` : "Paste a copied mask onto this layer", onClick: () => {
+                    const l = this.layers.find((x) => x.id === id);
+                    if (!l) { this.setStatus("That layer is gone."); return; }
+                    const src = this.maskClip ? this.layers.find((x) => x.id === this.maskClip.id) : null;
+                    const res = this.maskOp(l, "from_layer", { source: src });
+                    if (res && typeof res.catch === "function") res.catch((err) => this.setStatus(String(err.message || err)));
+                } },
                 { sep: true },
                 act("invert", "Invert mask", "invert", "What the mask shows is hidden and the other way round", !has),
                 { sep: true },
@@ -15444,7 +15530,7 @@ class InpaintEditor {
                     this.renderLayers();
                     this.draw();
                 } },
-                ...(isFilterWithLimit ? [{ icon: "eye", label: "Show the effect", title: "Show where the filter acts (mask × limit weight)", onClick: () => {
+                ...(isFilterWithLimit ? [{ icon: "eye", label: "Show the effect", title: "Show where the filter acts (mask \u00D7 limit weight)", onClick: () => {
                     this.maskView = { id, mode: "effect" };
                     this.renderLayers();
                     this.draw();
