@@ -17,6 +17,7 @@
 import { curvesToTables } from "./inpaint_curves.js";
 import { levelsTable, brightnessContrastTable, hueSatMatrix, lightnessTable, colorBalanceTables, hueToRgb, LOOK_DEFAULT, grainNoiseCanvas, colourStats } from "./inpaint_filters.js";
 import { registerHazeGL, registerDehazeGL } from "./inpaint_depthfx.js";
+import { registerLensBlurGL } from "./inpaint_lensblur.js";
 import { colorGradeTables, gradeIdentity, HSL_GLSL, HSL_UNIFORMS, hslUniforms, hslIdentity } from "./inpaint_grade.js";
 import {
     VIBRANCE_GLSL, VIBRANCE_UNIFORMS, vibranceUniforms, vibranceIdentity,
@@ -975,6 +976,7 @@ export function registerGLFilter(id, def) {
 
 try { registerHazeGL(); } catch (_) {}
 try { registerDehazeGL(); } catch (_) {}
+try { registerLensBlurGL(); } catch (_) {}
 
 export function unregisterGLFilter(id) {
     const pg = PLUGIN_GL.get(id);
@@ -1178,6 +1180,7 @@ export function runShader(def, src, values, info = {}) {
 export function applyFilterGL(id, src, params, info = {}) {
     if (id === "haze") { try { registerHazeGL(); } catch (_) {} }
     if (id === "dehaze") { try { registerDehazeGL(); } catch (_) {} }
+    if (id === "lens_blur") { try { registerLensBlurGL(); } catch (_) {} }
     if (!SUPPORTED.has(id)) { const pg = PLUGIN_GL.get(id); return pg ? applyPluginGL(id, pg, src, params, info) : null; }
     const g = context();
     if (!g) return null;

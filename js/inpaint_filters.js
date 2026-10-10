@@ -18,6 +18,7 @@ import { hazeStats, applyHaze, dehazeStats, applyDehaze } from "./inpaint_depthf
 import { colorGradeTables, gradeIdentity, hslPixel, hslIdentity } from "./inpaint_grade.js";
 import { buildWheelsControl, buildHslControl } from "./inpaint_wheels.js";
 import { applyVibrance, applyGradientMap, applyThreshold, applyPosterize } from "./inpaint_adjustments.js";
+import { applyLensBlur, lensBlurReach } from "./inpaint_lensblur.js";
 
 
 function makeCanvas(w, h) {
@@ -1183,6 +1184,19 @@ export const FILTERS = {
         reach: 0,
         apply: applyDehaze,
     },
+    lens_blur: {
+        label: "Lens blur",
+        params: [
+            { key: "focus", label: "Focus", min: 0, max: 100, step: 1, default: 30, unit: "%" },
+            { key: "dof", label: "Depth of field", min: 0, max: 100, step: 1, default: 15, unit: "%" },
+            { key: "aperture", label: "Aperture", min: 0.1, max: 1.5, step: 0.1, default: 0.8, unit: "%" },
+            { key: "highlights", label: "Highlights", min: 0, max: 100, step: 1, default: 20, unit: "%" },
+            { key: "threshold", label: "Threshold", min: 50, max: 100, step: 1, default: 75, unit: "%" },
+        ],
+        maps: () => ["depth"],
+        reach: (p, info) => lensBlurReach(p, info || { width: 1024, height: 1024 }),
+        apply: applyLensBlur,
+    },
     vibrance: {
         label: "Vibrance",
         params: [
@@ -1267,6 +1281,7 @@ export const FILTER_IDS = Object.keys(FILTERS);
 // table builders shared with the WebGL2 path
 export { levelsTable, brightnessContrastTable, hueSatMatrix, lightnessTable, colorBalanceTables, colorGradeTables, hueToRgb, LOOK_DEFAULT };
 export { applyVibrance, applyGradientMap, applyThreshold, applyPosterize };
+export { applyLensBlur, lensBlurReach };
 
 export function filterDefaults(id) {
     const out = {};
