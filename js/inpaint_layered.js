@@ -24,19 +24,10 @@
  * into their layers.
  */
 
+import { PSD_BLENDS, ORA_BLENDS } from "./blend_modes.js";
+
 export const LAYERED_EXT = /\.(psd|ora)$/i;
 
-const PSD_BLENDS = {
-    norm: "normal", "mul ": "multiply", scrn: "screen", over: "overlay", dark: "darken", lite: "lighten",
-    sLit: "soft-light", hLit: "hard-light", lLit: "linear-light", diff: "difference",
-};
-const ORA_BLENDS = {
-    "svg:src-over": "normal", "svg:multiply": "multiply", "svg:screen": "screen", "svg:overlay": "overlay",
-    "svg:darken": "darken", "svg:lighten": "lighten", "svg:soft-light": "soft-light", "svg:hard-light": "hard-light",
-    "svg:difference": "difference",
-    // OpenRaster has no linear light: our writer names it so, Krita's spellings are taken too (not checked against a Krita file)
-    "scumble:linear-light": "linear-light", "krita:linear_light": "linear-light", "krita:linear light": "linear-light",
-};
 // additional layer info keys that make a layer an adjustment or a fill (no pixels of its own)
 const ADJUSTMENTS = new Set(["SoCo", "GdFl", "PtFl", "brit", "levl", "curv", "expA", "vibA", "hue ", "hue2", "blnc", "blwh",
     "phfl", "mixr", "clrL", "nvrt", "post", "thrs", "grdm", "selc", "CgEd"]);

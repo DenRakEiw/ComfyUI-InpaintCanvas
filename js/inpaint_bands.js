@@ -18,6 +18,7 @@
  */
 import { PngStreamWriter, partRows } from "./inpaint_png.js";
 import { TiffStreamWriter, tiffStripRows } from "./inpaint_tiff.js";
+import { PSD_BLEND, ORA_BLEND } from "./blend_modes.js";
 
 const TILE = 256;
 
@@ -228,9 +229,6 @@ async function packChannels(source, run, { flights = 8, progress = null, pause =
     for (const r of replies) r.channels.forEach((c, i) => { const d = new Uint8Array(c.data); out[i].lens.push(new Uint8Array(c.lens)); out[i].data.push(d); out[i].total += d.length; });
     return out;
 }
-
-const PSD_BLEND = { normal: "norm", multiply: "mul ", screen: "scrn", overlay: "over", darken: "dark", lighten: "lite", "soft-light": "sLit", "hard-light": "hLit", "linear-light": "lLit", difference: "diff" };
-const ORA_BLEND = { normal: "svg:src-over", multiply: "svg:multiply", screen: "svg:screen", overlay: "svg:overlay", darken: "svg:darken", lighten: "svg:lighten", "soft-light": "svg:soft-light", "hard-light": "svg:hard-light", "linear-light": "scumble:linear-light", difference: "svg:difference" };
 
 class Bytes {
     constructor() { this.parts = []; this.size = 0; }

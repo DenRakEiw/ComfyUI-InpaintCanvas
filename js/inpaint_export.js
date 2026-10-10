@@ -10,6 +10,8 @@
  * no place for one and ignores the field (the caller bakes masks into the pixels for ORA).
  */
 
+import { PSD_BLEND, ORA_BLEND } from "./blend_modes.js";
+
 /** A 2D canvas in the window or in a worker. */
 function makeExportCanvas(w, h) {
     const width = Math.max(1, w | 0), height = Math.max(1, h | 0);
@@ -19,9 +21,6 @@ function makeExportCanvas(w, h) {
     c.height = height;
     return c;
 }
-
-const PSD_BLEND = { normal: "norm", multiply: "mul ", screen: "scrn", overlay: "over", darken: "dark", lighten: "lite", "soft-light": "sLit", "hard-light": "hLit", "linear-light": "lLit", difference: "diff" };
-const ORA_BLEND = { normal: "svg:src-over", multiply: "svg:multiply", screen: "svg:screen", overlay: "svg:overlay", darken: "svg:darken", lighten: "svg:lighten", "soft-light": "svg:soft-light", "hard-light": "svg:hard-light", "linear-light": "scumble:linear-light", difference: "svg:difference" };
 
 class ByteWriter {
     constructor() { this.chunks = []; this.size = 0; }

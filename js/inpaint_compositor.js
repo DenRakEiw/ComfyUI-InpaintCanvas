@@ -26,11 +26,7 @@
  */
 
 import { TILE_SIZE, MIP_LEVELS, GUTTER, slotSide } from "./inpaint_tiles.js";
-
-export const BLEND_INDEX = {
-    normal: 0, multiply: 1, screen: 2, overlay: 3, darken: 4,
-    lighten: 5, "soft-light": 6, "hard-light": 7, difference: 8, "linear-light": 9,
-};
+import { BLEND_OPS } from "./blend_modes.js";
 
 const VS = `#version 300 es
 in vec2 a_pos;
@@ -60,15 +56,15 @@ float bSoftLight(float b, float s) {
     return s <= 0.5 ? b - (1.0 - 2.0 * s) * b * (1.0 - b) : b + (2.0 * s - 1.0) * (d - b);
 }
 float blend1(float b, float s) {
-    if (u_mode == 1) return b * s;
-    if (u_mode == 2) return bScreen(b, s);
-    if (u_mode == 3) return bHardLight(s, b);   // overlay: hard-light with the arguments swapped
-    if (u_mode == 4) return min(b, s);
-    if (u_mode == 5) return max(b, s);
-    if (u_mode == 6) return bSoftLight(b, s);
-    if (u_mode == 7) return bHardLight(b, s);
-    if (u_mode == 8) return abs(b - s);
-    if (u_mode == 9) return clamp(b + 2.0 * s - 1.0, 0.0, 1.0);   // linear light (PLAN_0_1_31 §4 step 8)
+    if (u_mode == 5) return b * s;
+    if (u_mode == 6) return bScreen(b, s);
+    if (u_mode == 7) return bHardLight(s, b);   // overlay: hard-light with the arguments swapped
+    if (u_mode == 8) return min(b, s);
+    if (u_mode == 9) return max(b, s);
+    if (u_mode == 10) return bSoftLight(b, s);
+    if (u_mode == 11) return bHardLight(b, s);
+    if (u_mode == 12) return abs(b - s);
+    if (u_mode == 13) return clamp(b + 2.0 * s - 1.0, 0.0, 1.0);   // linear light (PLAN_0_1_31 section 4 step 8)
     return s;
 }
 
@@ -843,7 +839,7 @@ export class GLCompositor {
             gl.activeTexture(gl.TEXTURE3);
             gl.bindTexture(gl.TEXTURE_2D, clipTex);
         }
-        gl.uniform1i(this.atlasU.mode, BLEND_INDEX[prepared.blend] || 0);
+        gl.uniform1i(this.atlasU.mode, BLEND_OPS[prepared.blend] || 0);
         gl.uniform1f(this.atlasU.opacity, prepared.opacity == null ? 1 : prepared.opacity);
         gl.uniform2f(this.atlasU.size, W, H);
         gl.uniform4f(this.atlasU.region, region.x, region.y, region.w, region.h);
@@ -1108,7 +1104,7 @@ export class GLCompositor {
             gl.enableVertexAttribArray(loc);
             gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
             gl.uniform4f(uRect, x0, y1 - sh * 2, sw * 2, sh * 2);
-            gl.uniform1i(uMode, BLEND_INDEX[l.blend] || 0);
+            gl.uniform1i(uMode, BLEND_OPS[l.blend] || 0);
             gl.uniform1f(uOpacity, l.opacity == null ? 1 : l.opacity);
             gl.uniform2f(uSize, W, H);
             gl.uniform1i(uHasClip, clipTex ? 1 : 0);

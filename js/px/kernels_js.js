@@ -13,6 +13,8 @@
  * source modulo 4,096 makes a 256 KB copy 16× slower (4K aliasing, §10).
  */
 
+import { BLEND_OPS, LAST_BLEND } from "../blend_modes.js";
+
 export const OPS = Object.freeze({
     "source-over": 0,
     "destination-out": 1,
@@ -20,15 +22,7 @@ export const OPS = Object.freeze({
     "destination-in": 3,
     copy: 4,
     // the blend modes (a layer's `blend`), source-over with B(backdrop, source) where both cover
-    multiply: 5,
-    screen: 6,
-    overlay: 7,
-    darken: 8,
-    lighten: 9,
-    "soft-light": 10,
-    "hard-light": 11,
-    difference: 12,
-    "linear-light": 13,
+    ...BLEND_OPS,
 });
 
 // ---- element kinds and byte order --------------------------------------------------------------
@@ -388,7 +382,7 @@ export function compositeTile(dst, srcs, ops, alphas, masks = null) {
         else if (op === 1) erase(d, src, o, mask, px);
         else if (op === 2) atop(d, src, o, mask, px);
         else if (op === 3) keepIn(d, src, o, mask, px);
-        else if (op >= 5 && op <= 13) blendOp(d, src, o, mask, px, op);
+        else if (op >= 5 && op <= LAST_BLEND) blendOp(d, src, o, mask, px, op);
         else copyOp(d, src, o, mask, px);
     }
     for (let i = 0, n = px * 4; i < n; i += 4) {
