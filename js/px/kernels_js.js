@@ -13,7 +13,7 @@
  * source modulo 4,096 makes a 256 KB copy 16× slower (4K aliasing, §10).
  */
 
-import { BLEND_OPS, LAST_BLEND } from "../blend_modes.js";
+import { BLEND_OPS } from "../blend_modes.js";
 
 export const OPS = Object.freeze({
     "source-over": 0,
@@ -23,6 +23,12 @@ export const OPS = Object.freeze({
     copy: 4,
     // the blend modes (a layer's `blend`), source-over with B(backdrop, source) where both cover
     ...BLEND_OPS,
+    hue: 24,
+    saturation: 25,
+    color: 26,
+    luminosity: 27,
+    "darker-color": 28,
+    "lighter-color": 29,
 });
 
 // ---- element kinds and byte order --------------------------------------------------------------
@@ -346,9 +352,10 @@ function similarAt(d, i, r0, g0, b0, a0, tol) {
  * The operator is chosen once per layer, not per pixel, and the common case (no mask, full
  * opacity) has loops of its own.
  *
- * The nineteen blend modes (ops 5 to 12, docs/PLAN_BCE.md section 3b B item 7; linear light, op 13, docs/PLAN_0_1_31.md section 4 step 8;
+ * The twenty-five blend modes (ops 5 to 12, docs/PLAN_BCE.md section 3b B item 7; linear light, op 13, docs/PLAN_0_1_31.md section 4 step 8;
  * ops 14 to 19 exclusion, linear dodge, linear burn, subtract, pin light, hard mix, docs/PLAN_NIK9_BUILD.md R4-S4;
- * ops 20 to 23 colour dodge, colour burn, vivid light, divide, docs/PLAN_NIK9_BUILD.md R4-S5)
+ * ops 20 to 23 colour dodge, colour burn, vivid light, divide, docs/PLAN_NIK9_BUILD.md R4-S5;
+ * ops 24 to 29 hue, saturation, colour, luminosity, darker colour, lighter colour, docs/PLAN_NIK9_BUILD.md R4-S6)
  * are the W3C formula rounded ONCE per channel (three rounded products were up to 1.45 levels from the exact value; this
  * is within half a level). Linear light is not a W3C mode; B = clamp(cb + 2*cs - 1, 0, 1) as Photoshop has it:
  *
@@ -394,8 +401,8 @@ export function compositeTile(dst, srcs, ops, alphas, masks = null) {
         else if (op === 1) erase(d, src, o, mask, px);
         else if (op === 2) atop(d, src, o, mask, px);
         else if (op === 3) keepIn(d, src, o, mask, px);
-        else if (op >= 5 && op <= LAST_BLEND) blendOp(d, src, o, mask, px, op);
-        else if (op > LAST_BLEND) over(d, src, o, mask, px);
+        else if (op >= 5 && op <= 29) blendOp(d, src, o, mask, px, op);
+        else if (op > 29) over(d, src, o, mask, px);
         else copyOp(d, src, o, mask, px);
     }
     for (let i = 0, n = px * 4; i < n; i += 4) {
@@ -607,7 +614,112 @@ function blendOf(op, b, s) {
     }
 }
 
+function nonsep(op, b0, b1, b2, s0, s1, s2, out) {
+    let p0 = 0, p1 = 0, p2 = 0;
+    let d = 1;
+    let l = 0;
+
+    if (op === 24) {
+        const minS = Math.min(s0, s1, s2);
+        const maxS = Math.max(s0, s1, s2);
+        const satS = maxS - minS;
+        if (satS === 0) {
+            p0 = 0; p1 = 0; p2 = 0;
+            d = 1;
+        } else {
+            const minB = Math.min(b0, b1, b2);
+            const maxB = Math.max(b0, b1, b2);
+            const satB = maxB - minB;
+            p0 = (s0 - minS) * satB;
+            p1 = (s1 - minS) * satB;
+            p2 = (s2 - minS) * satB;
+            d = satS;
+        }
+        l = 30 * b0 + 59 * b1 + 11 * b2;
+    } else if (op === 25) {
+        const minB = Math.min(b0, b1, b2);
+        const maxB = Math.max(b0, b1, b2);
+        const satB = maxB - minB;
+        if (satB === 0) {
+            p0 = 0; p1 = 0; p2 = 0;
+            d = 1;
+        } else {
+            const minS = Math.min(s0, s1, s2);
+            const maxS = Math.max(s0, s1, s2);
+            const satS = maxS - minS;
+            p0 = (b0 - minB) * satS;
+            p1 = (b1 - minB) * satS;
+            p2 = (b2 - minB) * satS;
+            d = satB;
+        }
+        l = 30 * b0 + 59 * b1 + 11 * b2;
+    } else if (op === 26) {
+        p0 = s0; p1 = s1; p2 = s2;
+        d = 1;
+        l = 30 * b0 + 59 * b1 + 11 * b2;
+    } else if (op === 27) {
+        p0 = b0; p1 = b1; p2 = b2;
+        d = 1;
+        l = 30 * s0 + 59 * s1 + 11 * s2;
+    }
+
+    const lumP = 30 * p0 + 59 * p1 + 11 * p2;
+    const lu = l * d;
+    const u0 = 100 * p0 + lu - lumP;
+    const u1 = 100 * p1 + lu - lumP;
+    const u2 = 100 * p2 + lu - lumP;
+    const un = Math.min(u0, u1, u2);
+    const ux = Math.max(u0, u1, u2);
+
+    if (un < 0) {
+        const denom = 100 * (lu - un);
+        out[0] = Math.floor((2 * 255 * l * (u0 - un) + denom) / (2 * denom));
+        out[1] = Math.floor((2 * 255 * l * (u1 - un) + denom) / (2 * denom));
+        out[2] = Math.floor((2 * 255 * l * (u2 - un) + denom) / (2 * denom));
+    } else if (ux > 25500 * d) {
+        const denom = 100 * (ux - lu);
+        const k1 = l * (ux - lu);
+        const k2 = 25500 - l;
+        out[0] = Math.floor((2 * 255 * (k1 + (u0 - lu) * k2) + denom) / (2 * denom));
+        out[1] = Math.floor((2 * 255 * (k1 + (u1 - lu) * k2) + denom) / (2 * denom));
+        out[2] = Math.floor((2 * 255 * (k1 + (u2 - lu) * k2) + denom) / (2 * denom));
+    } else {
+        const denom = 100 * d;
+        out[0] = Math.floor((2 * 255 * u0 + denom) / (2 * denom));
+        out[1] = Math.floor((2 * 255 * u1 + denom) / (2 * denom));
+        out[2] = Math.floor((2 * 255 * u2 + denom) / (2 * denom));
+    }
+    return out;
+}
+
 export function blend3(op, b0, b1, b2, s0, s1, s2, out) {
+    if (op >= 24 && op <= 27) {
+        return nonsep(op, b0, b1, b2, s0, s1, s2, out);
+    }
+    if (op === 28) {
+        if (s0 + s1 + s2 < b0 + b1 + b2) {
+            out[0] = 255 * s0;
+            out[1] = 255 * s1;
+            out[2] = 255 * s2;
+        } else {
+            out[0] = 255 * b0;
+            out[1] = 255 * b1;
+            out[2] = 255 * b2;
+        }
+        return out;
+    }
+    if (op === 29) {
+        if (s0 + s1 + s2 > b0 + b1 + b2) {
+            out[0] = 255 * s0;
+            out[1] = 255 * s1;
+            out[2] = 255 * s2;
+        } else {
+            out[0] = 255 * b0;
+            out[1] = 255 * b1;
+            out[2] = 255 * b2;
+        }
+        return out;
+    }
     out[0] = blendOf(op, b0, s0);
     out[1] = blendOf(op, b1, s1);
     out[2] = blendOf(op, b2, s2);
