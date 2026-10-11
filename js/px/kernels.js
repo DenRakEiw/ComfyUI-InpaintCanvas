@@ -133,3 +133,11 @@ export function pngFilterRows(rgba, w, rows, prev = null, out = null) {
     const p = rustPx();
     return p ? p.pngFilterRows(rgba, w, rows, prev, out) : J.pngFilterRows(rgba, w, rows, prev, out || undefined);
 }
+
+/** Computes max - min over each texel's 4x4 block of a w x h Uint16Array. */
+export function rangeMax(src, w, h, out = null) {
+    const p = rustPx();
+    if (!p) return J.rangeMax(src, w, h, out);
+    try { return p.rangeMax(src, w, h, out); } finally { releaseIfLarge(); }
+}
+

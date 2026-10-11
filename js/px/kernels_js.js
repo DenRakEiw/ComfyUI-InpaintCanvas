@@ -1386,3 +1386,54 @@ export function poissonBlend(dst, src, mask, w, h, out = new Uint8Array(w * h * 
     if (info) { info[0] = unknowns; info[1] = cycles; info[2] = levels.length; info[3] = last < POISSON_TOL ? 0 : 1; }
     return out;
 }
+
+/**
+ * Computes max - min over each texel's 4x4 block of a w x h Uint16Array (separable).
+ * @param {Uint16Array} src
+ * @param {number} w
+ * @param {number} h
+ * @param {Uint16Array} [out]
+ * @returns {Uint16Array}
+ */
+export function rangeMax(src, w, h, out = null) {
+    const res = out || new Uint16Array(w * h);
+    if (!src || w <= 0 || h <= 0) return res;
+
+    const rowMax = new Uint16Array(w * h);
+    const rowMin = new Uint16Array(w * h);
+
+    // Pass 1: horizontal 4-tap [-1, 0, 1, 2]
+    for (let y = 0; y < h; y++) {
+        const row = y * w;
+        for (let x = 0; x < w; x++) {
+            let mx = 0, mn = 65535;
+            for (let i = -1; i <= 2; i++) {
+                const cx = Math.max(0, Math.min(w - 1, x + i));
+                const v = src[row + cx];
+                if (v > mx) mx = v;
+                if (v < mn) mn = v;
+            }
+            rowMax[row + x] = mx;
+            rowMin[row + x] = mn;
+        }
+    }
+
+    // Pass 2: vertical 4-tap over Pass 1 results
+    for (let y = 0; y < h; y++) {
+        const row = y * w;
+        for (let x = 0; x < w; x++) {
+            let mx = 0, mn = 65535;
+            for (let j = -1; j <= 2; j++) {
+                const cy = Math.max(0, Math.min(h - 1, y + j));
+                const cRow = cy * w;
+                const vMax = rowMax[cRow + x];
+                const vMin = rowMin[cRow + x];
+                if (vMax > mx) mx = vMax;
+                if (vMin < mn) mn = vMin;
+            }
+            res[row + x] = mx - mn;
+        }
+    }
+    return res;
+}
+

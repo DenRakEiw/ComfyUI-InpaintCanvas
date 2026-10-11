@@ -4,7 +4,7 @@
 // Holds JS functions and SNAP_GLSL with identical maths. No DOM at import.
 
 import { u16Bilinear, sstep } from "./inpaint_weights.js";
-import { boxBlurs } from "./px/kernels.js";
+import { boxBlurs, rangeMax as rangeMaxKernel } from "./px/kernels.js";
 import { xfBox } from "./inpaint_resample.js";
 
 /** Default edge snap depth threshold (R2-S3) */
@@ -535,45 +535,8 @@ export function fuseTiles(global, tiles, W, H, wf, hf, { sigmaLow } = {}) {
  * @returns {Uint16Array}
  */
 export function rangeMax(map) {
-    const w = map.w, h = map.h;
-    const src = map.data;
-    const rowMax = new Uint16Array(w * h);
-    const rowMin = new Uint16Array(w * h);
-
-    // Pass 1: horizontal 4-tap [-1, 0, 1, 2]
-    for (let y = 0; y < h; y++) {
-        const row = y * w;
-        for (let x = 0; x < w; x++) {
-            let mx = 0, mn = 65535;
-            for (let i = -1; i <= 2; i++) {
-                const cx = Math.max(0, Math.min(w - 1, x + i));
-                const v = src[row + cx];
-                if (v > mx) mx = v;
-                if (v < mn) mn = v;
-            }
-            rowMax[row + x] = mx;
-            rowMin[row + x] = mn;
-        }
-    }
-
-    // Pass 2: vertical 4-tap over Pass 1 results
-    const out = new Uint16Array(w * h);
-    for (let y = 0; y < h; y++) {
-        const row = y * w;
-        for (let x = 0; x < w; x++) {
-            let mx = 0, mn = 65535;
-            for (let j = -1; j <= 2; j++) {
-                const cy = Math.max(0, Math.min(h - 1, y + j));
-                const cRow = cy * w;
-                const vMax = rowMax[cRow + x];
-                const vMin = rowMin[cRow + x];
-                if (vMax > mx) mx = vMax;
-                if (vMin < mn) mn = vMin;
-            }
-            out[row + x] = mx - mn;
-        }
-    }
-    return out;
+    if (!map || !map.data || !map.w || !map.h) return new Uint16Array(0);
+    return rangeMaxKernel(map.data, map.w, map.h);
 }
 
 /**

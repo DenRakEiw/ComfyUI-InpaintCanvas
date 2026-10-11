@@ -12,7 +12,7 @@
  * anything that could have allocated, never keep one across `alloc` / `take`.
  */
 
-export const PX_ABI = 17;
+export const PX_ABI = 18;
 
 // arithmetic, not `& -n`: sizes above 2 GB do not survive a 32-bit bitwise operator
 const roundUp = (n, to) => Math.ceil(n / to) * to;
@@ -195,6 +195,17 @@ export class Px {
             const pd = this._in(a, data, n * 4);
             this.exports.box_blurs(pd, w, h, radii[0] | 0, radii[1] | 0, radii[2] | 0);
             return this._out(Float32Array, pd, n, null);
+        } finally { a.reset(); }
+    }
+
+    /** Computes max - min over each texel's 4x4 block of a w x h Uint16Array; a new array. */
+    rangeMax(src, w, h, out = null) {
+        const a = this.job, n = w * h;
+        try {
+            const ps = this._in(a, src, n * 2);
+            const po = a.take(n * 2);
+            this.exports.range_max(ps, w, h, po);
+            return this._out(Uint16Array, po, n, out);
         } finally { a.reset(); }
     }
 
