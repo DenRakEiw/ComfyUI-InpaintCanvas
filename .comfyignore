@@ -1,0 +1,9 @@
+# Left out of the Comfy Registry package (comfy node publish packs the git-tracked files minus these).
+# They stay in the git repository: a git clone has all of them.
+.comfyignore
+.github/
+.gitignore
+DEVELOPMENT.md
+docs/
+mcp/
+tests/

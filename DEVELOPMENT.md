@@ -1429,3 +1429,27 @@ result layer, a film look) on an RTX 5090 shared with ComfyUI. The rules that ca
   the 2:1 pyramid levels gives the same pixels and is often faster, but the timings are
   drowned in GPU queue waits on a shared card, so "medium" stays until a quiet measurement
   says otherwise.
+
+## 24. Paths and the registry package (2026-10-07, 0.3.4)
+
+Every Comfy Registry version up to 0.3.3 was flagged ("policy-v0.4: PATH_TRAVERSAL", then
+"policy-v0.5: path-traversal"), so the ComfyUI Manager had nothing to install. The verdict names no file; what was found:
+
+- **Writes.** `InpaintCanvasMaskOut` and `InpaintCanvasObjectMap` put their `canvas_node` and
+  `purpose` widget strings into the file name as they came, and `InpaintCanvasStitch` did the
+  same with the `canvas_node` of `stitch_info`. A prompt with `purpose = "/../../../../x"` wrote
+  a PNG outside `temp/inpaint_canvas` (reproduced in `tests/test_paths.py` against 0.3.3).
+  Now `_name_token` keeps letters, digits, `.`, `_`, `-` only (valid ids and purposes are
+  unchanged), and every write goes through `_inside`.
+- **Reads and the upload route** checked `commonpath` on `abspath`, so a symlink or junction
+  inside the input folder could point anywhere. `_inside(base, *parts)` refuses NUL bytes,
+  absolute and drive-prefixed parts (on Windows any `:`), `..` segments, and a result whose
+  `realpath` is not inside `realpath(base)` (another drive included). `_ref_path` and
+  `/inpaint_canvas/upload` use it; the cleanup skips links.
+
+The registry package is `git ls-files` minus `.comfyignore` (comfy-cli's `zip_files`, used by
+`comfy node publish` in the publish action). It leaves out `docs/`, `mcp/`, `tests/`,
+`DEVELOPMENT.md`, `.github/` and the ignore files: the scanner's info hits were there
+(`docs/shots.py`, `DEVELOPMENT.md` line 233, `mcp/inpaint_canvas_mcp.py`). Check the package
+with `python -c "from comfy_cli.file_utils import zip_files; zip_files('node.zip')"` in the repo
+root (writes `node.zip` only). Tests: `python -m unittest discover -s tests -v`.
