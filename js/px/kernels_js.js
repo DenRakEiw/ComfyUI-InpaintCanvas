@@ -1438,3 +1438,195 @@ export function rangeMax(src, w, h, out = null) {
     return res;
 }
 
+// ---- Relight kernels (PLAN_RELIGHT_BUILD.md sec 4.3 / 5.2) ------------------------------------------
+
+/**
+ * Three box radii approximating Gaussian blur (Peter Kovesi's method).
+ * @param {number} sigma
+ * @returns {[number, number, number]}
+ */
+function relightGaussRadii(sigma) {
+    if (sigma <= 0) return [0, 0, 0];
+    const wIdeal = Math.sqrt((12 * sigma * sigma) / 3 + 1);
+    let wl = Math.floor(wIdeal);
+    if (wl % 2 === 0) wl--;
+    const wu = wl + 2;
+    const mIdeal = (12 * sigma * sigma - 3 * wl * wl - 12 * wl - 9) / (-4 * wl - 4);
+    const mm = Math.round(mIdeal);
+    const r0 = ((0 < mm ? wl : wu) - 1) / 2;
+    const r1 = ((1 < mm ? wl : wu) - 1) / 2;
+    const r2 = ((2 < mm ? wl : wu) - 1) / 2;
+    return [r0, r1, r2];
+}
+
+/**
+ * Computes surface normals from u16 height field: n = normalize(-dz/dx, -dz/dy, 1.0)
+ * after optional Gaussian blur with sigma. Packed as RGBA8 (n * 127.5 + 127.5, A=255).
+ *
+ * @param {Uint16Array} depth - u16 depth map (w * h)
+ * @param {number} w - map width
+ * @param {number} h - map height
+ * @param {number} scale - scale factor mapping u16 depth to z height
+ * @param {number} sigma - Gaussian smoothing standard deviation
+ * @param {Uint8Array} [out] - output buffer (w * h * 4)
+ * @returns {Uint8Array} packed RGBA8 normals
+ */
+export function heightNormals(depth, w, h, scale, sigma, out = null) {
+    const dst = out || new Uint8Array(w * h * 4);
+    let heights = new Float32Array(w * h);
+    const inv65535 = scale / 65535.0;
+
+    for (let i = 0; i < w * h; i++) {
+        heights[i] = depth[i] * inv65535;
+    }
+
+    if (sigma > 0) {
+        const radii = relightGaussRadii(sigma);
+        heights = boxBlurs(heights, w, h, radii);
+    }
+
+    for (let y = 0; y < h; y++) {
+        const rowOffset = y * w;
+        const yTop = Math.max(0, y - 1);
+        const yBottom = Math.min(h - 1, y + 1);
+        const rowTop = yTop * w;
+        const rowBottom = yBottom * w;
+        const dyStep = yBottom > yTop ? (yBottom - yTop) : 1;
+
+        for (let x = 0; x < w; x++) {
+            const xLeft = Math.max(0, x - 1);
+            const xRight = Math.min(w - 1, x + 1);
+            const dxStep = xRight > xLeft ? (xRight - xLeft) : 1;
+
+            const dzdx = (heights[rowOffset + xRight] - heights[rowOffset + xLeft]) / dxStep;
+            const dzdy = (heights[rowBottom + x] - heights[rowTop + x]) / dyStep;
+
+            const nx = -dzdx;
+            const ny = -dzdy;
+            const nz = 1.0;
+            const len = Math.hypot(nx, ny, nz) || 1.0;
+
+            const outOffset = (rowOffset + x) * 4;
+            dst[outOffset + 0] = Math.max(0, Math.min(255, Math.round((nx / len) * 127.5 + 127.5)));
+            dst[outOffset + 1] = Math.max(0, Math.min(255, Math.round((ny / len) * 127.5 + 127.5)));
+            dst[outOffset + 2] = Math.max(0, Math.min(255, Math.round((nz / len) * 127.5 + 127.5)));
+            dst[outOffset + 3] = 255;
+        }
+    }
+
+    return dst;
+}
+
+/**
+ * Precomputed Vogel disc points in unit circle.
+ * @param {number} n
+ * @returns {Array<[number, number]>}
+ */
+function relightVogel(n) {
+    const N = Math.max(1, Math.round(n) || 16);
+    const ga = 2.39996323;
+    const taps = [];
+    for (let i = 0; i < N; i++) {
+        const r = Math.sqrt((i + 0.5) / N);
+        const theta = i * ga;
+        taps.push([r * Math.cos(theta), r * Math.sin(theta)]);
+    }
+    return taps;
+}
+
+/**
+ * Marches shadow rays through the u16 depth height field.
+ *
+ * @param {Uint16Array} depth - u16 depth map (w * h)
+ * @param {number} w - map width
+ * @param {number} h - map height
+ * @param {number} scale - scale factor mapping u16 depth to z height
+ * @param {number[]|Float32Array} light - [lx, ly, lz, kind] where kind: 0=point, 1=sun, 2=spot
+ * @param {number} radius - light source radius in map pixels for soft shadows
+ * @param {number} taps - number of light sample taps (1..16)
+ * @param {number} steps - number of march steps per ray (1..64)
+ * @param {number} bias - height bias in z to avoid self-shadowing
+ * @param {number} row0 - start row
+ * @param {number} rows - number of rows to compute
+ * @param {Uint8Array} [out] - output buffer (length >= w * rows)
+ * @returns {Uint8Array} visibility map (0=shadow, 255=lit)
+ */
+export function shadowMarch(depth, w, h, scale, light, radius, taps, steps, bias, row0, rows, out = null) {
+    const bandRows = Math.min(rows, h - row0);
+    const dst = out || new Uint8Array(w * bandRows);
+
+    const lx = Number(light[0]) || 0;
+    const ly = Number(light[1]) || 0;
+    const lz = Number(light[2]) || 0;
+    const kind = Number(light[3]) || 0;
+
+    const nTaps = Math.max(1, Math.min(16, Math.round(taps) || 4));
+    const nSteps = Math.max(1, Math.min(64, Math.round(steps) || 32));
+    const r = Math.max(0, Number(radius) || 0);
+    const zBias = Number(bias) || 1.0;
+    const disc = relightVogel(nTaps);
+    const longSide = Math.max(w, h);
+    const sunDist = longSide * 1.5;
+    const inv65535 = scale / 65535.0;
+
+    for (let rIdx = 0; rIdx < bandRows; rIdx++) {
+        const y = row0 + rIdx;
+        const rowOffset = y * w;
+        const outRowOffset = (dst.length >= w * h) ? y * w : rIdx * w;
+
+        for (let x = 0; x < w; x++) {
+            const z0 = depth[rowOffset + x] * inv65535;
+            const px = x;
+            const py = y;
+            const pz = z0 + zBias;
+            let litCount = 0;
+
+            for (let t = 0; t < nTaps; t++) {
+                let tx, ty, tz;
+                if (kind === 1) {
+                    const jx = disc[t][0] * (r / longSide);
+                    const jy = disc[t][1] * (r / longSide);
+                    const dirX = lx + jx;
+                    const dirY = ly + jy;
+                    const dirZ = lz;
+                    const dLen = Math.hypot(dirX, dirY, dirZ) || 1.0;
+                    tx = px + (dirX / dLen) * sunDist;
+                    ty = py + (dirY / dLen) * sunDist;
+                    tz = pz + (dirZ / dLen) * sunDist;
+                } else {
+                    tx = lx + disc[t][0] * r;
+                    ty = ly + disc[t][1] * r;
+                    tz = lz;
+                }
+
+                const rdx = tx - px;
+                const rdy = ty - py;
+                const rdz = tz - pz;
+                let blocked = false;
+
+                for (let s = 1; s <= nSteps; s++) {
+                    const frac = s / nSteps;
+                    const sx = px + frac * rdx;
+                    const sy = py + frac * rdy;
+                    const sz = pz + frac * rdz;
+                    const ix = Math.round(sx);
+                    const iy = Math.round(sy);
+                    if (ix < 0 || ix >= w || iy < 0 || iy >= h) continue;
+
+                    const mapZ = depth[iy * w + ix] * inv65535;
+                    if (mapZ > sz + zBias) {
+                        blocked = true;
+                        break;
+                    }
+                }
+
+                if (!blocked) litCount++;
+            }
+
+            dst[outRowOffset + x] = Math.round((litCount / nTaps) * 255);
+        }
+    }
+
+    return dst;
+}
+

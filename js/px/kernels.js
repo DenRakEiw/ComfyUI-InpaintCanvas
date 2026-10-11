@@ -141,3 +141,13 @@ export function rangeMax(src, w, h, out = null) {
     try { return p.rangeMax(src, w, h, out); } finally { releaseIfLarge(); }
 }
 
+/** Computes surface normals from u16 height field: n = normalize(-dz/dx, -dz/dy, 1.0). */
+export function heightNormals(depth, w, h, scale, sigma, out = null) {
+    return J.heightNormals(depth, w, h, scale, sigma, out);
+}
+
+/** Marches shadow rays through u16 depth height field. */
+export function shadowMarch(depth, w, h, scale, light, radius, taps, steps, bias, row0, rows, out = null) {
+    return J.shadowMarch(depth, w, h, scale, light, radius, taps, steps, bias, row0, rows, out);
+}
+
