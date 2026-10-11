@@ -64,6 +64,124 @@ export const KELVIN_PRESETS = Object.freeze([
     Object.freeze({ kelvin: 10000, label: "Blue sky" }),
 ]);
 
+export const SPOT_GOBOS = Object.freeze(["none", "blinds", "window", "leaves", "stripes"]);
+
+export const LIGHT_PRESETS = Object.freeze([
+    Object.freeze({
+        id: "studio_portrait",
+        label: "Studio portrait",
+        description: "Classic 3-point studio lighting with key, fill, and rim",
+        lights: [
+            Object.freeze({ type: "point", rx: 0.70, ry: 0.35, dist: -35, intensity: 120, color: 4000, diffusion: 35, specular: 25, range: 60 }),
+            Object.freeze({ type: "point", rx: 0.30, ry: 0.40, dist: -30, intensity: 45, color: 6500, diffusion: 50, specular: 10, range: 70 }),
+            Object.freeze({ type: "point", rx: 0.20, ry: 0.25, dist: 15, intensity: 90, color: 5500, diffusion: 20, specular: 40, range: 50 }),
+        ],
+    }),
+    Object.freeze({
+        id: "warm_sunset",
+        label: "Warm sunset",
+        description: "Warm directional low sun with soft skylight fill",
+        lights: [
+            Object.freeze({ type: "sun", rx: 0.85, ry: 0.65, dist: -10, intensity: 150, color: 2700, diffusion: 25, specular: 30 }),
+            Object.freeze({ type: "point", rx: 0.25, ry: 0.25, dist: -40, intensity: 40, color: 8000, diffusion: 60, specular: 0, range: 80 }),
+        ],
+    }),
+    Object.freeze({
+        id: "cyberpunk_neon",
+        label: "Cyberpunk neon",
+        description: "Vivid opposing magenta and electric cyan neon with purple rim",
+        lights: [
+            Object.freeze({ type: "point", rx: 0.20, ry: 0.45, dist: -25, intensity: 140, color: "#ff0077", diffusion: 25, specular: 50, range: 55 }),
+            Object.freeze({ type: "point", rx: 0.80, ry: 0.45, dist: -25, intensity: 130, color: "#00e5ff", diffusion: 25, specular: 50, range: 55 }),
+            Object.freeze({ type: "spot", rx: 0.50, ry: 0.15, dist: 20, intensity: 90, color: "#8b00ff", diffusion: 20, specular: 40, cone: 45, edge: 30, rax: 0.50, ray: 0.50 }),
+        ],
+    }),
+    Object.freeze({
+        id: "rembrandt",
+        label: "Rembrandt",
+        description: "High 45-degree key light creating signature triangle highlight",
+        lights: [
+            Object.freeze({ type: "spot", rx: 0.75, ry: 0.25, dist: -40, intensity: 135, color: 3200, diffusion: 20, specular: 20, range: 60, cone: 35, edge: 25, rax: 0.45, ray: 0.55 }),
+            Object.freeze({ type: "point", rx: 0.25, ry: 0.50, dist: -30, intensity: 30, color: 5500, diffusion: 60, specular: 0, range: 75 }),
+        ],
+    }),
+    Object.freeze({
+        id: "soft_window",
+        label: "Soft window",
+        description: "Large diffuse daylight window with gentle room bounce",
+        lights: [
+            Object.freeze({ type: "point", rx: 0.15, ry: 0.40, dist: -35, intensity: 110, color: 5500, diffusion: 70, specular: 15, range: 90 }),
+            Object.freeze({ type: "point", rx: 0.85, ry: 0.60, dist: -20, intensity: 25, color: 3200, diffusion: 80, specular: 0, range: 80 }),
+        ],
+    }),
+    Object.freeze({
+        id: "dramatic_rim",
+        label: "Dramatic rim",
+        description: "Two powerful kicker/rim lights highlighting subject contours",
+        lights: [
+            Object.freeze({ type: "point", rx: 0.15, ry: 0.35, dist: 25, intensity: 150, color: 5500, diffusion: 15, specular: 60, range: 45 }),
+            Object.freeze({ type: "point", rx: 0.85, ry: 0.35, dist: 25, intensity: 130, color: 4000, diffusion: 15, specular: 50, range: 45 }),
+            Object.freeze({ type: "point", rx: 0.50, ry: 0.50, dist: -50, intensity: 20, color: 5500, diffusion: 75, specular: 0, range: 80 }),
+        ],
+    }),
+    Object.freeze({
+        id: "golden_hour",
+        label: "Golden hour",
+        description: "Low golden sun angle with rich warm amber fill",
+        lights: [
+            Object.freeze({ type: "sun", rx: 0.25, ry: 0.30, dist: -15, intensity: 160, color: 2700, diffusion: 30, specular: 35 }),
+            Object.freeze({ type: "point", rx: 0.75, ry: 0.65, dist: -30, intensity: 50, color: 3200, diffusion: 55, specular: 10, range: 70 }),
+        ],
+    }),
+    Object.freeze({
+        id: "film_noir",
+        label: "Film noir",
+        description: "High-contrast focused spotlight with sharp falloff and venetian blinds",
+        lights: [
+            Object.freeze({ type: "spot", rx: 0.80, ry: 0.20, dist: -45, intensity: 160, color: 3200, diffusion: 10, specular: 30, range: 50, cone: 25, edge: 10, rax: 0.40, ray: 0.55, gobo: "blinds" }),
+            Object.freeze({ type: "point", rx: 0.20, ry: 0.70, dist: -20, intensity: 15, color: 6500, diffusion: 50, specular: 0, range: 60 }),
+        ],
+    }),
+]);
+
+/**
+ * Instantiates lights from a preset scaled to the document size.
+ * @param {string} presetId
+ * @param {{ width?: number, height?: number }|null} [size=null]
+ * @returns {object[]|null}
+ */
+export function applyLightPreset(presetId, size = null) {
+    const preset = LIGHT_PRESETS.find((p) => p.id === presetId);
+    if (!preset) return null;
+    const w = size?.width || 1024;
+    const h = size?.height || 1024;
+    const result = preset.lights.map((tmpl, idx) => {
+        const x = Math.round(tmpl.rx * w);
+        const y = Math.round(tmpl.ry * h);
+        const aim = (tmpl.rax != null && tmpl.ray != null)
+            ? [Math.round(tmpl.rax * w), Math.round(tmpl.ray * h)]
+            : [x, Math.round(y + 100)];
+        return {
+            id: `light_${idx + 1}`,
+            type: tmpl.type || "point",
+            x,
+            y,
+            dist: tmpl.dist ?? -30,
+            intensity: tmpl.intensity ?? 100,
+            color: tmpl.color ?? 5500,
+            diffusion: tmpl.diffusion ?? 30,
+            specular: tmpl.specular ?? 0,
+            range: tmpl.range ?? 50,
+            on: true,
+            cone: tmpl.cone ?? 30,
+            edge: tmpl.edge ?? 20,
+            gobo: tmpl.gobo ?? "none",
+            aim,
+        };
+    });
+    return normalizeLights(result, size);
+}
+
 /**
  * Parses a hex colour string into [r, g, b] in 0..1 (sRGB).
  * @param {string} hex
@@ -199,10 +317,12 @@ export function defaultLight(i = 0, size = null) {
         intensity: 100,
         color: 5500,
         diffusion: 30,
+        specular: 0,
         range: 50,
         on: true,
         cone: 30,
         edge: 20,
+        gobo: "none",
         aim: [Math.round(cx + ox), Math.round(cy + oy + 100)],
     };
 }
@@ -256,6 +376,8 @@ export function normalizeLights(list, size = null) {
 
         const diffVal = Number(item.diffusion);
         const diffusion = Math.max(0, Math.min(100, Number.isFinite(diffVal) ? diffVal : 30));
+        const specVal = Number(item.specular);
+        const specular = Math.max(0, Math.min(100, Number.isFinite(specVal) ? specVal : 0));
         const rangeVal = Number(item.range);
         const range = Math.max(5, Math.min(500, Number.isFinite(rangeVal) ? rangeVal : 50));
         const on = item.on === false || item.on === "false" || item.on === 0 || item.on === "0" ? false : true;
@@ -263,6 +385,7 @@ export function normalizeLights(list, size = null) {
         const cone = Math.max(1, Math.min(89, Number.isFinite(coneVal) ? coneVal : 30));
         const edgeVal = Number(item.edge);
         const edge = Math.max(0, Math.min(100, Number.isFinite(edgeVal) ? edgeVal : 20));
+        const gobo = (typeof item.gobo === "string" && SPOT_GOBOS.includes(item.gobo)) ? item.gobo : "none";
 
         let aim = [Math.round(x), Math.round(y + 100)];
         if (Array.isArray(item.aim) && item.aim.length >= 2) {
@@ -282,10 +405,12 @@ export function normalizeLights(list, size = null) {
             intensity,
             color,
             diffusion,
+            specular,
             range,
             on,
             cone,
             edge,
+            gobo,
             aim,
         });
     }
@@ -691,8 +816,25 @@ export function shadePixel(srcRgba, normal, mapCoord, lights, params = null, fit
         const dotNL = nx * dirX + ny * dirY + nz * dirZ;
         const ndl = Math.max(0.0, (dotNL + diffusion) / (1.0 + diffusion));
 
-        // Spot cone term
+        // Specular (gloss) term
+        let specTerm = 0.0;
+        const specularPct = Number.isFinite(l.specular) ? Number(l.specular) : 0;
+        if (specularPct > 0 && dotNL > 0) {
+            const hx = dirX;
+            const hy = dirY;
+            const hz = dirZ + 1.0;
+            const hLen = Math.hypot(hx, hy, hz);
+            if (hLen > 1e-6) {
+                const ndh = Math.max(0.0, (nx * hx + ny * hy + nz * hz) / hLen);
+                const specNorm = specularPct / 100.0;
+                const power = 16.0 + 48.0 * specNorm;
+                specTerm = specNorm * Math.pow(ndh, power);
+            }
+        }
+
+        // Spot cone and gobo term
         let coneTerm = 1.0;
+        let goboTerm = 1.0;
         if (l.type === "spot" && l.aim) {
             const [ax, ay, az] = l.aim;
             const aimDx = ax - lx;
@@ -718,13 +860,52 @@ export function shadePixel(srcRgba, normal, mapCoord, lights, params = null, fit
                 const t = (cosAngle - cosOuter) / Math.max(1e-6, cosCone - cosOuter);
                 coneTerm = t * t * (3.0 - 2.0 * t);
             }
+
+            if (coneTerm > 0.0 && l.gobo && l.gobo !== "none") {
+                const rDirX = -dirX, rDirY = -dirY, rDirZ = -dirZ;
+                const zProj = rDirX * sDirX + rDirY * sDirY + rDirZ * sDirZ;
+                if (zProj > 1e-4) {
+                    const up = Math.abs(sDirZ) < 0.99 ? [0, 0, 1] : [0, 1, 0];
+                    let ux = up[1] * sDirZ - up[2] * sDirY;
+                    let uy = up[2] * sDirX - up[0] * sDirZ;
+                    let uz = up[0] * sDirY - up[1] * sDirX;
+                    const uLen = Math.hypot(ux, uy, uz) || 1.0;
+                    ux /= uLen; uy /= uLen; uz /= uLen;
+                    const vx = sDirY * uz - sDirZ * uy;
+                    const vy = sDirZ * ux - sDirX * uz;
+                    const vz = sDirX * uy - sDirY * ux;
+
+                    const sinCone = Math.sqrt(Math.max(0.0, 1.0 - cosCone * cosCone));
+                    const tanCone = sinCone / Math.max(1e-4, cosCone);
+                    const invSpan = 1.0 / (zProj * tanCone);
+                    const gx = (rDirX * ux + rDirY * uy + rDirZ * uz) * invSpan;
+                    const gy = (rDirX * vx + rDirY * vy + rDirZ * vz) * invSpan;
+
+                    if (l.gobo === "blinds") {
+                        const s = Math.sin(gy * 16.0);
+                        const w = Math.max(0.0, Math.min(1.0, (s + 0.3) / 0.6));
+                        goboTerm = 0.05 + 0.95 * (w * w * (3.0 - 2.0 * w));
+                    } else if (l.gobo === "window") {
+                        const tx = Math.max(0.0, Math.min(1.0, (Math.abs(gx) - 0.08) / 0.04));
+                        const ty = Math.max(0.0, Math.min(1.0, (Math.abs(gy) - 0.08) / 0.04));
+                        goboTerm = 0.05 + 0.95 * (tx * ty);
+                    } else if (l.gobo === "leaves") {
+                        const val = Math.sin(gx * 10.0 + Math.sin(gy * 8.0)) * Math.cos(gy * 11.0 + Math.sin(gx * 7.0)) + 0.3 * Math.sin((gx + gy) * 16.0);
+                        goboTerm = 0.10 + 0.90 * Math.max(0.0, Math.min(1.0, (val + 0.4) / 0.9));
+                    } else if (l.gobo === "stripes") {
+                        const s = Math.sin(gx * 18.0);
+                        const w = Math.max(0.0, Math.min(1.0, (s + 0.3) / 0.6));
+                        goboTerm = 0.05 + 0.95 * (w * w * (3.0 - 2.0 * w));
+                    }
+                }
+            }
         }
 
         // Shadow visibility
         const vis = visValues && Number.isFinite(visValues[i]) ? Number(visValues[i]) : 1.0;
         const vTerm = 1.0 - shadowsStrength * (1.0 - vis);
 
-        const factor = intensity * ndl * att * coneTerm * vTerm;
+        const factor = intensity * (ndl + specTerm) * att * coneTerm * vTerm * goboTerm;
         lsumR += rgbLin[0] * factor;
         lsumG += rgbLin[1] * factor;
         lsumB += rgbLin[2] * factor;
@@ -1180,6 +1361,8 @@ vec3 rl_evalLight(
     float l_edge,
     float kind,
     float l_mask,
+    float l_spec,
+    float gobo_type,
     float vis,
     vec3 normal,
     vec3 mpos
@@ -1200,9 +1383,19 @@ vec3 rl_evalLight(
     }
 
     float diff = l_col.w;
-    float ndl = max(0.0, (dot(normal, dir) + diff) / (1.0 + diff));
+    float dotNL = dot(normal, dir);
+    float ndl = max(0.0, (dotNL + diff) / (1.0 + diff));
+
+    float specTerm = 0.0;
+    if (l_spec > 0.0 && dotNL > 0.0) {
+        vec3 h = normalize(dir + vec3(0.0, 0.0, 1.0));
+        float ndh = max(0.0, dot(normal, h));
+        float power = 16.0 + 48.0 * l_spec;
+        specTerm = l_spec * pow(ndh, power);
+    }
 
     float coneTerm = 1.0;
+    float goboTerm = 1.0;
     if (kind > 1.5) {
         vec3 sDir = l_cone.xyz;
         float sLen = length(sDir);
@@ -1218,10 +1411,42 @@ vec3 rl_evalLight(
             float t = clamp((cosAngle - cosOuter) / max(1e-6, cosCone - cosOuter), 0.0, 1.0);
             coneTerm = t * t * (3.0 - 2.0 * t);
         }
+
+        if (coneTerm > 0.0 && gobo_type > 0.5) {
+            vec3 rDir = -dir;
+            float zProj = dot(rDir, sDir);
+            if (zProj > 1e-4) {
+                vec3 up = abs(sDir.z) < 0.99 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
+                vec3 uAxis = normalize(cross(up, sDir));
+                vec3 vAxis = cross(sDir, uAxis);
+                float sinCone = sqrt(max(0.0, 1.0 - cosCone * cosCone));
+                float tanCone = sinCone / max(1e-4, cosCone);
+                float invSpan = 1.0 / (zProj * tanCone);
+                float gx = dot(rDir, uAxis) * invSpan;
+                float gy = dot(rDir, vAxis) * invSpan;
+
+                if (gobo_type < 1.5) {
+                    float s = sin(gy * 16.0);
+                    float w = clamp((s + 0.3) / 0.6, 0.0, 1.0);
+                    goboTerm = 0.05 + 0.95 * (w * w * (3.0 - 2.0 * w));
+                } else if (gobo_type < 2.5) {
+                    float tx = clamp((abs(gx) - 0.08) / 0.04, 0.0, 1.0);
+                    float ty = clamp((abs(gy) - 0.08) / 0.04, 0.0, 1.0);
+                    goboTerm = 0.05 + 0.95 * (tx * ty);
+                } else if (gobo_type < 3.5) {
+                    float val = sin(gx * 10.0 + sin(gy * 8.0)) * cos(gy * 11.0 + sin(gx * 7.0)) + 0.3 * sin((gx + gy) * 16.0);
+                    goboTerm = 0.10 + 0.90 * clamp((val + 0.4) / 0.9, 0.0, 1.0);
+                } else {
+                    float s = sin(gx * 18.0);
+                    float w = clamp((s + 0.3) / 0.6, 0.0, 1.0);
+                    goboTerm = 0.05 + 0.95 * (w * w * (3.0 - 2.0 * w));
+                }
+            }
+        }
     }
 
     float vTerm = 1.0 - l_mask * (1.0 - vis);
-    return l_col.rgb * (ndl * att * coneTerm * vTerm);
+    return l_col.rgb * ((ndl + specTerm) * att * coneTerm * vTerm * goboTerm);
 }
 
 vec4 shade(vec4 c, vec2 uv) {
@@ -1304,10 +1529,10 @@ vec4 shade(vec4 c, vec2 uv) {
     vec3 fLin = pLin * gain;
 
     vec3 lsum = vec3(0.0);
-    lsum += rl_evalLight(u_l0_pos, u_l0_col, u_l0_cone, u_l0_edge, u_lkind.x, u_lmask.x, vis.r, normal, mpos);
-    lsum += rl_evalLight(u_l1_pos, u_l1_col, u_l1_cone, u_l1_edge, u_lkind.y, u_lmask.y, vis.g, normal, mpos);
-    lsum += rl_evalLight(u_l2_pos, u_l2_col, u_l2_cone, u_l2_edge, u_lkind.z, u_lmask.z, vis.b, normal, mpos);
-    lsum += rl_evalLight(u_l3_pos, u_l3_col, u_l3_cone, u_l3_edge, u_lkind.w, u_lmask.w, vis.a, normal, mpos);
+    lsum += rl_evalLight(u_l0_pos, u_l0_col, u_l0_cone, u_l0_edge, u_lkind.x, u_lmask.x, u_lspec.x, u_lgobo.x, vis.r, normal, mpos);
+    lsum += rl_evalLight(u_l1_pos, u_l1_col, u_l1_cone, u_l1_edge, u_lkind.y, u_lmask.y, u_lspec.y, u_lgobo.y, vis.g, normal, mpos);
+    lsum += rl_evalLight(u_l2_pos, u_l2_col, u_l2_cone, u_l2_edge, u_lkind.z, u_lmask.z, u_lspec.z, u_lgobo.z, vis.b, normal, mpos);
+    lsum += rl_evalLight(u_l3_pos, u_l3_col, u_l3_cone, u_l3_edge, u_lkind.w, u_lmask.w, u_lspec.w, u_lgobo.w, vis.a, normal, mpos);
 
     if (u_mode == 1) {
         vec3 lm = lsum + vec3(u_ambient);
@@ -1357,6 +1582,8 @@ export function registerRelightGL() {
             u_l3_edge: "float",
             u_lkind: "vec4",
             u_lmask: "vec4",
+            u_lspec: "vec4",
+            u_lgobo: "vec4",
             u_original: "float",
             u_ambient: "float",
             u_recover: "float",
@@ -1403,6 +1630,9 @@ export function registerRelightGL() {
             const lEdges = [];
             const lKinds = [0, 0, 0, 0];
             const lMasks = [0, 0, 0, 0];
+            const lSpecs = [0, 0, 0, 0];
+            const lGobos = [0, 0, 0, 0];
+            const GOBOS = { none: 0, blinds: 1, window: 2, leaves: 3, stripes: 4 };
 
             for (let i = 0; i < 4; i++) {
                 const l = lightsList[i];
@@ -1437,6 +1667,8 @@ export function registerRelightGL() {
                     lKinds[i] = l.type === "sun" ? 1.0 : (l.type === "spot" ? 2.0 : 0.0);
                     const shadowsStrength = (Number.isFinite(p.shadows) ? Number(p.shadows) : 60) / 100.0;
                     lMasks[i] = shadowsStrength;
+                    lSpecs[i] = (Number.isFinite(l.specular) ? Number(l.specular) : 0) / 100.0;
+                    lGobos[i] = GOBOS[l.gobo] || 0;
                 } else {
                     lPositions.push([0, 0, 0, 1]);
                     lColors.push([0, 0, 0, 0]);
@@ -1444,6 +1676,8 @@ export function registerRelightGL() {
                     lEdges.push(0);
                     lKinds[i] = 0;
                     lMasks[i] = 0;
+                    lSpecs[i] = 0;
+                    lGobos[i] = 0;
                 }
             }
 
@@ -1479,6 +1713,8 @@ export function registerRelightGL() {
                 u_l3_edge: lEdges[3],
                 u_lkind: lKinds,
                 u_lmask: lMasks,
+                u_lspec: lSpecs,
+                u_lgobo: lGobos,
                 u_original: origPct / 100.0,
                 u_ambient: ambientPct / 100.0,
                 u_recover: recoverVal,

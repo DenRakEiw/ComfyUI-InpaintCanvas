@@ -50,7 +50,7 @@ import { limitAlphaRows } from "./inpaint_limit.js";
 import { buildRangeBar } from "./inpaint_rangebar.js";
 import { BLENDS, BLEND_GROUPS, BLEND_MODES, EMULATED_BLENDS, BLEND_OPS, canvasOp, normalBlend, seedOfLayer, hash32, mul255 } from "./blend_modes.js";
 import { heightNormals, shadowMarch } from "./px/kernels.js";
-import { lightToMap, defaultLight, KELVIN_PRESETS, LIGHT_MAX, lightColorHex } from "./inpaint_relight.js";
+import { lightToMap, defaultLight, KELVIN_PRESETS, LIGHT_MAX, lightColorHex, LIGHT_PRESETS, SPOT_GOBOS, applyLightPreset } from "./inpaint_relight.js";
 
 /**
  * The pixel backend a new editor takes (docs/PLAN_BCE.md §C2 step b): the host's choice when it made
@@ -1784,6 +1784,9 @@ const STYLE = `
 .ipc-relight-controls { display:grid; grid-template-columns:auto 1fr auto; gap:4px 6px; align-items:center; margin-top:4px; padding:6px; border-radius:var(--sc-radius, 3px); background:var(--sc-well, #161616); font-size:11px; }
 .ipc-relight-color-row { grid-column:1 / -1; display:flex; align-items:center; gap:6px; font-size:11px; }
 .ipc-relight-kelvin-sel { flex:1; min-width:0; height:22px; font-size:11px; }
+.ipc-relight-preset-sel { max-width:110px; height:20px; font-size:11px; padding:0 4px; }
+.ipc-relight-gobo-row { grid-column:1 / -1; display:flex; align-items:center; gap:6px; font-size:11px; }
+.ipc-relight-gobo-sel { flex:1; min-width:0; height:20px; font-size:11px; padding:0 4px; }
 `;
 
 function injectStyle() {
@@ -2118,6 +2121,7 @@ class InpaintEditor {
         this.uploaded = this.makeUploaded();
         this.filterCounter = 0;
         this.filterPreview = null;      // id of the filter layer whose slider is being dragged (low-res preview)
+        this.hideLightHandles = false;  // view toggle: hide 3D light handles and overlays on canvas
         this.seenResults = new Set();
         this.layerCounter = 0;
         this.paintCounter = 0;
@@ -3373,7 +3377,7 @@ class InpaintEditor {
             if (this.moveOpts.mode === "move") this.warmRemove();
         }
         if (tool === "lights") {
-            this.setStatus("Lights: drag a light to move it, Alt+drag for Close/Far, wheel for diffusion (Shift: intensity). Click to add a light, Delete removes.");
+            this.setStatus("Lights: drag a light to move it, Alt+drag for Close/Far, wheel for diffusion (Shift: intensity), H toggles handles. Click to add a light, Delete removes.");
         }
         if (prevTool === "lights" && tool !== "lights") {
             this.viewEl.style.cursor = "";
@@ -3529,7 +3533,16 @@ class InpaintEditor {
             case "p": this.setTool("paint"); break;
             case "e": this.setTool("erase"); break;
             case "t": this.setTool("transform"); break;
-            case "h": this.setTool("hand"); break;
+            case "h":
+                if (this.tool === "lights" && this.isRelightActive()) {
+                    this.hideLightHandles = !this.hideLightHandles;
+                    this.draw();
+                    this.renderLayers();
+                    this.setStatus(this.hideLightHandles ? "Light handles hidden (press H to show)." : "Light handles visible (press H to hide).");
+                    break;
+                }
+                this.setTool("hand");
+                break;
             case "c": this.setTool("canvas"); break;
             case "i": this.setTool("eyedropper"); break;
             case "w": this.setTool(e.shiftKey ? "liquify" : "wand"); break;
@@ -19322,6 +19335,54 @@ class InpaintEditor {
         editBtn.classList.add("ipc-small", "ipc-edit-lights");
         head.appendChild(editBtn);
 
+        const toggleHandlesBtn = miniButton(this.hideLightHandles ? "eyeOff" : "eye", this.hideLightHandles ? "Show light handles on canvas (H)" : "Hide light handles on canvas (H)", (e) => {
+            stop(e);
+            this.hideLightHandles = !this.hideLightHandles;
+            this.draw();
+            this.renderLayers();
+            this.setStatus(this.hideLightHandles ? "Light handles hidden (press H to show)." : "Light handles visible (press H to hide).");
+        }, "ipc-relight-toggle-handles");
+        if (this.hideLightHandles) toggleHandlesBtn.classList.add("ipc-on");
+        head.appendChild(toggleHandlesBtn);
+
+        const presetSel = document.createElement("select");
+        presetSel.className = "ipc-sel ipc-relight-preset-sel";
+        presetSel.title = "Apply lighting preset";
+        const defOpt = document.createElement("option");
+        defOpt.value = "";
+        defOpt.textContent = "Preset...";
+        presetSel.appendChild(defOpt);
+        for (const p of LIGHT_PRESETS) {
+            const opt = document.createElement("option");
+            opt.value = p.id;
+            opt.textContent = p.label;
+            opt.title = p.description;
+            presetSel.appendChild(opt);
+        }
+        presetSel.addEventListener("click", stop);
+        presetSel.addEventListener("keydown", stop);
+        presetSel.addEventListener("change", () => {
+            const pid = presetSel.value;
+            if (!pid) return;
+            const pObj = LIGHT_PRESETS.find((x) => x.id === pid);
+            const pLabel = pObj ? pObj.label : pid;
+            this.pushUndo({ kind: "filter", id: layer.id, label: `Light preset: ${pLabel}` });
+            const w = this.doc ? this.doc.width : 1024;
+            const h = this.doc ? this.doc.height : 1024;
+            const newLights = applyLightPreset(pid, { width: w, height: h });
+            if (newLights && newLights.length > 0) {
+                layer.params.lights = newLights;
+                layer._selectedLightId = newLights[0].id;
+                this.ensureRelightMaps(layer, { quick: false });
+                this.markFilterChanged(layer);
+                this.renderLayers();
+                this.draw();
+                this.setStatus(`Applied preset "${pLabel}".`);
+            }
+            presetSel.value = "";
+        });
+        head.appendChild(presetSel);
+
         const count = lights.length;
         const addBtn = iconButton("plus", count >= LIGHT_MAX ? "Maximum 4 lights reached" : "Add a new light", () => {
             if (layer.params.lights.length >= LIGHT_MAX) return;
@@ -19484,12 +19545,45 @@ class InpaintEditor {
 
             addSlider("Intensity", "intensity", 0, 200, 1, 100, "%");
             addSlider("Diffusion", "diffusion", 0, 100, 1, 30, "%");
+            addSlider("Gloss", "specular", 0, 100, 1, 0, "%");
             addSlider("Close/Far", "dist", -100, 100, 1, -30, "%");
             addSlider("Range", "range", 5, 500, 1, 50, "%");
 
             if (selLight.type === "spot") {
                 addSlider("Cone", "cone", 1, 89, 1, 30, "\u00b0");
                 addSlider("Edge", "edge", 0, 100, 1, 20, "%");
+
+                // Gobo select
+                const goboRow = el("div", "ipc-relight-gobo-row");
+                const goboLab = el("span", null, "Gobo");
+                goboRow.appendChild(goboLab);
+                const goboSel = document.createElement("select");
+                goboSel.className = "ipc-sel ipc-relight-gobo-sel";
+                goboSel.title = "Spotlight gobo pattern";
+                const goboLabels = {
+                    none: "None",
+                    blinds: "Venetian blinds",
+                    window: "Window frame",
+                    leaves: "Foliage dappled",
+                    stripes: "Vertical bars",
+                };
+                for (const g of SPOT_GOBOS) {
+                    const opt = document.createElement("option");
+                    opt.value = g;
+                    opt.textContent = goboLabels[g] || g;
+                    goboSel.appendChild(opt);
+                }
+                goboSel.value = selLight.gobo || "none";
+                goboSel.addEventListener("click", stop);
+                goboSel.addEventListener("keydown", stop);
+                goboSel.addEventListener("change", () => {
+                    this.pushUndo({ kind: "filter", id: layer.id, label: "Relight: Gobo" });
+                    selLight.gobo = goboSel.value;
+                    this.markFilterChanged(layer);
+                    this.renderLayers();
+                });
+                goboRow.appendChild(goboSel);
+                controlsBox.appendChild(goboRow);
             }
 
             // Colour row
@@ -22303,7 +22397,7 @@ class InpaintEditor {
     }
 
     drawLightsOverlay(ctx) {
-        if (!this.isOpen || !this.isRelightActive()) return;
+        if (!this.isOpen || !this.isRelightActive() || this.hideLightHandles) return;
         const activeLayer = this.activeLayer();
         if (!activeLayer || !activeLayer.params || !Array.isArray(activeLayer.params.lights)) return;
         const lights = activeLayer.params.lights;
