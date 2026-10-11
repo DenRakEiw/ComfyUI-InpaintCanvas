@@ -1209,7 +1209,8 @@ export const FILTERS = {
     gradient_map: {
         label: "Gradient map",
         params: [
-            { key: "preset", label: "Preset", type: "select", default: "cyberpunk", options: [
+            // its own title: a select keyed "preset" without one shows the grain's film-stock text
+            { key: "preset", label: "Preset", type: "select", default: "cyberpunk", title: "The colours the picture's brightness is mapped to, dark to light; Custom: the two colours below", options: [
                 { id: "cyberpunk", label: "Cyberpunk" },
                 { id: "sunset", label: "Sunset" },
                 { id: "teal_orange", label: "Teal / Orange" },
@@ -1221,7 +1222,8 @@ export const FILTERS = {
             { key: "shadow", label: "Shadow", type: "color", default: "#000000", when: { preset: "custom" } },
             { key: "highlight", label: "Highlight", type: "color", default: "#ffffff", when: { preset: "custom" } },
             { key: "reverse", label: "Reverse", type: "bool", default: false },
-            { key: "opacity", label: "Opacity", min: 0, max: 100, step: 1, default: 100, unit: "%" },
+            // an offset on any preset, as the grain's look strength: moving it must not turn the preset to Custom
+            { key: "opacity", label: "Opacity", min: 0, max: 100, step: 1, default: 100, unit: "%", keepPreset: true },
         ],
         reach: 0,
         apply: applyGradientMap,

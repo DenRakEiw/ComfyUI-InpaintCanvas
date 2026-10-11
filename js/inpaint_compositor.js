@@ -54,10 +54,12 @@ vec3 bm_clip(vec3 c) {
     float l = bm_lum(c);
     float n = min(min(c.r, c.g), c.b);
     float x = max(max(c.r, c.g), c.b);
-    if (n < 0.0) {
+    // an exactly grey c has l == n == x (lum of (v, v, v) can round to v): without the second test that is 0 / 0, a NaN
+    // that reaches the framebuffer as black; a grey c needs no clip, its channels are already l
+    if (n < 0.0 && l > n) {
         c = l + (((c - l) * l) / (l - n));
     }
-    if (x > 1.0) {
+    if (x > 1.0 && x > l) {
         c = l + (((c - l) * (1.0 - l)) / (x - l));
     }
     return c;
@@ -89,7 +91,10 @@ float blend1(int mode, float b, float s) {
     if (mode == 16) return max(0.0, b + s - 1.0);
     if (mode == 17) return max(0.0, b - s);
     if (mode == 18) return s <= 0.5 ? min(b, 2.0 * s) : max(b, 2.0 * s - 1.0);
-    if (mode == 19) return floor(b * 255.0 + 0.5) + floor(s * 255.0 + 0.5) >= 255.0 ? 1.0 : 0.0;
+    if (mode == 19) {   // hard mix on rounded bytes; the tie b + s = 255 as Photoshop has it: white for s <= 127, black from 128
+        float s8 = floor(s * 255.0 + 0.5);
+        return floor(b * 255.0 + 0.5) + s8 >= 255.0 + step(127.5, s8) ? 1.0 : 0.0;
+    }
     if (mode == 20) return bm_dodge(b, s);
     if (mode == 21) return bm_burn(b, s);
     if (mode == 22) return s <= 0.5 ? bm_burn(b, 2.0 * s) : bm_dodge(b, 2.0 * s - 1.0);

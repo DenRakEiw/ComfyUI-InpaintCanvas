@@ -230,7 +230,9 @@ let hazeRegistered = false;
 
 export function registerHazeGL() {
     if (hazeRegistered) return;
-    hazeRegistered = true;
+    // the flag is set after registerGLFilter went through: at import, inside the import cycle with
+    // inpaint_filters_gl.js, the call can throw (its tables are not initialised yet), and the later calls
+    // (inpaint_filters_gl.js after its tables, applyFilterGL) have to try again
     registerGLFilter("haze", {
         uniforms: {
             u_map: "sampler2D",
@@ -276,6 +278,7 @@ export function registerHazeGL() {
         },
         skip: (p, info) => !(info && info.maps && info.maps.depth) || (p.amount !== undefined && Number(p.amount) <= 0),
     });
+    hazeRegistered = true;
 }
 
 /**
@@ -410,7 +413,7 @@ let dehazeRegistered = false;
 
 export function registerDehazeGL() {
     if (dehazeRegistered) return;
-    dehazeRegistered = true;
+    // set after registerGLFilter went through, as in registerHazeGL
     registerGLFilter("dehaze", {
         uniforms: {
             u_t: "sampler2D",
@@ -495,13 +498,12 @@ export function registerDehazeGL() {
             return false;
         },
     });
+    dehazeRegistered = true;
 }
 
-try {
-    registerHazeGL();
-    registerDehazeGL();
-} catch (_) {
-    // Registered when inpaint_filters_gl.js initializes
-}
+// Each on its own: inside the import cycle the first can throw, which must not keep the second from trying.
+// Whatever throws here is registered when inpaint_filters_gl.js initializes (or at its first applyFilterGL).
+try { registerHazeGL(); } catch (_) { /* see above */ }
+try { registerDehazeGL(); } catch (_) { /* see above */ }
 
 

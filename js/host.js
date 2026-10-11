@@ -184,6 +184,8 @@ export const host = {
     upsampleInstruction: null,   // the built-in upsample instruction (Scumble hands out its templates)
     generateNewAvailable() { return false; },
     openGenerateNew() {},
+    newCanvasChoices() { return null; },   // a New dialog with a model is a Scumble feature (item 34): the node's asks width x height
+    async newCanvasChosen() {},
     editorBuilt() {},
     toolChanged() {},
     pluginPointer() { return false; },

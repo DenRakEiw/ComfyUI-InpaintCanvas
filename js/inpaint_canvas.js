@@ -339,9 +339,14 @@ const EMULATED_BLEND_CLIP_SHADER = {
     code: EMULATED_BLEND_SHADER.code.replace("float as = S.a * u_opacity,", "float as = S.a * u_opacity * texture(u_clip, uv).a,"),
 };
 
+// dissolve over the backdrop (R4-S9): a kept pixel is the layer's colour at full alpha, a dropped one the backdrop. The
+// hash runs on image pixels (`u_invX`, `u_invY`: the canvas-to-image map), and the layer's opacity comes in as the
+// integer the CPU paths take (`u_alpha255`, Math.round in JS): GLSL's round() leaves the direction at .5 to the GPU
+// (half to even is allowed, and ANGLE's D3D11 backend may take it), and float32 0.3 * 255 is exactly 76.5, so at 30 %
+// the screen could keep other pixels than the export. Every rounding here is floor(x + 0.5), as Math.round
 const DISSOLVE_SHADER = {
     label: "dissolve",
-    uniforms: { u_layer: "sampler2D", u_opacity: "float", u_seed_hi: "float", u_seed_lo: "float", u_invX: "vec3", u_invY: "vec3" },
+    uniforms: { u_layer: "sampler2D", u_alpha255: "float", u_seed_hi: "float", u_seed_lo: "float", u_invX: "vec3", u_invY: "vec3" },
     code: `
 uint lowbias32(uint x) {
     x ^= x >> 16u;
@@ -367,8 +372,8 @@ vec4 shade(vec4 B, vec2 uv) {
     int imgX = int(floor(dot(u_invX, vec3(fragPx, 1.0))));
     int imgY = int(floor(dot(u_invY, vec3(fragPx, 1.0))));
     uint seed = uint(u_seed_lo) | (uint(u_seed_hi) << 16u);
-    int srcA = int(round(S.a * 255.0));
-    int alpha255 = int(round(u_opacity * 255.0));
+    int srcA = int(floor(S.a * 255.0 + 0.5));
+    int alpha255 = int(floor(u_alpha255 + 0.5));
     int c = mul255(srcA, alpha255);
     bool keep = (c == 255) || ((hash32(uint(imgX), uint(imgY), seed) >> 24u) < uint(c));
     return keep ? vec4(S.rgb, 1.0) : B;
@@ -378,10 +383,10 @@ vec4 shade(vec4 B, vec2 uv) {
 
 const DISSOLVE_CLIP_SHADER = {
     label: "dissolve, clipped",
-    uniforms: { u_layer: "sampler2D", u_clip: "sampler2D", u_opacity: "float", u_seed_hi: "float", u_seed_lo: "float", u_invX: "vec3", u_invY: "vec3" },
+    uniforms: { u_layer: "sampler2D", u_clip: "sampler2D", u_alpha255: "float", u_seed_hi: "float", u_seed_lo: "float", u_invX: "vec3", u_invY: "vec3" },
     code: DISSOLVE_SHADER.code.replace(
         "int c = mul255(srcA, alpha255);",
-        "int mask = int(round(texture(u_clip, uv).a * 255.0));\n    int c = mul255(mul255(srcA, alpha255), mask);"
+        "int mask = int(floor(texture(u_clip, uv).a * 255.0 + 0.5));\n    int c = mul255(mul255(srcA, alpha255), mask);"
     ),
 };
 
@@ -1446,10 +1451,15 @@ const STYLE = `
 .ipc-askbox .ipc-askmsg { color:var(--sc-fg-2, #aaa); white-space:pre-line; }
 .ipc-askbox .ipc-askinput { background:var(--sc-field, #1b1b1b); color:var(--sc-fg, #eee); border:1px solid var(--sc-line, #4a4a4a); border-radius:var(--sc-radius, 6px); padding:7px 9px; font:inherit; }
 .ipc-askbox .ipc-askrow { display:flex; gap:8px; align-items:center; }
-.ipc-askbox .ipc-askfields { display:flex; gap:10px; }
-.ipc-askbox .ipc-askfield { display:flex; flex-direction:column; gap:4px; flex:1 1 0; font-size:12px; color:var(--sc-fg-2, #aaa); }
-.ipc-askbox .ipc-askfield input { width:100%; box-sizing:border-box; }
+.ipc-askbox .ipc-askfields { display:flex; flex-wrap:wrap; gap:10px; }
+.ipc-askbox .ipc-askfield { display:flex; flex-direction:column; gap:4px; flex:1 1 0; min-width:0; font-size:12px; color:var(--sc-fg-2, #aaa); }
+.ipc-askbox .ipc-askfield input, .ipc-askbox .ipc-askfield select { width:100%; box-sizing:border-box; }
+.ipc-askbox .ipc-askfield .ipc-askinput:disabled { opacity:.55; }
+.ipc-askbox .ipc-askwide, .ipc-askbox .ipc-asknote { flex-basis:100%; }
+.ipc-askbox .ipc-asknote { font-size:12px; color:var(--sc-fg-2, #aaa); }
+.ipc-askbox .ipc-askfields > [hidden] { display:none; }
 .ipc-askbox .ipc-asklink { display:flex; gap:6px; align-items:center; color:var(--sc-fg-2, #aaa); font-size:12px; }
+.ipc-askbox .ipc-asklink.ipc-off { opacity:.5; }
 .ipc-flyout { position:absolute; z-index:6; display:flex; flex-direction:column; gap:3px; padding:5px; background:var(--sc-raised, #262626); border:1px solid var(--sc-border, #444); border-radius:var(--sc-radius-lg, 8px); box-shadow:var(--sc-shadow, 0 8px 24px rgba(0,0,0,.55)); min-width:170px; }
 .ipc-flyout .ipc-ib { justify-content:flex-start; padding:5px 10px; width:auto; height:auto; text-align:left; white-space:nowrap; }
 .ipc-flyout .ipc-key { margin-left:auto; padding-left:14px; color:var(--sc-muted, #8a8a8a); font-size:11px; }
@@ -3098,32 +3108,87 @@ class InpaintEditor {
      * "prompt() is not supported"), and a native dialog would block the canvas.
      * Resolves with the entered text, with true for a plain confirm, or with null
      * when the question was cancelled.
+     *
+     * `fields` makes a form: number boxes ({ key, label, value, min, max, disabled }), selects ({ key, label,
+     * type: "select", options: [{ value, label, group }], value, hidden, disabled, wide }; options with a group go in an
+     * optgroup of that name, a `wide` field takes a row of its own) and note lines ({ key, type: "note", text, hidden }).
+     * The answer is then an object: a number per number box, a string per select (hidden ones too), no notes.
+     * `linked` offers to tie exactly two number boxes by their ratio (a disabled box is not tied). `onChange(key, values,
+     * set)` runs after a select is changed or a number box is typed in: `values` the answer as it is now,
+     * `set(key, { options, value, hidden, disabled, text })` changes a field without calling onChange again.
      */
-    ask({ title = "", message = "", value = null, fields = null, linked = false, ok = "OK", cancel = "Cancel", danger = false } = {}) {
+    ask({ title = "", message = "", value = null, fields = null, linked = false, ok = "OK", cancel = "Cancel", danger = false, onChange = null } = {}) {
         return new Promise((resolve) => {
             const wrap = el("div", "ipc-ask");
             const box = el("div", "ipc-askbox");
             if (title) box.appendChild(el("div", "ipc-asktitle", title));
             if (message) box.appendChild(el("div", "ipc-askmsg", message));
             let input = null;
-            const nums = [];
+            const nums = [];        // the number boxes, in order
+            const ctls = [];        // every control that answers: number boxes and selects, in order
+            const parts = new Map();   // key -> { kind, cell, ctl }
+            // the ratio tie (two number boxes): its hooks stay no-ops without one
+            let tied = () => false, retie = () => {}, syncLink = () => {};
+            // a select's value: `want` when it is one of the options, else the first option
+            const pickOption = (sel, want) => {
+                const v = want == null ? "" : String(want);
+                sel.value = v;
+                if (sel.selectedIndex < 0 && sel.options.length) sel.selectedIndex = 0;
+            };
+            const fillSelect = (sel, options, want) => {
+                sel.textContent = "";
+                let group = null;
+                for (const raw of options || []) {
+                    const o = raw && typeof raw === "object" ? raw : { value: raw, label: raw };
+                    const opt = document.createElement("option");
+                    opt.value = String(o.value == null ? "" : o.value);
+                    opt.textContent = String(o.label != null ? o.label : opt.value);
+                    if (o.group) {
+                        if (!group || group.label !== String(o.group)) { group = document.createElement("optgroup"); group.label = String(o.group); sel.appendChild(group); }
+                        group.appendChild(opt);
+                    } else {
+                        group = null;
+                        sel.appendChild(opt);
+                    }
+                }
+                pickOption(sel, want);
+            };
             if (fields && fields.length) {
-                // one labelled number box per field; two of them can be tied by their ratio
+                // one labelled box per field (a number box or a select), notes between them; two number boxes can be
+                // tied by their ratio
                 const grid = el("div", "ipc-askfields");
-                const ratio = fields.length === 2 && +fields[0].value > 0 ? +fields[1].value / +fields[0].value : 1;
                 for (const f of fields) {
-                    const cell = el("div", "ipc-askfield");
+                    const kind = f.type === "select" ? "select" : f.type === "note" ? "note" : "number";
+                    if (kind === "note") {
+                        const note = el("div", "ipc-asknote", f.text != null ? String(f.text) : "");
+                        note.hidden = !!f.hidden;
+                        grid.appendChild(note);
+                        parts.set(f.key, { kind, cell: note, ctl: null });
+                        continue;
+                    }
+                    const cell = el("div", "ipc-askfield" + (f.wide ? " ipc-askwide" : ""));
                     cell.appendChild(el("span", null, f.label || f.key));
-                    const inp = document.createElement("input");
-                    inp.type = "number";
-                    inp.className = "ipc-askinput";
-                    inp.value = String(f.value != null ? f.value : "");
-                    if (f.min != null) inp.min = String(f.min);
-                    if (f.max != null) inp.max = String(f.max);
-                    inp.dataset.key = f.key;
-                    cell.appendChild(inp);
+                    let ctl;
+                    if (kind === "select") {
+                        ctl = document.createElement("select");
+                        ctl.className = "ipc-askinput";
+                        fillSelect(ctl, f.options, f.value);
+                    } else {
+                        ctl = document.createElement("input");
+                        ctl.type = "number";
+                        ctl.className = "ipc-askinput";
+                        ctl.value = String(f.value != null ? f.value : "");
+                        if (f.min != null) ctl.min = String(f.min);
+                        if (f.max != null) ctl.max = String(f.max);
+                        nums.push(ctl);
+                    }
+                    ctl.dataset.key = f.key;
+                    ctl.disabled = !!f.disabled;
+                    cell.hidden = !!f.hidden;
+                    cell.appendChild(ctl);
                     grid.appendChild(cell);
-                    nums.push(inp);
+                    ctls.push(ctl);
+                    parts.set(f.key, { kind, cell, ctl });
                 }
                 box.appendChild(grid);
                 if (nums.length === 2 && linked) {
@@ -3134,13 +3199,24 @@ class InpaintEditor {
                     lab.appendChild(link);
                     lab.appendChild(el("span", null, "Keep the ratio"));
                     box.appendChild(lab);
+                    // the ratio of the two values: taken at the start; with onChange (a dialog whose fields the caller
+                    // changes, New with a model) also when the tie is ticked and when set() changes them while they are
+                    // not tied (a disabled box is not tied). A plain dialog (the two-number New, the node's, SVG import)
+                    // keeps the ratio it opened with
+                    let ratio = 1;
+                    retie = () => { const a = +nums[0].value, b = +nums[1].value; if (a > 0 && b > 0) ratio = b / a; };
+                    retie();
+                    tied = () => link.checked && !nums[0].disabled && !nums[1].disabled;
+                    syncLink = () => { const off = nums[0].disabled || nums[1].disabled; link.disabled = off; lab.classList.toggle("ipc-off", off); };
+                    syncLink();
                     const tie = (from, to, factor) => () => {
-                        if (!link.checked) return;
+                        if (!tied()) return;
                         const v = +from.value;
-                        if (v > 0) to.value = String(Math.max(1, Math.round(v * factor)));
+                        if (v > 0) to.value = String(Math.max(1, Math.round(v * factor())));
                     };
-                    nums[0].addEventListener("input", tie(nums[0], nums[1], ratio));
-                    nums[1].addEventListener("input", tie(nums[1], nums[0], ratio ? 1 / ratio : 1));
+                    nums[0].addEventListener("input", tie(nums[0], nums[1], () => ratio));
+                    nums[1].addEventListener("input", tie(nums[1], nums[0], () => (ratio ? 1 / ratio : 1)));
+                    if (typeof onChange === "function") link.addEventListener("change", () => { if (link.checked) retie(); });
                 }
             } else if (value != null) {
                 input = document.createElement("input");
@@ -3159,13 +3235,41 @@ class InpaintEditor {
             row.appendChild(okBtn);
             box.appendChild(row);
             wrap.appendChild(box);
-            // the answer: an object of numbers for fields, the string for a text input, true otherwise
+            // the answer: an object for fields (numbers for number boxes, strings for selects), the string for a text
+            // input, true otherwise
             const answer = () => {
-                if (!nums.length) return input ? input.value : true;
+                if (!ctls.length) return input ? input.value : true;
                 const out = {};
-                for (const inp of nums) out[inp.dataset.key] = +inp.value;
+                for (const c of ctls) out[c.dataset.key] = c.tagName === "SELECT" ? c.value : +c.value;
                 return out;
             };
+            // a field changed by the caller (onChange): its options, value, text, hidden and disabled state
+            const set = (key, patch = {}) => {
+                const p = parts.get(key);
+                if (!p || !patch) return;
+                if (p.kind === "note") {
+                    if (patch.text != null) p.cell.textContent = String(patch.text);
+                } else {
+                    const wasOff = p.ctl.disabled;
+                    if (p.kind === "select" && patch.options) fillSelect(p.ctl, patch.options, patch.value != null ? patch.value : p.ctl.value);
+                    else if (patch.value != null) {
+                        if (p.kind === "select") pickOption(p.ctl, patch.value);
+                        else p.ctl.value = String(patch.value);
+                    }
+                    if (patch.disabled != null) p.ctl.disabled = !!patch.disabled;
+                    // the tie takes the new values as its ratio unless it holds them (a box enabled again joins it anew)
+                    if (p.kind === "number" && (patch.value != null || wasOff !== p.ctl.disabled) && (!tied() || (wasOff && !p.ctl.disabled))) retie();
+                }
+                if (patch.hidden != null) p.cell.hidden = !!patch.hidden;
+                syncLink();
+            };
+            if (typeof onChange === "function") {
+                const fire = (key) => {
+                    try { onChange(key, answer(), set); } catch (err) { console.error(err); }
+                };
+                // after the tie's own listeners, so onChange sees both values
+                for (const c of ctls) c.addEventListener(c.tagName === "SELECT" ? "change" : "input", () => fire(c.dataset.key));
+            }
             const finish = (val) => {
                 if (this.askOpen !== wrap) return;
                 this.askOpen = null;
@@ -3184,7 +3288,12 @@ class InpaintEditor {
             this.askOpen = wrap;
             window.addEventListener("keydown", onKey, true);
             this.root.appendChild(wrap);
-            if (nums.length) { nums[0].focus(); nums[0].select(); }
+            // the first number box that can be typed in, else the first select, else the text input or OK
+            const usable = (c) => !c.disabled && !c.closest("[hidden]");
+            const firstNum = nums.find(usable);
+            const firstSel = ctls.find((c) => c.tagName === "SELECT" && usable(c));
+            if (firstNum) { firstNum.focus(); firstNum.select(); }
+            else if (firstSel) firstSel.focus();
             else if (input) { input.focus(); input.select(); }
             else okBtn.focus();
         });
@@ -8196,7 +8305,17 @@ class InpaintEditor {
         // `release`; the region tier keeps the press by first reads (above)
         const clones = [];
         const held = (s) => { if (!snapshot || !s) return s; const c = s.clone(); clones.push(c); return c; };
-        const stack = plan.map((s) => s && { px: held(s.px), mask: held(s.mask || null), x: s.x, y: s.y, alpha: s.alpha, op: s.op | 0, match: s.match ? this.boxMatchOf(s.match) : null });
+        // a clipped entry's `clip` becomes its base's mapped entry (held clones included), as `holdStackNow` does; a base
+        // comes before its layers. `dissolve` (the layer's seed) goes on: without it compositeBox drew a dissolve layer as
+        // a smooth normal blend at its opacity, and clipped layers over their whole extent, where the screen shows dots
+        // and the base's coverage (the canvas backend's region read did, so the two backends wrote different pixels)
+        const mapped = new Map();
+        const stack = plan.map((s) => {
+            if (!s) return s;
+            const e = { px: held(s.px), mask: held(s.mask || null), x: s.x, y: s.y, alpha: s.alpha, op: s.op | 0, match: s.match ? this.boxMatchOf(s.match) : null, clip: s.clip ? mapped.get(s.clip) || null : null, dissolve: s.dissolve ?? null };
+            mapped.set(s, e);
+            return e;
+        });
         const src = {
             tier: "tiles",
             read: (box, slot = 0) => {
@@ -14125,8 +14244,14 @@ class InpaintEditor {
      * `clip` (PLAN_0_1_31 §6 step 3): the coverage of a clipped layer's base (`clipCoverage`, a canvas of `ctx`'s size in
      * its pixels): the scratch keeps the layer only where the base is (`destination-in`), and then goes over the canvas
      * in any blend mode, the ones Canvas 2D has as well.
+     *
+     * Dissolve (`seed`, the layer's `seedOfLayer`): a pixel is kept or dropped by a hash of its image pixel, so the dots
+     * stay where they are on every path. `toImage` maps the canvas's pixels to image pixels for that hash; without it
+     * the inverse of `ctx`'s transform does, which is right for a canvas the image is drawn into through its transform
+     * (the screen, the region pass, the flatten). A canvas whose transform does not say where its origin lies in the
+     * image (a merge's union box, drawn at offsets of its own) passes the map.
      */
-    blendEmulated(ctx, mode, draw, opacity = 1, clip = null, seed = null) {
+    blendEmulated(ctx, mode, draw, opacity = 1, clip = null, seed = null, toImage = null) {
         const cv = ctx.canvas, W = cv.width, H = cv.height;
         if (!W || !H) return;
         const screen = !!(this.viewPass && this.viewPass.screen);
@@ -14165,11 +14290,11 @@ class InpaintEditor {
         if (screen && EMULATED_BLENDS.has(mode)) {
             let out = null;
             if (mode === "dissolve") {
-                const inv = ctx.getTransform().inverse();
+                const inv = toImage || ctx.getTransform().inverse();
                 const seedVal = seed !== null ? (seed >>> 0) : 0;
                 const uniforms = {
                     u_layer: s,
-                    u_opacity: Math.max(0, Math.min(1, opacity)),
+                    u_alpha255: Math.round(Math.max(0, Math.min(1, opacity)) * 255),
                     u_seed_hi: (seedVal >>> 16) & 0xffff,
                     u_seed_lo: seedVal & 0xffff,
                     u_invX: [inv.a, inv.c, inv.e],
@@ -14215,7 +14340,7 @@ class InpaintEditor {
             else for (let i = 0; i < mask.length; i++) { const t = cd[i * 4 + 3] * ca + 128; mask[i] = (t + (t >> 8)) >> 8; }
         }
         if (mode === "dissolve") {
-            const inv = ctx.getTransform().inverse();
+            const inv = toImage || ctx.getTransform().inverse();
             const td = t.data;
             const alpha255 = Math.round(Math.max(0, Math.min(1, opacity)) * 255);
             const seedVal = seed !== null ? (seed >>> 0) : 0;
@@ -16300,7 +16425,10 @@ class InpaintEditor {
             // the layer's pixels where `below` (all the canvas holds yet) is; in a blend mode the base's alpha is put back after
             const cov = clipTo ? cpuDab(null, c.width, c.height) : null;
             if (cov) cov.getContext("2d").drawImage(c, 0, 0);
-            this.blendEmulated(ctx, layer.blend, (lc) => { lc.imageSmoothingEnabled = true; lc.imageSmoothingQuality = "high"; lc.drawImage(this.layerPixels(layer), (layer.x - x0) * res, (layer.y - y0) * res, layer.w * res, layer.h * res); }, layer.opacity, cov, seedOfLayer(layer.id));
+            // the canvas is the union box at `res` with no transform: dissolve hashes the image pixel, (x0, y0) + p / res,
+            // as the screen and the export do (the identity hashed the box's own pixels and moved half the dots)
+            const toImage = new DOMMatrix([1 / res, 0, 0, 1 / res, x0, y0]);
+            this.blendEmulated(ctx, layer.blend, (lc) => { lc.imageSmoothingEnabled = true; lc.imageSmoothingQuality = "high"; lc.drawImage(this.layerPixels(layer), (layer.x - x0) * res, (layer.y - y0) * res, layer.w * res, layer.h * res); }, layer.opacity, cov, seedOfLayer(layer.id), toImage);
             if (cov) {
                 const a = cov.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, c.width, c.height).data;
                 const img = ctx.getImageData(0, 0, c.width, c.height), d = img.data;
@@ -17303,27 +17431,36 @@ class InpaintEditor {
 
     // ---- layers: management ------------------------------------------------
 
-    /** A new base from a file in the mirror (`ref`), all else dropped: a large one decoded off the window on tiles. */
+    /**
+     * A new base from a file in the mirror (`ref`), all else dropped: a large one decoded off the window on tiles.
+     * Another picture is not the canvas a preset was made for: Generate new's preset (`genSettings.target`, item 34)
+     * goes with the old one, as in loadFile (Generate new's own base, setBaseFromCanvas, keeps it: the run writes it).
+     */
     async setBaseFromRef(ref) {
-        if (TIFF_EXT.test(ref.filename || "")) {
-            const blob = await (await fetch(viewUrl(ref))).blob();
-            if (await isTiffFile(blob)) {
-                const info = await tiffInfo(blob);
-                this.checkBaseSize(info.width, info.height);
-                const { px } = await pixelsFromTiff(blob, this.pixels.Layer);
-                const up = await uploadPixels(px, String(ref.filename).replace(/\.[a-z0-9]+$/i, "").replace(/[^a-z0-9._-]/gi, "_") || "image");
-                return this.setBasePixels(up.ref, px, { keepLayers: false });
+        const before = this.base;
+        try {
+            if (TIFF_EXT.test(ref.filename || "")) {
+                const blob = await (await fetch(viewUrl(ref))).blob();
+                if (await isTiffFile(blob)) {
+                    const info = await tiffInfo(blob);
+                    this.checkBaseSize(info.width, info.height);
+                    const { px } = await pixelsFromTiff(blob, this.pixels.Layer);
+                    const up = await uploadPixels(px, String(ref.filename).replace(/\.[a-z0-9]+$/i, "").replace(/[^a-z0-9._-]/gi, "_") || "image");
+                    return await this.setBasePixels(up.ref, px, { keepLayers: false });
+                }
             }
+            if (this.tileMode) {
+                const blob = await (await fetch(viewUrl(ref))).blob();
+                const big = (await hugePngSize(blob)) || (await imageFileSize(blob));
+                if (big) this.checkBaseSize(big.width, big.height);
+                const px = big ? await pixelsOffThread(blob, this.pixels.Layer) : null;
+                if (px) return await this.setBasePixels(ref, px, { keepLayers: false });
+                return await this.setBase(ref, await imageOfBlob(blob), { keepLayers: false });
+            }
+            return await this.setBase(ref, await loadImageEl(viewUrl(ref)), { keepLayers: false });
+        } finally {
+            if (this.base !== before && this.genSettings && this.genSettings.target) { delete this.genSettings.target; this.notifyChanged(); }
         }
-        if (this.tileMode) {
-            const blob = await (await fetch(viewUrl(ref))).blob();
-            const big = (await hugePngSize(blob)) || (await imageFileSize(blob));
-            if (big) this.checkBaseSize(big.width, big.height);
-            const px = big ? await pixelsOffThread(blob, this.pixels.Layer) : null;
-            if (px) return this.setBasePixels(ref, px, { keepLayers: false });
-            return this.setBase(ref, await imageOfBlob(blob), { keepLayers: false });
-        }
-        return this.setBase(ref, await loadImageEl(viewUrl(ref)), { keepLayers: false });
     }
 
     /** A new base from an <img> (or a canvas with `naturalWidth` / `naturalHeight`): its pixels are made here, the image is not kept. */
@@ -17413,6 +17550,7 @@ class InpaintEditor {
         // over a later one: the last file asked for is the base
         const token = (this._openToken = (this._openToken || 0) + 1);
         const later = () => this._openToken !== token;
+        const before = this.base;
         try {
             const layered = await layeredKind(file);
             if (layered) { await this.loadLayered(file, layered, later); return; }
@@ -17444,6 +17582,10 @@ class InpaintEditor {
         } catch (err) {
             console.error(err);
             this.setStatus(String(err.message || err));
+        } finally {
+            // another picture (open, drag and drop, paste, load_image) is not the canvas a preset was made for: Generate
+            // new's preset (`genSettings.target`, item 34) goes with the old one, even at the same size
+            if (this.base !== before && this.genSettings && this.genSettings.target) { delete this.genSettings.target; this.notifyChanged(); }
         }
     }
 
@@ -18931,17 +19073,164 @@ class InpaintEditor {
     }
 
     /**
+     * The models the New dialog offers (host.newCanvasChoices: the app's host; the node's has none or answers null), or
+     * null when there is no model besides "Any size": the dialog then asks for the width and height alone.
+     */
+    newCanvasModels() {
+        if (typeof host.newCanvasChoices !== "function") return null;
+        let ch = null;
+        try { ch = host.newCanvasChoices(this); } catch (err) { console.error(err); return null; }
+        return ch && Array.isArray(ch.models) && ch.models.some((m) => m && typeof m.value === "string" && m.value) ? ch : null;
+    }
+
+    /**
+     * The New dialog with the host's models (item 34, docs/PLAN_NEW_PRESETS.md section 8; the app's
+     * host.newCanvasChoices, the node has none): Model ("Any size" first, then grouped), Provider (hidden when the model
+     * has one way to run), the provider's own Aspect and Size class, a note with the canvas the preset makes, then Width
+     * and Height, which show that canvas and are disabled while a model is chosen, and are free with "Any size" (from
+     * the document's size). A change of model or provider keeps the aspect and the class where the new lists have them,
+     * else takes the nearest. A class may carry `labels` ({ aspect: label }): its name at an aspect where the provider
+     * counts it otherwise (a tier by area). Resolves with { width, height, target, about } (target null for "Any size")
+     * or null when cancelled.
+     */
+    async askNewCanvas(choices, message, curW, curH) {
+        const models = choices.models.filter((m) => m && typeof m === "object" && typeof m.value === "string");
+        // "Any size" (value "") is what the dialog opens on without a preset: added when the host's list lacks it, or the
+        // Model select would show the first model while the boxes are free, and Create would make that model's canvas
+        if (!models.some((m) => m.value === "")) models.unshift({ value: "", label: "Any size", group: "", providers: [] });
+        const ASPECT = /^\s*(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)\s*$/;
+        const ratioOf = (a) => { const m = ASPECT.exec(String(a == null ? "" : a)); return m && +m[1] > 0 && +m[2] > 0 ? +m[1] / +m[2] : null; };
+        const nearestAspect = (r, list) => {
+            if (!(r > 0)) return null;
+            let best = null, bestD = Infinity;
+            for (const a of list) {
+                const q = ratioOf(a);
+                if (!q) continue;
+                const d = Math.abs(Math.log(q / r));
+                if (d < bestD - 1e-12) { best = a; bestD = d; }
+            }
+            return best;
+        };
+        const nearestClass = (list, want) => {
+            const w = +want > 0 ? +want : 1024;
+            return list.reduce((best, c) => (!best || Math.abs(+c.value - w) < Math.abs(+best.value - w) ? c : best), null);
+        };
+        // the canvas of a preset: the host's rule (the class's long side, at most 2048 px, multiples of 16), else the same
+        const working = (aspect, px) => {
+            const wh = typeof choices.working === "function" ? choices.working(aspect, px) : null;
+            if (Array.isArray(wh) && +wh[0] > 0 && +wh[1] > 0) return [Math.round(+wh[0]), Math.round(+wh[1])];
+            const r = ratioOf(aspect) || 1, L = Math.min(+px || 1024, 2048);
+            const r16 = (v) => Math.max(64, Math.min(8192, Math.round(v / 16) * 16));
+            return r >= 1 ? [r16(L), r16(L / r)] : [r16(L * r), r16(L)];
+        };
+        const modelOf = (v) => (v ? models.find((m) => m.value === v) || null : null);
+        const providersOf = (m) => (m && Array.isArray(m.providers) ? m.providers.filter((p) => p && typeof p === "object") : []);
+        const aspectsOf = (p) => (p && Array.isArray(p.aspects) ? p.aspects.map(String) : []);
+        const classesOf = (p) => (p && Array.isArray(p.classes) ? p.classes.filter((k) => k && +k.value > 0) : []);
+        // what the dialog shows; `free` is the size "Any size" makes (the document's, then what was typed)
+        const st = { model: "", provider: "", aspect: null, size: null, free: [curW, curH] };
+        const pick = choices.pick;
+        if (pick && modelOf(pick.model)) Object.assign(st, { model: pick.model, provider: pick.provider || "", aspect: pick.aspect || null, size: +pick.size || null });
+        // the model, its provider (the one asked for, else the first: the remembered one), the aspect and the class (the
+        // ones before when offered, else the nearest, else the first) and the canvas they make
+        const current = () => {
+            const m = modelOf(st.model);
+            const provs = providersOf(m);
+            const p = provs.find((x) => x.value === st.provider) || provs[0] || null;
+            if (!m || !p) return { m: null, p: null, aspect: null, cls: null, single: true, wh: st.free };
+            const aspects = aspectsOf(p);
+            const shape = ratioOf(st.aspect) || (st.free[0] > 0 && st.free[1] > 0 ? st.free[0] / st.free[1] : null);
+            const aspect = st.aspect && aspects.includes(st.aspect) ? st.aspect : nearestAspect(shape, aspects) || aspects[0] || null;
+            const cls = nearestClass(classesOf(p), st.size || Math.max(st.free[0], st.free[1]));
+            const px = cls ? +cls.value : null;
+            // what is shown is what the next change keeps or nears
+            st.provider = p.value;
+            if (aspect) st.aspect = aspect;
+            if (px) st.size = px;
+            return { m, p, aspect, cls, single: provs.length === 1 && !provs[0].value, wh: working(aspect, px) };
+        };
+        // a class's name at the aspect shown (its `labels` where the provider counts that aspect otherwise)
+        const classLabel = (k, aspect) => (k.labels && aspect && k.labels[aspect]) || k.label || `${k.value} px`;
+        const asks = (c) => [c.cls ? classLabel(c.cls, c.aspect) : "", c.aspect ? `at ${c.aspect}` : ""].filter(Boolean).join(" ");
+        const noteOf = (c) => {
+            if (!c.m) return "Choose a model to make the canvas in its aspect, at a working size for its size class.";
+            const a = asks(c);
+            return `Canvas ${c.wh[0]} \u00d7 ${c.wh[1]} px${a ? `; Generate new asks for ${a}` : ""}.`;
+        };
+        const providerOptions = (c) => providersOf(c.m).map((p) => ({ value: p.value, label: p.label || p.value }));
+        const aspectOptions = (c) => aspectsOf(c.p).map((a) => ({ value: a, label: a }));
+        const classOptions = (c) => classesOf(c.p).map((k) => ({ value: String(k.value), label: classLabel(k, c.aspect) }));
+        const c0 = current();
+        const fields = [
+            { key: "model", label: "Model", type: "select", wide: true, value: c0.m ? c0.m.value : "",
+                options: models.map((m) => ({ value: m.value, label: m.label || m.value || "Any size", group: m.value ? m.group || "" : "" })) },
+            { key: "provider", label: "Provider", type: "select", wide: true, options: providerOptions(c0), value: c0.p ? c0.p.value : "", hidden: c0.single },
+            { key: "aspect", label: "Aspect", type: "select", options: aspectOptions(c0), value: c0.aspect || "", hidden: !c0.m },
+            { key: "size", label: "Size class", type: "select", options: classOptions(c0), value: c0.cls ? String(c0.cls.value) : "", hidden: !c0.m },
+            { key: "note", type: "note", text: noteOf(c0) },
+            { key: "width", label: "Width", value: c0.wh[0], min: 16, max: 16384, disabled: !!c0.m },
+            { key: "height", label: "Height", value: c0.wh[1], min: 16, max: 16384, disabled: !!c0.m },
+        ];
+        const onChange = (key, values, set) => {
+            if (key === "width" || key === "height") {
+                if (!modelOf(st.model)) st.free = [+values.width, +values.height];
+                return;
+            }
+            if (key === "model") { st.model = values.model; st.provider = ""; }
+            else if (key === "provider") st.provider = values.provider;
+            else if (key === "aspect") st.aspect = values.aspect || null;
+            else if (key === "size") st.size = +values.size || null;
+            else return;
+            const c = current();
+            set("provider", { options: providerOptions(c), value: c.p ? c.p.value : "", hidden: c.single });
+            set("aspect", { options: aspectOptions(c), value: c.aspect || "", hidden: !c.m });
+            set("size", { options: classOptions(c), value: c.cls ? String(c.cls.value) : "", hidden: !c.m });
+            set("note", { text: noteOf(c) });
+            set("width", { value: c.wh[0], disabled: !!c.m });
+            set("height", { value: c.wh[1], disabled: !!c.m });
+        };
+        const answer = await this.ask({ title: "New empty canvas", message, fields, linked: true, ok: "Create", danger: !!this.base, onChange });
+        if (answer == null) return null;
+        // the answer as it stands (a select set without its change event counts too)
+        st.model = modelOf(answer.model) ? answer.model : "";
+        if (st.model) {
+            if (answer.provider != null) st.provider = answer.provider;
+            if (answer.aspect) st.aspect = answer.aspect;
+            if (+answer.size > 0) st.size = +answer.size;
+        }
+        const c = current();
+        if (!c.m) return { width: answer.width, height: answer.height, target: null, about: "" };
+        const [w, h] = c.wh;
+        const name = (c.m.label || c.m.value) + (c.single ? "" : ` (${c.p.label || c.p.value})`);
+        const a = asks(c);
+        return {
+            width: w, height: h,
+            target: { recipe: c.m.value, provider: c.p.value || null, aspect: c.aspect || null, size: c.cls ? +c.cls.value : Math.max(w, h), width: w, height: h },
+            about: `for ${name}${a ? `; Generate new asks for ${a}` : ""}`,
+        };
+    }
+
+    /**
      * A fresh white canvas after a confirmation; the size is asked for in the same dialog. `keepRefs`: the reference
-     * layers stay, placed again on the new canvas (generate_new's local path, 26f).
+     * layers stay, placed again on the new canvas (generate_new's local path, 26f). In the app the dialog also offers the
+     * models (askNewCanvas): a canvas made for one keeps it as `genSettings.target`, which Generate new opens on, and
+     * selects its recipe (host.newCanvasChosen); "Any size" leaves none. A size given (`"1024x768"`) asks nothing and
+     * leaves the preset to the caller.
      */
     async newCanvas(size = null, { keepRefs = false } = {}) {
         const curW = this.width || 1024, curH = this.height || 1024;
         const what = this.base ? `This discards the current image, ${this.layers.length} layer${this.layers.length === 1 ? "" : "s"}, the selection and ${this.history.length} history entr${this.history.length === 1 ? "y" : "ies"} in this editor.` : "";
         let w, h;
+        let choices = null, preset = null;   // the dialog's models (the app's host only) and what was made from them
         if (size != null) {
             const m = /^\s*(\d{2,5})\s*[x*,\s\u00d7]\s*(\d{2,5})\s*$/i.exec(String(size));
             if (!m) { this.setStatus("Size not understood. Use width x height, e.g. 1024x1024."); return; }
             w = +m[1]; h = +m[2];
+        } else if ((choices = this.newCanvasModels()) != null) {
+            const got = await this.askNewCanvas(choices, what, curW, curH);
+            if (got == null) { this.setStatus("New canvas cancelled."); return; }
+            w = got.width; h = got.height;
+            preset = got;
         } else {
             const answer = await this.ask({
                 title: "New empty canvas",
@@ -18982,6 +19271,29 @@ class InpaintEditor {
             this.renderHistory();
             this.renderSelectionList();
             this.setStatus(`New ${w} × ${h} canvas.${keep && keep.length ? ` The reference layer${keep.length > 1 ? "s stay" : " stays"}.` : ""} Load an image as a layer, paint, or select and generate.`);
+            if (size == null) {
+                // item 34: the preset this canvas was made for stays with the document (inside `gen`, saved with it;
+                // Generate new opens on it while the picture keeps this size) and selects its recipe; a canvas of a
+                // size typed in ("Any size", or a host without models) has none
+                const target = preset && preset.target ? { ...preset.target, width: this.width, height: this.height } : null;
+                if (target) {
+                    this.genSettings.target = target;
+                    let failed = null;
+                    if (typeof host.newCanvasChosen === "function") {
+                        try { await host.newCanvasChosen(this, { ...target }); } catch (err) { console.error(err); failed = err; }
+                    }
+                    this.notifyChanged();
+                    this.setStatus(failed
+                        ? `New ${w} \u00d7 ${h} canvas, but its model could not be selected: ${failed.message || failed}`
+                        : `New ${w} \u00d7 ${h} canvas ${preset.about}.`);
+                } else {
+                    if (this.genSettings.target) { delete this.genSettings.target; this.notifyChanged(); }
+                    // the next New opens on "Any size", as this one was made
+                    if (choices && typeof host.newCanvasChosen === "function") {
+                        try { await host.newCanvasChosen(this, null); } catch (err) { console.error(err); }
+                    }
+                }
+            }
         } catch (err) {
             console.error(err);
             this.setStatus("Could not create the canvas: " + (err.message || err));

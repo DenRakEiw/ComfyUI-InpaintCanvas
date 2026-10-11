@@ -44,6 +44,38 @@ export function hexToRgb(hex) {
 }
 
 /**
+ * Skin protection width in channel units (0..1): the vibrance change is halved for colours ordered r > g > b, and
+ * the share of that halving rises smoothly over this distance from r == g and from g == b. A hard switch put a
+ * contour into smooth ramps crossing either border (18 levels in blue for one level in red at vibrance 100); at 0.1
+ * a one-level step anywhere moves no channel by more than 2 levels at vibrance 100, as without the protection.
+ */
+export const SKIN_SOFT = 0.1;
+
+/**
+ * smoothstep(0, SKIN_SOFT, x) as GLSL defines it.
+ *
+ * @param {number} x
+ * @returns {number}
+ */
+function skinRamp(x) {
+    const t = Math.max(0.0, Math.min(1.0, x / SKIN_SOFT));
+    return t * t * (3.0 - 2.0 * t);
+}
+
+/**
+ * The share of the skin protection for one colour: 1 where r > g > b by SKIN_SOFT or more, 0 where r <= g or
+ * g <= b (neutral greys included), smooth between. VIBRANCE_GLSL computes the same with smoothstep.
+ *
+ * @param {number} r 0..1
+ * @param {number} g 0..1
+ * @param {number} b 0..1
+ * @returns {number} 0..1
+ */
+export function vibranceSkinWeight(r, g, b) {
+    return skinRamp(r - g) * skinRamp(g - b);
+}
+
+/**
  * Pure vibrance math for a single pixel.
  *
  * @param {number} r 0..1
@@ -58,10 +90,10 @@ export function vibrancePixel(r, g, b, vibrance = 0, saturation = 0) {
     const mx = Math.max(r, g, b);
     const mn = Math.min(r, g, b);
     const sat = mx - mn;
-    const vAmt = vibrance / 100.0;
-    const sAmt = saturation / 100.0;
+    const vAmt = Math.max(-100, Math.min(100, vibrance)) / 100.0;
+    const sAmt = Math.max(-100, Math.min(100, saturation)) / 100.0;
     let vFactor = vAmt > 0.0 ? vAmt * (1.0 - sat) : vAmt * sat;
-    if (r > g && g > b) vFactor *= 0.5;
+    vFactor *= 1.0 - 0.5 * vibranceSkinWeight(r, g, b);
     const factor = Math.max(-1.0, Math.min(3.0, vFactor + sAmt));
     const k = 1.0 + factor;
     const resR = Math.max(0.0, Math.min(1.0, luma + (r - luma) * k));
@@ -92,7 +124,8 @@ vec4 shade(vec4 c, vec2 uv) {
     float vAmt = u_vibrance / 100.0;
     float sAmt = u_saturation / 100.0;
     float vFactor = vAmt > 0.0 ? vAmt * (1.0 - sat) : vAmt * sat;
-    if (c.r > c.g && c.g > c.b) vFactor *= 0.5;
+    float skin = smoothstep(0.0, ${SKIN_SOFT.toFixed(3)}, c.r - c.g) * smoothstep(0.0, ${SKIN_SOFT.toFixed(3)}, c.g - c.b);
+    vFactor *= 1.0 - 0.5 * skin;
     float factor = clamp(vFactor + sAmt, -1.0, 3.0);
     vec3 res = clamp(mix(vec3(luma), c.rgb, 1.0 + factor), 0.0, 1.0);
     return vec4(res, c.a);
@@ -110,9 +143,10 @@ export const VIBRANCE_UNIFORMS = {
  */
 export function vibranceUniforms(params) {
     const p = params || {};
+    // clamped as applyVibrance clamps
     return {
-        u_vibrance: p.vibrance != null ? +p.vibrance : 0,
-        u_saturation: p.saturation != null ? +p.saturation : 0,
+        u_vibrance: p.vibrance != null ? Math.max(-100, Math.min(100, +p.vibrance)) : 0,
+        u_saturation: p.saturation != null ? Math.max(-100, Math.min(100, +p.saturation)) : 0,
     };
 }
 
@@ -292,6 +326,27 @@ export function gradientMapUniforms(params) {
 }
 
 /**
+ * A pixel turns white where its Rec. 601 luma in levels (0..255) is at or above the level. On the bytes that luma is
+ * (299 R + 587 G + 114 B) / 1000, so applyThreshold compares those integers exactly: the float sum
+ * 0.299 * r + 0.587 * g + 0.114 * b lands a hair below the level for some greys (grey 100 at level 100 went black,
+ * 84 of the 254 levels). thresholdPixel and THRESHOLD_GLSL compare floats against the level less THRESHOLD_EPS,
+ * half the spacing (1/1000 level) of the lumas bytes can give, so they cut where the integer compare does.
+ */
+export const THRESHOLD_EPS = 0.0005;
+
+/**
+ * The level a threshold layer cuts at: a whole level 1..254 (default 128), so a fractional one from an agent cuts
+ * the same on both paths.
+ *
+ * @param {any} v
+ * @returns {number}
+ */
+function thresholdLevel(v) {
+    const n = v != null ? +v : 128;
+    return Number.isFinite(n) ? Math.max(1, Math.min(254, Math.round(n))) : 128;
+}
+
+/**
  * Pure threshold math for a single pixel.
  *
  * @param {number} r 0..1
@@ -301,16 +356,15 @@ export function gradientMapUniforms(params) {
  * @returns {[number, number, number]}
  */
 export function thresholdPixel(r, g, b, level = 128) {
-    const luma = LUMA_601[0] * r + LUMA_601[1] * g + LUMA_601[2] * b;
-    const threshold = level / 255.0;
-    const v = luma >= threshold ? 1.0 : 0.0;
+    const luma = (LUMA_601[0] * r + LUMA_601[1] * g + LUMA_601[2] * b) * 255.0;
+    const v = luma >= thresholdLevel(level) - THRESHOLD_EPS ? 1.0 : 0.0;
     return [v, v, v];
 }
 
 export const THRESHOLD_GLSL = `
 vec4 shade(vec4 c, vec2 uv) {
-    float luma = dot(c.rgb, vec3(0.299, 0.587, 0.114));
-    vec3 res = luma >= (u_level / 255.0) ? vec3(1.0) : vec3(0.0);
+    float luma = dot(c.rgb, vec3(0.299, 0.587, 0.114)) * 255.0;
+    vec3 res = luma >= u_level - ${THRESHOLD_EPS} ? vec3(1.0) : vec3(0.0);
     return vec4(res, c.a);
 }
 `;
@@ -325,10 +379,22 @@ export const THRESHOLD_UNIFORMS = {
  */
 export function thresholdUniforms(params) {
     const p = params || {};
-    const level = p.level != null ? +p.level : 128;
     return {
-        u_level: Math.max(1, Math.min(254, level)),
+        u_level: thresholdLevel(p.level),
     };
+}
+
+/**
+ * The number of levels a posterize layer keeps: a whole number 2..32 (default 4). The uniform carries the rounded
+ * value too: a fractional one from an agent (4.5) quantised the GPU picture off the level grid while the CPU path
+ * rounded it.
+ *
+ * @param {any} v
+ * @returns {number}
+ */
+function posterizeLevels(v) {
+    const n = v != null ? +v : 4;
+    return Number.isFinite(n) ? Math.max(2, Math.min(32, Math.round(n))) : 4;
 }
 
 /**
@@ -341,7 +407,7 @@ export function thresholdUniforms(params) {
  * @returns {[number, number, number]}
  */
 export function posterizePixel(r, g, b, levels = 4) {
-    const stepVal = Math.max(2, Math.min(32, Math.round(levels))) - 1;
+    const stepVal = posterizeLevels(levels) - 1;
     const outR = Math.min(1.0, Math.max(0.0, Math.floor(r * stepVal + 0.5) / stepVal));
     const outG = Math.min(1.0, Math.max(0.0, Math.floor(g * stepVal + 0.5) / stepVal));
     const outB = Math.min(1.0, Math.max(0.0, Math.floor(b * stepVal + 0.5) / stepVal));
@@ -366,9 +432,8 @@ export const POSTERIZE_UNIFORMS = {
  */
 export function posterizeUniforms(params) {
     const p = params || {};
-    const levels = p.levels != null ? +p.levels : 4;
     return {
-        u_levels: Math.max(2, Math.min(32, levels)),
+        u_levels: posterizeLevels(p.levels),
     };
 }
 
@@ -445,7 +510,7 @@ export function applyVibrance(src, params) {
         const mn = Math.min(r, g, b);
         const sat = mx - mn;
         let vFactor = vAmt > 0.0 ? vAmt * (1.0 - sat) : vAmt * sat;
-        if (r > g && g > b) vFactor *= 0.5;
+        vFactor *= 1.0 - 0.5 * vibranceSkinWeight(r, g, b);
         const factor = Math.max(-1.0, Math.min(3.0, vFactor + sAmt));
         const k = 1.0 + factor;
         const outR = Math.max(0.0, Math.min(1.0, luma + (r - luma) * k));
@@ -549,15 +614,11 @@ export function applyGradientMap(src, params) {
 export function applyThreshold(src, params) {
     const { out, octx, img, px } = openPixels(src);
     const p = params || {};
-    const level = p.level != null ? Math.max(1, Math.min(254, +p.level)) : 128;
-    const threshold = level / 255.0;
+    // luma in thousandths of a level, exact in integers (THRESHOLD_EPS)
+    const cut = thresholdLevel(p.level) * 1000;
 
     for (let i = 0; i < px.length; i += 4) {
-        const r = px[i] / 255.0;
-        const g = px[i + 1] / 255.0;
-        const b = px[i + 2] / 255.0;
-        const luma = LUMA_601[0] * r + LUMA_601[1] * g + LUMA_601[2] * b;
-        const v = luma >= threshold ? 255 : 0;
+        const v = 299 * px[i] + 587 * px[i + 1] + 114 * px[i + 2] >= cut ? 255 : 0;
         px[i] = v;
         px[i + 1] = v;
         px[i + 2] = v;
@@ -576,8 +637,7 @@ export function applyThreshold(src, params) {
 export function applyPosterize(src, params) {
     const { out, octx, img, px } = openPixels(src);
     const p = params || {};
-    const levels = p.levels != null ? Math.max(2, Math.min(32, Math.round(+p.levels))) : 4;
-    const stepVal = levels - 1;
+    const stepVal = posterizeLevels(p.levels) - 1;
 
     for (let i = 0; i < px.length; i += 4) {
         const r = px[i] / 255.0;
