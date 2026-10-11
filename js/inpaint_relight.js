@@ -625,7 +625,6 @@ export function lightsToWords(lights, size = null) {
         };
     };
 
-    const first = describeLight(active[0]);
     const phrases = active.map(describeLight).map(d => d.phrase);
     const prompt = `Relight: ${phrases.join(", ")}`;
 
