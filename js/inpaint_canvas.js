@@ -19602,6 +19602,10 @@ class InpaintEditor {
         const routes = [
             { id: "app", label: "In-app shader (preview & export)" },
             { id: "magnific", label: "Magnific Relight" },
+            { id: "fal-iclight", label: "fal.ai IC-Light v2" },
+            { id: "fal-bria", label: "fal.ai Bria FIBO Relight" },
+            { id: "comfycloud", label: "Comfy Cloud Qwen 2509 Relight" },
+            { id: "comfyui", label: "ComfyUI Local Qwen 2509 Relight" },
         ];
         for (const r of routes) {
             const opt = document.createElement("option");
@@ -19622,7 +19626,15 @@ class InpaintEditor {
 
         // Render button (active when route !== "app")
         if (layer.params.route && layer.params.route !== "app") {
-            const renderBtn = iconButton("play", "Render with " + (layer.params.route === "magnific" ? "Magnific Relight" : layer.params.route), async () => {
+            const rLabels = {
+                magnific: "Magnific Relight",
+                "fal-iclight": "fal.ai IC-Light v2",
+                "fal-bria": "fal.ai Bria FIBO Relight",
+                comfycloud: "Comfy Cloud",
+                comfyui: "ComfyUI Local",
+            };
+            const rName = rLabels[layer.params.route] || layer.params.route;
+            const renderBtn = iconButton("play", "Render with " + rName, async () => {
                 try {
                     renderBtn.disabled = true;
                     await host.relightWhole(this, layer, { route: layer.params.route });
@@ -19766,6 +19778,219 @@ class InpaintEditor {
             magControls.appendChild(detRow);
 
             routeBox.appendChild(magControls);
+        } else if (layer.params.route === "fal-iclight") {
+            const icControls = el("div", "ipc-relight-fal-controls");
+            icControls.style.display = "flex";
+            icControls.style.flexWrap = "wrap";
+            icControls.style.gap = "8px";
+            icControls.style.fontSize = "12px";
+
+            // High-res fix checkbox (default true)
+            const hrRow = el("label", "ipc-checkbox-row");
+            hrRow.style.display = "flex";
+            hrRow.style.alignItems = "center";
+            hrRow.style.gap = "6px";
+            hrRow.style.cursor = "pointer";
+            const hrCheck = document.createElement("input");
+            hrCheck.type = "checkbox";
+            hrCheck.checked = layer.params.enable_hr_fix !== false;
+            hrCheck.addEventListener("click", stop);
+            hrCheck.addEventListener("change", () => {
+                this.pushUndo({ kind: "filter", id: layer.id, label: "Relight: High-res fix" });
+                layer.params.enable_hr_fix = hrCheck.checked;
+                this.markFilterChanged(layer);
+            });
+            hrRow.appendChild(hrCheck);
+            hrRow.appendChild(el("span", null, "High-res fix"));
+            icControls.appendChild(hrRow);
+
+            // Detail from original switch (default true)
+            const detRow = el("label", "ipc-checkbox-row");
+            detRow.style.display = "flex";
+            detRow.style.alignItems = "center";
+            detRow.style.gap = "6px";
+            detRow.style.cursor = "pointer";
+            const detCheck = document.createElement("input");
+            detCheck.type = "checkbox";
+            detCheck.checked = layer.params.detail !== false;
+            detCheck.title = "Apply lighting ratio guided by the full-resolution original to preserve 100% fine texture";
+            detCheck.addEventListener("click", stop);
+            detCheck.addEventListener("change", () => {
+                this.pushUndo({ kind: "filter", id: layer.id, label: "Relight: Detail from original" });
+                layer.params.detail = detCheck.checked;
+                this.markFilterChanged(layer);
+            });
+            detRow.appendChild(detCheck);
+            detRow.appendChild(el("span", null, "Detail from original"));
+            icControls.appendChild(detRow);
+
+            routeBox.appendChild(icControls);
+        } else if (layer.params.route === "fal-bria") {
+            const briaControls = el("div", "ipc-relight-bria-controls");
+            briaControls.style.display = "flex";
+            briaControls.style.flexDirection = "column";
+            briaControls.style.gap = "6px";
+            briaControls.style.fontSize = "12px";
+
+            // Light type select
+            const briaRow = el("div", "ipc-relight-bria-row");
+            briaRow.style.display = "flex";
+            briaRow.style.alignItems = "center";
+            briaRow.style.gap = "6px";
+            const ltLabel = el("span", null, "Light type");
+            ltLabel.style.width = "70px";
+            const ltSel = document.createElement("select");
+            ltSel.className = "ipc-sel";
+            const briaTypes = [
+                "soft overcast daylight lighting",
+                "midday",
+                "blue hour light",
+                "low-angle sunlight",
+                "sunrise light",
+                "spotlight on subject",
+                "overcast light",
+                "cloud-filtered lighting",
+                "fog-diffused lighting",
+                "moonlight lighting",
+                "starlight nighttime",
+                "soft bokeh lighting",
+                "harsh studio lighting"
+            ];
+            for (const bt of briaTypes) {
+                const opt = document.createElement("option");
+                opt.value = bt;
+                opt.textContent = bt;
+                ltSel.appendChild(opt);
+            }
+            ltSel.value = layer.params.light_type || "soft overcast daylight lighting";
+            ltSel.addEventListener("click", stop);
+            ltSel.addEventListener("keydown", stop);
+            ltSel.addEventListener("change", () => {
+                this.pushUndo({ kind: "filter", id: layer.id, label: "Relight: Light type" });
+                layer.params.light_type = ltSel.value;
+                this.markFilterChanged(layer);
+            });
+            briaRow.appendChild(ltLabel);
+            briaRow.appendChild(ltSel);
+            briaControls.appendChild(briaRow);
+
+            // Detail from original switch (default true)
+            const detRow = el("label", "ipc-checkbox-row");
+            detRow.style.display = "flex";
+            detRow.style.alignItems = "center";
+            detRow.style.gap = "6px";
+            detRow.style.cursor = "pointer";
+            const detCheck = document.createElement("input");
+            detCheck.type = "checkbox";
+            detCheck.checked = layer.params.detail !== false;
+            detCheck.title = "Apply lighting ratio guided by the full-resolution original to preserve 100% fine texture";
+            detCheck.addEventListener("click", stop);
+            detCheck.addEventListener("change", () => {
+                this.pushUndo({ kind: "filter", id: layer.id, label: "Relight: Detail from original" });
+                layer.params.detail = detCheck.checked;
+                this.markFilterChanged(layer);
+            });
+            detRow.appendChild(detCheck);
+            detRow.appendChild(el("span", null, "Detail from original"));
+            briaControls.appendChild(detRow);
+
+            routeBox.appendChild(briaControls);
+        } else if (layer.params.route === "comfycloud" || layer.params.route === "comfyui") {
+            const qwenControls = el("div", "ipc-relight-qwen-controls");
+            qwenControls.style.display = "flex";
+            qwenControls.style.flexDirection = "column";
+            qwenControls.style.gap = "6px";
+            qwenControls.style.fontSize = "12px";
+
+            // LoRA strength slider (0..100)
+            const loraRow = el("div", "ipc-relight-lora-row");
+            loraRow.style.display = "flex";
+            loraRow.style.alignItems = "center";
+            loraRow.style.gap = "8px";
+            const loraLabel = el("span", null, "LoRA strength");
+            loraLabel.style.width = "90px";
+            const loraSlider = document.createElement("input");
+            loraSlider.type = "range";
+            loraSlider.min = "0"; loraSlider.max = "100"; loraSlider.step = "5";
+            loraSlider.value = String(layer.params.lora_strength ?? layer.params.strength_model ?? 100);
+            loraSlider.className = "ipc-slider";
+            loraSlider.addEventListener("click", stop);
+            loraSlider.addEventListener("keydown", stop);
+            const loraVal = el("span", "ipc-val", loraSlider.value + "%");
+            loraSlider.addEventListener("input", () => {
+                loraVal.textContent = loraSlider.value + "%";
+                layer.params.lora_strength = +loraSlider.value;
+                layer.params.strength_model = +loraSlider.value;
+            });
+            loraSlider.addEventListener("change", () => {
+                this.pushUndo({ kind: "filter", id: layer.id, label: "Relight: LoRA strength" });
+                layer.params.lora_strength = +loraSlider.value;
+                layer.params.strength_model = +loraSlider.value;
+                this.markFilterChanged(layer);
+            });
+            loraRow.appendChild(loraLabel);
+            loraRow.appendChild(loraSlider);
+            loraRow.appendChild(loraVal);
+            qwenControls.appendChild(loraRow);
+
+            // Steps slider (1..20)
+            const stepsRow = el("div", "ipc-relight-steps-row");
+            stepsRow.style.display = "flex";
+            stepsRow.style.alignItems = "center";
+            stepsRow.style.gap = "8px";
+            const stepsLabel = el("span", null, "Steps");
+            stepsLabel.style.width = "90px";
+            const stepsSlider = document.createElement("input");
+            stepsSlider.type = "range";
+            stepsSlider.min = "1"; stepsSlider.max = "20"; stepsSlider.step = "1";
+            stepsSlider.value = String(layer.params.steps ?? 4);
+            stepsSlider.className = "ipc-slider";
+            stepsSlider.addEventListener("click", stop);
+            stepsSlider.addEventListener("keydown", stop);
+            const stepsVal = el("span", "ipc-val", stepsSlider.value);
+            stepsSlider.addEventListener("input", () => {
+                stepsVal.textContent = stepsSlider.value;
+                layer.params.steps = +stepsSlider.value;
+            });
+            stepsSlider.addEventListener("change", () => {
+                this.pushUndo({ kind: "filter", id: layer.id, label: "Relight: Steps" });
+                layer.params.steps = +stepsSlider.value;
+                this.markFilterChanged(layer);
+            });
+            stepsRow.appendChild(stepsLabel);
+            stepsRow.appendChild(stepsSlider);
+            stepsRow.appendChild(stepsVal);
+            qwenControls.appendChild(stepsRow);
+
+            // Detail from original switch (default true)
+            const detRow = el("label", "ipc-checkbox-row");
+            detRow.style.display = "flex";
+            detRow.style.alignItems = "center";
+            detRow.style.gap = "6px";
+            detRow.style.cursor = "pointer";
+            const detCheck = document.createElement("input");
+            detCheck.type = "checkbox";
+            detCheck.checked = layer.params.detail !== false;
+            detCheck.title = "Apply lighting ratio guided by the full-resolution original to preserve 100% fine texture";
+            detCheck.addEventListener("click", stop);
+            detCheck.addEventListener("change", () => {
+                this.pushUndo({ kind: "filter", id: layer.id, label: "Relight: Detail from original" });
+                layer.params.detail = detCheck.checked;
+                this.markFilterChanged(layer);
+            });
+            detRow.appendChild(detCheck);
+            detRow.appendChild(el("span", null, "Detail from original"));
+            qwenControls.appendChild(detRow);
+
+            if (layer.params.route === "comfyui") {
+                const hint = el("div", "ipc-hint");
+                hint.style.fontSize = "11px";
+                hint.style.marginTop = "4px";
+                hint.textContent = "Requires Qwen-Image-Edit-2509 fp8 unet and Relight LoRA on your local ComfyUI";
+                qwenControls.appendChild(hint);
+            }
+
+            routeBox.appendChild(qwenControls);
         }
 
         // Last run note
