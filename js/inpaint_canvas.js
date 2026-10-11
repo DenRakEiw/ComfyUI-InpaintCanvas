@@ -19997,7 +19997,7 @@ class InpaintEditor {
         if (layer.params.last && layer.params.last.ms) {
             const lastNote = el("div", "ipc-relight-last-note");
             lastNote.style.fontSize = "11px";
-            lastNote.style.color = "var(--sc-fg-muted, #888)";
+            lastNote.style.color = "var(--sc-fg-2, #888)";
             lastNote.style.marginTop = "4px";
             const s = (layer.params.last.ms / 1000).toFixed(1);
             lastNote.textContent = `Last render: ${layer.params.last.route} in ${s} s${layer.params.last.seed != null ? ` (seed ${layer.params.last.seed})` : ""}`;
