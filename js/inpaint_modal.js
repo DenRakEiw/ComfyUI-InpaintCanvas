@@ -289,6 +289,9 @@ function buildTools(ed, body) {
     addTool("eyedropper", "Eyedropper (I): click to pick the colour under the cursor from the visible image. Alt+click with the brush does the same.");
     addTool("transform", "Move / scale / rotate the active layer (T). Drag inside to move, corners scale (Shift: free aspect), edges scale one axis, drag just outside a corner to rotate (Shift snaps to 15°). Rotation is applied with Enter.");
     addTool("text", "Text (Shift+T): click on the canvas to add a text layer, click a text layer to select it, drag to move it, double-click to edit it on the canvas.");
+    if (host.depthSupported !== false) {
+        addTool("lights", "Lights (L): place and drag lights on the active Relight layer. Alt+drag changes Close/Far, wheel adjusts diffusion (Shift: intensity). Click empty canvas to add a light, Delete removes.");
+    }
     addTool("hand", "Pan (H, Space or middle mouse)");
     addTool("canvas", "Canvas (C): drag the frame's edges or corners outward to extend the canvas (outpainting), inward to crop, outside the frame to turn the picture; Ctrl+drag along a horizon straightens it. Aspect presets and lines in the bar above. Enter or a double click inside applies, Esc resets. Snaps to 8 px, Alt for single pixels.");
     tools.appendChild(el("div", "ipc-sep"));

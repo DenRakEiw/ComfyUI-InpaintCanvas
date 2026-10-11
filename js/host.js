@@ -181,6 +181,7 @@ export const host = {
     getDepthDetail() { return "standard"; },
     setDepthDetail() {},
     async freeHelpers() {},
+    async relightWhole() { throw new Error("relight whole picture is a Scumble feature"); },
     upsampleInstruction: null,   // the built-in upsample instruction (Scumble hands out its templates)
     generateNewAvailable() { return false; },
     openGenerateNew() {},

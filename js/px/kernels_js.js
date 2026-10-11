@@ -14,6 +14,7 @@
  */
 
 import { BLEND_OPS } from "../blend_modes.js";
+import { gaussRadii } from "../inpaint_edges.js";
 
 export const OPS = Object.freeze({
     "source-over": 0,
@@ -1441,25 +1442,6 @@ export function rangeMax(src, w, h, out = null) {
 // ---- Relight kernels (PLAN_RELIGHT_BUILD.md sec 4.3 / 5.2) ------------------------------------------
 
 /**
- * Three box radii approximating Gaussian blur (Peter Kovesi's method).
- * @param {number} sigma
- * @returns {[number, number, number]}
- */
-function relightGaussRadii(sigma) {
-    if (sigma <= 0) return [0, 0, 0];
-    const wIdeal = Math.sqrt((12 * sigma * sigma) / 3 + 1);
-    let wl = Math.floor(wIdeal);
-    if (wl % 2 === 0) wl--;
-    const wu = wl + 2;
-    const mIdeal = (12 * sigma * sigma - 3 * wl * wl - 12 * wl - 9) / (-4 * wl - 4);
-    const mm = Math.round(mIdeal);
-    const r0 = ((0 < mm ? wl : wu) - 1) / 2;
-    const r1 = ((1 < mm ? wl : wu) - 1) / 2;
-    const r2 = ((2 < mm ? wl : wu) - 1) / 2;
-    return [r0, r1, r2];
-}
-
-/**
  * Computes surface normals from u16 height field: n = normalize(-dz/dx, -dz/dy, 1.0)
  * after optional Gaussian blur with sigma. Packed as RGBA8 (n * 127.5 + 127.5, A=255).
  *
@@ -1477,11 +1459,11 @@ export function heightNormals(depth, w, h, scale, sigma, out = null) {
     const inv65535 = scale / 65535.0;
 
     for (let i = 0; i < w * h; i++) {
-        heights[i] = depth[i] * inv65535;
+        heights[i] = (65535.0 - depth[i]) * inv65535;
     }
 
     if (sigma > 0) {
-        const radii = relightGaussRadii(sigma);
+        const radii = gaussRadii(sigma);
         heights = boxBlurs(heights, w, h, radii);
     }
 
@@ -1560,10 +1542,10 @@ export function shadowMarch(depth, w, h, scale, light, radius, taps, steps, bias
     const lz = Number(light[2]) || 0;
     const kind = Number(light[3]) || 0;
 
-    const nTaps = Math.max(1, Math.min(16, Math.round(taps) || 4));
-    const nSteps = Math.max(1, Math.min(64, Math.round(steps) || 32));
+    const nTaps = Math.max(1, Math.min(16, Number.isFinite(Number(taps)) ? Math.round(Number(taps)) : 4));
+    const nSteps = Math.max(1, Math.min(64, Number.isFinite(Number(steps)) ? Math.round(Number(steps)) : 32));
     const r = Math.max(0, Number(radius) || 0);
-    const zBias = Number(bias) || 1.0;
+    const zBias = Math.max(0, Number.isFinite(Number(bias)) ? Number(bias) : 0);
     const disc = relightVogel(nTaps);
     const longSide = Math.max(w, h);
     const sunDist = longSide * 1.5;
@@ -1575,7 +1557,7 @@ export function shadowMarch(depth, w, h, scale, light, radius, taps, steps, bias
         const outRowOffset = (dst.length >= w * h) ? y * w : rIdx * w;
 
         for (let x = 0; x < w; x++) {
-            const z0 = depth[rowOffset + x] * inv65535;
+            const z0 = (65535.0 - depth[rowOffset + x]) * inv65535;
             const px = x;
             const py = y;
             const pz = z0 + zBias;
@@ -1609,11 +1591,18 @@ export function shadowMarch(depth, w, h, scale, light, radius, taps, steps, bias
                     const sx = px + frac * rdx;
                     const sy = py + frac * rdy;
                     const sz = pz + frac * rdz;
-                    const ix = Math.round(sx);
-                    const iy = Math.round(sy);
-                    if (ix < 0 || ix >= w || iy < 0 || iy >= h) continue;
 
-                    const mapZ = depth[iy * w + ix] * inv65535;
+                    if (rdz >= 0 && sz > scale) {
+                        break;
+                    }
+
+                    const ix = Math.floor(sx + 0.5);
+                    const iy = Math.floor(sy + 0.5);
+                    if (ix < 0 || ix >= w || iy < 0 || iy >= h) {
+                        break;
+                    }
+
+                    const mapZ = (65535.0 - depth[iy * w + ix]) * inv65535;
                     if (mapZ > sz + zBias) {
                         blocked = true;
                         break;

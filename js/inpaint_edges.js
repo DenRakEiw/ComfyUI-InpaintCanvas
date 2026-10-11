@@ -34,7 +34,7 @@ export function snapParams(strength) {
  * @param {number} y
  * @returns {number}
  */
-function u16At(mapData, mw, mh, x, y) {
+export function u16At(mapData, mw, mh, x, y) {
     const cx = Math.max(0, Math.min(mw - 1, x));
     const cy = Math.max(0, Math.min(mh - 1, y));
     return mapData[cy * mw + cx] / 65535;
@@ -49,7 +49,7 @@ function u16At(mapData, mw, mh, x, y) {
  * @param {number} y
  * @returns {[number, number, number]}
  */
-function snapRgb(guideData, gw, gh, x, y) {
+export function snapRgb(guideData, gw, gh, x, y) {
     const cx = Math.max(0, Math.min(gw - 1, x));
     const cy = Math.max(0, Math.min(gh - 1, y));
     const idx = (cy * gw + cx) * 4;
