@@ -1523,7 +1523,7 @@ export function heightNormals(depth, w, h, scale, sigma, out = null) {
  * @returns {Array<[number, number]>}
  */
 function relightVogel(n) {
-    const N = Math.max(1, Math.round(n) || 16);
+    const N = 16;
     const ga = 2.39996323;
     const taps = [];
     for (let i = 0; i < N; i++) {
@@ -1531,7 +1531,7 @@ function relightVogel(n) {
         const theta = i * ga;
         taps.push([r * Math.cos(theta), r * Math.sin(theta)]);
     }
-    return taps;
+    return taps.slice(0, Math.max(1, Math.min(16, n || 16)));
 }
 
 /**

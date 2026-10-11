@@ -12,7 +12,7 @@
  * anything that could have allocated, never keep one across `alloc` / `take`.
  */
 
-export const PX_ABI = 18;
+export const PX_ABI = 19;
 
 // arithmetic, not `& -n`: sizes above 2 GB do not survive a 32-bit bitwise operator
 const roundUp = (n, to) => Math.ceil(n / to) * to;
@@ -206,6 +206,40 @@ export class Px {
             const po = a.take(n * 2);
             this.exports.range_max(ps, w, h, po);
             return this._out(Uint16Array, po, n, out);
+        } finally { a.reset(); }
+    }
+
+    /**
+     * Surface normals from u16 height field: n = normalize(-dz/dx, -dz/dy, 1.0)
+     * after Gaussian blur with sigma; packed as RGBA8 (n * 127.5 + 127.5, A=255).
+     */
+    heightNormals(depth, w, h, scale, sigma, out = null) {
+        const a = this.job, n = w * h;
+        try {
+            const ps = this._in(a, depth, n * 2);
+            const po = a.take(n * 4);
+            this.exports.height_normals(ps, w, h, scale, sigma, po);
+            return this._out(Uint8Array, po, n * 4, out);
+        } finally { a.reset(); }
+    }
+
+    /**
+     * Marches shadow rays through u16 depth height field.
+     * Visibility map into `out` (0=shadow, 255=lit).
+     */
+    shadowMarch(depth, w, h, scale, light, radius, taps, steps, bias, row0, rows, out = null) {
+        const bandRows = Math.min(rows, h - row0);
+        const a = this.job, n = w * h, nOut = w * bandRows;
+        try {
+            const pd = this._in(a, depth, n * 2);
+            const pl = this._in(a, new Float32Array(light), 16);
+            const po = a.take(nOut);
+            this.exports.shadow_march(pd, w, h, scale, pl, radius, taps, steps, bias, row0, bandRows, po);
+            if (out && out.length >= w * h && row0 > 0) {
+                const target = out.subarray(row0 * w, (row0 + bandRows) * w);
+                return this._out(Uint8Array, po, nOut, target);
+            }
+            return this._out(Uint8Array, po, nOut, out);
         } finally { a.reset(); }
     }
 
