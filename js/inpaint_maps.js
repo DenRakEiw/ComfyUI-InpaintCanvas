@@ -335,7 +335,7 @@ export function passToMap(map, scale = 1) {
  */
 export function sampleMap(map, docX, docY) {
     if (!map || !map.data || map.w <= 0 || map.h <= 0) return 0;
-    const inv = xfInv(map.xf);
+    const inv = xfInv(map.xf || [map.w, 0, 0, map.h, 0, 0]);
     const [ux, uy] = xfApply(inv, docX, docY);
     return u16Bilinear(map.data, map.w, map.h, ux * map.w, uy * map.h);
 }

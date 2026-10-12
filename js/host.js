@@ -180,6 +180,9 @@ export const host = {
     depthDetailSetting: "standard",
     getDepthDetail() { return "standard"; },
     setDepthDetail() {},
+    relightSettings: {},
+    getRelightSettings() { return this.relightSettings || {}; },
+    setRelightSettings(patch) { this.relightSettings = { ...(this.relightSettings || {}), ...(patch || {}) }; },
     async freeHelpers() {},
     async relightWhole() { throw new Error("relight whole picture is a Scumble feature"); },
     upsampleInstruction: null,   // the built-in upsample instruction (Scumble hands out its templates)

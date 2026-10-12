@@ -3003,6 +3003,7 @@ class InpaintEditor {
                 else if (this.tool === "lights" && this.isRelightActive()) {
                     const l = this.activeLayer();
                     if (l && l._selectedLightId) {
+                        l._deselected = true;
                         l._selectedLightId = null;
                         this.renderLayers();
                         this.draw();
@@ -3417,6 +3418,7 @@ class InpaintEditor {
             } else if (this.tool === "lights" && this.isRelightActive()) {
                 const l = this.activeLayer();
                 if (l && l._selectedLightId) {
+                    l._deselected = true;
                     l._selectedLightId = null;
                     this.renderLayers();
                     this.draw();
@@ -3455,11 +3457,14 @@ class InpaintEditor {
         if (this.tool === "lights" && this.isRelightActive() && e.key.startsWith("Arrow")) {
             const l = this.activeLayer();
             if (l && l.params && Array.isArray(l.params.lights) && l.params.lights.length > 0) {
-                const selected = l.params.lights.find((item) => item && item.id === l._selectedLightId) || l.params.lights[0];
+                const selected = l._selectedLightId ? l.params.lights.find((item) => item && item.id === l._selectedLightId) : null;
                 if (selected) {
                     e.preventDefault();
                     const step = e.shiftKey ? 10 : 1;
-                    this.pushUndo({ kind: "filter", id: l.id, label: "Move light" });
+                    if (!l._undoPending) {
+                        l._undoPending = this.snapshot({ kind: "filter", id: l.id });
+                        l._undoLabel = "Move light";
+                    }
                     let dx = 0, dy = 0;
                     if (e.key === "ArrowLeft") dx = -step;
                     if (e.key === "ArrowRight") dx = step;
@@ -3471,10 +3476,25 @@ class InpaintEditor {
                         selected.aim[0] += dx;
                         selected.aim[1] += dy;
                     }
-                    this.ensureRelightMaps(l, { quick: false });
-                    this.markFilterChanged(l);
+                    this.filterPreview = l.id;
+                    this.ensureRelightMaps(l, { quick: true });
+                    this.markFilterChanged(l, { soon: true });
                     this.renderLayers();
                     this.draw();
+                    if (this._nudgeRelightTimer) clearTimeout(this._nudgeRelightTimer);
+                    this._nudgeRelightTimer = setTimeout(() => {
+                        this._nudgeRelightTimer = null;
+                        this.filterPreview = null;
+                        if (l._undoPending) {
+                            this.pushUndoSnapshot(l._undoPending, { label: l._undoLabel || "Move light" });
+                            l._undoPending = null;
+                            l._undoLabel = null;
+                        }
+                        this.ensureRelightMaps(l, { quick: false });
+                        this.markFilterChanged(l);
+                        this.renderLayers();
+                        this.draw();
+                    }, 300);
                 }
             }
             return;
@@ -3573,9 +3593,9 @@ class InpaintEditor {
                             this.markFilterChanged(l);
                             this.renderLayers();
                             this.draw();
-                            break;
                         }
                     }
+                    break;
                 }
                 // with a selection: clear the selected pixels of the active layer (Krita / Photoshop); without: delete the layer
                 if (this.getBounds()) { this.clearSelectedPixels(); break; }
@@ -3815,11 +3835,13 @@ class InpaintEditor {
             if (hit && hit.light) {
                 if (e.preventDefault) e.preventDefault();
                 const l = hit.light;
+                layer._deselected = false;
                 layer._selectedLightId = l.id;
                 const dir = Math.sign(-e.deltaY || 0);
                 if (dir !== 0) {
                     if (!layer._undoPending) {
                         layer._undoPending = this.snapshot({ kind: "filter", id: layer.id });
+                        layer._undoLabel = e.shiftKey ? "Relight: Intensity" : "Relight: Diffusion";
                     }
                     if (e.shiftKey) {
                         l.intensity = Math.max(0, Math.min(300, Math.round((l.intensity || 100) + dir * 5)));
@@ -3836,8 +3858,9 @@ class InpaintEditor {
                         this._wheelRelightTimer = null;
                         this.filterPreview = null;
                         if (layer._undoPending) {
-                            this.pushUndoSnapshot(layer._undoPending, { label: e.shiftKey ? "Relight: Intensity" : "Relight: Diffusion" });
+                            this.pushUndoSnapshot(layer._undoPending, { label: layer._undoLabel || (e.shiftKey ? "Relight: Intensity" : "Relight: Diffusion") });
                             layer._undoPending = null;
+                            layer._undoLabel = null;
                         }
                         this.ensureRelightMaps(layer, { quick: false });
                         this.markFilterChanged(layer);
@@ -6179,6 +6202,7 @@ class InpaintEditor {
             if (!Array.isArray(layer.params.lights)) layer.params.lights = [];
             const hit = this.hitLight(layer, ix, iy);
             if (hit && hit.mode === "aim") {
+                layer._deselected = false;
                 layer._selectedLightId = hit.light.id;
                 this.renderLayers();
                 this.pointer = {
@@ -6195,6 +6219,7 @@ class InpaintEditor {
                     moved: false,
                 };
             } else if (hit && hit.mode === "light") {
+                layer._deselected = false;
                 layer._selectedLightId = hit.light.id;
                 this.renderLayers();
                 if ((e.detail >= 2 || isDouble)) {
@@ -6237,11 +6262,15 @@ class InpaintEditor {
             } else if (hit && hit.mode === "own_light") {
                 if (layer.params.lights.length < LIGHT_MAX) {
                     this.pushUndo({ kind: "filter", id: layer.id, label: "Add light" });
-                    const nl = defaultLight(layer.params.lights.length, { width: this.width, height: this.height });
+                    let n = 1;
+                    while (layer.params.lights.some((l) => l && l.id === `light_${n}`)) n++;
+                    const nl = defaultLight(n - 1, { width: this.width, height: this.height });
+                    nl.id = `light_${n}`;
                     nl.x = Math.round(hit.pos[0]);
                     nl.y = Math.round(hit.pos[1]);
                     nl.aim = [Math.round(hit.pos[0]), Math.round(hit.pos[1] + 100)];
                     layer.params.lights.push(nl);
+                    layer._deselected = false;
                     layer._selectedLightId = nl.id;
                     this.ensureRelightMaps(layer, { quick: false });
                     this.markFilterChanged(layer);
@@ -6251,17 +6280,22 @@ class InpaintEditor {
             } else {
                 if (layer.params.lights.length < LIGHT_MAX) {
                     this.pushUndo({ kind: "filter", id: layer.id, label: "Add light" });
-                    const nl = defaultLight(layer.params.lights.length, { width: this.width, height: this.height });
+                    let n = 1;
+                    while (layer.params.lights.some((l) => l && l.id === `light_${n}`)) n++;
+                    const nl = defaultLight(n - 1, { width: this.width, height: this.height });
+                    nl.id = `light_${n}`;
                     nl.x = Math.round(ix);
                     nl.y = Math.round(iy);
                     nl.aim = [Math.round(ix), Math.round(iy + 100)];
                     layer.params.lights.push(nl);
+                    layer._deselected = false;
                     layer._selectedLightId = nl.id;
                     this.ensureRelightMaps(layer, { quick: false });
                     this.markFilterChanged(layer);
                     this.renderLayers();
                     this.draw();
                 } else {
+                    layer._deselected = true;
                     layer._selectedLightId = null;
                     this.renderLayers();
                     this.draw();
@@ -6466,7 +6500,7 @@ class InpaintEditor {
                 }
                 this.filterPreview = p.layer.id;
                 this.ensureRelightMaps(p.layer, { quick: true });
-                this.markFilterChanged(p.layer);
+                this.markFilterChanged(p.layer, { soon: true });
             }
         }
         this.drawSoon();
@@ -14370,9 +14404,30 @@ class InpaintEditor {
      */
     // `historyGen` is read when the key is pressed, not when the queued step runs: an edit made after
     // that stops it, and so a held Ctrl+Z that is still queued never takes back a stroke made meanwhile
-    undoStep() { this.closeFlyout(); const gen = this.historyGen; return this.queueHistory(() => this.historyStepNow(false, gen)); }
+    flushPendingDebounces() {
+        if (this._nudgeRelightTimer) {
+            clearTimeout(this._nudgeRelightTimer);
+            this._nudgeRelightTimer = null;
+        }
+        if (this._wheelRelightTimer) {
+            clearTimeout(this._wheelRelightTimer);
+            this._wheelRelightTimer = null;
+        }
+        this.filterPreview = null;
+        if (this.layers) {
+            for (const l of this.layers) {
+                if (l && l._undoPending) {
+                    this.pushUndoSnapshot(l._undoPending, { label: l._undoLabel || "Edit" });
+                    l._undoPending = null;
+                    l._undoLabel = null;
+                }
+            }
+        }
+    }
 
-    redoStep() { this.closeFlyout(); const gen = this.historyGen; return this.queueHistory(() => this.historyStepNow(true, gen)); }
+    undoStep() { this.flushPendingDebounces(); this.closeFlyout(); const gen = this.historyGen; return this.queueHistory(() => this.historyStepNow(false, gen)); }
+
+    redoStep() { this.flushPendingDebounces(); this.closeFlyout(); const gen = this.historyGen; return this.queueHistory(() => this.historyStepNow(true, gen)); }
 
     queueHistory(fn) {
         const prev = this._historyQueue;
@@ -14854,7 +14909,22 @@ class InpaintEditor {
             ? `${layer.name} added. It covers everything below it; set the colour in the layer list, the blend mode, the opacity or a mask to let the picture through.`
             : `${layer.name} added. It filters everything below it; pick the type and drag the sliders in the layer list.`);
         if (id === "relight") {
+            const relightConf = host.getRelightSettings ? host.getRelightSettings() : null;
+            if (relightConf && relightConf.route) {
+                params.route = relightConf.route;
+            }
+            if (relightConf && relightConf.magnific) {
+                params.strength = relightConf.magnific.strength ?? 100;
+                params.style = relightConf.magnific.style ?? "standard";
+            }
+            if (relightConf && relightConf.detailFromOriginal !== undefined) {
+                params.detail = relightConf.detailFromOriginal;
+            }
             this.setTool("lights");
+            const hasDepth = !!(this.maps && this.maps.depth && (this.maps.depth.data || this.maps.depth.u16));
+            if (!hasDepth && this.ensureDepthMap) {
+                this.ensureDepthMap();
+            }
         }
         return layer;
     }
@@ -14868,6 +14938,17 @@ class InpaintEditor {
         const seed = was === "fill" ? hex(prev.color) : was === "gradient" ? hex(prev.from) : hex(this.color);
         layer.filter = id;
         layer.params = filterDefaults(id);
+        if (id === "relight") {
+            const relightConf = host.getRelightSettings ? host.getRelightSettings() : null;
+            if (relightConf && relightConf.route) {
+                layer.params.route = relightConf.route;
+            }
+            this.setTool("lights");
+            const hasDepth = !!(this.maps && this.maps.depth && (this.maps.depth.data || this.maps.depth.u16));
+            if (!hasDepth && this.ensureDepthMap) {
+                this.ensureDepthMap();
+            }
+        }
         if (prev.limit) {
             layer.params.limit = { ...prev.limit };
             if (FILTERS[id] && FILTERS[id].over && layer.params.limit.source !== "depth") {
@@ -14923,7 +15004,7 @@ class InpaintEditor {
         layer._fcacheView = null; layer._fcacheSample = null; layer._fxCacheSample = null;
         this.uploaded.baseHash = null;
         if (layer && layer.kind === "filter" && layer.filter === "relight") {
-            this.ensureRelightMaps(layer, { quick: !!this.filterPreview });
+            this.ensureRelightMaps(layer, { quick: this.filterPreview === layer.id });
         }
         if (this.isFillLayer(layer)) this.redrawThumbsOf(layer);   // a fill layer's row shows its fill
         if (soon) { this.drawSoon(); return; }   // slider drag: one draw per frame, thumbnail and save on release
@@ -15043,7 +15124,7 @@ class InpaintEditor {
         if (layer.filter === "relight") {
             info.layer = layer;
             info.relight = layer._relight;
-            this.ensureRelightMaps(layer, { quick: !!this.filterPreview });
+            this.ensureRelightMaps(layer, { quick: this.filterPreview === layer.id });
         }
         if (this._filterInfoHook) this._filterInfoHook(info, layer, pass);
         return info;
@@ -16616,6 +16697,7 @@ class InpaintEditor {
             ref: layer.dirty ? null : layer.ref, dirty: !!layer.dirty || !layer.ref, exportRef: null, locked: false,
             maskRef: layer.maskDirty ? null : layer.maskRef, maskDirty: !!layer.maskPx && (!!layer.maskDirty || !layer.maskRef), maskEdit: false,
             _masked: null, _maskedValid: false, _mcache: null, _fcache: null, _fxCache: null, _textUndo: null, _undoPending: null,
+            _relight: null, _bstats: null, _bstatsRun: null,
         };
         // the spread shares the pixels; the copy gets its own (the aliases are not enumerable, so they are installed again)
         if (layer.px) copy.px = layer.px.clone();
@@ -19297,11 +19379,12 @@ class InpaintEditor {
         }
         const lights = layer.params.lights;
         if (lights.length > 0) {
-            if (!layer._selectedLightId || !lights.some((l) => l && l.id === layer._selectedLightId)) {
+            if (!layer._deselected && (!layer._selectedLightId || !lights.some((l) => l && l.id === layer._selectedLightId))) {
                 layer._selectedLightId = lights[0].id;
             }
         } else {
             layer._selectedLightId = null;
+            layer._deselected = false;
         }
 
         // 1. Missing depth map hint (if applicable)
@@ -19372,6 +19455,7 @@ class InpaintEditor {
             const newLights = applyLightPreset(pid, { width: w, height: h });
             if (newLights && newLights.length > 0) {
                 layer.params.lights = newLights;
+                layer._deselected = false;
                 layer._selectedLightId = newLights[0].id;
                 this.ensureRelightMaps(layer, { quick: false });
                 this.markFilterChanged(layer);
@@ -19394,6 +19478,7 @@ class InpaintEditor {
             const nl = defaultLight(n - 1, { width: w, height: h });
             nl.id = `light_${n}`;
             layer.params.lights.push(nl);
+            layer._deselected = false;
             layer._selectedLightId = nl.id;
             this.markFilterChanged(layer);
             this.renderLayers();
@@ -19426,6 +19511,7 @@ class InpaintEditor {
             row.title = `Light ${i + 1}`;
             row.addEventListener("click", (e) => {
                 stop(e);
+                layer._deselected = false;
                 if (layer._selectedLightId !== l.id) {
                     layer._selectedLightId = l.id;
                     this.renderLayers();
@@ -19713,6 +19799,7 @@ class InpaintEditor {
         routeSel.addEventListener("change", () => {
             this.pushUndo({ kind: "filter", id: layer.id, label: "Relight route" });
             layer.params.route = routeSel.value;
+            host.setRelightSettings({ route: routeSel.value });
             this.markFilterChanged(layer);
             this.renderLayers();
         });
@@ -19769,14 +19856,21 @@ class InpaintEditor {
             strSlider.addEventListener("keydown", stop);
             const strVal = el("span", "ipc-val", strSlider.value + "%");
             strSlider.addEventListener("input", () => {
+                if (!layer._undoPending) {
+                    layer._undoPending = this.snapshot({ kind: "filter", id: layer.id });
+                }
                 strVal.textContent = strSlider.value + "%";
                 layer.params.strength = +strSlider.value;
                 layer.params.light_transfer_strength = +strSlider.value;
             });
             strSlider.addEventListener("change", () => {
-                this.pushUndo({ kind: "filter", id: layer.id, label: "Relight: Strength" });
+                if (layer._undoPending) {
+                    this.pushUndoSnapshot(layer._undoPending, { label: "Relight: Strength" });
+                    layer._undoPending = null;
+                }
                 layer.params.strength = +strSlider.value;
                 layer.params.light_transfer_strength = +strSlider.value;
+                host.setRelightSettings({ strength: +strSlider.value });
                 this.markFilterChanged(layer);
             });
             strengthRow.appendChild(strLabel);
@@ -19806,6 +19900,7 @@ class InpaintEditor {
             styleSel.addEventListener("change", () => {
                 this.pushUndo({ kind: "filter", id: layer.id, label: "Relight: Style" });
                 layer.params.style = styleSel.value;
+                host.setRelightSettings({ style: styleSel.value });
                 this.markFilterChanged(layer);
             });
             styleRow.appendChild(styLabel);
@@ -19825,6 +19920,7 @@ class InpaintEditor {
             pdCheck.addEventListener("change", () => {
                 this.pushUndo({ kind: "filter", id: layer.id, label: "Relight: Preserve details" });
                 layer.params.preserve_details = pdCheck.checked;
+                host.setRelightSettings({ preserve_details: pdCheck.checked });
                 this.markFilterChanged(layer);
             });
             pdRow.appendChild(pdCheck);
@@ -19845,6 +19941,7 @@ class InpaintEditor {
                 this.pushUndo({ kind: "filter", id: layer.id, label: "Relight: Interpolate" });
                 layer.params.interpolate = intCheck.checked;
                 layer.params.interpolate_from_original = intCheck.checked;
+                host.setRelightSettings({ interpolate: intCheck.checked });
                 this.markFilterChanged(layer);
             });
             intRow.appendChild(intCheck);
@@ -19865,6 +19962,7 @@ class InpaintEditor {
             detCheck.addEventListener("change", () => {
                 this.pushUndo({ kind: "filter", id: layer.id, label: "Relight: Detail from original" });
                 layer.params.detail = detCheck.checked;
+                host.setRelightSettings({ detail: detCheck.checked });
                 this.markFilterChanged(layer);
             });
             detRow.appendChild(detCheck);
@@ -19892,6 +19990,7 @@ class InpaintEditor {
             hrCheck.addEventListener("change", () => {
                 this.pushUndo({ kind: "filter", id: layer.id, label: "Relight: High-res fix" });
                 layer.params.enable_hr_fix = hrCheck.checked;
+                host.setRelightSettings({ enable_hr_fix: hrCheck.checked });
                 this.markFilterChanged(layer);
             });
             hrRow.appendChild(hrCheck);
@@ -19912,6 +20011,7 @@ class InpaintEditor {
             detCheck.addEventListener("change", () => {
                 this.pushUndo({ kind: "filter", id: layer.id, label: "Relight: Detail from original" });
                 layer.params.detail = detCheck.checked;
+                host.setRelightSettings({ detail: detCheck.checked });
                 this.markFilterChanged(layer);
             });
             detRow.appendChild(detCheck);
@@ -19962,6 +20062,7 @@ class InpaintEditor {
             ltSel.addEventListener("change", () => {
                 this.pushUndo({ kind: "filter", id: layer.id, label: "Relight: Light type" });
                 layer.params.light_type = ltSel.value;
+                host.setRelightSettings({ light_type: ltSel.value });
                 this.markFilterChanged(layer);
             });
             briaRow.appendChild(ltLabel);
@@ -19982,6 +20083,7 @@ class InpaintEditor {
             detCheck.addEventListener("change", () => {
                 this.pushUndo({ kind: "filter", id: layer.id, label: "Relight: Detail from original" });
                 layer.params.detail = detCheck.checked;
+                host.setRelightSettings({ detail: detCheck.checked });
                 this.markFilterChanged(layer);
             });
             detRow.appendChild(detCheck);
@@ -20012,14 +20114,21 @@ class InpaintEditor {
             loraSlider.addEventListener("keydown", stop);
             const loraVal = el("span", "ipc-val", loraSlider.value + "%");
             loraSlider.addEventListener("input", () => {
+                if (!layer._undoPending) {
+                    layer._undoPending = this.snapshot({ kind: "filter", id: layer.id });
+                }
                 loraVal.textContent = loraSlider.value + "%";
                 layer.params.lora_strength = +loraSlider.value;
                 layer.params.strength_model = +loraSlider.value;
             });
             loraSlider.addEventListener("change", () => {
-                this.pushUndo({ kind: "filter", id: layer.id, label: "Relight: LoRA strength" });
+                if (layer._undoPending) {
+                    this.pushUndoSnapshot(layer._undoPending, { label: "Relight: LoRA strength" });
+                    layer._undoPending = null;
+                }
                 layer.params.lora_strength = +loraSlider.value;
                 layer.params.strength_model = +loraSlider.value;
+                host.setRelightSettings({ lora_strength: +loraSlider.value });
                 this.markFilterChanged(layer);
             });
             loraRow.appendChild(loraLabel);
@@ -20043,12 +20152,19 @@ class InpaintEditor {
             stepsSlider.addEventListener("keydown", stop);
             const stepsVal = el("span", "ipc-val", stepsSlider.value);
             stepsSlider.addEventListener("input", () => {
+                if (!layer._undoPending) {
+                    layer._undoPending = this.snapshot({ kind: "filter", id: layer.id });
+                }
                 stepsVal.textContent = stepsSlider.value;
                 layer.params.steps = +stepsSlider.value;
             });
             stepsSlider.addEventListener("change", () => {
-                this.pushUndo({ kind: "filter", id: layer.id, label: "Relight: Steps" });
+                if (layer._undoPending) {
+                    this.pushUndoSnapshot(layer._undoPending, { label: "Relight: Steps" });
+                    layer._undoPending = null;
+                }
                 layer.params.steps = +stepsSlider.value;
+                host.setRelightSettings({ steps: +stepsSlider.value });
                 this.markFilterChanged(layer);
             });
             stepsRow.appendChild(stepsLabel);
@@ -20070,6 +20186,7 @@ class InpaintEditor {
             detCheck.addEventListener("change", () => {
                 this.pushUndo({ kind: "filter", id: layer.id, label: "Relight: Detail from original" });
                 layer.params.detail = detCheck.checked;
+                host.setRelightSettings({ detail: detCheck.checked });
                 this.markFilterChanged(layer);
             });
             detRow.appendChild(detCheck);
@@ -22314,6 +22431,7 @@ class InpaintEditor {
      * Resolves when all pending relight worker pool operations are completed.
      */
     async relightSettled() {
+        this.flushPendingDebounces();
         if (this.layers) {
             for (const l of this.layers) {
                 if (l.kind === "filter" && l.filter === "relight") {
@@ -22421,7 +22539,7 @@ class InpaintEditor {
         ctx.arc(ox, oy, 2.5 * invScale, 0, Math.PI * 2);
         ctx.fill();
 
-        ctx.font = `600 ${Math.round(10 * invScale)}px system-ui, sans-serif`;
+        ctx.font = `600 ${Math.max(1, Math.round(10 * invScale))}px system-ui, sans-serif`;
         const ownText = "own light";
         const tw = ctx.measureText(ownText).width + 6 * invScale;
         const th = 13 * invScale;
@@ -22536,7 +22654,7 @@ class InpaintEditor {
             ctx.strokeStyle = isSelected ? "#7cc7ff" : "rgba(255, 255, 255, 0.4)";
             ctx.lineWidth = 1 * invScale;
             ctx.stroke();
-            ctx.font = `bold ${Math.round(9 * invScale)}px system-ui, sans-serif`;
+            ctx.font = `bold ${Math.max(1, Math.round(9 * invScale))}px system-ui, sans-serif`;
             ctx.fillStyle = isSelected ? "#7cc7ff" : "#ffffff";
             ctx.textAlign = "center";
             ctx.textBaseline = "middle";
@@ -22560,6 +22678,8 @@ class InpaintEditor {
             key: null,
             normals: null,
             vis: null,
+            visQuick: null,
+            depthQuick: null,
             fit: null,
             pending: new Set(),
         });
@@ -22613,41 +22733,64 @@ class InpaintEditor {
         }
 
         // Vis cache
+        const shadows = Number.isFinite(layer.params?.shadows) ? Number(layer.params.shadows) : 60;
         const lights = Array.isArray(layer.params?.lights) ? layer.params.lights : [];
         const targetW = quick ? Math.max(1, Math.floor(depthMap.w / 4)) : depthMap.w;
         const targetH = quick ? Math.max(1, Math.floor(depthMap.h / 4)) : depthMap.h;
-        if (!cache.vis || cache.vis.w !== targetW || cache.vis.h !== targetH) {
+
+        let targetVis = quick ? cache.visQuick : cache.vis;
+        if (!targetVis || targetVis.w !== targetW || targetVis.h !== targetH) {
             const visData = new Uint8Array(targetW * targetH * 4);
             visData.fill(255);
-            cache.vis = {
+            targetVis = {
                 data: visData,
                 w: targetW,
                 h: targetH,
                 keys: [null, null, null, null],
             };
+            if (quick) cache.visQuick = targetVis;
+            else cache.vis = targetVis;
         }
 
-        const marchDepth = quick
-            ? this.downsampleDepth(depthMap.data, depthMap.w, depthMap.h, targetW, targetH)
-            : depthMap.data;
+        if (shadows === 0) {
+            targetVis.data.fill(255);
+            targetVis.keys = [null, null, null, null];
+            return;
+        }
+
+        let marchDepth;
+        if (quick) {
+            if (!cache.depthQuick || cache.depthQuick.w !== targetW || cache.depthQuick.h !== targetH || cache.depthQuick.mapVersion !== mapVersion) {
+                cache.depthQuick = {
+                    data: this.downsampleDepth(depthMap.data, depthMap.w, depthMap.h, targetW, targetH),
+                    w: targetW,
+                    h: targetH,
+                    mapVersion,
+                };
+            }
+            marchDepth = cache.depthQuick.data;
+        } else {
+            marchDepth = depthMap.data;
+        }
         const scaleFactor = targetW / depthMap.w;
         const marchScale = scaleZ * scaleFactor;
 
         for (let i = 0; i < 4; i++) {
             const l = lights[i];
             if (!l || !l.on) {
-                if (cache.vis.keys[i] !== null) {
+                if (targetVis.keys[i] !== null) {
                     for (let idx = 0; idx < targetW * targetH; idx++) {
-                        cache.vis.data[idx * 4 + i] = 255;
+                        targetVis.data[idx * 4 + i] = 255;
                     }
-                    cache.vis.keys[i] = null;
+                    targetVis.keys[i] = null;
                 }
                 continue;
             }
 
             const vKey = `${l.type}_${l.x}_${l.y}_${l.dist}_${l.diffusion}_${l.range}_${depthScale}_${mapVersion}_${quick ? "q" : "f"}`;
-            if (cache.vis.keys[i] !== vKey && !cache.pending.has(`v:${i}:${vKey}`)) {
-                cache.pending.add(`v:${i}:${vKey}`);
+            const pendingKey = `v:${quick ? "q" : "f"}:${i}:${vKey}`;
+            if (targetVis.keys[i] !== vKey && !cache.pending.has(pendingKey)) {
+                cache.pending.add(pendingKey);
                 const chan = i;
                 const p = (async () => {
                     try {
@@ -22679,27 +22822,27 @@ class InpaintEditor {
                                 row0: 0,
                                 rows: targetH,
                             }, [], { priority: quick ? INTERACTIVE : NORMAL });
-                            if (cache.vis && cache.vis.w === targetW && cache.vis.h === targetH) {
+                            if (targetVis && targetVis.w === targetW && targetVis.h === targetH) {
                                 const vChan = new Uint8Array(res.vis);
                                 for (let idx = 0; idx < targetW * targetH; idx++) {
-                                    cache.vis.data[idx * 4 + chan] = vChan[idx];
+                                    targetVis.data[idx * 4 + chan] = vChan[idx];
                                 }
-                                cache.vis.keys[chan] = vKey;
+                                targetVis.keys[chan] = vKey;
                             }
                         } else {
                             const vChan = shadowMarch(marchDepth, targetW, targetH, marchScale, lightVec, radius, taps, steps, bias, 0, targetH);
-                            if (cache.vis && cache.vis.w === targetW && cache.vis.h === targetH) {
+                            if (targetVis && targetVis.w === targetW && targetVis.h === targetH) {
                                 for (let idx = 0; idx < targetW * targetH; idx++) {
-                                    cache.vis.data[idx * 4 + chan] = vChan[idx];
+                                    targetVis.data[idx * 4 + chan] = vChan[idx];
                                 }
-                                cache.vis.keys[chan] = vKey;
+                                targetVis.keys[chan] = vKey;
                             }
                         }
                         this.markFilterChanged(layer, { soon: true });
                     } catch (err) {
                         console.warn(`relight_shadow channel ${chan} failed:`, err);
                     } finally {
-                        cache.pending.delete(`v:${chan}:${vKey}`);
+                        cache.pending.delete(pendingKey);
                     }
                 })();
                 this._relightPending.add(p);

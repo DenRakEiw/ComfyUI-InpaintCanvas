@@ -247,9 +247,12 @@ function rawKelvinLinear(kelvin) {
     return [srgbToLinear(rNorm), srgbToLinear(gNorm), srgbToLinear(bNorm)];
 }
 
+const RAW_5500 = rawKelvinLinear(5500);
+
 /**
  * Converts a Kelvin colour temperature (1000..10000 K) or hex colour string
- * into linear RGB, normalized so luminance (Rec. 709) is exactly 1.0.
+ * into linear RGB, normalized so luminance (Rec. 709) is exactly 1.0,
+ * and 5500 K is neutral white [1.0, 1.0, 1.0].
  * @param {number|string} k - Kelvin number or hex colour string
  * @returns {[number, number, number]} Linear RGB components
  */
@@ -262,9 +265,12 @@ export function kelvinToRgb(k) {
         return [0, 0, 0];
     }
     const raw = rawKelvinLinear(typeof k === "number" ? k : Number(k) || 5500);
-    const luma = 0.2126 * raw[0] + 0.7152 * raw[1] + 0.0722 * raw[2];
+    const cr = raw[0] / RAW_5500[0];
+    const cg = raw[1] / RAW_5500[1];
+    const cb = raw[2] / RAW_5500[2];
+    const luma = 0.2126 * cr + 0.7152 * cg + 0.0722 * cb;
     if (luma > 1e-6) {
-        return [raw[0] / luma, raw[1] / luma, raw[2] / luma];
+        return [cr / luma, cg / luma, cb / luma];
     }
     return [1, 1, 1];
 }
@@ -336,6 +342,13 @@ export function defaultLight(i = 0, size = null) {
  * @returns {object[]}
  */
 export function normalizeLights(list, size = null) {
+    if (typeof list === "string") {
+        try {
+            list = JSON.parse(list);
+        } catch (_) {
+            list = [];
+        }
+    }
     if (!Array.isArray(list) || list.length === 0) return [];
     const out = [];
     const count = Math.min(LIGHT_MAX, list.length);
@@ -1192,8 +1205,13 @@ export function applyRelight(src, params, info = {}) {
     }
 
     let visData = null;
-    if (cache && cache.vis && cache.vis.data) {
-        visData = cache.vis.data;
+    let visW = map.w;
+    let visH = map.h;
+    const visObj = (info.quick && cache?.visQuick) || cache?.vis || null;
+    if (visObj && visObj.data) {
+        visData = visObj.data;
+        visW = visObj.w || map.w;
+        visH = visObj.h || map.h;
     } else {
         const vd = new Uint8Array(map.w * map.h * 4);
         vd.fill(255);
@@ -1215,6 +1233,8 @@ export function applyRelight(src, params, info = {}) {
 
     const fit = (info && (info.wholeStats?.fit || info.stats?.fit || cache?.fit)) || { l0: [0, 0, 1], ka: 1.0, kd: 0.0 };
     const mappedLights = lightsList.map((l) => ({ ...l, ...lightToMap(l, map, { depth_scale: depthScale }) }));
+    const scaleVisX = visW / map.w;
+    const scaleVisY = visH / map.h;
 
     for (let y = 0; y < H; y++) {
         const py = origin[1] + y + 0.5;
@@ -1229,11 +1249,11 @@ export function applyRelight(src, params, info = {}) {
             const sg = px[idx + 1];
             const sb = px[idx + 2];
             const sa = px[idx + 3];
-            if (sa === 0) continue;
+            if (sa === 0 && p?.mode !== 1) continue;
 
             const far = snapField(map, guide, mx, my, sr / 255.0, sg / 255.0, sb / 255.0, sigmaR, tau);
             let nRgba = sampleRgbaBilinear(normalsData, map.w, map.h, mx, my);
-            let vRgba = sampleRgbaBilinear(visData, map.w, map.h, mx, my);
+            let vRgba = sampleRgbaBilinear(visData, visW, visH, mx * scaleVisX, my * scaleVisY);
 
             if (sigmaR > 0 && guide) {
                 const qx = mx - 0.5;
@@ -1283,7 +1303,9 @@ export function applyRelight(src, params, info = {}) {
                             sdN2 += w * normalsData[offNorm + 2];
                             sdN3 += w * normalsData[offNorm + 3];
 
-                            const offVis = (clpY * map.w + clpX) * 4;
+                            const clpVx = Math.max(0, Math.min(visW - 1, Math.floor(pX * scaleVisX)));
+                            const clpVy = Math.max(0, Math.min(visH - 1, Math.floor(pY * scaleVisY)));
+                            const offVis = (clpVy * visW + clpVx) * 4;
                             sdV0 += w * visData[offVis];
                             sdV1 += w * visData[offVis + 1];
                             sdV2 += w * visData[offVis + 2];
@@ -1464,7 +1486,7 @@ vec4 shade(vec4 c, vec2 uv) {
     if (normSize.x > 1 && normSize.y > 1) {
         vec2 suv_map = mpx / vec2(normSize);
         vec4 nTex = texture(u_normals, suv_map);
-        vec2 suv_vis = visSize.x > 1 ? mpx / vec2(visSize) : suv_map;
+        vec2 suv_vis = suv_map;
         vec4 vTex = visSize.x > 1 ? texture(u_vis, suv_vis) : vec4(1.0);
 
         if (u_snap.x > 0.0) {
@@ -1492,7 +1514,7 @@ vec4 shade(vec4 c, vec2 uv) {
                         float w = exp(-0.5 * dot(dd, dd)) * exp(-dot(e, e) * inv);
                         sw += w;
                         ivec2 clpN = clamp(p, ivec2(0), normSize - 1);
-                        ivec2 clpV = clamp(p, ivec2(0), visSize - 1);
+                        ivec2 clpV = clamp(ivec2(floor(vec2(p) * (vec2(visSize) / vec2(normSize)))), ivec2(0), visSize - 1);
                         sdN += w * texelFetch(u_normals, clpN, 0);
                         sdV += w * texelFetch(u_vis, clpV, 0);
                     }
@@ -1609,14 +1631,15 @@ export function registerRelightGL() {
                 key: "relight:n:" + (cache.normals.key || cache.key || 0),
             } : DUMMY_NORMALS;
 
-            const visSampler = (cache && cache.vis && cache.vis.data) ? {
-                data: cache.vis.data,
-                width: cache.vis.w,
-                height: cache.vis.h,
+            const visObj = (info.quick && cache?.visQuick) || cache?.vis || null;
+            const visSampler = (visObj && visObj.data) ? {
+                data: visObj.data,
+                width: visObj.w,
+                height: visObj.h,
                 channels: 4,
                 linear: true,
                 static: true,
-                key: "relight:v:" + (cache.vis.keys ? cache.vis.keys.join("_") : (cache.key || 0)),
+                key: (info.quick ? "relight:vq:" : "relight:v:") + (visObj.keys ? visObj.keys.join("_") : (visObj.key || cache?.key || 0)),
             } : DUMMY_VIS;
 
             const fit = (info && (info.wholeStats?.fit || info.stats?.fit || cache?.fit)) || { l0: [0, 0, 1], ka: 1.0, kd: 0.0 };
@@ -1797,7 +1820,7 @@ export function detailRatio(fullPx, lowPx, ansPx, W, H, wAns, hAns, box = null) 
     const nFull = W * H;
     const nAns = wAns * hAns;
     const out = new Uint8Array(nFull * 4);
-    const haveLow = lowPx && lowPx.length >= nAns * 4;
+    const haveLow = lowPx && lowPx.length === nAns * 4;
 
     for (let c = 0; c < 3; c++) {
         let lowC;

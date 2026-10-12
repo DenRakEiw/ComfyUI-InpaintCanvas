@@ -1551,6 +1551,14 @@ export function shadowMarch(depth, w, h, scale, light, radius, taps, steps, bias
     const sunDist = longSide * 1.5;
     const inv65535 = scale / 65535.0;
 
+    let normLx = 0, normLy = 0, normLz = 0;
+    if (kind === 1) {
+        const lLen = Math.hypot(lx, ly, lz) || 1.0;
+        normLx = lx / lLen;
+        normLy = ly / lLen;
+        normLz = lz / lLen;
+    }
+
     for (let rIdx = 0; rIdx < bandRows; rIdx++) {
         const y = row0 + rIdx;
         const rowOffset = y * w;
@@ -1568,9 +1576,9 @@ export function shadowMarch(depth, w, h, scale, light, radius, taps, steps, bias
                 if (kind === 1) {
                     const jx = disc[t][0] * (r / longSide);
                     const jy = disc[t][1] * (r / longSide);
-                    const dirX = lx + jx;
-                    const dirY = ly + jy;
-                    const dirZ = lz;
+                    const dirX = normLx + jx;
+                    const dirY = normLy + jy;
+                    const dirZ = normLz;
                     const dLen = Math.hypot(dirX, dirY, dirZ) || 1.0;
                     tx = px + (dirX / dLen) * sunDist;
                     ty = py + (dirY / dLen) * sunDist;
@@ -1586,19 +1594,27 @@ export function shadowMarch(depth, w, h, scale, light, radius, taps, steps, bias
                 const rdz = tz - pz;
                 let blocked = false;
 
-                for (let s = 1; s <= nSteps; s++) {
-                    const frac = s / nSteps;
-                    const sx = px + frac * rdx;
-                    const sy = py + frac * rdy;
-                    const sz = pz + frac * rdz;
+                const invSteps = 1.0 / nSteps;
+                const stepX = rdx * invSteps;
+                const stepY = rdy * invSteps;
+                const stepZ = rdz * invSteps;
+                let sx = px + stepX;
+                let sy = py + stepY;
+                let sz = pz + stepZ;
 
+                for (let s = 1; s <= nSteps; s++) {
                     if (rdz >= 0 && sz > scale) {
                         break;
                     }
 
-                    const ix = Math.floor(sx + 0.5);
-                    const iy = Math.floor(sy + 0.5);
-                    if (ix < 0 || ix >= w || iy < 0 || iy >= h) {
+                    const cx = sx + 0.5;
+                    const cy = sy + 0.5;
+                    if (cx < 0 || cy < 0) {
+                        break;
+                    }
+                    const ix = cx | 0;
+                    const iy = cy | 0;
+                    if (ix >= w || iy >= h) {
                         break;
                     }
 
@@ -1607,6 +1623,10 @@ export function shadowMarch(depth, w, h, scale, light, radius, taps, steps, bias
                         blocked = true;
                         break;
                     }
+
+                    sx += stepX;
+                    sy += stepY;
+                    sz += stepZ;
                 }
 
                 if (!blocked) litCount++;
