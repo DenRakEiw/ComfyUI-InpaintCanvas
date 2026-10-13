@@ -150,6 +150,9 @@ export function heightNormals(depth, w, h, scale, sigma, out = null) {
 
 /** Marches shadow rays through u16 depth height field. */
 export function shadowMarch(depth, w, h, scale, light, radius, taps, steps, bias, row0, rows, out = null) {
+    if (light && light[3] !== 1) {
+        return J.shadowMarch(depth, w, h, scale, light, radius, taps, steps, bias, row0, rows, out);
+    }
     const p = rustPx();
     if (!p) return J.shadowMarch(depth, w, h, scale, light, radius, taps, steps, bias, row0, rows, out);
     try { return p.shadowMarch(depth, w, h, scale, light, radius, taps, steps, bias, row0, rows, out); } finally { releaseIfLarge(); }

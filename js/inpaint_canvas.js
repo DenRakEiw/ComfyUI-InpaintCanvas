@@ -50,7 +50,7 @@ import { limitAlphaRows } from "./inpaint_limit.js";
 import { buildRangeBar } from "./inpaint_rangebar.js";
 import { BLENDS, BLEND_GROUPS, BLEND_MODES, EMULATED_BLENDS, BLEND_OPS, canvasOp, normalBlend, seedOfLayer, hash32, mul255 } from "./blend_modes.js";
 import { heightNormals, shadowMarch } from "./px/kernels.js";
-import { lightToMap, defaultLight, KELVIN_PRESETS, LIGHT_MAX, lightColorHex, LIGHT_PRESETS, SPOT_GOBOS, applyLightPreset } from "./inpaint_relight.js";
+import { lightToMap, defaultLight, KELVIN_PRESETS, LIGHT_MAX, lightColorHex, LIGHT_PRESETS, SPOT_GOBOS, applyLightPreset, loraPercent, relightMapKey, relightDepthScale, relightVisKey, relightVisCurrent } from "./inpaint_relight.js";
 
 /**
  * The pixel backend a new editor takes (docs/PLAN_BCE.md §C2 step b): the host's choice when it made
@@ -78,6 +78,13 @@ const STITCH_CLASS = "InpaintCanvasStitch";
 const MAX_UNDO = 30;
 const MAX_UNDO_BYTES = 384 * 1024 * 1024;   // rect undo copies: older steps are dropped past this
 const MAX_SNAPSHOTS = 8;                    // named snapshots of the whole document (the Undo history section)
+/**
+ * What a layer holds of an edit still in progress: the "before" of a slider or preview, a text edit, a colour match drag,
+ * a choice list's hover, a relight nudge or wheel burst with its flush and timer. Never part of an undo step, a named
+ * snapshot or a copy: a record holding one would bring the edit back half done (docs/PLAN_RELIGHT_FIXES.md F3).
+ */
+const LAYER_PENDING_KEYS = ["_undoPending", "_textUndo", "_matchUndo", "_hoverSnap", "_nudgePending", "_wheelPending", "_wheelLabel",
+    "_flushNudge", "_flushWheel", "_nudgeRelightTimer", "_wheelRelightTimer"];
 /** Said when a run holds the document (the app's host; the node's sets no `providerPending`). */
 const RUN_GOING_TEXT = "A run is still going on this document: wait for it, or Cancel.";
 /** What an undo step is called in the Undo history when its site gives no label of its own. */
@@ -1816,6 +1823,17 @@ const STROKE_BAND = 1024;
 // WeakMap caching rangeMax(map) keyed by map.data (immutable Uint16Array) for selectRange depth edge tiles (R2-S6)
 const RMAX_CACHE = new WeakMap();
 
+// A pixel source's identity and version as a key part, "-" for none (`belowSignature`): a source replaced by another
+// (an undo, a flip, a new base) is another key even where `pixelVersion` would not tell
+const SOURCE_IDS = new WeakMap();
+let sourceIdSeq = 0;
+function sourceTag(o) {
+    if (!o || typeof o !== "object") return "-";
+    let id = SOURCE_IDS.get(o);
+    if (id === undefined) { id = ++sourceIdSeq; SOURCE_IDS.set(o, id); }
+    return `${id}.${o.version || 0}`;
+}
+
 /**
  * What an editor has uploaded, by hash. Setting `baseHash` to null (the base or a layer that is
  * part of it changed) moves the composite version on. A class with the accessor on its prototype
@@ -3066,8 +3084,18 @@ class InpaintEditor {
         this._docKeyUp = null;
         if (this.textEdit) this.endTextEdit(true);
         this.closeFlyout();
-        this.closeTipPicker();
-        if (this._wheelRelightTimer) { clearTimeout(this._wheelRelightTimer); this._wheelRelightTimer = null; }
+        this.closeTipPicker();   // its window listener and preview slices go with the editor (8c14eee)
+        // a relight nudge or wheel burst still in its 300 ms is dropped, not committed: its timer and flush, the snapshot it
+        // would have pushed (the layer's next edit would take it as its own "before") and its preview
+        for (const l of this.layers || []) {
+            if (!l || !(l._flushNudge || l._flushWheel || l._nudgeRelightTimer || l._wheelRelightTimer || l._nudgePending || l._wheelPending)) continue;
+            clearTimeout(l._nudgeRelightTimer);
+            clearTimeout(l._wheelRelightTimer);
+            l._nudgeRelightTimer = l._wheelRelightTimer = null;
+            l._flushNudge = l._flushWheel = null;
+            l._nudgePending = l._wheelPending = l._wheelLabel = null;
+            if (this.filterPreview === l.id) this.filterPreview = null;
+        }
         if (this.promptField) this.promptField.closePopups();
         clearTimeout(this._autosave);
         this.compare = null;
@@ -3461,9 +3489,11 @@ class InpaintEditor {
                 if (selected) {
                     e.preventDefault();
                     const step = e.shiftKey ? 10 : 1;
-                    if (!l._undoPending) {
-                        l._undoPending = this.snapshot({ kind: "filter", id: l.id });
-                        l._undoLabel = "Move light";
+                    // a nudge burst is a step of its own: not a slider's `_undoPending` (its commit would push the same
+                    // snapshot again), and a wheel burst still open ends first so the two steps stay in order
+                    if (!l._nudgePending) {
+                        if (typeof l._flushWheel === "function") l._flushWheel();
+                        l._nudgePending = this.snapshot({ kind: "filter", id: l.id });
                     }
                     let dx = 0, dy = 0;
                     if (e.key === "ArrowLeft") dx = -step;
@@ -3481,20 +3511,22 @@ class InpaintEditor {
                     this.markFilterChanged(l, { soon: true });
                     this.renderLayers();
                     this.draw();
-                    if (this._nudgeRelightTimer) clearTimeout(this._nudgeRelightTimer);
-                    this._nudgeRelightTimer = setTimeout(() => {
-                        this._nudgeRelightTimer = null;
-                        this.filterPreview = null;
-                        if (l._undoPending) {
-                            this.pushUndoSnapshot(l._undoPending, { label: l._undoLabel || "Move light" });
-                            l._undoPending = null;
-                            l._undoLabel = null;
-                        }
+                    if (l._nudgeRelightTimer) clearTimeout(l._nudgeRelightTimer);
+                    const flushNudge = () => {
+                        if (l._nudgeRelightTimer) { clearTimeout(l._nudgeRelightTimer); l._nudgeRelightTimer = null; }
+                        l._flushNudge = null;
+                        const snap = l._nudgePending;
+                        l._nudgePending = null;
+                        if (this.filterPreview === l.id) this.filterPreview = null;
+                        if (!this.layers || !this.layers.includes(l)) return;   // the layer left the document (an undo replaced it)
+                        if (snap) this.pushUndoSnapshot(snap, { label: "Move light", fromDebounce: true });
                         this.ensureRelightMaps(l, { quick: false });
                         this.markFilterChanged(l);
-                        this.renderLayers();
+                        this.renderLayersUnlessEditing();
                         this.draw();
-                    }, 300);
+                    };
+                    l._flushNudge = flushNudge;
+                    l._nudgeRelightTimer = setTimeout(flushNudge, 300);
                 }
             }
             return;
@@ -3839,9 +3871,11 @@ class InpaintEditor {
                 layer._selectedLightId = l.id;
                 const dir = Math.sign(-e.deltaY || 0);
                 if (dir !== 0) {
-                    if (!layer._undoPending) {
-                        layer._undoPending = this.snapshot({ kind: "filter", id: layer.id });
-                        layer._undoLabel = e.shiftKey ? "Relight: Intensity" : "Relight: Diffusion";
+                    // a wheel burst is a step of its own, as a nudge burst is (onKey); one still open ends first
+                    if (!layer._wheelPending) {
+                        if (typeof layer._flushNudge === "function") layer._flushNudge();
+                        layer._wheelPending = this.snapshot({ kind: "filter", id: layer.id });
+                        layer._wheelLabel = e.shiftKey ? "Relight: Intensity" : "Relight: Diffusion";
                     }
                     if (e.shiftKey) {
                         l.intensity = Math.max(0, Math.min(300, Math.round((l.intensity || 100) + dir * 5)));
@@ -3853,20 +3887,23 @@ class InpaintEditor {
                     this.markFilterChanged(layer);
                     this.renderLayers();
                     this.draw();
-                    if (this._wheelRelightTimer) clearTimeout(this._wheelRelightTimer);
-                    this._wheelRelightTimer = setTimeout(() => {
-                        this._wheelRelightTimer = null;
-                        this.filterPreview = null;
-                        if (layer._undoPending) {
-                            this.pushUndoSnapshot(layer._undoPending, { label: layer._undoLabel || (e.shiftKey ? "Relight: Intensity" : "Relight: Diffusion") });
-                            layer._undoPending = null;
-                            layer._undoLabel = null;
-                        }
+                    if (layer._wheelRelightTimer) clearTimeout(layer._wheelRelightTimer);
+                    const flushWheel = () => {
+                        if (layer._wheelRelightTimer) { clearTimeout(layer._wheelRelightTimer); layer._wheelRelightTimer = null; }
+                        layer._flushWheel = null;
+                        const snap = layer._wheelPending, label = layer._wheelLabel || "Relight: Diffusion";
+                        layer._wheelPending = null;
+                        layer._wheelLabel = null;
+                        if (this.filterPreview === layer.id) this.filterPreview = null;
+                        if (!this.layers || !this.layers.includes(layer)) return;   // the layer left the document (an undo replaced it)
+                        if (snap) this.pushUndoSnapshot(snap, { label, fromDebounce: true });
                         this.ensureRelightMaps(layer, { quick: false });
                         this.markFilterChanged(layer);
-                        this.renderLayers();
+                        this.renderLayersUnlessEditing();
                         this.draw();
-                    }, 300);
+                    };
+                    layer._flushWheel = flushWheel;
+                    layer._wheelRelightTimer = setTimeout(flushWheel, 300);
                     return;
                 }
             }
@@ -8777,6 +8814,7 @@ class InpaintEditor {
     async readBoxBytes(box, { forRun = true, priority = INTERACTIVE, held: given = undefined } = {}) {
         const [bx, by, bx1, by1] = box, w = bx1 - bx, h = by1 - by;
         if (!(w > 0 && h > 0)) throw new Error("an empty box");
+        await this.relightIdle();   // relight's full shadow maps, not the quick map of a light on the move (F2.7)
         if (this.tileMode && !this.huge && w * h * 4 <= 0x7fffffff && InpaintEditor.boxOverTiles !== false) {
             // `held`: the stack taken earlier by `holdRunStack` (the caller releases it); else held here, now
             const held = given !== undefined ? await given : await this.holdStack(this.stackPlan({ forRun, filters: true }), { forRun, priority });
@@ -8909,6 +8947,9 @@ class InpaintEditor {
      * the document may have changed meanwhile, exactly as for any other await.
      */
     async sampleRegionSettled(source, box, scale, opts = {}) {
+        // relight's full shadow maps first: a settled read of the picture never takes the quick map of a light on the move
+        // or the map of where it was (F2.7); a read without the filters or of the base alone does not wait for them
+        if (source !== "layer" && !opts.skipFilters && !opts.baseOnly && !opts.controlOnly) await this.relightIdle();
         if (!this.tileMode) return this.sampleRegion(source, box, scale, opts);
         const jobs = await this.primePass(source, box, scale, opts);
         try {
@@ -12317,6 +12358,7 @@ class InpaintEditor {
             ctx = c.getContext("2d");
             ctx.setTransform(1, 0, 0, 1, 0, 0);   // the pass left its transform on the context
         } else {
+            await this.relightIdle();   // as sampleRegionSettled waits on tiles (F2.7)
             const flat = this.flattenToCanvas({ forRun: true });
             c = makeCanvas(cw, ch);
             ctx = c.getContext("2d");
@@ -13459,6 +13501,52 @@ class InpaintEditor {
     }
 
     /**
+     * Every preview still shown goes back to its committed values: a choice list's hover and a filter layer's
+     * `_undoPending` while `filterPreview` names its layer (a plugin's hover over a stock, a slider not let go). An
+     * `_undoPending` no preview shows any more is a slider the list was rebuilt under: it is not cancelled (that would
+     * put back the values from before it over every later edit of the layer). A relight nudge or wheel burst is not a
+     * preview but a step of its own (`_nudgePending` / `_wheelPending`, pushed by flushPendingDebounces).
+     */
+    cancelPreviews() {
+        this.cancelChoicePreview();
+        for (const l of this.layers || []) if (this.previewShown(l)) this.cancelFilterParams(l);
+    }
+
+    /**
+     * Whether `filterPreview` shows a preview whose "before" the layer holds in `_undoPending`: not a relight nudge's or
+     * wheel burst's preview (theirs is `_nudgePending` / `_wheelPending`), not an `_undoPending` left by a slider the list
+     * was rebuilt under (nothing shows it any more).
+     */
+    previewShown(l) {
+        return !!(l && l._undoPending && this.filterPreview === l.id && !l._nudgePending && !l._wheelPending);
+    }
+
+    /**
+     * The committed parameters (and name) of a filter layer whose preview is shown, as cancelPreviews would put them
+     * back (a choice list's hover first: its cancel ends the preview); null when none is. An undo record or a copy holds
+     * these, not the hovered or half-dragged ones.
+     */
+    committedFilter(l) {
+        if (!l || l.kind !== "filter") return null;
+        const snap = l._hoverSnap && this.filterPreview === l.id ? l._hoverSnap
+            : this.previewShown(l) && l._undoPending.kind === "filter" ? l._undoPending : null;
+        if (!snap) return null;
+        const params = { ...(snap.params || {}) };
+        if (Array.isArray(params.lights)) params.lights = JSON.parse(JSON.stringify(params.lights));
+        return { params, name: l._hoverSnap === snap ? snap.name || null : null };
+    }
+
+    /**
+     * renderLayers, unless a control of the list holds an edit still in progress (a slider being dragged): rebuilding the
+     * list under it ends the drag without its change event, and its step would never be pushed. The control's own
+     * change renders the list when it lets go.
+     */
+    renderLayersUnlessEditing() {
+        if ((this.layers || []).some((x) => x && (x._undoPending || x._matchUndo))) return;
+        this.renderLayers();
+    }
+
+    /**
      * Checks if the document map under `kind` is stale against the current picture.
      * Renders pictureInput through the map's xf into 64 x 64 and compares fingerprint against meta.fp.
      * @param {string} kind
@@ -13499,6 +13587,7 @@ class InpaintEditor {
         const v = vals || this.extendValues();
         const top = Math.max(0, v.top || 0), right = Math.max(0, v.right || 0), bottom = Math.max(0, v.bottom || 0), left = Math.max(0, v.left || 0);
         if (!(top || right || bottom || left)) { this.setStatus("Enter how many pixels to add on each side (negative crops)."); return; }
+        await this.relightSettled();   // the flatten below becomes the new base: relight's full shadow maps first (F2.7)
         const W = this.width, H = this.height;
         const nw = W + left + right, nh = H + top + bottom;
         const before = this.snapshot({ kind: "canvas" });
@@ -13698,6 +13787,18 @@ class InpaintEditor {
     }
 
     /** Free a discarded undo step: its blob URLs, its pixels copy and its share of the memory budget. */
+    /**
+     * Layers an undo took out of the document (replaced by the objects of a record) let go of an edit still in progress:
+     * a text edit's or a colour match drag's "before" (on canvases a blob URL), which no record holds (LAYER_PENDING_KEYS).
+     */
+    releaseDroppedEdits(outgoing) {
+        for (const l of outgoing || []) {
+            if (!l || this.layers.includes(l)) continue;
+            if (l._textUndo) { this.releaseSnapshot(l._textUndo); l._textUndo = null; }
+            if (l._matchUndo) { this.releaseSnapshot(l._matchUndo); l._matchUndo = null; }
+        }
+    }
+
     releaseSnapshot(snap) {
         if (!snap) return;
         this.undoBytes -= snap.bytes || 0;
@@ -13738,6 +13839,7 @@ class InpaintEditor {
      */
     snapshotLayer(l) {
         const c = { ...l };
+        for (const k of LAYER_PENDING_KEYS) delete c[k];
         if (l.text) c.text = JSON.parse(JSON.stringify(l.text));
         if (l.params && typeof l.params === "object") {
             c.params = { ...l.params };
@@ -13745,6 +13847,10 @@ class InpaintEditor {
                 c.params.lights = JSON.parse(JSON.stringify(l.params.lights));
             }
         }
+        // a preview still shown is not the layer's value: the record holds what was committed (an undo of it brings back
+        // what was clicked, not what was hovered; its guard is not in the record to put it back later)
+        const committed = this.committedFilter(l);
+        if (committed) { c.params = committed.params; if (committed.name) c.name = committed.name; }
         for (const k of ["match", "lut", "plate"]) if (l[k] && typeof l[k] === "object") c[k] = { ...l[k] };
         return c;
     }
@@ -13803,6 +13909,7 @@ class InpaintEditor {
      */
     restoreTurn(snap, { label } = {}) {
         if (!snap || snap.kind !== "turn" || !this.tileMode) return false;
+        this.cancelPreviews();   // the present pushed below holds committed values, not a hover's (historyStepNow)
         const now = this.turnSnapshot();
         if (now) this.pushUndoSnapshot(now, { label });
         this.applySnapshot(snap);
@@ -13958,7 +14065,7 @@ class InpaintEditor {
         if (step.kind === "filter") {
             const p = { ...(layer.params || {}) };
             if (Array.isArray(p.lights)) p.lights = JSON.parse(JSON.stringify(p.lights));
-            return { kind: "filter", id: layer.id, filter: layer.filter, params: p, lut: layer.lut ? { ...layer.lut } : null, lutData: layer._lutData || null, plate: layer.plate ? { ...layer.plate } : null, plateImg: layer._plateImg || null, name: layer.name, _selectedLightId: layer._selectedLightId || null };
+            return { kind: "filter", id: layer.id, filter: layer.filter, params: p, lut: layer.lut ? { ...layer.lut } : null, lutData: layer._lutData || null, plate: layer.plate ? { ...layer.plate } : null, plateImg: layer._plateImg || null, name: layer.name, _selectedLightId: layer._selectedLightId || null, _deselected: !!layer._deselected };
         }
         if (step.kind === "text") return { kind: "text", id: layer.id, text: JSON.parse(JSON.stringify(layer.text || TEXT_DEFAULTS)), ...pixelsOf(layer.px), cw: layer.px.width, ch: layer.px.height, x: layer.x, y: layer.y, w: layer.w, h: layer.h,
             behind: !!layer._textRendering };
@@ -13978,8 +14085,9 @@ class InpaintEditor {
      */
     // `label`: what the Undo history calls the step (the edit it takes back); else the one the snapshot carries, else
     // its kind's
-    pushUndoSnapshot(snap, { tracked = false, label } = {}) {
+    pushUndoSnapshot(snap, { tracked = false, label, fromDebounce = false } = {}) {
         if (!snap) return;
+        if (!fromDebounce) this.flushPendingDebounces();
         if (!tracked) this.historyGen++;
         if (label) snap.label = label;
         if (!snap.label) snap.label = UNDO_LABELS[snap.kind] || snap.kind;
@@ -14040,6 +14148,7 @@ class InpaintEditor {
      * a step does not happen (a held stroke, an edit in between). Resolves with the steps taken.
      */
     async stepHistory(n) {
+        this.flushPendingDebounces();
         const redo = n > 0;
         let done = 0;
         for (let i = 0; i < Math.abs(Math.round(n) || 0); i++) {
@@ -14127,7 +14236,9 @@ class InpaintEditor {
         if (snap.kind === "layers") {
             if (this.pending) this.cancelPending();
             // a spread carries px / maskPx and not the non-enumerable aliases: installed again
+            const outgoing = this.layers;
             this.layers = snap.layers.map((l) => installLayerAliases({ ...l, _maskedValid: false, _mcache: null, _fcache: null }, this.pixels));
+            this.releaseDroppedEdits(outgoing);
             this.groups = (snap.groups || []).map((g) => ({ ...g }));
             this.activeLayerId = this.layers.some((l) => l.id === snap.activeLayerId) ? snap.activeLayerId : null;
             this.uploaded.baseHash = null;
@@ -14178,6 +14289,7 @@ class InpaintEditor {
             this.base = snap.base;
             this.width = snap.width;
             this.height = snap.height;
+            const outgoing = this.layers;
             this.layers = snap.layers.map((l) => {
                 const kept = byId.get(l.id);
                 const copy = installLayerAliases({ ...l, dirty: true, exportRef: null, _maskedValid: false, _mcache: null, _fcache: null, _fxCache: null }, this.pixels);
@@ -14188,6 +14300,7 @@ class InpaintEditor {
                 }
                 return copy;
             });
+            this.releaseDroppedEdits(outgoing);
             snap.pixels = null;
             this.activeLayerId = this.layers.some((l) => l.id === snap.activeLayerId) ? snap.activeLayerId : null;
             const sel = snap.selPx || this.pixels.Mask.empty(this.width, this.height);
@@ -14237,7 +14350,9 @@ class InpaintEditor {
             this.base = snap.base;
             this.width = snap.width;
             this.height = snap.height;
+            const outgoing = this.layers;
             this.layers = snap.layers.map((l) => installLayerAliases({ ...l, dirty: true, exportRef: null, _maskedValid: false, _mcache: null, _fxCache: null, maskDirty: !!l.maskPx }, this.pixels));
+            this.releaseDroppedEdits(outgoing);
             this.activeLayerId = snap.activeLayerId;
             let sel = snap.selPx || null;   // on tiles the step's clone, taken out of the step (it is released after this)
             snap.selPx = null;
@@ -14325,8 +14440,12 @@ class InpaintEditor {
                 if (Array.isArray(snap.params?.lights)) {
                     layer.params.lights = JSON.parse(JSON.stringify(snap.params.lights));
                 }
-                if (snap._selectedLightId !== undefined) layer._selectedLightId = snap._selectedLightId;
-                else if (layer._selectedLightId && (!layer.params.lights || !layer.params.lights.some((x) => x && x.id === layer._selectedLightId))) {
+                if (snap._selectedLightId !== undefined) {
+                    layer._selectedLightId = snap._selectedLightId;
+                    // Escape's "no light" belongs to the selection the step recorded; a step taken before any light was
+                    // picked (id null, no flag) stays "the first light", not "none" (docs/PLAN_RELIGHT_FIXES.md F4)
+                    layer._deselected = !!snap._deselected;
+                } else if (layer._selectedLightId && (!layer.params.lights || !layer.params.lights.some((x) => x && x.id === layer._selectedLightId))) {
                     layer._selectedLightId = layer.params.lights && layer.params.lights[0] ? layer.params.lights[0].id : null;
                 }
                 layer.lut = snap.lut ? { ...snap.lut } : null;
@@ -14405,26 +14524,18 @@ class InpaintEditor {
     // `historyGen` is read when the key is pressed, not when the queued step runs: an edit made after
     // that stops it, and so a held Ctrl+Z that is still queued never takes back a stroke made meanwhile
     flushPendingDebounces() {
-        if (this._nudgeRelightTimer) {
-            clearTimeout(this._nudgeRelightTimer);
-            this._nudgeRelightTimer = null;
-        }
-        if (this._wheelRelightTimer) {
-            clearTimeout(this._wheelRelightTimer);
-            this._wheelRelightTimer = null;
-        }
-        this.filterPreview = null;
         if (this.layers) {
             for (const l of this.layers) {
-                if (l && l._undoPending) {
-                    this.pushUndoSnapshot(l._undoPending, { label: l._undoLabel || "Edit" });
-                    l._undoPending = null;
-                    l._undoLabel = null;
-                }
+                if (!l) continue;
+                // the field is cleared on the layer that holds it, so a flush that returns early runs once, not on every push
+                const nudge = l._flushNudge, wheel = l._flushWheel;
+                if (typeof nudge === "function") { l._flushNudge = null; nudge(); }
+                if (typeof wheel === "function") { l._flushWheel = null; wheel(); }
             }
         }
     }
 
+    // a nudge or wheel burst still in its 300 ms window is a step before the key press: pushed first, then `gen` is read
     undoStep() { this.flushPendingDebounces(); this.closeFlyout(); const gen = this.historyGen; return this.queueHistory(() => this.historyStepNow(false, gen)); }
 
     redoStep() { this.flushPendingDebounces(); this.closeFlyout(); const gen = this.historyGen; return this.queueHistory(() => this.historyStepNow(true, gen)); }
@@ -14476,6 +14587,10 @@ class InpaintEditor {
         // `gen` was taken before the wait: an edit made during it is not the step this undo was pressed for
         while (this._pendingEdits && this._pendingEdits.size) await Promise.all(Array.from(this._pendingEdits));
         if (held()) return;
+        // a nudge or wheel burst begun before the key press was pushed by undoStep / redoStep before `gen` was read; one
+        // begun during the wait is pushed now and, like any edit made then, stops this step (the gen check below).
+        // Taking `gen` again here forgot every edit made while the wait ran, and an undo ran over them.
+        this.flushPendingDebounces();
         // the stacks are looked up now, not when the step was queued: an edit or a new image replaces them
         const stack = () => (redo ? this.redo : this.undo);
         const snap = stack()[stack().length - 1];
@@ -14511,6 +14626,9 @@ class InpaintEditor {
             this.releaseSnapshot(snap);
             return;
         }
+        // a preview still open is not the present (a plugin's hover over a stock, a slider not let go): its committed
+        // values go back first, or the other stack's copy below keeps the preview and the redo applies it
+        this.cancelPreviews();
         // the present, as the other stack's step: it keeps the step's label and time, so the list reads the same
         const current = this.snapshot(snap);
         if (current) { (redo ? this.undo : this.redo).push(current); this.undoBytes += current.bytes || 0; }
@@ -14910,20 +15028,22 @@ class InpaintEditor {
             : `${layer.name} added. It filters everything below it; pick the type and drag the sliders in the layer list.`);
         if (id === "relight") {
             const relightConf = host.getRelightSettings ? host.getRelightSettings() : null;
-            if (relightConf && relightConf.route) {
-                params.route = relightConf.route;
-            }
-            if (relightConf && relightConf.magnific) {
-                params.strength = relightConf.magnific.strength ?? 100;
-                params.style = relightConf.magnific.style ?? "standard";
-            }
-            if (relightConf && relightConf.detailFromOriginal !== undefined) {
-                params.detail = relightConf.detailFromOriginal;
+            params.route = "app";
+            if (relightConf) {
+                if (relightConf.strength !== undefined) params.strength = relightConf.strength;
+                if (relightConf.style !== undefined) params.style = relightConf.style;
+                if (relightConf.preserve_details !== undefined) params.preserve_details = relightConf.preserve_details;
+                if (relightConf.interpolate !== undefined) params.interpolate = relightConf.interpolate;
+                if (relightConf.detail !== undefined) params.detail = relightConf.detail;
+                if (relightConf.enable_hr_fix !== undefined) params.enable_hr_fix = relightConf.enable_hr_fix;
+                if (relightConf.light_type !== undefined) params.light_type = relightConf.light_type;
+                if (relightConf.lora_strength !== undefined) params.lora_strength = relightConf.lora_strength;
+                if (relightConf.steps !== undefined) params.steps = relightConf.steps;
             }
             this.setTool("lights");
             const hasDepth = !!(this.maps && this.maps.depth && (this.maps.depth.data || this.maps.depth.u16));
             if (!hasDepth && this.ensureDepthMap) {
-                this.ensureDepthMap();
+                this.ensureDepthMap().catch(() => {});
             }
         }
         return layer;
@@ -14940,13 +15060,22 @@ class InpaintEditor {
         layer.params = filterDefaults(id);
         if (id === "relight") {
             const relightConf = host.getRelightSettings ? host.getRelightSettings() : null;
-            if (relightConf && relightConf.route) {
-                layer.params.route = relightConf.route;
+            layer.params.route = "app";
+            if (relightConf) {
+                if (relightConf.strength !== undefined) layer.params.strength = relightConf.strength;
+                if (relightConf.style !== undefined) layer.params.style = relightConf.style;
+                if (relightConf.preserve_details !== undefined) layer.params.preserve_details = relightConf.preserve_details;
+                if (relightConf.interpolate !== undefined) layer.params.interpolate = relightConf.interpolate;
+                if (relightConf.detail !== undefined) layer.params.detail = relightConf.detail;
+                if (relightConf.enable_hr_fix !== undefined) layer.params.enable_hr_fix = relightConf.enable_hr_fix;
+                if (relightConf.light_type !== undefined) layer.params.light_type = relightConf.light_type;
+                if (relightConf.lora_strength !== undefined) layer.params.lora_strength = relightConf.lora_strength;
+                if (relightConf.steps !== undefined) layer.params.steps = relightConf.steps;
             }
             this.setTool("lights");
             const hasDepth = !!(this.maps && this.maps.depth && (this.maps.depth.data || this.maps.depth.u16));
             if (!hasDepth && this.ensureDepthMap) {
-                this.ensureDepthMap();
+                this.ensureDepthMap().catch(() => {});
             }
         }
         if (prev.limit) {
@@ -15124,7 +15253,9 @@ class InpaintEditor {
         if (layer.filter === "relight") {
             info.layer = layer;
             info.relight = layer._relight;
-            this.ensureRelightMaps(layer, { quick: this.filterPreview === layer.id });
+            info.forRun = !!pass.forRun;   // pickVis: a run never reads the quick shadow map
+            info.quick = !pass.forRun && this.filterPreview === layer.id;
+            this.ensureRelightMaps(layer, { quick: info.quick });
         }
         if (this._filterInfoHook) this._filterInfoHook(info, layer, pass);
         return info;
@@ -15201,14 +15332,19 @@ class InpaintEditor {
     /**
      * `colourStats` or custom `wholeStats` of the whole picture below a filter layer (E3, F10):
      * from a sampled pass of the layers below it (size chosen by def.wholeStatsSize, 64..1024, default 256),
-     * kept per composite version and map version.
+     * kept while the picture below (`belowSignature`) and the parameters the statistics read stay the same: a custom
+     * `wholeStats` reads the ones `wholeStatsParams` names (relight's fit: depth_scale and sigma), or all of them.
+     * Keyed on `compositeVersion` before (F2.6), which every slider and light drag of the layer itself bumps: a drag of
+     * ten moves read the picture below back 22 times.
      */
     belowStats(layer, forRun) {
         if (!layer || !this.layers || !this.width || !this.height) return null;
         const def = FILTERS[layer.filter];
         const n = Math.max(64, Math.min(1024, (def && def.wholeStatsSize) || 256));
-        const readsMap = this.mapsOf(layer).length > 0;
-        const vKey = `${this.compositeVersion}:${readsMap ? (this.mapsVersion || 0) : 0}:${n}`;
+        const params = layer.params || {};
+        const reads = !def || typeof def.wholeStats !== "function" ? ""
+            : Array.isArray(def.wholeStatsParams) ? JSON.stringify(def.wholeStatsParams.map((k) => params[k] ?? null)) : JSON.stringify(params);
+        const vKey = `${this.belowSignature(layer)}#${reads}#${n}#${this.mapsOf(layer).length ? this.mapsVersion || 0 : 0}`;
         const slot = forRun ? "_bstatsRun" : "_bstats";
         const c = layer[slot];
         if (c && c.version === vKey) return c.stats;
@@ -15229,6 +15365,38 @@ class InpaintEditor {
             entry.stats = colourStats(small);
         }
         return entry.stats;
+    }
+
+    /**
+     * What the picture below `layer` is made of, as a string (F2.6): the base and every layer below it as the composite
+     * reads them - each pixel source by identity and version (every write reaches the display through `touchSource` /
+     * `touchSourceRect`, whose `touch()` moves the source's version on both backends), place, size, visibility (groups
+     * included), opacity, blend, clip, mask, colour match, role, a filter's parameters, LUT and plate, and a relight
+     * layer's shadow and normal maps (they land after its parameters change), the maps for a layer below that reads
+     * them - and the compare side shown and a filter preview of another layer. A change of the layer's own parameters or
+     * of a layer above it leaves it as it is, and so does a brush dab anywhere above (the document-wide `pixelVersion`
+     * is not in it: it moves with every dab). `belowStats` adds the maps when the layer itself reads them.
+     * @param {any} layer
+     */
+    belowSignature(layer) {
+        const index = this.layers.indexOf(layer);
+        const parts = [this.width, this.height, sourceTag(this.basePx),
+            this.compareShow || "", this.filterPreview && this.filterPreview !== layer.id ? this.filterPreview : ""];
+        for (const g of this.groups || []) parts.push(g.id, g.parent || "", g.visible === false ? 0 : 1);
+        for (let i = 0; i < index; i++) {
+            const l = this.layers[i];
+            let filter = "";
+            if (l.kind === "filter") {
+                filter = `${l.filter}${JSON.stringify(l.params || {})}${sourceTag(l._lutData)}${sourceTag(l._plateImg)}`;
+                const r = l.filter === "relight" ? l._relight : null;
+                if (r) filter += `:${r.seq || 0}:${r.visQuick ? r.visQuick.seq || 0 : "-"}:${(r.normals && r.normals.key) || ""}`;
+                if (this.mapsOf(l).length) filter += `@${this.mapsVersion || 0}`;
+            }
+            parts.push(l.id, l.kind, l.role || "", this.shown(l) ? 1 : 0, l.opacity, l.blend || "", l.clip ? 1 : 0, l.group || "",
+                l.x, l.y, l.w, l.h, sourceTag(l.px), sourceTag(l.maskPx), l.maskOff ? 1 : 0,
+                l.match ? `${l.match.strength}:${l.match.source}` : "", filter);
+        }
+        return parts.join("|");
     }
 
     /**
@@ -16699,12 +16867,16 @@ class InpaintEditor {
             _masked: null, _maskedValid: false, _mcache: null, _fcache: null, _fxCache: null, _textUndo: null, _undoPending: null,
             _relight: null, _bstats: null, _bstatsRun: null,
         };
+        for (const k of LAYER_PENDING_KEYS) delete copy[k];   // an edit still in progress stays with the original
         // the spread shares the pixels; the copy gets its own (the aliases are not enumerable, so they are installed again)
         if (layer.px) copy.px = layer.px.clone();
         if (layer.maskPx) copy.maskPx = layer.maskPx.clone();
         installLayerAliases(copy, this.pixels);
         if (layer.text) copy.text = JSON.parse(JSON.stringify(layer.text));
-        if (layer.params) copy.params = JSON.parse(JSON.stringify(layer.params));
+        // a preview still shown stays with the original: the copy takes the committed values (committedFilter)
+        const committed = this.committedFilter(layer);
+        if (layer.params) copy.params = JSON.parse(JSON.stringify(committed ? committed.params : layer.params));
+        if (committed && committed.name) copy.name = committed.name + " copy";
         if (layer.match) copy.match = { ...layer.match };
         if (layer.lut) copy.lut = { ...layer.lut };
         if (layer.plate) copy.plate = { ...layer.plate };
@@ -17495,6 +17667,7 @@ class InpaintEditor {
     async exportImage({ download = false } = {}) {
         if (!this.base) { this.setStatus("Nothing to save yet."); return null; }
         if (this.removePending || this.healPending || this.liquifyPending) { this.setStatus("Waiting for the stroke to land..."); await this.heldEdit(); }
+        await this.relightSettled();   // every format: the layered and TIFF writers read bands that do not wait by themselves (F2.7)
         const fmt = ["png", "jpg", "webp", "tiff", "psd", "ora"].includes(this.saveFormatSel && this.saveFormatSel.value) ? this.saveFormatSel.value : "png";
         const stem = ((this.saveNameInput && this.saveNameInput.value) || "inpaint_canvas").trim().replace(/\.[a-z0-9]+$/i, "").replace(/[^a-z0-9._ -]/gi, "_") || "inpaint_canvas";
         try {
@@ -18920,7 +19093,7 @@ class InpaintEditor {
             box.appendChild(el("div", "ipc-hint", `The filter "${layer.filter}" is not installed (its plugin is off or missing). The layer passes the picture through and keeps its settings.`));
             return box;
         }
-        if (this.mapsOf(layer).includes("depth") && !(this.maps && this.maps.depth)) {
+        if (layer.filter !== "relight" && this.mapsOf(layer).includes("depth") && !(this.maps && this.maps.depth)) {
             box.appendChild(el("div", "ipc-hint", "Needs a depth map: compute it under Selection \u203A Depth"));
         }
         const def = FILTERS[layer.filter];
@@ -19390,7 +19563,7 @@ class InpaintEditor {
         // 1. Missing depth map hint (if applicable)
         const hasDepth = !!((this.maps && this.maps.depth) || this.depth);
         if (!hasDepth) {
-            const noteRow = el("div", "ipc-relight-note");
+            const noteRow = el("div", "ipc-hint ipc-relight-note");
             noteRow.appendChild(el("span", null, "Needs a depth map: compute it first"));
             if (host.depthSupported !== false) {
                 const compBtn = iconButton("magic", "Compute 16-bit depth map with Depth Anything V2 Small", async () => {
@@ -20035,6 +20208,11 @@ class InpaintEditor {
             ltLabel.style.width = "70px";
             const ltSel = document.createElement("select");
             ltSel.className = "ipc-sel";
+            ltSel.title = "From the lights: the first light that is on gives the type (a sun: low-angle sunlight, a spot: spotlight on subject, otherwise soft overcast daylight lighting). A type picked here is kept for new relight layers.";
+            const fromLights = document.createElement("option");
+            fromLights.value = "";
+            fromLights.textContent = "From the lights";
+            ltSel.appendChild(fromLights);
             const briaTypes = [
                 "soft overcast daylight lighting",
                 "midday",
@@ -20056,13 +20234,14 @@ class InpaintEditor {
                 opt.textContent = bt;
                 ltSel.appendChild(opt);
             }
-            ltSel.value = layer.params.light_type || "soft overcast daylight lighting";
+            ltSel.value = layer.params.light_type || "";
             ltSel.addEventListener("click", stop);
             ltSel.addEventListener("keydown", stop);
             ltSel.addEventListener("change", () => {
                 this.pushUndo({ kind: "filter", id: layer.id, label: "Relight: Light type" });
-                layer.params.light_type = ltSel.value;
-                host.setRelightSettings({ light_type: ltSel.value });
+                // "" is From the lights: the layer and the remembered settings forget the pick
+                if (ltSel.value) layer.params.light_type = ltSel.value; else delete layer.params.light_type;
+                host.setRelightSettings({ light_type: ltSel.value || undefined });
                 this.markFilterChanged(layer);
             });
             briaRow.appendChild(ltLabel);
@@ -20108,7 +20287,7 @@ class InpaintEditor {
             const loraSlider = document.createElement("input");
             loraSlider.type = "range";
             loraSlider.min = "0"; loraSlider.max = "100"; loraSlider.step = "5";
-            loraSlider.value = String(layer.params.lora_strength ?? layer.params.strength_model ?? 100);
+            loraSlider.value = String(loraPercent(layer.params.lora_strength ?? layer.params.strength_model));
             loraSlider.className = "ipc-slider";
             loraSlider.addEventListener("click", stop);
             loraSlider.addEventListener("keydown", stop);
@@ -22416,11 +22595,11 @@ class InpaintEditor {
     downsampleDepth(src, srcW, srcH, dstW, dstH) {
         const dst = new Uint16Array(dstW * dstH);
         for (let dy = 0; dy < dstH; dy++) {
-            const sy = Math.min(srcH - 1, Math.floor((dy / dstH) * srcH));
+            const sy = Math.min(srcH - 1, Math.floor(((dy + 0.5) / dstH) * srcH));
             const sRow = sy * srcW;
             const dRow = dy * dstW;
             for (let dx = 0; dx < dstW; dx++) {
-                const sx = Math.min(srcW - 1, Math.floor((dx / dstW) * srcW));
+                const sx = Math.min(srcW - 1, Math.floor(((dx + 0.5) / dstW) * srcW));
                 dst[dRow + dx] = src[sRow + sx];
             }
         }
@@ -22428,19 +22607,32 @@ class InpaintEditor {
     }
 
     /**
-     * Resolves when all pending relight worker pool operations are completed.
+     * Resolves when a pending nudge or wheel step is committed and every relight layer's full shadow map is computed
+     * for its lights (`relightIdle`): what a run and an export wait for. `also`: a relight layer to settle even when it is
+     * hidden (a relight render reads its own maps for the light map).
      */
-    async relightSettled() {
+    async relightSettled(also = null) {
         this.flushPendingDebounces();
-        if (this.layers) {
-            for (const l of this.layers) {
-                if (l.kind === "filter" && l.filter === "relight") {
-                    this.ensureRelightMaps(l);
-                }
+        await this.relightIdle(also);
+    }
+
+    /**
+     * Resolves when every relight layer's full shadow map is computed for its current lights (F2.7): what a reader of
+     * the picture a run sees waits for (a crop, a screenshot, a plugin's settled flatten), so it reads neither the quick
+     * map of a light on the move nor the map of where a light was. Unlike `relightSettled` it leaves a pending nudge as it
+     * is: a read pushes no undo step. Each round waits for the jobs there are when it starts (a drag goes on adding quick
+     * ones); a light moved during the wait starts another round, three at most. Hidden relight layers are not read
+     * (`also` is one that is, whether shown or not).
+     * @param {any} [also]
+     */
+    async relightIdle(also = null) {
+        for (let round = 0; round < 3; round++) {
+            for (const l of this.layers || []) {
+                if (l.kind === "filter" && l.filter === "relight" && (l === also || this.shown(l))) this.ensureRelightMaps(l);
             }
-        }
-        while (this._relightPending && this._relightPending.size > 0) {
-            await Promise.all(Array.from(this._relightPending));
+            const jobs = this._relightPending ? Array.from(this._relightPending) : [];
+            if (!jobs.length) return;
+            await Promise.all(jobs);
         }
     }
 
@@ -22539,7 +22731,7 @@ class InpaintEditor {
         ctx.arc(ox, oy, 2.5 * invScale, 0, Math.PI * 2);
         ctx.fill();
 
-        ctx.font = `600 ${Math.max(1, Math.round(10 * invScale))}px system-ui, sans-serif`;
+        ctx.font = `600 ${(10 * invScale).toFixed(2)}px system-ui, sans-serif`;
         const ownText = "own light";
         const tw = ctx.measureText(ownText).width + 6 * invScale;
         const th = 13 * invScale;
@@ -22654,7 +22846,7 @@ class InpaintEditor {
             ctx.strokeStyle = isSelected ? "#7cc7ff" : "rgba(255, 255, 255, 0.4)";
             ctx.lineWidth = 1 * invScale;
             ctx.stroke();
-            ctx.font = `bold ${Math.max(1, Math.round(9 * invScale))}px system-ui, sans-serif`;
+            ctx.font = `bold ${(9 * invScale).toFixed(2)}px system-ui, sans-serif`;
             ctx.fillStyle = isSelected ? "#7cc7ff" : "#ffffff";
             ctx.textAlign = "center";
             ctx.textBaseline = "middle";
@@ -22684,8 +22876,8 @@ class InpaintEditor {
             pending: new Set(),
         });
 
-        const mapVersion = depthMap.dataVersion || 0;
-        const depthScale = Number.isFinite(layer.params?.depth_scale) ? Number(layer.params.depth_scale) : 50;
+        const mapVersion = depthMap.dataVersion ?? depthMap.version ?? 0;   // the normals read the data alone
+        const depthScale = relightDepthScale(layer.params);
         const sigma = Number.isFinite(layer.params?.sigma) ? Number(layer.params.sigma) : 2.0;
         const mapLongSide = Math.max(depthMap.w, depthMap.h);
         const scaleZ = (depthScale / 100.0) * mapLongSide;
@@ -22732,30 +22924,54 @@ class InpaintEditor {
             p.finally(() => this._relightPending.delete(p));
         }
 
-        // Vis cache
+        // Shadow maps: a channel per light under relightVisKey, the keys pickVis reads (docs/PLAN_RELIGHT_FIXES.md F2.5)
         const shadows = Number.isFinite(layer.params?.shadows) ? Number(layer.params.shadows) : 60;
+        if (shadows === 0) return;   // pickVis hands an all-lit map; the maps stay as they are for when the shadows come back
+        const mapKey = relightMapKey(depthMap);
         const lights = Array.isArray(layer.params?.lights) ? layer.params.lights : [];
         const targetW = quick ? Math.max(1, Math.floor(depthMap.w / 4)) : depthMap.w;
         const targetH = quick ? Math.max(1, Math.floor(depthMap.h / 4)) : depthMap.h;
+        const stamp = () => (cache.ticket = (cache.ticket || 0) + 1);
 
         let targetVis = quick ? cache.visQuick : cache.vis;
         if (!targetVis || targetVis.w !== targetW || targetVis.h !== targetH) {
             const visData = new Uint8Array(targetW * targetH * 4);
-            visData.fill(255);
-            targetVis = {
-                data: visData,
-                w: targetW,
-                h: targetH,
-                keys: [null, null, null, null],
-            };
+            let keys = [null, null, null, null], tickets = [0, 0, 0, 0], seq = 0;
+            const full = cache.vis;
+            if (quick && full && full.data && full.w && full.h) {
+                const srcVis = full.data;
+                const srcW = full.w;
+                const srcH = full.h;
+                for (let dy = 0; dy < targetH; dy++) {
+                    const sy = Math.min(srcH - 1, Math.floor(((dy + 0.5) / targetH) * srcH));
+                    const sRow = sy * srcW;
+                    const dRow = dy * targetW;
+                    for (let dx = 0; dx < targetW; dx++) {
+                        const sx = Math.min(srcW - 1, Math.floor(((dx + 0.5) / targetW) * srcW));
+                        const sIdx = (sRow + sx) * 4;
+                        const dIdx = (dRow + dx) * 4;
+                        visData[dIdx] = srcVis[sIdx];
+                        visData[dIdx + 1] = srcVis[sIdx + 1];
+                        visData[dIdx + 2] = srcVis[sIdx + 2];
+                        visData[dIdx + 3] = srcVis[sIdx + 3];
+                    }
+                }
+                // the full map at a quarter of its size: current for every light that has not moved since it was made, so
+                // a drag marches only the light it moves, and its first frames show the shadows from before the drag
+                if (Array.isArray(full.keys)) keys = full.keys.map((k) => (k ? k.slice(0, -1) + "q" : null));
+                if (Array.isArray(full.tickets)) tickets = full.tickets.slice();
+                seq = full.seq || 0;
+            } else {
+                visData.fill(255);
+            }
+            if (!quick) {
+                // a new full map (a depth map of another size): newer than any quick map, which belongs to the old one
+                seq = cache.seq = (cache.seq || 0) + 1;
+                cache.visQuick = null;
+            }
+            targetVis = { data: visData, w: targetW, h: targetH, keys, tickets, seq };
             if (quick) cache.visQuick = targetVis;
             else cache.vis = targetVis;
-        }
-
-        if (shadows === 0) {
-            targetVis.data.fill(255);
-            targetVis.keys = [null, null, null, null];
-            return;
         }
 
         let marchDepth;
@@ -22777,77 +22993,121 @@ class InpaintEditor {
 
         for (let i = 0; i < 4; i++) {
             const l = lights[i];
-            if (!l || !l.on) {
+            const vKey = relightVisKey(l, depthScale, mapKey, quick);
+            if (vKey === null) {
                 if (targetVis.keys[i] !== null) {
                     for (let idx = 0; idx < targetW * targetH; idx++) {
                         targetVis.data[idx * 4 + i] = 255;
                     }
                     targetVis.keys[i] = null;
+                    (targetVis.tickets || (targetVis.tickets = [0, 0, 0, 0]))[i] = stamp();
+                    targetVis.seq = cache.seq = (cache.seq || 0) + 1;
                 }
                 continue;
             }
 
-            const vKey = `${l.type}_${l.x}_${l.y}_${l.dist}_${l.diffusion}_${l.range}_${depthScale}_${mapVersion}_${quick ? "q" : "f"}`;
             const pendingKey = `v:${quick ? "q" : "f"}:${i}:${vKey}`;
-            if (targetVis.keys[i] !== vKey && !cache.pending.has(pendingKey)) {
-                cache.pending.add(pendingKey);
-                const chan = i;
-                const p = (async () => {
-                    try {
-                        const lm = lightToMap(l, depthMap, { depth_scale: depthScale });
-                        const lightVec = [
-                            (lm.mx / depthMap.w) * targetW,
-                            (lm.my / depthMap.h) * targetH,
-                            lm.mz * scaleFactor,
-                            l.type === "sun" ? 1 : 0,
-                        ];
-                        const diff = Number.isFinite(l.diffusion) ? Number(l.diffusion) : 30;
-                        const radius = (diff / 100.0) * (0.05 * Math.max(targetW, targetH));
-                        const bias = 0.005 * marchScale;
-                        const taps = quick ? 1 : 4;
-                        const steps = quick ? 16 : 32;
+            if (targetVis.keys[i] === vKey || cache.pending.has(pendingKey)) continue;
+            cache.pending.add(pendingKey);
+            const chan = i;
+            const ticket = stamp();
+            const p = (async () => {
+                try {
+                    const lm = lightToMap(l, depthMap, { depth_scale: depthScale });
+                    const lightVec = [
+                        (lm.mx / depthMap.w) * targetW,
+                        (lm.my / depthMap.h) * targetH,
+                        lm.mz * scaleFactor,
+                        l.type === "sun" ? 1 : 0,
+                    ];
+                    const diff = Number.isFinite(l.diffusion) ? Number(l.diffusion) : 30;
+                    const radius = (diff / 100.0) * (0.05 * Math.max(targetW, targetH));
+                    const bias = 0.005 * marchScale;
+                    const taps = quick ? 1 : 4;
+                    const steps = quick ? 16 : 32;
 
-                        const pool = editorPool();
-                        if (pool && !pool.off) {
-                            const res = await pool.run("relight_shadow", {
-                                depth: marchDepth,
-                                w: targetW,
-                                h: targetH,
-                                scale: marchScale,
-                                light: lightVec,
-                                radius,
-                                taps,
-                                steps,
-                                bias,
-                                row0: 0,
-                                rows: targetH,
-                            }, [], { priority: quick ? INTERACTIVE : NORMAL });
-                            if (targetVis && targetVis.w === targetW && targetVis.h === targetH) {
-                                const vChan = new Uint8Array(res.vis);
-                                for (let idx = 0; idx < targetW * targetH; idx++) {
-                                    targetVis.data[idx * 4 + chan] = vChan[idx];
-                                }
-                                targetVis.keys[chan] = vKey;
-                            }
-                        } else {
-                            const vChan = shadowMarch(marchDepth, targetW, targetH, marchScale, lightVec, radius, taps, steps, bias, 0, targetH);
-                            if (targetVis && targetVis.w === targetW && targetVis.h === targetH) {
-                                for (let idx = 0; idx < targetW * targetH; idx++) {
-                                    targetVis.data[idx * 4 + chan] = vChan[idx];
-                                }
-                                targetVis.keys[chan] = vKey;
-                            }
-                        }
-                        this.markFilterChanged(layer, { soon: true });
-                    } catch (err) {
-                        console.warn(`relight_shadow channel ${chan} failed:`, err);
-                    } finally {
-                        cache.pending.delete(pendingKey);
+                    let vChan;
+                    const pool = editorPool();
+                    if (pool && !pool.off) {
+                        const res = await pool.run("relight_shadow", {
+                            depth: marchDepth,
+                            w: targetW,
+                            h: targetH,
+                            scale: marchScale,
+                            light: lightVec,
+                            radius,
+                            taps,
+                            steps,
+                            bias,
+                            row0: 0,
+                            rows: targetH,
+                        }, [], { priority: quick ? INTERACTIVE : NORMAL });
+                        vChan = new Uint8Array(res.vis);
+                    } else {
+                        vChan = shadowMarch(marchDepth, targetW, targetH, marchScale, lightVec, radius, taps, steps, bias, 0, targetH);
                     }
-                })();
-                this._relightPending.add(p);
-                p.finally(() => this._relightPending.delete(p));
-            }
+                    // Into the map of this size that is there now (a quick map seeded again meanwhile takes it too). A march for
+                    // the key the channel wants now (the light, the relief scale and the depth map at landing) always lands
+                    // and outranks any older march still on its way; one for a light that has moved on lands only in the
+                    // quick map and only over an older march: during a drag the quick map trails the pointer instead of
+                    // waiting for it to stop. pickVis tells current from trailing by the keys.
+                    const tv = quick ? cache.visQuick : cache.vis;
+                    const current = vKey === this.relightChannelKey(layer, chan, quick);
+                    if (tv && tv.w === targetW && tv.h === targetH && tv.keys[chan] !== vKey) {
+                        const tickets = tv.tickets || (tv.tickets = [0, 0, 0, 0]);
+                        if (current || (quick && ticket > (tickets[chan] || 0))) {
+                            for (let idx = 0; idx < targetW * targetH; idx++) {
+                                tv.data[idx * 4 + chan] = vChan[idx];
+                            }
+                            tv.keys[chan] = vKey;
+                            tickets[chan] = current ? stamp() : ticket;
+                            tv.seq = cache.seq = (cache.seq || 0) + 1;
+                            if (!quick) this.dropQuickVis(layer);
+                            this.markFilterChanged(layer, { soon: true });
+                        }
+                    }
+                } catch (err) {
+                    console.warn(`relight_shadow channel ${chan} failed:`, err);
+                } finally {
+                    cache.pending.delete(pendingKey);
+                    // the channel still lacks the key it wants now and no march for that key is on its way (a light turned
+                    // off and on while its march ran, a march for a key left behind): ask for one
+                    const want = this.relightChannelKey(layer, chan, quick);
+                    const tvNow = quick ? cache.visQuick : cache.vis;
+                    if (want && tvNow && Array.isArray(tvNow.keys) && tvNow.keys[chan] !== want
+                        && !cache.pending.has(`v:${quick ? "q" : "f"}:${chan}:${want}`) && this.layers.includes(layer)) {
+                        this.markFilterChanged(layer, { soon: true });
+                    }
+                }
+            })();
+            this._relightPending.add(p);
+            p.finally(() => this._relightPending.delete(p));
+        }
+        if (!quick) this.dropQuickVis(layer);
+    }
+
+    /**
+     * The key shadow channel `chan` of a relight layer wants now: its light, relief scale and the depth map as they are
+     * (`relightVisKey`), null for a light that is off.
+     * @param {any} layer
+     * @param {number} chan
+     * @param {boolean} quick
+     */
+    relightChannelKey(layer, chan, quick) {
+        const p = layer.params || {};
+        return relightVisKey((Array.isArray(p.lights) ? p.lights : [])[chan], relightDepthScale(p), relightMapKey(this.maps && this.maps.depth), quick);
+    }
+
+    /**
+     * A relight layer's quick shadow map goes once its full map is current for its lights (F2.5): the next drag or slider
+     * preview seeds a quick map from the full one, instead of showing the shadows of an earlier drag in its first frames.
+     * @param {any} layer
+     */
+    dropQuickVis(layer) {
+        const cache = layer && layer._relight;
+        if (!cache || !cache.visQuick) return;
+        if (relightVisCurrent(cache.vis, layer.params?.lights, relightDepthScale(layer.params), relightMapKey(this.maps && this.maps.depth), false)) {
+            cache.visQuick = null;
         }
     }
 
@@ -23524,6 +23784,8 @@ class InpaintEditor {
             if (deep && l._relight) {
                 if (l._relight.normals && l._relight.normals.data) freed += l._relight.normals.data.byteLength;
                 if (l._relight.vis && l._relight.vis.data) freed += l._relight.vis.data.byteLength;
+                if (l._relight.visQuick && l._relight.visQuick.data) freed += l._relight.visQuick.data.byteLength;
+                if (l._relight.depthQuick && l._relight.depthQuick.data) freed += l._relight.depthQuick.data.byteLength;
                 l._relight = null;
             }
             for (const p of [l.px, l.maskPx]) if (p) sources.push(displayCanvasIfMade(p));
@@ -23743,6 +24005,7 @@ class InpaintEditor {
                 ...(l.group ? { group: l.group } : {}),
                 ...(l.kind === "filter" ? { filter: l.filter, params: l.params, lut: l.lut || null, plate: l.plate || null } : {}),
                 ...(l.kind === "text" && l.text ? { text: l.text } : {}),
+                ...(l.relightOf ? { relightOf: l.relightOf } : {}),
             })),
             history: this.history.slice(-100).map((h) => ({ key: h.key, name: h.name, ref: h.ref, x: h.x, y: h.y, w: h.w, h: h.h, prompt: h.prompt, layerId: h.layerId, time: h.time, seed: h.seed, mode: h.mode, denoise: h.denoise,
                 ...(orientIsUp(h.orient) ? {} : { orient: { ...h.orient } }), ...(validXf(h.xf) ? { xf: h.xf.slice() } : {}) })),
@@ -23909,6 +24172,7 @@ class InpaintEditor {
                             x: l.x, y: l.y, w: l.w, h: l.h, opacity: l.opacity ?? 1, visible: l.visible !== false, dirty: false, locked: !!l.locked, alphaLock: !!l.alphaLock, clip: !!l.clip, group: l.group || null,
                             maskPx, maskRef: maskPx ? l.mask : null, maskDirty: false, maskEdit: false, maskOff: !!(maskPx && l.maskOff),
                             match: l.match && typeof l.match === "object" ? { strength: +l.match.strength || 0, source: l.match.source === "underneath" ? "underneath" : "surroundings" } : { strength: 0, source: "surroundings" },
+                            relightOf: l.relightOf || null,
                             ...(l.kind === "text" && l.text ? { text: { ...TEXT_DEFAULTS, ...l.text } } : {}),
                         }, this.pixels));
                         if (l.kind === "paint") this.paintCounter += 1;

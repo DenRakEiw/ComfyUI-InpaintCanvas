@@ -53,6 +53,8 @@ function sampleRgbaBilinear(data, w, h, x, y) {
 
 export const LIGHT_MAX = 4;
 export const LIGHT_TYPES = Object.freeze(["point", "sun", "spot"]);
+/** The relight routes: the in-app filter and the generative ones (the host's relightWhole), as the row's route select lists them. */
+export const RELIGHT_ROUTES = Object.freeze(["app", "magnific", "fal-iclight", "fal-bria", "comfycloud", "comfyui"]);
 
 export const KELVIN_PRESETS = Object.freeze([
     Object.freeze({ kelvin: 2700, label: "Tungsten" }),
@@ -297,6 +299,18 @@ export function lightColorHex(color) {
 }
 
 /**
+ * The relight LoRA's strength in percent (0..100; the routes send it / 100 as strength_model). Unset is 100. A value in
+ * (0, 1] is a fraction, stored under the default 1.0 that 77da63f shipped (the slider steps by 5): read as v x 100 %.
+ * @param {any} v
+ * @returns {number}
+ */
+export function loraPercent(v) {
+    const n = Number(v);
+    if (v == null || v === "" || !Number.isFinite(n)) return 100;
+    return Math.max(0, Math.min(100, n > 0 && n <= 1 ? n * 100 : n));
+}
+
+/**
  * Creates a default light configuration object.
  * @param {number} [i=0]
  * @param {{ width?: number, height?: number }|null} [size=null]
@@ -483,9 +497,12 @@ export function lightToMap(light, map = null, params = null) {
     if (light.type === "sun") {
         const cx = map && map.w > 0 ? map.w * 0.5 : (longSide * 0.5);
         const cy = map && map.h > 0 ? map.h * 0.5 : (longSide * 0.5);
-        const dirX = mx - cx;
-        const dirY = my - cy;
-        const dirZ = -(dist / 100.0) * scaleZ;
+        let dirX = mx - cx;
+        let dirY = my - cy;
+        let dirZ = -(dist / 100.0) * scaleZ;
+        // a sun on the map's centre with dist 0 has no direction of its own: straight from the front, the shader's rule
+        // (rl_evalLight: a sun vector of length <= 1e-5 is (0, 0, 1)); the CPU twin, the shader and the march read this
+        if (!(Math.hypot(dirX, dirY, dirZ) > 1e-5)) { dirX = 0; dirY = 0; dirZ = 1; }
         return {
             mx: dirX,
             my: dirY,
@@ -697,8 +714,21 @@ export function fitOriginalLight(small, normalsSmall, w = 256, h = 256) {
     return { l0, ka, kd };
 }
 
-function rolloff(x) {
-    return x > 0.8 ? 0.8 + 0.2 * (1.0 - Math.exp(-(x - 0.8) / 0.2)) : x;
+/**
+ * The highlight shoulder (linear light): a channel the lights push above the knee rolls off towards white instead of
+ * clipping at 1. The knee is 0.8 or the channel's value without the lights (`base`), whichever is higher, so a pixel
+ * the lights leave alone, or leave under the knee, keeps its value exactly (the identity at defaults); above the knee
+ * the curve leaves with slope 1 and nears 1. The shader's `rl_shoulder` is the same formula.
+ * @param {number} base - the channel without the lights: Original light times the picture plus the Ambient fill, 0..1
+ * @param {number} x - the channel with them
+ * @returns {number}
+ */
+export function relightShoulder(base, x) {
+    const k = Math.max(0.8, base);
+    if (!(x > k)) return x;
+    const h = 1.0 - k;
+    if (h < 1e-6) return k;
+    return k + h * (1.0 - Math.exp(-(x - k) / h));
 }
 
 /**
@@ -803,10 +833,8 @@ export function shadePixel(srcRgba, normal, mapCoord, lights, params = null, fit
             dirX = lx;
             dirY = ly;
             dirZ = lz;
-            const dLen = Math.hypot(dirX, dirY, dirZ) || 1.0;
-            dirX /= dLen;
-            dirY /= dLen;
-            dirZ /= dLen;
+            const dLen = Math.hypot(dirX, dirY, dirZ);
+            if (dLen > 1e-5) { dirX /= dLen; dirY /= dLen; dirZ /= dLen; } else { dirX = 0; dirY = 0; dirZ = 1; }   // as the shader
             att = 1.0;
         } else {
             const dx = lx - mx;
@@ -943,9 +971,11 @@ export function shadePixel(srcRgba, normal, mapCoord, lights, params = null, fit
     const addedG = fg * ((1.0 - o) * ambient + lsumG);
     const addedB = fb * ((1.0 - o) * ambient + lsumB);
 
-    const outLinR = o * pr + rolloff(addedR);
-    const outLinG = o * pg + rolloff(addedG);
-    const outLinB = o * pb + rolloff(addedB);
+    // the knee's base: the picture without the lights (Original light and the Ambient fill that replaces the rest)
+    const fill = (1.0 - o) * ambient;
+    const outLinR = relightShoulder(Math.min(1.0, o * pr + fr * fill), o * pr + addedR);
+    const outLinG = relightShoulder(Math.min(1.0, o * pg + fg * fill), o * pg + addedG);
+    const outLinB = relightShoulder(Math.min(1.0, o * pb + fb * fill), o * pb + addedB);
 
     const outSrgbR = Math.max(0, Math.min(255, Math.round(linearToSrgb(outLinR) * 255)));
     const outSrgbG = Math.max(0, Math.min(255, Math.round(linearToSrgb(outLinG) * 255)));
@@ -1107,6 +1137,16 @@ export function relightStats(small, size, ctx) {
         return { fit: { l0: [0, 0, 1], ka: 1.0, kd: 0.0 }, seq: 0 };
     }
 
+    const params = ctx?.params || ctx?.layer?.params || null;
+    const depthScale = Math.max(5, Math.min(200, Number(params?.depth_scale) || 50));
+    const sigma = Math.max(0, Math.min(10, Number.isFinite(params?.sigma) ? Number(params?.sigma) : 2.0));
+    // keyed on the picture below too (F2.6): a picture lit from the other side under the same layer and map is another fit
+    const fitKey = `${relightMapKey(depthMap)}_${depthScale}_${sigma}_${W}_${H}_${bytesHash(pxData)}`;
+    const rCache = ctx?.layer?._relight;
+    if (rCache && rCache._fitKey === fitKey && rCache._fit) {
+        return { fit: rCache._fit, seq: rCache._fitSeq || Date.now() };
+    }
+
     const docW = size?.width || W;
     const docH = size?.height || H;
     const depthSmall = new Uint16Array(W * H);
@@ -1119,15 +1159,33 @@ export function relightStats(small, size, ctx) {
         }
     }
 
-    const params = ctx?.params || ctx?.layer?.params || null;
-    const depthScale = Math.max(5, Math.min(200, Number(params?.depth_scale) || 50));
-    const sigma = Math.max(0, Math.min(10, Number.isFinite(params?.sigma) ? Number(params?.sigma) : 2.0));
     const longSide = Math.max(W, H);
     const scaleZ = (depthScale / 100.0) * longSide;
     const normalsSmall = heightNormals(depthSmall, W, H, scaleZ, sigma);
     const fit = fitOriginalLight(pxData, normalsSmall, W, H);
+    const seq = Date.now();
+    if (rCache) {
+        rCache._fitKey = fitKey;
+        rCache._fit = fit;
+        rCache._fitSeq = seq;
+    }
 
-    return { fit, seq: Date.now() };
+    return { fit, seq };
+}
+
+/**
+ * FNV-1a of a byte array, for a cache key: about a millisecond for the 256 px sample the fit reads.
+ *
+ * @param {ArrayLike<number>} d
+ * @returns {string}
+ */
+function bytesHash(d) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < d.length; i++) {
+        h ^= d[i];
+        h = Math.imul(h, 0x01000193);
+    }
+    return (h >>> 0).toString(36) + ":" + d.length;
 }
 
 function makeCanvas(w, h) {
@@ -1164,6 +1222,109 @@ function copyCanvas(src) {
 }
 
 /**
+ * Skip predicate for the relight filter.
+ *
+ * @param {any} p
+ * @param {any} info
+ * @returns {boolean}
+ */
+export function relightSkip(p, info) {
+    return !(info && info.maps && info.maps.depth) || (p?.mode !== 1 && (!p?.lights || p.lights.every((l) => !l || !l.on)) && (p?.original === undefined || Number(p.original) === 100));
+}
+
+/**
+ * What a relight layer's shadow maps are computed from on the depth map's side, as one key part: its data and where it
+ * lies on the picture (`xf`). A change of the map's meta alone (the Edges snap, `setMapMeta`) keeps the key: the shadow
+ * march does not read it. `ensureRelightMaps` keys the maps it makes on it and `pickVis` and the fit read them by it, so
+ * the two sides cannot drift apart again (docs/PLAN_RELIGHT_FIXES.md F2.5: one side keyed on `version`, the other on
+ * `dataVersion`, and after an Edges change the full map never matched).
+ *
+ * @param {any} map
+ * @returns {string}
+ */
+export function relightMapKey(map) {
+    if (!map) return "none";
+    const v = map.dataVersion ?? map.version ?? 0;
+    return Array.isArray(map.xf) ? `${v}@${map.xf.join(",")}` : String(v);
+}
+
+/**
+ * The relief scale a relight layer's maps are made at: its `depth_scale`, 50 when unset.
+ *
+ * @param {any} params
+ * @returns {number}
+ */
+export function relightDepthScale(params) {
+    return Number.isFinite(params?.depth_scale) ? Number(params.depth_scale) : 50;
+}
+
+/**
+ * The key of one light's channel in a shadow map (`quick`: the quarter-size map of a drag); null for a light that is off,
+ * whose channel is all lit.
+ *
+ * @param {any} light
+ * @param {number} depthScale
+ * @param {string} mapKey `relightMapKey` of the depth map
+ * @param {boolean} quick
+ * @returns {string|null}
+ */
+export function relightVisKey(light, depthScale, mapKey, quick) {
+    if (!light || !light.on) return null;
+    const l = light;
+    return `${l.type}_${l.x}_${l.y}_${l.dist}_${l.diffusion}_${l.range}_${depthScale}_${mapKey}_${quick ? "q" : "f"}`;
+}
+
+/**
+ * Whether a shadow map was computed for exactly these lights, in all four channels.
+ *
+ * @param {any} vis
+ * @param {any[]} lights
+ * @param {number} depthScale
+ * @param {string} mapKey
+ * @param {boolean} quick
+ * @returns {boolean}
+ */
+export function relightVisCurrent(vis, lights, depthScale, mapKey, quick) {
+    if (!vis || !vis.data || !Array.isArray(vis.keys)) return false;
+    const list = Array.isArray(lights) ? lights : [];
+    for (let i = 0; i < 4; i++) {
+        if (vis.keys[i] !== relightVisKey(list[i], depthScale, mapKey, quick)) return false;
+    }
+    return true;
+}
+
+/** The shadow map of a layer whose shadows are at 0: all lit (the shading does not read it then). */
+const LIT_VIS = { data: new Uint8Array([255, 255, 255, 255]), w: 1, h: 1, keys: null, seq: 0, lit: true };
+
+/**
+ * The shadow map the shading reads (docs/PLAN_RELIGHT_FIXES.md F2.5). The full map when it was computed for the current
+ * lights. A run (`info.forRun`) never reads the quick one: it reads the full map, which its reader waited for
+ * (`relightIdle`), even when a light moved during that wait. The view reads the quick map when that one is current, and
+ * while neither is the one written last: during a drag the quick map trails the pointer, after it the quick map shows
+ * until the full one lands, and a quick map left from an earlier drag is older than the full map made since. A layer
+ * with its shadows at 0 reads an all-lit map. Null when the layer has no map yet.
+ *
+ * @param {any} cache the layer's `_relight`
+ * @param {any} info the pass (`forRun`)
+ * @param {any} params the layer's parameters
+ * @param {any} map the depth map
+ * @returns {any}
+ */
+export function pickVis(cache, info, params, map) {
+    const p = params || {};
+    if ((Number.isFinite(p.shadows) ? Number(p.shadows) : 60) === 0) return LIT_VIS;
+    const lights = Array.isArray(p.lights) ? p.lights : [];
+    const ds = relightDepthScale(p), mk = relightMapKey(map);
+    const vis = cache?.vis?.data ? cache.vis : null;
+    if (relightVisCurrent(vis, lights, ds, mk, false)) return vis;
+    if (info?.forRun) return vis;
+    const quick = cache?.visQuick?.data ? cache.visQuick : null;
+    if (relightVisCurrent(quick, lights, ds, mk, true)) return quick;
+    if (vis && quick) return (quick.seq || 0) > (vis.seq || 0) ? quick : vis;
+    return vis || quick;
+}
+
+/**
  * CPU twin for the relight filter (PLAN_RELIGHT_BUILD.md sec 4.2).
  * Shaded per-pixel with bilinear map sampling and bilateral edge snap.
  *
@@ -1176,9 +1337,7 @@ export function applyRelight(src, params, info = {}) {
     const map = (info && info.maps && info.maps.depth) || null;
     if (!map || !map.data || map.w <= 0 || map.h <= 0) return copyCanvas(src);
     const p = params || {};
-    const lightsList = Array.isArray(p.lights) ? p.lights : [];
-    const origPct = Number.isFinite(p.original) ? Number(p.original) : 100;
-    if (p.mode !== 1 && (!lightsList || lightsList.every((l) => !l || !l.on)) && origPct === 100) {
+    if (relightSkip(p, info)) {
         return copyCanvas(src);
     }
 
@@ -1204,10 +1363,11 @@ export function applyRelight(src, params, info = {}) {
         normalsData = heightNormals(map.data, map.w, map.h, scaleZ, sigma);
     }
 
+    const lightsList = Array.isArray(p.lights) ? p.lights : [];
     let visData = null;
     let visW = map.w;
     let visH = map.h;
-    const visObj = (info.quick && cache?.visQuick) || cache?.vis || null;
+    const visObj = pickVis(cache, info, p, map);
     if (visObj && visObj.data) {
         visData = visObj.data;
         visW = visObj.w || map.w;
@@ -1232,7 +1392,7 @@ export function applyRelight(src, params, info = {}) {
     }
 
     const fit = (info && (info.wholeStats?.fit || info.stats?.fit || cache?.fit)) || { l0: [0, 0, 1], ka: 1.0, kd: 0.0 };
-    const mappedLights = lightsList.map((l) => ({ ...l, ...lightToMap(l, map, { depth_scale: depthScale }) }));
+    const mappedLights = lightsList.map((l) => ({ ...l, ...lightToMap(l, map, { depth_scale: depthScale }), rgbLin: kelvinToRgb(l.color) }));
     const scaleVisX = visW / map.w;
     const scaleVisY = visH / map.h;
 
@@ -1372,8 +1532,12 @@ float rl_linearToSrgb(float c) {
 vec3 rl_linearToSrgb(vec3 c) {
     return vec3(rl_linearToSrgb(c.r), rl_linearToSrgb(c.g), rl_linearToSrgb(c.b));
 }
-float rl_rolloff(float x) {
-    return x > 0.8 ? 0.8 + 0.2 * (1.0 - exp(-(x - 0.8) / 0.2)) : x;
+float rl_shoulder(float base, float x) {
+    float k = max(0.8, base);
+    if (!(x > k)) return x;
+    float h = 1.0 - k;
+    if (h < 1e-6) return k;
+    return k + h * (1.0 - exp(-(x - k) / h));
 }
 
 vec3 rl_evalLight(
@@ -1562,10 +1726,9 @@ vec4 shade(vec4 c, vec2 uv) {
     }
 
     vec3 added = fLin * (vec3((1.0 - u_original) * u_ambient) + lsum);
-    added.r = rl_rolloff(added.r);
-    added.g = rl_rolloff(added.g);
-    added.b = rl_rolloff(added.b);
     vec3 outLin = u_original * pLin + added;
+    vec3 baseLin = min(vec3(1.0), u_original * pLin + fLin * ((1.0 - u_original) * u_ambient));
+    outLin = vec3(rl_shoulder(baseLin.r, outLin.r), rl_shoulder(baseLin.g, outLin.g), rl_shoulder(baseLin.b, outLin.b));
 
     return vec4(rl_linearToSrgb(outLin), c.a);
 }
@@ -1631,7 +1794,11 @@ export function registerRelightGL() {
                 key: "relight:n:" + (cache.normals.key || cache.key || 0),
             } : DUMMY_NORMALS;
 
-            const visObj = (info.quick && cache?.visQuick) || cache?.vis || null;
+            const lightsList = Array.isArray(p.lights) ? p.lights : [];
+            const depthScale = Number.isFinite(p.depth_scale) ? Number(p.depth_scale) : 50;
+            const visObj = pickVis(cache, info, p, map);
+            const isQuick = visObj === cache?.visQuick;
+            // `seq` in the key: a channel written in place under the keys it had (a trailing march) is uploaded again
             const visSampler = (visObj && visObj.data) ? {
                 data: visObj.data,
                 width: visObj.w,
@@ -1639,14 +1806,11 @@ export function registerRelightGL() {
                 channels: 4,
                 linear: true,
                 static: true,
-                key: (info.quick ? "relight:vq:" : "relight:v:") + (visObj.keys ? visObj.keys.join("_") : (visObj.key || cache?.key || 0)),
+                key: visObj.lit ? "relight:lit" : (isQuick ? "relight:vq:" : "relight:v:") + (visObj.seq || 0) + ":" + (visObj.keys ? visObj.keys.join("_") : ""),
             } : DUMMY_VIS;
 
             const fit = (info && (info.wholeStats?.fit || info.stats?.fit || cache?.fit)) || { l0: [0, 0, 1], ka: 1.0, kd: 0.0 };
-            const depthScale = Number.isFinite(p.depth_scale) ? Number(p.depth_scale) : 50;
             const depthScaleMap = (depthScale / 100.0) * (map ? Math.max(map.w, map.h) : 1024);
-
-            const lightsList = Array.isArray(p.lights) ? p.lights : [];
             const lPositions = [];
             const lColors = [];
             const lCones = [];
@@ -1745,7 +1909,7 @@ export function registerRelightGL() {
                 u_mode: p.mode === 1 ? 1 : 0,
             };
         },
-        skip: (p, info) => !(info && info.maps && info.maps.depth) || (p?.mode !== 1 && (!p?.lights || p.lights.every((l) => !l || !l.on)) && (p?.original === undefined || Number(p.original) === 100)),
+        skip: relightSkip,   // the CPU twin's own predicate (applyRelight), not a copy of it
     });
     relightRegistered = true;
 }
