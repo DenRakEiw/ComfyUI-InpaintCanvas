@@ -17,7 +17,7 @@ import { HELP, KIND_LABELS, nextId, addBox, setBox, removeBox, selectionInput, c
 /** The tool's button title in the tool column. */
 export const BOXES_TOOL_TITLE = "Boxes (X): boxes for FLUX 3's box prompt. Drag to draw a box, click to select, double-click to describe it, drag to move, the handles resize; Delete removes, D duplicates, arrows nudge (Shift 10 px), Alt+click picks a box under another. The Generate pane's Boxes section lists them; box_prompt carries them.";
 
-const NODE_HELP = "Wire the canvas output box_prompt into the prompt of a FLUX 3 node and crop_image whole into its first image: the boxes go as FLUX 3's rows (New, Keep, Move, Remove, From reference, Text). elements carries the New and Text boxes for a Flux 3 Image node's bounding_boxes on a new image (never both on an edit). " + HELP.replace(/ Ideogram 4 takes[^.]*\.$/, "");
+const NODE_HELP = "Wire the canvas output box_prompt into the prompt of a FLUX 3 node and crop_image whole into its first image: the boxes go as FLUX 3's rows (New, Keep, Move, Remove, From reference, Text). elements carries the New and Text boxes for a Flux 3 Image node's bounding_boxes on a new image (never both on an edit). " + HELP.replace(/ Ideogram 4 takes[^.]*\.$/, "").replace(" (FLUX 3 Image, Ideogram 4)", " (FLUX 3)");
 
 /** [l, t, r, b] of a span fitted to a multiple as nodes.py _fit_span_to_multiple does (target_size 0). */
 function fitSpan(a0, a1, limit, m) {
@@ -185,7 +185,7 @@ export class EditorBoxes {
                 () => ed.setStatus(`${said} could not be copied: the browser refused the clipboard.`, "warn"));
         } else {
             // ComfyUI over plain http on another machine: the browser has no clipboard API there
-            ed.setStatus(`${said}: this page has no clipboard access (ComfyUI over plain http from another machine); box_prompt carries the same rows.`, "warn");
+            ed.setStatus(`${said}: this page has no clipboard access (ComfyUI over plain http from another machine); box_prompt carries the rows, measured in the crop a run sends.`, "warn");
         }
         return got;
     }

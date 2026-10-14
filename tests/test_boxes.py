@@ -412,6 +412,37 @@ class RunTests(unittest.TestCase):
         self.assertEqual((d["box_prompt"], d["elements"]), ("make it night", []))
         self.assertEqual(self.notes(d), ["Boxes were not written: worse"])
 
+    def test_img_tokens_name_the_pictures(self):
+        # @img1 / @img2 (the editor's labels of the references, referenceLabels) become FLUX 3's "image n": the crop is
+        # image 1, then the Original when it goes, then the references that loaded
+        box = {"id": "vase_1", "kind": "new", "rect": [420, 220, 500, 300], "desc": "the vase from @img2"}
+        refs = [self.ref("square.png"), self.ref("wide.png")]
+        d = self.run_node(self.state([box], prompt="put @img1 at the left", references=refs, referenceLabels=["img1", "img2"]))
+        self.assertEqual(d["rows"][0]["desc"], "the vase from image 3")
+        self.assertTrue(d["box_prompt"].startswith("put image 2 at the left. "), d["box_prompt"])
+        self.assertEqual(d["prompt"], "put @img1 at the left")   # the plain prompt output is untouched
+        on = self.run_node(self.state([box], prompt="x", references=refs, referenceLabels=["img1", "img2"], crop={"fill": "green", "withOriginal": True}))
+        self.assertEqual(on["rows"][0]["desc"], "the vase from image 4")
+        # a reference that did not load: the token stays, a note says so; without labels (an older editor) nothing changes
+        miss = self.run_node(self.state([box], references=[self.ref("square.png"), self.ref("missing.png")], referenceLabels=["img1", "img2"]))
+        self.assertEqual(miss["rows"][0]["desc"], "the vase from @img2")
+        self.assertIn("Box vase_1: its description names @img2, which is not a reference picture of this run.", self.notes(miss))
+        old = self.run_node(self.state([box], references=refs))
+        self.assertEqual(old["rows"][0]["desc"], "the vase from @img2")
+        # the selection's box: its description is the prompt, both named the same way, so it says only where
+        s1 = self.run_node(self.state(None, prompt="put @img1 here", references=refs, referenceLabels=["img1", "img2"], selectionBoxId="edit_1"))
+        self.assertEqual(s1["box_prompt"].split(" [{")[0], "put image 2 here. In <ref_image_0>, the change goes in <edit_1> in the middle. Leave the rest of the picture as it is.")
+
+    def test_a_number_past_the_float_range_drops_one_box(self):
+        state = self.state(None)
+        raw = json.dumps(state)[:-1] + ', "boxes": [{"id": "a_1", "kind": "new", "rect": [1' + "0" * 400 + ', 0, 10, 10]}, {"id": "lamp_1", "kind": "new", "rect": [420, 220, 500, 300], "desc": "a lamp"}]}'
+        prompt = {"7": {"class_type": "InpaintCanvas", "inputs": {"canvas_state": raw}}}
+        out = nodes.InpaintCanvas().run(padding=56, target_size=512, feather=0, multiple_of=64, prompt=prompt, unique_id="7")
+        names = nodes.InpaintCanvas.RETURN_NAMES
+        d = dict(zip(names, out["result"]))
+        self.assertIn('"id":"lamp_1"', d["box_prompt"])
+        self.assertEqual(out["ui"]["inpaint_boxes"], ["Box a_1: rect is not [l, t, r, b] in image pixels with l < r and t < b, so the box was not sent."])
+
     def test_expand_keeps_the_notes(self):
         made = []
 

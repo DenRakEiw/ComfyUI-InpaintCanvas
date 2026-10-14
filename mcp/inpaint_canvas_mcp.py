@@ -480,7 +480,8 @@ def boxes_add(kind: str = "new", rect: list[float] | None = None, src: list[floa
 def boxes_set(id: str, kind: str | None = None, rect: list[float] | None = None, src: list[float] | None = None,
               layer: str | None = None, desc: str | None = None, text: str | None = None, new_id: str | None = None) -> str:
     """Change a box: only the given fields change (new_id renames it). A box still called box_1 takes its name from a
-    new description. One undo step. The fields are boxes_add's."""
+    new description. One undo step. The fields are boxes_add's; text "" makes a Text box a plain New box again (do
+    that before changing a Text box's kind), src [] puts a From box back to its whole layer."""
     return _text(cmd("boxes_set", {"id": id, "kind": kind, "rect": rect, "src": src, "layer": layer, "desc": desc, "text": text, "new_id": new_id}))
 
 

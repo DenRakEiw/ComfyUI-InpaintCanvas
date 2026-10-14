@@ -428,7 +428,7 @@ const ROLES = ["none", "reference", "scribble", "lineart", "depth", "pose", "can
 // settings (see syncSettingOutputs) and the queuePrompt wrapper maps the visible slot to the
 // backend slot. Outputs that are neither fixed, setting nor tail (e.g. the former
 // reference_images) are removed from loaded workflows. box_prompt: the prompt with FLUX 3's
-// box rows and caption (the plain prompt without boxes); elements: the New and Text boxes in
+// box rows and caption (the plain prompt while the Boxes switch is off); elements: the New and Text boxes in
 // ComfyUI core's bounding-box shape (docs/PLAN_NODE_BOXES.md D2-D4).
 const TAIL_OUTPUTS = [
     { name: "box_prompt", type: "STRING", label: "box_prompt" },
@@ -24536,7 +24536,10 @@ class InpaintEditor {
         if (boxSwitch && boxSwitch.takes) {
             const list = this.pluginData && this.pluginData.boxes && Array.isArray(this.pluginData.boxes.boxes) ? this.pluginData.boxes.boxes : [];
             const p = promptPayload(list, refLayers);
-            boxPart = { selectionBoxId: selectionBoxIdOf(promptSent), referenceIds: refLayers.map((l) => l.id), ...(list.length ? { boxes: p.boxes } : {}) };
+            // each reference's @img label (img1 ..), so nodes.py can name a token in a description or the prompt as the
+            // picture the batch holds ("image 3")
+            const labels = this.refLabels();
+            boxPart = { selectionBoxId: selectionBoxIdOf(promptSent), referenceIds: refLayers.map((l) => l.id), referenceLabels: refLayers.map((l) => (labels.has(l.id) ? `img${labels.get(l.id)}` : null)), ...(list.length ? { boxes: p.boxes } : {}) };
             boxNote = p.notes.join(" ");
         }
         const [x, y, w, h] = this.cropRect();

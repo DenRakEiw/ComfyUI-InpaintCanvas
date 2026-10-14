@@ -454,6 +454,10 @@ export function installBridge({ api, app, viewUrl, loadImageEl, makeCanvas, FILT
             const patch = boxInput(a);
             delete patch.id;
             if (a.new_id != null) patch.id = String(a.new_id);
+            // the MCP server sends no nulls: "" takes a Text box's words away (a plain New box again, whose kind can then
+            // change), [] puts a From box back to its whole layer
+            if (patch.text === "") patch.text = null;
+            if (Array.isArray(patch.src) && !patch.src.length) patch.src = null;
             const b = bx.set(String(a.id), patch);
             ed.draw();
             return { ...b };

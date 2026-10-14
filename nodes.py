@@ -657,7 +657,7 @@ class InpaintCanvas:
         "\"api\" or \"local\": which result input the editor expects the result on.",
         "Negative prompt from the editor (shown in local mode; for SDXL-class models).",
     ) + tuple("Editor-driven setting: wire it into any widget input (lora_name, ckpt_name, steps, ...) and a matching control appears in the editor. The next free slot shows up once this one is connected." for _ in range(SETTING_SLOTS)) + (
-        "The prompt with FLUX 3's box rows: the boxes drawn in the editor (tool X, the Boxes switch on) as a caption and the JSON rows FLUX 3 reads (New, Keep, Move, Remove, From a reference). Wire it into the prompt of a FLUX 3 node, with crop_image whole into its first image. The plain prompt when there is no box.",
+        "The prompt with FLUX 3's box rows: the boxes drawn in the editor (tool X, the Boxes switch on) as a caption and the JSON rows FLUX 3 reads (New, Keep, Move, Remove, From a reference). Wire it into the prompt of a FLUX 3 node, with crop_image whole into its first image. The plain prompt while the Boxes switch is off; with it on and no box, the selection goes as one box.",
         "The New and Text boxes as bounding-box elements, for Flux 3 Image's bounding_boxes on a new image, Create Bounding Boxes or a JSON prompt builder. On an edit, wire box_prompt instead: both at once give the rows twice.",
     )
     FUNCTION = "run"

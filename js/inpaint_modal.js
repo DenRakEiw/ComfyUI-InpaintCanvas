@@ -983,7 +983,9 @@ function buildPrompt(ed, section) {
         ed.boxesRow = el("div", "ipc-sec ipc-boxes");
         ed.boxesRow.hidden = true;
         const boxLab = el("label", null, "");
-        boxLab.title = "Send boxes with Generate and Generate new: the document's boxes (the Boxes panel and tool), or the selection as one box when there are none. Off, no box goes and the boxes stay with the document. The first box a document gets turns it on.";
+        boxLab.title = host.boxesInEditor
+            ? "Send boxes in the node's box_prompt output: the boxes (the Boxes section and tool X), or the selection as one box when there are none. Off, box_prompt is the plain prompt and the boxes stay with the workflow. The first box turns it on."
+            : "Send boxes with Generate and Generate new: the document's boxes (the Boxes panel and tool), or the selection as one box when there are none. Off, no box goes and the boxes stay with the document. The first box a document gets turns it on.";
         ed.boxesCheck = document.createElement("input");
         ed.boxesCheck.type = "checkbox";
         ed.boxesCheck.addEventListener("change", () => {

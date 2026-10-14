@@ -458,8 +458,11 @@ of a FLUX 3 node and `crop_image` **whole** into its first image: the crop is
 `ref_image_0`, the untouched crop (Original) the next picture when it goes, then
 the reference layers. A box outside the crop, a reference that did not load or
 a prompt over 15000 characters is left out or reported: the notes show in the
-editor's status line and in ComfyUI's console. Without boxes `box_prompt` is the
-plain prompt, so it is safe to wire.
+editor's status line and in ComfyUI's console. With the Boxes switch off
+`box_prompt` is the plain prompt; with it on and no box, the selection goes as
+one box, so switch it off before `box_prompt` feeds a model that reads no boxes.
+An `@img1` in a description or the prompt (the editor's label of a reference
+layer) becomes the name FLUX 3 reads for that picture, "image 2" and so on.
 
 **`elements`** carries the New and Text boxes as bounding-box elements for a
 Flux 3 Image node's `bounding_boxes` input on a new image, a Create Bounding
@@ -728,7 +731,7 @@ Outputs
 | `control_image`              | control layers on black, aligned with `crop_image` (black if none)      |
 | `denoise` / `seed` / `mode`  | the Generate settings (`mode` is "api" or "local")                      |
 | `setting_1` ... `setting_8`  | wildcard outputs driven from the editor's Settings section              |
-| `box_prompt`                 | the prompt with FLUX 3's box sentences and JSON rows (*Boxes for FLUX 3*); the plain prompt without boxes |
+| `box_prompt`                 | the prompt with FLUX 3's box sentences and JSON rows (*Boxes for FLUX 3*); the plain prompt while the Boxes switch is off |
 | `elements`                   | the New and Text boxes as bounding-box elements (`ARRAY`, for a `bounding_boxes` input on a new image) |
 
 Only ever appended, so saved workflows keep working. The node shows only the

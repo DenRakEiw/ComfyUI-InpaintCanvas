@@ -121,7 +121,12 @@ def dumps(v):
 # ---- the shape check -------------------------------------------------------------------------------------------------
 
 def _is_num(x):
-    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return False
+    try:
+        return math.isfinite(x)
+    except OverflowError:   # a JSON integer past the float range (JavaScript reads it as Infinity)
+        return False
 
 
 def _fracs(v):
@@ -527,6 +532,7 @@ def _overlaps(r, s):
 
 
 _ID_TAIL = re.compile(r"(.*_)([1-9][0-9]*)\Z")
+_TOKEN = re.compile(r"@img([1-9][0-9]*)\b", re.A)
 
 
 def _free_id(bid, used):
@@ -577,6 +583,22 @@ def node_outputs(state, prompt, frame, crop_size, original=False, loaded=(), fit
         for k, (j, w, h) in enumerate(loaded):
             slots[int(j)] = (k, w, h)
             names[k] = f"ref_image_{1 + o + k}"
+        # an @img token names a reference layer as the editor labels it (referenceLabels, in the order of references):
+        # in the rows and the caption it is the picture's name FLUX 3 reads, "image n" (the crop is image 1)
+        labels = state.get("referenceLabels")
+        labels = [x if isinstance(x, str) else None for x in labels] if isinstance(labels, list) else []
+
+        def picture_words(text, who=None):
+            def sub(m):
+                lab = "img" + m.group(1)
+                j = labels.index(lab) if lab in labels else None
+                if j is not None and j in slots:
+                    return f"image {2 + o + slots[j][0]}"
+                if who is not None:
+                    notes.append(f"{who}: its description names @{lab}, which is not a reference picture of this run.")
+                return m.group(0)
+            return _TOKEN.sub(sub, text)
+
         boxes, used = [], set()
         for i, b in enumerate(raw):
             err = check_payload_box(b, i)
@@ -608,13 +630,13 @@ def node_outputs(state, prompt, frame, crop_size, original=False, loaded=(), fit
                 notes.append(f"{who}: its source lies in the selection, which the crop shows filled: the model sees the fill there, not the picture.")
             bid = _free_id(b["id"], used)
             used.add(bid)
-            box = {"id": bid, "kind": kind, "rect": rect, "src": src, "ref": ref, "desc": fold(b.get("desc"))}
+            box = {"id": bid, "kind": kind, "rect": rect, "src": src, "ref": ref, "desc": fold(picture_words(fold(b.get("desc")), who))}
             if b.get("text") is not None:
                 box["text"] = fold(b["text"])
             boxes.append(box)
         if not boxes:
             return plain, [], notes
-        a = apply_boxes(plain, boxes, "ref_image_0", names)
+        a = apply_boxes(picture_words(plain), boxes, "ref_image_0", names)
         notes.extend(a["notes"])
         W, H = crop_size
         small = small_note([b["id"] for b in boxes if b["kind"] in ("new", "from", "move")

@@ -66,7 +66,7 @@ The Prompt field is the node's `prompt` output. **Upsample** (Ctrl+U) rewrites i
 
 - The **Boxes** tool (X) draws boxes FLUX 3 reads: drag to draw, click to select, double-click to describe, drag to move, the handles resize; Delete removes the selected box, D duplicates it, the arrows nudge it. The Generate pane's **Boxes** section lists them with their id, kind (New, Text, Keep, Move, Remove, From reference) and description.
 - The **Boxes** switch under the prompt sends them (the first box turns it on); without a box the selection goes as one box described by the prompt.
-- The node's **`box_prompt`** output carries the prompt, a sentence per box and FLUX 3's JSON rows, measured in the crop it sends: wire it into the prompt of a FLUX 3 node and `crop_image` whole into its first image. Without boxes it is the plain prompt. **`elements`** carries the New and Text boxes for a `bounding_boxes` input on a new image; never wire both into one node on an edit.
+- The node's **`box_prompt`** output carries the prompt, a sentence per box and FLUX 3's JSON rows, measured in the crop it sends: wire it into the prompt of a FLUX 3 node and `crop_image` whole into its first image. With the switch off it is the plain prompt (on, without a box, the selection goes as one box). An `@img1` in a description becomes the picture's name FLUX 3 reads ("image 2"). **`elements`** carries the New and Text boxes for a `bounding_boxes` input on a new image; never wire both into one node on an edit.
 - Boxes left out (outside the crop, a reference that did not load) are named in the status line and the console.
 
 ## Generate

@@ -1,6 +1,6 @@
 # Development notes
 
-> **js/ is generated** (build 1dbc92efa6f6d83d from scumble ec19c19): every file in js/ except host.js, inpaint_node.js and inpaint_bridge.js comes from `renderer/editor/` in DenRakEiw/scumble through its `tools/build_node.py`. Edit the editor there, build, commit both repos.
+> **js/ is generated** (build a11889f639d973d0 from scumble b717107): every file in js/ except host.js, inpaint_node.js and inpaint_bridge.js comes from `renderer/editor/` in DenRakEiw/scumble through its `tools/build_node.py`. Edit the editor there, build, commit both repos.
 
 Everything that is not obvious from the code. Written so a fresh session can
 continue without the chat history. Dates are 2026-09-04 unless stated.
@@ -1471,6 +1471,8 @@ in the scumble repo (D1-D12).
   (`mapExtras`); the geometry step's own undo puts the old ones back.
 - **canvas_state** (`serializeForPrompt`, only while the switch is on): `boxes` (only when the document holds some; an
   empty list means the editor had to leave every box out), `referenceIds` (the layer ids of `references`, same order),
+  `referenceLabels` (each reference's `@img` label, `img1` ..: nodes.py writes an `@imgN` in a description, and in the
+  prompt that goes into `box_prompt`, as FLUX 3's "image n" of the batch as built; one that did not load stays, noted),
   `selectionBoxId` (`idWords(prompt) || "edit"` + `_1`). A box: `{id, kind, rect: [l, t, r, b] document pixels, src
   (keep / move / remove: document pixels; from: fractions of its layer's frame as shown), ref (from: index into
   references), desc, text?}`.
