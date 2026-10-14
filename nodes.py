@@ -33,6 +33,20 @@ import comfy.utils
 import folder_paths
 from comfy_execution.graph_utils import GraphBuilder
 
+try:
+    from . import boxes_rows
+except ImportError:
+    # nodes.py loaded by file, not as a package (tests/): boxes_rows.py beside it, loaded the same way under one name.
+    # Never a plain "import boxes_rows" (it depends on the working directory and could pick up another node's module).
+    import importlib.util
+    import sys
+    boxes_rows = sys.modules.get("inpaint_canvas_boxes_rows")
+    if boxes_rows is None:
+        _spec = importlib.util.spec_from_file_location("inpaint_canvas_boxes_rows", os.path.join(os.path.dirname(os.path.abspath(__file__)), "boxes_rows.py"))
+        boxes_rows = importlib.util.module_from_spec(_spec)
+        sys.modules["inpaint_canvas_boxes_rows"] = boxes_rows
+        _spec.loader.exec_module(boxes_rows)
+
 SUBFOLDER = "inpaint_canvas"
 # Pillow refuses images above ~89 megapixels as "decompression bombs"; the editor's images are the
 # user's own files, so allow up to 20000 x 20000 (400 MP). Beyond that Pillow still raises.
