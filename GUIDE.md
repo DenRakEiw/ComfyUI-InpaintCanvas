@@ -62,6 +62,13 @@ The fx button in the Layers header adds a filter layer. It filters everything be
 
 The Prompt field is the node's `prompt` output. **Upsample** (Ctrl+U) rewrites it with a local vision-language model (Qwen3-VL) or Gemini, looking at the crop with the selection marked. The use case (auto, edit, fill, add, remove, outpaint) decides the shape of the text: an edit instruction for Flux.2 / Kontext by default. Revert puts the old prompt back.
 
+## Boxes for FLUX 3
+
+- The **Boxes** tool (X) draws boxes FLUX 3 reads: drag to draw, click to select, double-click to describe, drag to move, the handles resize; Delete removes the selected box, D duplicates it, the arrows nudge it. The Generate pane's **Boxes** section lists them with their id, kind (New, Text, Keep, Move, Remove, From reference) and description.
+- The **Boxes** switch under the prompt sends them (the first box turns it on); without a box the selection goes as one box described by the prompt.
+- The node's **`box_prompt`** output carries the prompt, a sentence per box and FLUX 3's JSON rows, measured in the crop it sends: wire it into the prompt of a FLUX 3 node and `crop_image` whole into its first image. Without boxes it is the plain prompt. **`elements`** carries the New and Text boxes for a `bounding_boxes` input on a new image; never wire both into one node on an edit.
+- Boxes left out (outside the crop, a reference that did not load) are named in the status line and the console.
+
 ## Generate
 
 - **API / Local** switch: only the chain of the chosen mode runs; a paid API node stays idle while you work locally. Both modes have their own result input.
@@ -86,7 +93,7 @@ The **Export** section in the Image tab and the Save button (Ctrl+S) write the v
 
 - Wheel zooms, Space or the middle mouse pans, F fits, 1 shows 100 %, 4 / 6 rotate the view, 5 resets. Rulers (Ctrl+Shift+R, drag guides out of them), grid (Ctrl+Shift+G) and before / after (hold \) are in the top bar.
 - Undo Ctrl+Z, redo Ctrl+Shift+Z. Clear selection Ctrl+D, invert Ctrl+I, fill the selection Shift+F, generate Ctrl+Enter, save Ctrl+S.
-- Tools: B R L O D P E T H C I G S J W Q, with Shift for the second tool of a group (Shift+R ellipse, Shift+L polygon, Shift+G gradient, Shift+S smudge, Shift+T text). The tool column groups related tools: left-click picks the shown tool, right-click, holding or the small triangle opens the group.
+- Tools: B R L O D P E T H C I G S J W Q X, with Shift for the second tool of a group (Shift+R ellipse, Shift+L polygon, Shift+G gradient, Shift+S smudge, Shift+T text). The tool column groups related tools: left-click picks the shown tool, right-click, holding or the small triangle opens the group.
 
 ## Driving the editor from an agent
 

@@ -65,7 +65,8 @@ Environment: `COMFYUI_URL` (default `http://127.0.0.1:8188`), `INPAINT_CANVAS_NO
 | Look | `inpaint_status`, `list_nodes`, `list_layers`, `screenshot` (JPEG of the composite, selection tinted, optional layer frames), `get_state` |
 | Image | `load_image`, `new_canvas`, `add_image_layer` (image or reference), `extend_canvas` (grow for outpainting, negative crops) |
 | Selection | `select_rect`, `select_by_text` (SAM3), `select_all`, `select_none`, `select_invert`, `select_feather`, `select_grow`, `select_from_layer` |
-| Generate | `set_prompt`, `set_generation` (api/local, seed, denoise), `set_crop`, `upsample_prompt`, `generate` (waits for the result layer) |
+| Generate | `set_prompt`, `set_generation` (api/local, seed, denoise, the Boxes switch), `set_crop`, `upsample_prompt`, `generate` (waits for the result layer) |
+| Boxes (FLUX 3) | `boxes_list`, `boxes_add`, `boxes_set`, `boxes_remove`, `boxes_from_selection`, `boxes_clear`: the boxes the node writes into its `box_prompt` output |
 | Layers | `set_layer` (visibility, opacity, blend, **colour match**, role, position, size), `set_active_layer`, `remove_layer`, `duplicate_layer`, `merge_down`, `move_layer`, `flip_layer`, `center_layer`, `cutout_layer` (RMBG) |
 | Filters, text | `filter_types`, `add_filter`, `set_filter`, `add_text`, `set_text` |
 | Rest | `undo`, `redo`, `compare`, `export_image` (png/jpg/webp/psd/ora), `export_mask`, `open_editor`, `close_editor` |

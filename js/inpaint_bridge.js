@@ -102,7 +102,8 @@ export function installBridge({ api, app, viewUrl, loadImageEl, makeCanvas, FILT
         return {
             node: ed.node.id, open: !!ed.isOpen, loaded: !!ed.base, width: ed.width || 0, height: ed.height || 0,
             base: ed.base ? ed.base.ref : null, prompt: ed.promptText || "", negative: ed.negativeText || "",
-            generation: { mode: ed.genSettings.mode, seed: ed.genSettings.seed, seed_random: !!ed.genSettings.seedRandom, denoise: ed.genSettings.denoise },
+            generation: { mode: ed.genSettings.mode, seed: ed.genSettings.seed, seed_random: !!ed.genSettings.seedRandom, denoise: ed.genSettings.denoise, boxes: !!ed.genSettings.boxes },
+            boxes: ed.boxes ? { switch: !!ed.genSettings.boxes, count: ed.boxes.list().length, ids: ed.boxes.list().map((b) => b.id) } : null,
             crop: { ...ed.cropSettings }, selection: bounds(ed), active_layer: ed.activeLayerId,
             layers: ed.layers.map((l) => layerSummary(ed, l)), results: results.length, history: ed.history.length,
             pending: { segment: !!ed.segmentPending, cutout: !!ed.cutoutPending, upsample: !!ed.upsamplePending, transform: !!ed.pending },
@@ -196,9 +197,11 @@ export function installBridge({ api, app, viewUrl, loadImageEl, makeCanvas, FILT
             if (a.seed_random != null) g.seedRandom = !!a.seed_random;
             if (a.denoise != null) g.denoise = Math.min(1, Math.max(0.05, +a.denoise || 1));
             if (a.refine != null) g.refine = !!a.refine;
+            if (a.boxes != null) g.boxes = !!a.boxes;
             if (ed.syncGenControls) ed.syncGenControls();
-            ed.renderInfo(); ed.notifyChanged();
-            return { mode: g.mode, seed: g.seed, seed_random: !!g.seedRandom, denoise: g.denoise, refine: !!g.refine };
+            if (ed.syncBoxesRow) ed.syncBoxesRow();
+            ed.renderInfo(); ed.notifyChanged(); ed.draw();
+            return { mode: g.mode, seed: g.seed, seed_random: !!g.seedRandom, denoise: g.denoise, refine: !!g.refine, boxes: !!g.boxes };
         },
         async set_crop(ed, a) {
             const allowed = ["context", "feather", "fill", "colorMatch", "extendFill", "withOriginal", "align", "paste"];
@@ -431,7 +434,64 @@ export function installBridge({ api, app, viewUrl, loadImageEl, makeCanvas, FILT
             return { width: w, height: h, scale: s, image_width: src.w, image_height: src.h, mime: "image/jpeg", data: url.slice(url.indexOf(",") + 1) };
         },
         async get_state(ed) { const v = JSON.parse(ed.getValue() || "{}"); delete v.selection; delete v.selections; return v; },
+
+        // ---- boxes for FLUX 3: the editor's own Boxes (js/inpaint_boxes.js), written by nodes.py into box_prompt ----
+        async boxes_list(ed) {
+            const bx = requireBoxes(ed);
+            return { boxes: bx.list().map((b) => ({ ...b })), count: bx.list().length, switch: !!ed.genSettings.boxes };
+        },
+        async boxes_add(ed, a) {
+            requireImage(ed);
+            const bx = requireBoxes(ed);
+            const b = bx.add(boxInput(a));
+            const on = bx.takeSwitchNote();
+            ed.draw();
+            return { ...b, ...(on ? { switched_on: true } : {}) };
+        },
+        async boxes_set(ed, a) {
+            const bx = requireBoxes(ed);
+            if (a.id == null || a.id === "") throw new Error("id missing: the box to change (boxes_list gives them)");
+            const patch = boxInput(a);
+            delete patch.id;
+            if (a.new_id != null) patch.id = String(a.new_id);
+            const b = bx.set(String(a.id), patch);
+            ed.draw();
+            return { ...b };
+        },
+        async boxes_remove(ed, a) {
+            const bx = requireBoxes(ed);
+            if (a.id == null || a.id === "") throw new Error("id missing: the box to remove");
+            bx.remove(String(a.id));
+            ed.draw();
+            return { removed: String(a.id), count: bx.list().length };
+        },
+        async boxes_from_selection(ed, a) {
+            requireImage(ed);
+            const bx = requireBoxes(ed);
+            const b = bx.fromSelection({ id: a.id || undefined, desc: a.desc != null ? String(a.desc) : undefined });
+            const on = bx.takeSwitchNote();
+            ed.draw();
+            return { ...b, ...(on ? { switched_on: true } : {}) };
+        },
+        async boxes_clear(ed) {
+            const bx = requireBoxes(ed);
+            const n = bx.clear();
+            ed.draw();
+            return { removed: n };
+        },
     };
+
+    function requireBoxes(ed) {
+        if (!ed.boxes) throw new Error("this editor has no Boxes (an editor build from before the box prompt): update the node");
+        return ed.boxes;
+    }
+
+    /** A box command's fields as the editor's model takes them (unknown keys dropped). */
+    function boxInput(a) {
+        const out = {};
+        for (const k of ["id", "kind", "rect", "src", "layer", "desc", "text"]) if (a[k] !== undefined) out[k] = a[k];
+        return out;
+    }
 
     /** Whether the frontend finished starting: Vue mounted, no loading overlay. The persisted workflow is
      *  restored right after that, so a caller should also wait until the node count stops changing. */

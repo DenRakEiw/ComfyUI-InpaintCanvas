@@ -12,6 +12,20 @@ import { InpaintEditor, viewUrl, loadImageEl, makeCanvas, FIXED_OUTPUTS, SETTING
 import { FILTERS, filterDefaults } from "./inpaint_filters.js";
 import { installBridge } from "./inpaint_bridge.js";
 
+/**
+ * The graph node of a prompt's node id: "7" in the root graph, "92:7" for a node inside the subgraph node 92 (each part
+ * looked up in the subgraph of the node before it). Not yet seen against a live subgraph (docs/PLAN_NODE_BOXES.md §8 in
+ * the scumble repo).
+ */
+function graphNodeOf(id) {
+    let g = app.graph, n = null;
+    for (const part of String(id).split(":")) {
+        n = g && (g.getNodeById(+part) || g.getNodeById(part));
+        g = n && n.subgraph;
+    }
+    return n;
+}
+
 // ---------------------------------------------------------------------------
 // extension registration
 // ---------------------------------------------------------------------------
@@ -127,6 +141,12 @@ app.registerExtension({
             const onExecuted = nodeType.prototype.onExecuted;
             nodeType.prototype.onExecuted = function (output) {
                 onExecuted?.apply(this, arguments);
+                // nodes.py's notes on the boxes it left out or could not write (box_prompt, docs/PLAN_NODE_BOXES.md D9)
+                const notes = output && Array.isArray(output.inpaint_boxes) ? output.inpaint_boxes.filter((n) => typeof n === "string" && n) : [];
+                if (notes.length && this.inpaintEditor) {
+                    console.warn("Inpaint Canvas: boxes:", notes);
+                    this.inpaintEditor.setStatus("Boxes: " + notes.join(" "), "warn");
+                }
                 if (output && output.inpaint_result && this.inpaintEditor) {
                     this.inpaintEditor.addResults(output.inpaint_result);
                 }
@@ -182,7 +202,7 @@ app.registerExtension({
                     for (const node of Object.values(output)) {
                         for (const [name, v] of Object.entries(node.inputs || {})) {
                             if (!Array.isArray(v) || v.length !== 2 || !canvasIds.has(String(v[0]))) continue;
-                            const gnode = app.graph.getNodeById(+v[0]);
+                            const gnode = graphNodeOf(v[0]);
                             const o = gnode && gnode.outputs && gnode.outputs[v[1]];
                             const ti = o ? TAIL_OUTPUTS.findIndex((t) => t.name === o.name) : -1;
                             if (ti >= 0) node.inputs[name] = [v[0], FIXED_OUTPUTS + SETTING_SLOTS + ti];

@@ -445,11 +445,61 @@ def set_prompt(text: str, negative: str | None = None) -> str:
 
 @mcp.tool()
 def set_generation(mode: str | None = None, seed: int | None = None, seed_random: bool | None = None,
-                   denoise: float | None = None) -> str:
+                   denoise: float | None = None, boxes: bool | None = None) -> str:
     """Generation settings. mode: "api" (result comes back through the result input) or "local" (result_local;
     helper models are freed from VRAM before the run). seed fixes the seed and turns seed_random off.
-    denoise 0.05..1 is emitted on the node's denoise output for local chains."""
-    return _text(cmd("set_generation", {"mode": mode, "seed": seed, "seed_random": seed_random, "denoise": denoise}))
+    denoise 0.05..1 is emitted on the node's denoise output for local chains. boxes: the Boxes switch under the
+    prompt (on: the node's box_prompt output carries the boxes, or the selection as one box when there are none)."""
+    return _text(cmd("set_generation", {"mode": mode, "seed": seed, "seed_random": seed_random, "denoise": denoise, "boxes": boxes}))
+
+
+# ---- boxes for FLUX 3 (the box_prompt output) ------------------------------------------------------------------------
+
+@mcp.tool()
+def boxes_list() -> str:
+    """The boxes of the canvas (image pixels) and whether the Boxes switch is on. The node writes them into its
+    box_prompt output as FLUX 3's caption and rows, measured in the crop it sends; wire box_prompt into the prompt of a
+    FLUX 3 node and crop_image whole into its first image."""
+    return _text(cmd("boxes_list"))
+
+
+@mcp.tool()
+def boxes_add(kind: str = "new", rect: list[float] | None = None, src: list[float] | None = None, layer: str | None = None,
+              desc: str | None = None, text: str | None = None, id: str | None = None) -> str:
+    """Add a box for FLUX 3's box prompt (one undo step). The first box turns the Boxes switch on (switched_on).
+    id: lowercase words and a number (red_scarf_1); default made from the description's words.
+    kind: new (an element added in the box), keep, move, remove (an element of the picture), from (a reference
+    layer placed in the box). rect: [left, top, right, bottom] in image pixels, where the element goes (remove: where it
+    was). src: keep / move / remove: where the element is now; from: the part of the reference layer in image pixels where
+    the layer sits (omit for the whole layer). layer: from only, the reference layer (id or name). desc: what the element
+    is (at most 400 characters). text: new only, words to render in the box (a Text box)."""
+    return _text(cmd("boxes_add", {"kind": kind, "rect": rect, "src": src, "layer": layer, "desc": desc, "text": text, "id": id}))
+
+
+@mcp.tool()
+def boxes_set(id: str, kind: str | None = None, rect: list[float] | None = None, src: list[float] | None = None,
+              layer: str | None = None, desc: str | None = None, text: str | None = None, new_id: str | None = None) -> str:
+    """Change a box: only the given fields change (new_id renames it). A box still called box_1 takes its name from a
+    new description. One undo step. The fields are boxes_add's."""
+    return _text(cmd("boxes_set", {"id": id, "kind": kind, "rect": rect, "src": src, "layer": layer, "desc": desc, "text": text, "new_id": new_id}))
+
+
+@mcp.tool()
+def boxes_remove(id: str) -> str:
+    """Remove a box. One undo step."""
+    return _text(cmd("boxes_remove", {"id": id}))
+
+
+@mcp.tool()
+def boxes_from_selection(desc: str | None = None, id: str | None = None) -> str:
+    """The selection's bounds as a New box described by the prompt (or desc). One undo step."""
+    return _text(cmd("boxes_from_selection", {"desc": desc, "id": id}))
+
+
+@mcp.tool()
+def boxes_clear() -> str:
+    """Remove every box. One undo step."""
+    return _text(cmd("boxes_clear"))
 
 
 @mcp.tool()

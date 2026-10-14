@@ -64,9 +64,8 @@ A compact English manual for a Note node or a text display lives in
 
 ## Installation
 
-Inpaint Canvas is not in the ComfyUI Manager's list yet. Once it is, you can
-install it there by searching for Inpaint Canvas. Until then, clone the
-repository into ComfyUI's `custom_nodes` folder:
+Install it from the ComfyUI Manager by searching for Inpaint Canvas, or clone
+the repository into ComfyUI's `custom_nodes` folder:
 
 ```bash
 cd ComfyUI/custom_nodes
@@ -161,7 +160,14 @@ ComfyUI, open the editor, load an image and press Generate.
   32 GB card see the VRAM notes under *Generate* below: the helper models
   are freed before a local run.
 
-Both graphs carry the guide as a note. The editor state in the examples is
+- [`inpaint_canvas_flux3_boxes.json`](examples/inpaint_canvas_flux3_boxes.json):
+  boxes for **FLUX 3** (see *Boxes for FLUX 3* below): `box_prompt` goes into
+  the prompt of ComfyUI's **Flux 3 Image** API node, `crop_image` whole into
+  its first image (`images.image_1`), `aspect_ratio` on auto, and the image
+  comes back into `result`. Needs ComfyUI API credits. Not yet loaded in a
+  real ComfyUI: check the links after dropping it in.
+
+The graphs carry the guide as a note. The editor state in the examples is
 empty, so the node shows "No image" until you load one.
 
 ## The editor
@@ -423,6 +429,45 @@ requests occasionally lose a word, so read the result), Qwen3-VL 4B
 (downloaded on first use, about 8 GB, better at *remove* and at translating),
 or Gemini through ComfyUI's API node.
 
+### Boxes for FLUX 3
+
+FLUX 3 reads boxes in the prompt: where a new element goes, which element
+stays, moves or goes, and which reference picture (or a part of it) is placed
+where. Draw them with the **Boxes** tool (X): drag to draw a box, click to
+select it, double-click to describe it, drag to move, the handles resize;
+Delete removes the selected box, D duplicates it, the arrows nudge it (Shift
+10 px), Alt+click picks a box under another. The **Boxes** section of the
+Generate pane lists them: each row has the box's id (the name the prompt can
+use as `<id>`), its kind and its description.
+
+| Kind           | What it says                                                     |
+| -------------- | ---------------------------------------------------------------- |
+| New            | what the description says goes in the box                        |
+| Text           | the words are rendered in the box (the description: how they look) |
+| Keep           | the element in the box stays where it is                         |
+| Move           | the element moves from its source box to this one                |
+| Remove         | the element is taken out, the background filled                  |
+| From reference | a reference layer (or a part of it) is placed in the box         |
+
+The **Boxes** switch under the prompt sends them; the first box turns it on.
+With the switch on and no box, the selection goes as one box described by the
+prompt. The node writes them into its **`box_prompt`** output: the prompt, a
+sentence per box saying what goes where (named as `<id>`), then FLUX 3's JSON
+rows, measured in the crop it actually sends. Wire `box_prompt` into the prompt
+of a FLUX 3 node and `crop_image` **whole** into its first image: the crop is
+`ref_image_0`, the untouched crop (Original) the next picture when it goes, then
+the reference layers. A box outside the crop, a reference that did not load or
+a prompt over 15000 characters is left out or reported: the notes show in the
+editor's status line and in ComfyUI's console. Without boxes `box_prompt` is the
+plain prompt, so it is safe to wire.
+
+**`elements`** carries the New and Text boxes as bounding-box elements for a
+Flux 3 Image node's `bounding_boxes` input on a new image, a Create Bounding
+Boxes preview or a JSON prompt builder. On an edit wire `box_prompt` instead,
+never both into one node: the rows would go twice. **Copy rows** puts the rows,
+measured against the whole picture, on the clipboard (a page served over plain
+http from another machine has no clipboard: wire `box_prompt` there).
+
 ### Generate: API or local, denoise, seed, refine
 
 **VRAM and the helper models.** Select by text, object selection, cutouts
@@ -599,6 +644,7 @@ and files stay.
 | Ctrl+Shift+R, Ctrl+Shift+G   | rulers, grid                             |
 | \ (hold)                    | before / after: the base without layers  |
 | Shift+T, C                   | text tool, canvas tool                   |
+| X                            | Boxes tool (FLUX 3's box prompt); on a selected box Delete removes it, D duplicates it, the arrows nudge it |
 | `[` `]`                      | brush size                               |
 | Ctrl+Z, Ctrl+Shift+Z, Ctrl+Y | undo, redo                               |
 | Ctrl+D, Ctrl+I               | clear, invert selection                  |
@@ -682,9 +728,12 @@ Outputs
 | `control_image`              | control layers on black, aligned with `crop_image` (black if none)      |
 | `denoise` / `seed` / `mode`  | the Generate settings (`mode` is "api" or "local")                      |
 | `setting_1` ... `setting_8`  | wildcard outputs driven from the editor's Settings section              |
+| `box_prompt`                 | the prompt with FLUX 3's box sentences and JSON rows (*Boxes for FLUX 3*); the plain prompt without boxes |
+| `elements`                   | the New and Text boxes as bounding-box elements (`ARRAY`, for a `bounding_boxes` input on a new image) |
 
 Only ever appended, so saved workflows keep working. The node shows only the
-connected setting slots plus one free one. (A `reference_images` output
+connected setting slots plus one free one, then `box_prompt` and `elements`
+(the frontend maps them to the backend's slots after `setting_8`). (A `reference_images` output
 existed for a few hours on 2026-09-05; references now ride in `crop_image`,
 and the old output is removed from loaded workflows.)
 
