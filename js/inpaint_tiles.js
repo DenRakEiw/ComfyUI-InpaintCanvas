@@ -35,6 +35,7 @@
  * - No module-level side effects: nothing touches the page until pixels are made.
  */
 
+import { CANVAS_MAX_PIXELS, CANVAS_MAX_SIDE } from "./inpaint_sizelimit.js";
 import { LayerPixels, MaskPixels, pixelRect, WHOLE_CANVAS_OPS, BLIT_MARGIN } from "./inpaint_pixels.js";
 import { mipChain, mipChainBytes, clampExtend, compositeTile, resampleBlock } from "./px/kernels.js";
 import { allocTileBytes, isShared } from "./inpaint_arena.js";
@@ -46,10 +47,8 @@ export const TILE_SIZE = 256;
 const TILE_BYTES = TILE_SIZE * TILE_SIZE * 4;
 /** 65,536 tiles a side: the key is (ty << 16) | tx. */
 export const TILE_MAX_SIDE = 16777216;
-/** Chromium's canvas area limit: a scratch or a materialised canvas above it cannot exist. */
-export const CANVAS_MAX_PIXELS = 268435456;
-/** Chromium's canvas side limit: a canvas of 65,536 px a side exists but draws and reads nothing (measured). */
-export const CANVAS_MAX_SIDE = 65535;
+// Chromium's canvas limits (a scratch or a materialised canvas above them cannot exist), one source for every module
+export { CANVAS_MAX_PIXELS, CANVAS_MAX_SIDE };
 /** Region canvases kept per pixels object: the screen's level and the navigator's. */
 const REGION_LEVELS = 2;
 /** The key of the one region canvas kept besides them, for reads that are not for the screen (C6 c1 review). */

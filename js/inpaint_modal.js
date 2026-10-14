@@ -48,8 +48,21 @@ export function buildEditorModal(ed) {
     root.appendChild(body);
 
     const bottom = el("div", "ipc-bottom");
-    ed.statusEl = el("span", null, ed.status);
+    ed.statusEl = el("span", "ipc-statusline", ed.status);
+    // a line set before the window was built keeps its colour (it has blinked already, unseen)
+    if (ed.statusKind) ed.statusEl.classList.add("ipc-status-error");
     bottom.appendChild(ed.statusEl);
+    // the run's bar beside the line (docs/PLAN_0_1_48.md S3): a sibling, so setStatus never wipes it
+    ed.runEl = el("span", "ipc-run");
+    ed.runEl.hidden = true;
+    const track = el("span", "ipc-run-track");
+    ed.runFill = el("span", "ipc-run-fill");
+    track.appendChild(ed.runFill);
+    ed.runLabel = el("span", "ipc-run-label");
+    ed.runEl.appendChild(track);
+    ed.runEl.appendChild(ed.runLabel);
+    bottom.appendChild(ed.runEl);
+    if (ed.runProgress) ed.runProgress.render();
     bottom.appendChild(el("span", "ipc-kbd", host.overlay ? "Wheel: zoom · Space/middle: pan · [ ]: size · Esc: close" : "Wheel: zoom · Space/middle: pan · [ ]: size · Ctrl+Enter: generate"));
     root.appendChild(bottom);
 

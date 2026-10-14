@@ -393,7 +393,9 @@ export async function readPsd(input, { inflate = null } = {}) {
     if (fillOpa) notes.push(`fill opacity below 100 % read as 100 % (${fillOpa} layer${fillOpa > 1 ? "s" : ""})`);
     if (depth === 16) notes.push("16 bits per channel rounded to 8");
     if (empty.length && !layers.length && !composite) notes.push("no layer has pixels");
-    return { width, height, layers, groups, composite, notes };
+    // a note that says something was lost or changed (not one that says what was kept): the status line shows it red
+    const lossy = !!(adjust.length || clipped.length || blends.length || groupBlends.length || fillOpa || depth === 16 || (empty.length && !layers.length && !composite));
+    return { width, height, layers, groups, composite, notes, lossy };
 }
 
 // ---- OpenRaster -------------------------------------------------------------------------
@@ -482,5 +484,5 @@ export async function readOra(input, { inflateRaw = null } = {}) {
     if (blends.length) notes.push(`blend modes the editor lacks became normal: ${listNames(blends)}`);
     if (missing.length) notes.push(`${missing.length} layer${missing.length > 1 ? "s" : ""} without a picture left out (${listNames(missing)})`);
     if (grouped) notes.push(`${grouped} group${grouped > 1 ? "s" : ""} flattened into their layers`);
-    return { width, height, layers: found.reverse(), notes };
+    return { width, height, layers: found.reverse(), notes, lossy: !!(blends.length || missing.length || grouped) };
 }

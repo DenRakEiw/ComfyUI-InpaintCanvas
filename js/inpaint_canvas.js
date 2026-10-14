@@ -50,6 +50,9 @@ import { limitAlphaRows } from "./inpaint_limit.js";
 import { buildRangeBar } from "./inpaint_rangebar.js";
 import { BLENDS, BLEND_GROUPS, BLEND_MODES, EMULATED_BLENDS, BLEND_OPS, canvasOp, normalBlend, seedOfLayer, hash32, mul255 } from "./blend_modes.js";
 import { heightNormals, shadowMarch } from "./px/kernels.js";
+import { statusKindFor, failKind, refusal } from "./inpaint_status.js";
+import { RunProgress } from "./inpaint_progress.js";
+import { canvasSizeRefusal, CANVAS_MAX_SIDE } from "./inpaint_sizelimit.js";
 import { lightToMap, defaultLight, KELVIN_PRESETS, LIGHT_MAX, lightColorHex, LIGHT_PRESETS, SPOT_GOBOS, applyLightPreset, loraPercent, relightMapKey, relightDepthScale, relightVisKey, relightVisCurrent } from "./inpaint_relight.js";
 
 /**
@@ -1737,7 +1740,17 @@ const STYLE = `
 .ipc-cropset label { display:contents; }
 .ipc-info b { color:var(--sc-fg, #ddd); font-weight:500; }
 .ipc-bottom { padding:5px 10px; background:var(--sc-chrome, #242424); border-top:1px solid var(--sc-chrome-edge, #0d0d0d); color:var(--sc-muted, #999); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; display:flex; }
-.ipc-kbd { color:var(--sc-faint, #777); margin-left:auto; }
+.ipc-kbd { color:var(--sc-faint, #777); margin-left:auto; min-width:0; overflow:hidden; text-overflow:ellipsis; flex-shrink:1000; }
+.ipc-statusline.ipc-status-error, .ipc-node .ipc-status.ipc-status-error { color:var(--sc-error, #e0533d); }
+.ipc-status-blink { animation:ipc-status-blink .6s ease-in-out 5; }
+.ipc-statusline { min-width:0; overflow:hidden; text-overflow:ellipsis; }
+.ipc-run { display:flex; align-items:center; gap:6px; flex:none; margin-left:12px; color:var(--sc-muted, #999); }
+.ipc-run-track { position:relative; width:96px; height:4px; border-radius:2px; overflow:hidden; background:var(--sc-line, #333); }
+.ipc-run-fill { position:absolute; left:0; top:0; bottom:0; width:0; border-radius:2px; background:var(--sc-active, #4a90d9); transition:width .25s linear; }
+.ipc-run-busy .ipc-run-fill { width:30%; animation:ipc-run-busy 1.4s ease-in-out infinite; }
+@keyframes ipc-run-busy { 0% { left:-30%; } 100% { left:100%; } }
+@keyframes ipc-status-blink { 50% { opacity:.2; } }
+@media (prefers-reduced-motion: reduce) { .ipc-status-blink { animation:none; } .ipc-run-fill { transition:none; } .ipc-run-busy .ipc-run-fill { animation:none; left:0; width:100%; opacity:.45; } }
 .ipc-view.ipc-scale-x { cursor:ew-resize; }
 .ipc-view.ipc-scale-y { cursor:ns-resize; }
 .ipc-view.ipc-rotate { cursor:alias; }
@@ -2183,6 +2196,9 @@ class InpaintEditor {
         try { selDisplay = localStorage.getItem("ipc.selectionDisplay") || "ants"; } catch (_) { /* no storage */ }
         this.selectionDisplay = selDisplay === "tint" ? "tint" : "ants";   // marching ants (default) or red tint
         this.status = "No image loaded.";
+        this.statusKind = "";
+        // the status row's bar: the hosts feed it the runs of this document (docs/PLAN_0_1_48.md S3)
+        this.runProgress = new RunProgress((s) => this.renderRunProgress(s));
         this.isOpen = false;
 
         injectStyle();
@@ -2904,7 +2920,7 @@ class InpaintEditor {
             this.pending = null;
             this.updateSubbar();
             this.setTextAngle(layer, textTotalAngle(layer.text) + p.angle * 180 / Math.PI, { label }).then((ok) => {
-                if (ok) this.setStatus(`${layer.name}: turned to ${Math.round(textTotalAngle(layer.text) * 10) / 10}°, still editable.`);
+                if (ok) this.setStatus(`${layer.name}: turned to ${Math.round(textTotalAngle(layer.text) * 10) / 10}°, still editable.`, "info");
                 else this.draw();   // refused (a locked layer): the preview goes
             });
             return;
@@ -2967,7 +2983,7 @@ class InpaintEditor {
         this.updateSubbar();
         this.draw();
         this.setStatus((madePixels ? `${layer.name} is pixels now: a ${p.mode} cannot be kept as text (Ctrl+Z brings the text back).`
-            : `${layer.name}: ${p.mode} applied (${bw} × ${bh}).`) + maskNote);
+            : `${layer.name}: ${p.mode} applied (${bw} × ${bh}).`) + maskNote, "info");
     }
 
     open() {
@@ -3361,10 +3377,49 @@ class InpaintEditor {
         });
     }
 
-    setStatus(text) {
+    /**
+     * The status line. `opts` gives its kind: "error" or "warn" (red, five blinks, then steady red until the next
+     * line; no blink under reduced motion), "info" (plain whatever the text says), or { kind }; left out, the text
+     * decides (inpaint_status.js statusKindOf). `status` stays the plain text, `statusKind` the kind ("" for a plain line).
+     */
+    setStatus(text, opts) {
+        const kind = statusKindFor(text, opts);
         this.status = text;
-        if (this.statusEl) this.statusEl.textContent = text;
-        if (this.nodeStatus) this.nodeStatus.textContent = text;
+        this.statusKind = kind;
+        for (const node of [this.statusEl, this.nodeStatus]) {
+            if (!node) continue;
+            // the same line again while it still blinks (a caller that repeats itself) keeps its blink going
+            const again = kind && node.textContent === String(text) && node.classList.contains("ipc-status-blink");
+            node.textContent = text;
+            node.classList.toggle("ipc-status-error", !!kind);
+            if (again) continue;
+            node.classList.remove("ipc-status-blink");
+            if (!kind) continue;
+            // the five pulses are over: drop the class, or a hidden tab shown again (display: none and back) would blink anew
+            if (!node._blinkEnds) {
+                node._blinkEnds = true;
+                node.addEventListener("animationend", (e) => { if (e.animationName === "ipc-status-blink") node.classList.remove("ipc-status-blink"); });
+            }
+            // every error line blinks anew, the same text after its blink too: the class comes back after a style flush
+            void node.offsetWidth;
+            node.classList.add("ipc-status-blink");
+        }
+    }
+
+    /**
+     * The status row's bar from a RunProgress state (null: hidden): the fill at the fraction, or a busy sweep without
+     * one (still under reduced motion), and the label beside it (the node k of n, a sampler's step, the seconds).
+     */
+    renderRunProgress(s) {
+        const box = this.runEl;
+        if (!box) return;
+        box.hidden = !s;
+        if (!s) return;
+        const busy = s.fraction == null;
+        box.classList.toggle("ipc-run-busy", busy);
+        this.runFill.style.width = busy ? "" : `${Math.round(Math.max(0, Math.min(1, s.fraction)) * 1000) / 10}%`;
+        if (this.runLabel.textContent !== s.label) this.runLabel.textContent = s.label;
+        box.title = s.label;
     }
 
     /** Hardness of the tool in use: the eraser has its own, softer default. */
@@ -4697,7 +4752,7 @@ class InpaintEditor {
         this.compare = { a: res[res.length - 2].id, b: res[res.length - 1].id, split: 0.5 };
         if (this.compareBtn) this.compareBtn.classList.add("ipc-on");
         this.draw();
-        this.setStatus(`Comparing A (${res[res.length - 2].name}, left) and B (${res[res.length - 1].name}, right). Drag the divider; Ctrl / Shift+click a history thumbnail changes A / B; Esc ends it.`);
+        this.setStatus(`Comparing A (${res[res.length - 2].name}, left) and B (${res[res.length - 1].name}, right). Drag the divider; Ctrl / Shift+click a history thumbnail changes A / B; Esc ends it.`, "info");
     }
 
     /** Edit a text layer right on the canvas: a transparent text box over the layer, the layer renders live. */
@@ -4895,7 +4950,7 @@ class InpaintEditor {
     flipLayer(axis) {
         const l = this.activeLayer();
         if (!l || l.kind === "filter") { this.setStatus("Select a pixel layer to flip."); return; }
-        if (this.isLocked(l)) { this.setStatus(`${l.name} is locked.`); return; }
+        if (this.isLocked(l)) { this.setStatus(`${l.name} is locked.`, "info"); return; }
         if (this.pending) this.cancelPending();
         const op = axis === "h" ? "h" : "v";
         const label = axis === "h" ? "Flip horizontally" : "Flip vertically";
@@ -4910,7 +4965,7 @@ class InpaintEditor {
         }
         this.markLayerChanged(l);
         this.renderLayers(); this.draw();
-        this.setStatus(`${l.name} flipped ${axis === "h" ? "horizontally" : "vertically"}.`);
+        this.setStatus(`${l.name} flipped ${axis === "h" ? "horizontally" : "vertically"}.`, "info");
     }
 
     /**
@@ -4958,7 +5013,7 @@ class InpaintEditor {
             "fit out of range": "the fit found is too large to be a drift (over 8 % scale or 5 % shift)", "no gain": "it already sits as well as a fit can put it",
             "no fit found": "no fit was found" }[r.reason] || r.reason;
         if (!r.aligned) {
-            this.setStatus(`${l.name}: edges not matched, ${what}. Nudge it with the move tool if it is still off.`);
+            this.setStatus(`${l.name}: edges not matched, ${what}. Nudge it with the move tool if it is still off.`, r.reason === "no gain" ? "info" : "warn");
             return out;
         }
         if (!apply) return out;
@@ -4973,13 +5028,13 @@ class InpaintEditor {
         } else {
             if (l.kind === "text" && l.text) {
                 out.aligned = false; out.reason = "text layer";
-                this.setStatus(`${l.name}: a fit was found (${scaleNote}moved ${out.centre[0]}, ${out.centre[1]} px) but a text layer can only be moved by whole pixels; turn it into pixels first or nudge it by hand.`);
+                this.setStatus(`${l.name}: a fit was found (${scaleNote}moved ${out.centre[0]}, ${out.centre[1]} px) but a text layer can only be moved by whole pixels; turn it into pixels first or nudge it by hand.`, "info");
                 return out;
             }
             const pw = l.px.width, ph = l.px.height;
             if (pw > 65535 || ph > 65535 || pw * ph > 268435456) {
                 out.aligned = false; out.reason = "too large";
-                this.setStatus(`${l.name} is ${pw} × ${ph} px, more than one canvas holds: its edges cannot be resampled.`);
+                this.setStatus(`${l.name} is ${pw} × ${ph} px, more than one canvas holds: its edges cannot be resampled.`, "warn");
                 return out;
             }
             // the inverse: where an old layer point lands
@@ -5012,7 +5067,7 @@ class InpaintEditor {
             this.renderLayers(); this.updateSubbar(); this.draw();
             out.how = "resampled";
         }
-        this.setStatus(`${l.name}: edges matched to the picture below (moved ${out.centre[0]}, ${out.centre[1]} px, ${scaleNote}edge difference ${out.before} → ${out.after}). Ctrl+Z takes it back; the move tool nudges it by hand.`);
+        this.setStatus(`${l.name}: edges matched to the picture below (moved ${out.centre[0]}, ${out.centre[1]} px, ${scaleNote}edge difference ${out.before} → ${out.after}). Ctrl+Z takes it back; the move tool nudges it by hand.`, "info");
         return out;
     }
 
@@ -5064,7 +5119,7 @@ class InpaintEditor {
     rotateLayer90(dir) {
         const l = this.activeLayer();
         if (!l || l.kind === "filter") { this.setStatus("Select a pixel layer to rotate."); return; }
-        if (this.isLocked(l)) { this.setStatus(`${l.name} is locked.`); return; }
+        if (this.isLocked(l)) { this.setStatus(`${l.name} is locked.`, "info"); return; }
         if (this.pending) this.cancelPending();
         const label = dir === 1 ? "Rotate 90° clockwise" : "Rotate 90° counter-clockwise";
         // a text layer keeps the turn in its description (the next edit renders it turned), which only a "layers" step holds
@@ -5081,7 +5136,7 @@ class InpaintEditor {
         l.x = Math.round(cx - l.w / 2); l.y = Math.round(cy - l.h / 2);
         this.markLayerChanged(l);
         this.renderLayers(); this.updateSubbar(); this.draw();
-        this.setStatus(`${l.name} rotated 90° ${dir > 0 ? "clockwise" : "counter-clockwise"}.`);
+        this.setStatus(`${l.name} rotated 90° ${dir > 0 ? "clockwise" : "counter-clockwise"}.`, "info");
     }
 
     /** (ix, iy) in a layer's un-rotated frame: the inverse rotation about its centre (or a given one). */
@@ -5233,7 +5288,7 @@ class InpaintEditor {
         } catch (err) {
             if (!pushed && before) this.releaseSnapshot(before);
             console.error(err);
-            this.setStatus(String(err.message || err));
+            this.setStatus(String(err.message || err), failKind(err));
             return false;
         } finally {
             this._turning = false;
@@ -5427,10 +5482,12 @@ class InpaintEditor {
         const deg = normDeg(+angle || 0);
         const W = this.width, H = this.height;
         let frame = [x, y, w, h].every((v) => v !== null && v !== undefined && Number.isFinite(+v)) ? [x, y, w, h].map((v) => Math.round(+v)) : autoCropFrame(W, H, deg, W / H);
-        if (!(frame[2] >= 8 && frame[3] >= 8)) { this.setStatus("The frame would be smaller than 8 px."); return false; }
+        if (!(frame[2] >= 8 && frame[3] >= 8)) { this.setStatus("The frame would be smaller than 8 px.", "warn"); return false; }
         if (!deg && frame[0] === 0 && frame[1] === 0 && frame[2] === W && frame[3] === H) { this.setStatus("Nothing to straighten or crop."); return false; }
-        if (!deg && (frame[0] < 0 || frame[1] < 0 || frame[0] + frame[2] > W || frame[1] + frame[3] > H)) { this.setStatus("A frame past the picture extends the canvas: use Extend."); return false; }
-        if (deg && !frameInside(W, H, deg, ...frame)) { this.setStatus("The frame reaches past the turned picture: keep it inside when the picture is turned."); return false; }
+        if (!deg && (frame[0] < 0 || frame[1] < 0 || frame[0] + frame[2] > W || frame[1] + frame[3] > H)) { this.setStatus("A frame past the picture extends the canvas: use Extend.", "warn"); return false; }
+        if (deg && !frameInside(W, H, deg, ...frame)) { this.setStatus("The frame reaches past the turned picture: keep it inside when the picture is turned.", "warn"); return false; }
+        // a turned frame can be wider than the picture: no side past what a canvas draws (its area stays within the document's)
+        if (frame[2] > CANVAS_MAX_SIDE || frame[3] > CANVAS_MAX_SIDE) { this.setStatus(canvasSizeRefusal(frame[2], frame[3], "The straightened picture"), "warn"); return false; }
         const blocked = this.turnBlocked();
         if (blocked) { this.setStatus(blocked); return false; }
         const [fx, fy, nw, nh] = frame;
@@ -5580,7 +5637,7 @@ class InpaintEditor {
             for (const p of made) if (typeof p.release === "function") p.release();
             if (!pushed && before) this.releaseSnapshot(before);
             console.error(err);
-            this.setStatus(String(err.message || err));
+            this.setStatus(String(err.message || err), failKind(err));
             return false;
         } finally {
             this._turning = false;
@@ -5732,6 +5789,17 @@ class InpaintEditor {
             const v = { top: -f.y, right: f.x + f.w - W, bottom: f.y + f.h - H, left: -f.x };
             const pos = {}, neg = {};
             for (const k of Object.keys(v)) { pos[k] = Math.max(0, v[k]); neg[k] = Math.min(0, v[k]); }
+            // the extend comes first and is made as one canvas: refused before either step, so the crop does not go alone;
+            // a crop alone makes no such canvas (a tile document above 268 MP is cropped on its tiles)
+            const extending = Object.values(pos).some((x) => x > 0);
+            const tooBig = extending ? canvasSizeRefusal(W + pos.left + pos.right, H + pos.top + pos.bottom, "The frame's picture before its crop") : "";
+            if (tooBig) {
+                this.setStatus(tooBig, "warn");
+                this.canvasFrame = f;
+                this.syncFrameControls({ force: true });
+                this.draw();
+                return false;
+            }
             if (Object.values(pos).some((x) => x > 0)) await this.extendCanvas(pos);
             if (Object.values(neg).some((x) => x < 0)) await this.cropCanvas(neg);
             ok = this.base !== base0;
@@ -5773,7 +5841,7 @@ class InpaintEditor {
         const left = -Math.min(0, v.left || 0), top = -Math.min(0, v.top || 0);
         const right = -Math.min(0, v.right || 0), bottom = -Math.min(0, v.bottom || 0);
         const nw = W - left - right, nh = H - top - bottom;
-        if (nw < 8 || nh < 8) { this.setStatus("The canvas would be smaller than 8 px."); return; }
+        if (nw < 8 || nh < 8) { this.setStatus("The canvas would be smaller than 8 px.", "warn"); return; }
         if (!(left || top || right || bottom)) return;
         let before = null, pushed = false;
         try {
@@ -5807,7 +5875,7 @@ class InpaintEditor {
         } catch (err) {
             if (!pushed) this.releaseSnapshot(before);
             console.error(err);
-            this.setStatus(String(err.message || err));
+            this.setStatus(String(err.message || err), failKind(err));
         }
     }
 
@@ -5823,6 +5891,9 @@ class InpaintEditor {
         if (blocked) { this.setStatus(blocked); return; }
         nw = Math.round(nw); nh = Math.round(nh);
         if (!(nw >= 8 && nh >= 8) || (nw === this.width && nh === this.height)) { this.setStatus("Enter a new size."); return; }
+        // the new picture is made as one canvas (S5): refused before anything is made, not an empty base
+        const tooBig = canvasSizeRefusal(nw, nh, "The resized picture");
+        if (tooBig) { this.setStatus(tooBig, "warn"); return; }
         const W = this.width, H = this.height, sx = nw / W, sy = nh / H;
         let before = null, pushed = false;
         try {
@@ -5868,7 +5939,7 @@ class InpaintEditor {
         } catch (err) {
             if (!pushed) this.releaseSnapshot(before);
             console.error(err);
-            this.setStatus(String(err.message || err));
+            this.setStatus(String(err.message || err), failKind(err));
         }
     }
 
@@ -6109,7 +6180,7 @@ class InpaintEditor {
             if (layer && this.isLocked(layer)) { this.setStatus(`${layer.name} is locked.`); return; }
             if (layer && layer.kind === "filter") { this.setStatus("Filter layers have no pixels. Select a paint or image layer."); return; }
             if (this.quickMask || (layer && layer.maskEdit)) { this.setStatus(`${this.quickMask ? "Quick mask is on" : `The mask of ${layer.name} is being edited`}: Remove works on pixels. ${this.quickMask ? "Press Q to leave it." : "Switch the mask edit off first."}`); return; }
-            if (!host.removeModel()) { this.setStatus("Remove needs the LaMa model: download it in Settings › Helpers (in-app models)."); return; }
+            if (!host.removeModel()) { this.setStatus("Remove needs the LaMa model: download it in Settings › Helpers (in-app models).", "warn"); return; }
             if (layer && (layer.px.width !== layer.w || layer.px.height !== layer.h || layer.x !== Math.round(layer.x) || layer.y !== Math.round(layer.y))) {
                 this.setStatus(`Remove paints into a layer at its own size on whole pixels, and ${layer.name} is scaled or placed between pixels: pick another layer, or the base (Remove then paints into a new layer).`);
                 return;
@@ -9083,7 +9154,7 @@ class InpaintEditor {
             this.setStatus(`"${s.name}" ${modeWord}.`);
         } catch (err) {
             console.error(err);
-            this.setStatus("Could not load the saved selection.");
+            this.setStatus("Could not load the saved selection.", "error");
         }
     }
 
@@ -9209,7 +9280,7 @@ class InpaintEditor {
                 for (const tip of tips) { this.brushTips.push(tip); added.push(tip); }
             } catch (err) {
                 console.warn("brush import", f.name, err);
-                this.setStatus(`${f.name}: ${err.message || err}`);
+                this.setStatus(`${f.name}: ${err.message || err}`, failKind(err));
             }
         }
         if (!added.length) return added;
@@ -9218,7 +9289,7 @@ class InpaintEditor {
         this.brushTipsChanged();
         const skipped = this._tipsSkipped || 0;
         this._tipsSkipped = 0;
-        this.setStatus(`${added.length} brush tip${added.length === 1 ? "" : "s"} imported${skipped ? `, ${skipped} computed (round) tip${skipped === 1 ? "" : "s"} skipped` : ""}. Pick one under Tip.`);
+        this.setStatus(`${added.length} brush tip${added.length === 1 ? "" : "s"} imported${skipped ? `, ${skipped} computed (round) tip${skipped === 1 ? "" : "s"} skipped` : ""}. Pick one under Tip.`, skipped ? "warn" : "info");
         return added;
     }
 
@@ -9623,7 +9694,7 @@ class InpaintEditor {
         // with the plain copy its buffer holds (`patchRun`)
         const land = (out, info, where) => {
             note(where, info);
-            if (info && info[3]) { this.setStatus(`The blend did not settle here (the source splits the ${p.patch ? "patch" : "stroke"} into strands): the ${p.patch ? "plain copy" : "quick heal"} stays.`); return; }
+            if (info && info[3]) { this.setStatus(`The blend did not settle here (the source splits the ${p.patch ? "patch" : "stroke"} into strands): the ${p.patch ? "plain copy" : "quick heal"} stays.`, "warn"); return; }
             if (p.patch && p.patch.blend < 1) patchMix(out, job.stroke.data, job.mask, p.patch.blend);
             this.healWrite(p, job, out);
         };
@@ -9813,7 +9884,7 @@ class InpaintEditor {
         const X = this.selectionExtent();
         if (!X) return null;
         const w0 = X[2] - X[0], h0 = X[3] - X[1], max = InpaintEditor.healBlendMax;
-        const tooLarge = () => new Error(`${name} blends up to ${Math.round(max / 1048576)} MP of selection: ${name === "Patch" ? "patch" : "move"} it in parts.`);
+        const tooLarge = () => refusal(`${name} blends up to ${Math.round(max / 1048576)} MP of selection: ${name === "Patch" ? "patch" : "move"} it in parts.`, "warn");
         if (w0 * h0 > 2 * max) throw tooLarge();
         const d = this.sel.readRect(X[0], X[1], w0, h0).data;
         let x0 = w0, y0 = h0, x1 = -1, y1 = -1;
@@ -9846,17 +9917,18 @@ class InpaintEditor {
         const move = this.tool === "contentmove", name = move ? "Content-aware move" : "Patch";
         const mode = move ? (this.moveOpts && this.moveOpts.mode === "extend" ? "extend" : "move") : (this.patchOpts && this.patchOpts.mode === "destination" ? "destination" : "source");
         const layer = this.activeLayer();
-        let why = this.patchRefusal(layer, name), got = null;
-        if (!why && mode === "move" && !host.removeModel()) why = "Content-aware move needs the LaMa model to fill the old place: download it in Settings › Helpers (in-app models), or set Mode to Extend.";
+        // the refusal and its kind (item 45): the layer's state plain, a missing model or a size red
+        let why = this.patchRefusal(layer, name), whyKind = "info", got = null;
+        if (!why && mode === "move" && !host.removeModel()) { why = "Content-aware move needs the LaMa model to fill the old place: download it in Settings › Helpers (in-app models), or set Mode to Extend."; whyKind = "warn"; }
         if (!why) {
             // the move takes the selection as the ants show it (alpha 128 and up) and lands it whole, its band blending the
             // edge: a feathered tail taken at full strength erased and copied what was selected by a few per cent
-            try { got = this.patchExtent(name, move ? 128 : 1); } catch (err) { why = String((err && err.message) || err); }
+            try { got = this.patchExtent(name, move ? 128 : 1); } catch (err) { why = String((err && err.message) || err); whyKind = failKind(err); }
             if (!why && !got) why = `Nothing is selected to ${move ? "move" : "patch"}.`;
         }
-        if (why) { this.setStatus(why); return; }
+        if (why) { this.setStatus(why, whyKind); return; }
         const E = got.E, ew = E[2] - E[0], eh = E[3] - E[1], span = Math.max(ew, eh);
-        if (mode === "move" && span > InpaintEditor.removeMaxHole) { this.setStatus(`Content-aware move fills up to ${InpaintEditor.removeMaxHole.toLocaleString()} px across where the selection was, and this one spans ${span.toLocaleString()} px: move it in parts, or use Extend.`); return; }
+        if (mode === "move" && span > InpaintEditor.removeMaxHole) { this.setStatus(`Content-aware move fills up to ${InpaintEditor.removeMaxHole.toLocaleString()} px across where the selection was, and this one spans ${span.toLocaleString()} px: move it in parts, or use Extend.`, "warn"); return; }
         const lim = [0, 0, this.width, this.height];
         if (layer) {
             const L = [layer.x, layer.y, layer.x + layer.w, layer.y + layer.h];
@@ -9865,7 +9937,7 @@ class InpaintEditor {
             // written where it is dropped: inside the layer too
             if (mode !== "source") { lim[0] = Math.max(0, L[0]); lim[1] = Math.max(0, L[1]); lim[2] = Math.min(this.width, L[2]); lim[3] = Math.min(this.height, L[3]); }
         }
-        if (lim[2] - lim[0] < ew || lim[3] - lim[1] < eh) { this.setStatus(`The selection is larger than ${layer ? layer.name : "the picture"}: there is nowhere to ${move ? "move" : "copy"} it to.`); return; }
+        if (lim[2] - lim[0] < ew || lim[3] - lim[1] < eh) { this.setStatus(`The selection is larger than ${layer ? layer.name : "the picture"}: there is nowhere to ${move ? "move" : "copy"} it to.`, "warn"); return; }
         // the preview reads the picture as it is now; above `patchPreviewMax` only the outline follows
         let src = null, maskC = null, ghost = null;
         if (ew * eh <= InpaintEditor.patchPreviewMax) {
@@ -9978,7 +10050,7 @@ class InpaintEditor {
         let layer = this.activeLayer();
         // a key during the drag may have changed what the press checked (quick mask, the active layer)
         const why = this.patchRefusal(layer);
-        if (why) { this.setStatus(why); return; }
+        if (why) { this.setStatus(why, "info"); return; }
         const E = p.E, [dx, dy] = p.d, ew = E[2] - E[0], eh = E[3] - E[1];
         const dest = p.mode === "destination";
         const T = dest ? [E[0] + dx, E[1] + dy, E[2] + dx, E[3] + dy] : E.slice();
@@ -10036,12 +10108,12 @@ class InpaintEditor {
     moveRun(p) {
         let layer = this.activeLayer();
         const why = this.patchRefusal(layer, "Content-aware move");
-        if (why) { this.setStatus(why); return; }
+        if (why) { this.setStatus(why, "info"); return; }
         const extend = p.mode === "extend";
-        if (!extend && !host.removeModel()) { this.setStatus("Content-aware move needs the LaMa model to fill the old place: download it in Settings › Helpers (in-app models), or set Mode to Extend."); return; }
+        if (!extend && !host.removeModel()) { this.setStatus("Content-aware move needs the LaMa model to fill the old place: download it in Settings › Helpers (in-app models), or set Mode to Extend.", "warn"); return; }
         const t0 = performance.now();
         let job = null;
-        try { job = this.moveInputs(p, layer); } catch (err) { this.setStatus(String((err && err.message) || err)); return; }
+        try { job = this.moveInputs(p, layer); } catch (err) { this.setStatus(String((err && err.message) || err), failKind(err)); return; }
         if (!job) { this.setStatus("Nothing to move: the picture is clear where the selection is."); return; }
         job.whole = (this.moveOpts || {}).blend === "all";
         const made = !layer;
@@ -10111,7 +10183,7 @@ class InpaintEditor {
             this.draw();
             const unsettled = seam && seam.info && seam.info[3];
             this.setStatus(!wrote ? `Content-aware move failed: ${why}` : unsettled ? `${extend ? "Extended" : "Moved"}, but its edge did not blend here (the picture splits it into strands): the piece lands as it was.`
-                : `${extend ? "Extended" : "Moved"} ${job.pn.toLocaleString()} px (${((performance.now() - t0) / 1000).toFixed(1)} s).`);
+                : `${extend ? "Extended" : "Moved"} ${job.pn.toLocaleString()} px (${((performance.now() - t0) / 1000).toFixed(1)} s).`, !wrote ? "error" : unsettled ? "warn" : "info");
         })();
         this.removePending = done;
         this.trackEdit(done);
@@ -10291,7 +10363,7 @@ class InpaintEditor {
         const t0 = performance.now();
         let job = null;
         try { job = this.removeInputs(p); }
-        catch (err) { this.dropStroke(p); this.setStatus(String((err && err.message) || err)); return; }
+        catch (err) { this.dropStroke(p); this.setStatus(String((err && err.message) || err), failKind(err)); return; }
         if (!job) { this.dropStroke(p); this.setStatus("Nothing to remove: the stroke lies outside the selection or the picture."); return; }
         p.healing = true;
         p.op = p.layer.alphaLock ? "source-atop" : "source-over";
@@ -10327,7 +10399,7 @@ class InpaintEditor {
             // `box`: the hole's extent (image pixels, x y w h), what the crop was placed around
             this.lastRemove = { box: [job.hole[0], job.hole[1], job.hole[2] - job.hole[0], job.hole[3] - job.hole[1]], crop: job.crop.slice(), holes: job.holes, wrote, seconds: res ? res.seconds : null, provider: res ? res.provider : null, ms: Math.round(performance.now() - t0), error: why };
             this.draw();
-            this.setStatus(wrote ? `Removed (${job.holes.toLocaleString()} px in ${((performance.now() - t0) / 1000).toFixed(1)} s).` : `Remove failed: ${why}`);
+            this.setStatus(wrote ? `Removed (${job.holes.toLocaleString()} px in ${((performance.now() - t0) / 1000).toFixed(1)} s).` : `Remove failed: ${why}`, wrote ? "info" : "error");
         })();
         this.removePending = done;
         this.trackEdit(done);
@@ -10350,7 +10422,7 @@ class InpaintEditor {
         // the buffer's box is the dabs' drawing rectangles, a margin of 1.5 radii wider than what they covered: a box
         // twice the limit is refused before it is read, the hole's own extent is measured below
         const max = InpaintEditor.removeMaxHole;
-        const tooWide = (span) => new Error(`Remove fills up to ${max.toLocaleString()} px across, and this stroke spans ${span.toLocaleString()} px: remove it in parts, or select it and use Generate.`);
+        const tooWide = (span) => refusal(`Remove fills up to ${max.toLocaleString()} px across, and this stroke spans ${span.toLocaleString()} px: remove it in parts, or select it and use Generate.`, "warn");
         if (Math.max(w, h) > 2 * max) throw tooWide(Math.max(w, h));
         const stroke = s.bytes(x0, y0, w, h);
         const sa = stroke.data, cover = new Uint8Array(n), mask = new Uint8Array(n);
@@ -10409,7 +10481,7 @@ class InpaintEditor {
             if (hole[i] || bytes[4 * i + 3] !== 255) continue;
             r += bytes[4 * i]; g += bytes[4 * i + 1]; b += bytes[4 * i + 2]; k++;
         }
-        if (!k) throw new Error("The active layer holds nothing opaque around the stroke to fill from: set Remove's Sample to image.");
+        if (!k) throw refusal("The active layer holds nothing opaque around the stroke to fill from: set Remove's Sample to image.");
         r /= k; g /= k; b /= k;
         for (let i = 0, o = 0; i < n; i++, o += 4) {
             const a = bytes[o + 3] / 255;
@@ -10611,7 +10683,7 @@ class InpaintEditor {
     liquifyPress(e, ix, iy) {
         let layer = this.activeLayer();
         const why = this.liquifyRefusal(layer);
-        if (why) { this.setStatus(why); return; }
+        if (why) { this.setStatus(why, "info"); return; }
         let made = null;
         if (!layer) {
             // the base is never written: a copy of it, the layer "Liquify" directly above it, is liquified like any photo layer
@@ -10718,7 +10790,7 @@ class InpaintEditor {
         if (this.pointer) { if (this.pointer.healing) this.setStatus(this.heldWord(this.pointer)); return; }
         const layer = this.activeLayer(), liq = this.liq;
         const why = layer && this.liquifyRefusal(layer);
-        if (why) { this.setStatus(why); return; }
+        if (why) { this.setStatus(why, "info"); return; }
         if (!layer || !this.liquifyValid(liq, layer) || liq.field.empty) {
             this.setStatus("Nothing to restore: Restore all brings back the layer as this Liquify session found it (a session ends when another tool is picked).");
             return;
@@ -10962,7 +11034,7 @@ class InpaintEditor {
     liquifyInvertFreeze() {
         const layer = this.activeLayer();
         const why = this.liquifyRefusal(layer);
-        if (why || !layer) { this.setStatus(why || "Freeze works on a layer: pick one (on the base, Liquify first makes a copy of it)."); return; }
+        if (why || !layer) { this.setStatus(why || "Freeze works on a layer: pick one (on the base, Liquify first makes a copy of it).", "info"); return; }
         const fr = this.liquifyFreezeOf(layer, true), n = fr.n;
         const cx = (((fr.w - 1) >> fr.ls) + 1) >> (8 - fr.ls), cy = (((fr.h - 1) >> fr.ls) + 1) >> (8 - fr.ls);
         for (let ty = 0; ty <= cy; ty++) {
@@ -11103,7 +11175,7 @@ class InpaintEditor {
     warmRemove() {
         if (!host.removeSupported) return;
         const move = this.tool === "contentmove";
-        if (!host.removeModel()) { this.setStatus(move ? "Content-aware move needs the LaMa model to fill the old place: download it in Settings › Helpers (in-app models), or set Mode to Extend." : "Remove needs the LaMa model: download it in Settings › Helpers (in-app models)."); return; }
+        if (!host.removeModel()) { this.setStatus(move ? "Content-aware move needs the LaMa model to fill the old place: download it in Settings › Helpers (in-app models), or set Mode to Extend." : "Remove needs the LaMa model: download it in Settings › Helpers (in-app models).", "warn"); return; }
         if (this._removeWarming) return;
         // asked at every pick: the process may have been stopped (a model folder change), and a loaded one answers at once
         this._removeWarming = true;
@@ -11112,7 +11184,7 @@ class InpaintEditor {
             this._removeWarming = false;
             this._removeReady = !!(r && r.ready);
             if ((this.tool !== "remove" && this.tool !== "contentmove") || this.pointer) return;
-            this.setStatus(r && r.ready ? (this.tool === "remove" ? "LaMa is ready: brush over what should go." : "LaMa is ready: lasso the object, then drag it.") : `LaMa could not be loaded: ${(r && r.error) || "no model"}.`);
+            this.setStatus(r && r.ready ? (this.tool === "remove" ? "LaMa is ready: brush over what should go." : "LaMa is ready: lasso the object, then drag it.") : `LaMa could not be loaded: ${(r && r.error) || "no model"}.`, r && r.ready ? "info" : "warn");
         });
     }
 
@@ -11612,7 +11684,7 @@ class InpaintEditor {
             // the renderer's memory for pixels ran out part way (PixelMemoryError, inpaint_arena.js): the undo step above is
             // in, so Ctrl+Z takes back what the commit wrote, and the release goes on to mark the stroke's box
             if (!err || err.name !== "PixelMemoryError") throw err;
-            this.setStatus(err.message);
+            this.setStatus(err.message, failKind(err));
             return false;
         }
     }
@@ -12250,15 +12322,15 @@ class InpaintEditor {
 
     async segmentByText() {
         if (!this.base) { this.setStatus("Load an image first."); return; }
-        if (this.resizingRun()) { this.setStatus(RUN_GOING_TEXT); return; }
+        if (this.resizingRun()) { this.setStatus(RUN_GOING_TEXT, "info"); return; }
         let text = (this.segInput.value || "").trim();
         // Empty field but a prompt: let the language model name the object the prompt is about.
         const fromPrompt = !text && !!(this.promptText || "").trim();
         const llm = fromPrompt ? (availableUpsampleBackends().find((b) => b.id === this.upBackendSel.value) || availableUpsampleBackends()[0]) : null;
         if (!text && !fromPrompt) { this.setStatus("Type what to select, e.g. \"shirt\", or write a prompt and press Go to select what it is about."); this.segInput.focus(); return; }
-        if (fromPrompt && !llm) { this.setStatus("Type what to select: no language model nodes installed to derive it from the prompt."); this.segInput.focus(); return; }
+        if (fromPrompt && !llm) { this.setStatus("Type what to select: no language model nodes installed to derive it from the prompt.", "warn"); this.segInput.focus(); return; }
         const backend = SEGMENT_BACKENDS.find((b) => b.id === this.segBackendSel.value) || availableSegmentBackends()[0];
-        if (!backend) { this.setStatus("No segmentation nodes installed (comfyui_segment_anything or comfyui-rmbg)."); return; }
+        if (!backend) { this.setStatus("No segmentation nodes installed (comfyui_segment_anything or comfyui-rmbg).", "warn"); return; }
         try {
             this.segBtn.disabled = true;
             this.setStatus(fromPrompt ? `Asking ${llm.label} what the prompt is about, then segmenting with ${backend.label} ...` : `Segmenting "${text}" with ${backend.label} ...`);
@@ -12293,7 +12365,7 @@ class InpaintEditor {
             console.error(err);
             this.segmentPending = null;
             this.segBtn.disabled = false;
-            this.setStatus("Segmentation failed: " + (err.message || err));
+            this.setStatus("Segmentation failed: " + (err.message || err), failKind(err));
         }
     }
 
@@ -12306,7 +12378,7 @@ class InpaintEditor {
         const layerMode = this.segSourceSel && this.segSourceSel.value === "active layer";
         if (layerMode) {
             const layer = this.activeLayer();
-            if (!layer) throw new Error("no active layer: pick a layer in the list or set Source to image");
+            if (!layer) throw refusal("no active layer: pick a layer in the list or set Source to image");
             const c = makeCanvas(this.width, this.height);
             const ctx = c.getContext("2d");
             ctx.fillStyle = "#808080";
@@ -12410,7 +12482,7 @@ class InpaintEditor {
         if (!this.base) { this.setStatus("Load an image first."); return; }
         if (this.upsamplePending) { this.setStatus("Upsampling is already running."); return; }
         const backend = availableUpsampleBackends().find((b) => b.id === this.upBackendSel.value) || availableUpsampleBackends()[0];
-        if (!backend) { this.setStatus(hostText("noUpsampleBackend", "No language model: add an OpenAI, Google or Anthropic key in Settings › API providers, or install ComfyUI-QwenVL on the server.")); return; }
+        if (!backend) { this.setStatus(hostText("noUpsampleBackend", "No language model: add an OpenAI, Google or Anthropic key in Settings › API providers, or install ComfyUI-QwenVL on the server."), "warn"); return; }
         // the @img tokens (docs/PLAN_REFS.md 26d1): the request and its labels as they are now, the references it names
         let request = this.promptText || "", labels = null, refs = [];
         if (host.refTokens) {
@@ -12448,7 +12520,7 @@ class InpaintEditor {
             console.error(err);
             this.upsamplePending = null;
             this.upBtn.disabled = false;
-            this.setStatus("Upsampling failed: " + (err.message || err));
+            this.setStatus("Upsampling failed: " + (err.message || err), failKind(err));
         }
     }
 
@@ -12494,7 +12566,7 @@ class InpaintEditor {
         this.upsamplePending = null;
         this.upBtn.disabled = false;
         let text = (info.text || "").trim();
-        if (!text) { this.setStatus("The model returned an empty prompt."); return; }
+        if (!text) { this.setStatus("The model returned an empty prompt.", "error"); return; }
         let note = "";
         if (host.refTokens) {
             text = normalize(text);
@@ -12513,7 +12585,7 @@ class InpaintEditor {
         this.upRevertBtn.disabled = false;
         this.setPromptText(text);
         this.notifyChanged();
-        this.setStatus(`Prompt upsampled for "${pending.useCase}" (${text.split(/\s+/).length} words).${note ? " " + note : ""} Revert puts the old one back.`);
+        this.setStatus(`Prompt upsampled for "${pending.useCase}" (${text.split(/\s+/).length} words).${note ? " " + note : ""} Revert puts the old one back.`, note ? "warn" : "info");
     }
 
     revertPrompt() {
@@ -12531,7 +12603,12 @@ class InpaintEditor {
     async ensureObjects() {
         if (!this.base || this.objectsPending) return;
         if (this.resizingRun()) { if (this.status !== RUN_GOING_TEXT) this.setStatus(RUN_GOING_TEXT); return; }
-        if (!objectBackendAvailable()) { this.setStatus(hostText("noObjectBackend", "Object selection needs a SAM2 model: download one in Settings › Helpers, or install ComfyUI-segment-anything-2 (Kijai) on the server.")); return; }
+        if (!objectBackendAvailable()) {
+            // asked on every pointer move while the tool hovers: write (and log) the line once
+            const t = hostText("noObjectBackend", "Object selection needs a SAM2 model: download one in Settings › Helpers, or install ComfyUI-segment-anything-2 (Kijai) on the server.");
+            if (this.status !== t) this.setStatus(t, "warn");
+            return;
+        }
         this.objectsPending = { stage: "upload" };
         try {
             if (host.objectsInApp()) {
@@ -12539,7 +12616,7 @@ class InpaintEditor {
                 // PNG and upload, whose only use here was that hash (C6 c slice 6)
                 const layerMode = this.segSourceSel && this.segSourceSel.value === "active layer";
                 const layer = layerMode ? this.activeLayer() : null;
-                if (layerMode && !layer) throw new Error("no active layer: pick a layer in the list or set Source to image");
+                if (layerMode && !layer) throw refusal("no active layer: pick a layer in the list or set Source to image");
                 await host.findObjects(this, { layer });
                 return;
             }
@@ -12561,7 +12638,7 @@ class InpaintEditor {
         } catch (err) {
             console.error(err);
             this.objectsPending = null;
-            this.setStatus("Object detection failed: " + (err.message || err));
+            this.setStatus("Object detection failed: " + (err.message || err), failKind(err));
         }
     }
 
@@ -12581,7 +12658,7 @@ class InpaintEditor {
             this.applySegmentIds(ids, w, h, info.count || 0, pending);
         } catch (err) {
             console.error(err);
-            this.setStatus("Could not read the object map: " + (err.message || err));
+            this.setStatus("Could not read the object map: " + (err.message || err), failKind(err));
         }
     }
 
@@ -12709,7 +12786,7 @@ class InpaintEditor {
             this.setStatus(count ? `Selected "${term}" (${pct}% of the image, ${pending.mode}${pending.fromPrompt ? ", derived from the prompt" : ""}).` : `Nothing found for "${term}". Lower the threshold or rephrase.`);
         } catch (err) {
             console.error(err);
-            this.setStatus("Could not apply the mask: " + (err.message || err));
+            this.setStatus("Could not apply the mask: " + (err.message || err), failKind(err));
         }
     }
 
@@ -12749,7 +12826,7 @@ class InpaintEditor {
         if (this.depthPending) return this.depthPending;
         const model = host.depthModel();
         if (!model) {
-            this.setStatus("Depth estimation needs Depth Anything V2 Small: download it in Settings › Helpers.");
+            this.setStatus("Depth estimation needs Depth Anything V2 Small: download it in Settings › Helpers.", "warn");
             throw new Error("No depth model is downloaded (Settings › Helpers)");
         }
         const run = async () => {
@@ -12807,7 +12884,7 @@ class InpaintEditor {
                         });
                     } catch (err) {
                         console.error("Depth detail failed:", err);
-                        this.setStatus("Depth detail failed: " + (err.message || err));
+                        this.setStatus("Depth detail failed: " + (err.message || err), failKind(err));
                         return existing || null;
                     } finally {
                         this._depthAbort = null;
@@ -12881,7 +12958,7 @@ class InpaintEditor {
                 return map;
             } catch (err) {
                 console.error("Depth estimation failed:", err);
-                this.setStatus("Depth estimation failed: " + (err.message || err));
+                this.setStatus("Depth estimation failed: " + (err.message || err), failKind(err));
                 throw err;
             } finally {
                 this.depthPending = null;
@@ -12927,7 +13004,7 @@ class InpaintEditor {
         }
 
         if (!layerCanvas) {
-            this.setStatus("Failed to read layer pixels");
+            this.setStatus("Failed to read layer pixels", "error");
             throw new Error("Failed to read layer pixels");
         }
 
@@ -13587,6 +13664,8 @@ class InpaintEditor {
         const v = vals || this.extendValues();
         const top = Math.max(0, v.top || 0), right = Math.max(0, v.right || 0), bottom = Math.max(0, v.bottom || 0), left = Math.max(0, v.left || 0);
         if (!(top || right || bottom || left)) { this.setStatus("Enter how many pixels to add on each side (negative crops)."); return; }
+        const tooBig = canvasSizeRefusal(this.width + left + right, this.height + top + bottom, "The extended picture");
+        if (tooBig) { this.setStatus(tooBig, "warn"); return; }
         await this.relightSettled();   // the flatten below becomes the new base: relight's full shadow maps first (F2.7)
         const W = this.width, H = this.height;
         const nw = W + left + right, nh = H + top + bottom;
@@ -13671,7 +13750,7 @@ class InpaintEditor {
         } catch (err) {
             if (!pushed) this.releaseSnapshot(before);   // its selection PNG is revoked, not left behind
             console.error(err);
-            this.setStatus(String(err.message || err));
+            this.setStatus(String(err.message || err), failKind(err));
         }
     }
 
@@ -14622,7 +14701,7 @@ class InpaintEditor {
         if (failed) {
             // a step whose pixels could not be kept (its encode failed): said, not thrown at a key handler
             console.error(`Inpaint Canvas: ${word} step could not be restored`, failed);
-            this.setStatus(`That ${word} step could not be restored: ${(failed && failed.message) || failed}`);
+            this.setStatus(`That ${word} step could not be restored: ${(failed && failed.message) || failed}`, failKind(failed));
             this.releaseSnapshot(snap);
             return;
         }
@@ -14637,7 +14716,7 @@ class InpaintEditor {
             if (snap.kind === "turn") this.setStatus(`${redo ? "Redone" : "Undone"}: ${snap.label || UNDO_LABELS.turn}.`);   // the whole document changed
         } catch (err) {
             console.error(`Inpaint Canvas: ${word} step could not be restored`, err);
-            this.setStatus(`That ${word} step could not be restored: ${(err && err.message) || err}`);
+            this.setStatus(`That ${word} step could not be restored: ${(err && err.message) || err}`, failKind(err));
         } finally {
             this.releaseSnapshot(snap);
             this.scheduleDetachedRelease();   // what the restore took out of the document is in the other stack now
@@ -14882,7 +14961,7 @@ class InpaintEditor {
         const box = b ? [Math.max(0, Math.floor(b[0])), Math.max(0, Math.floor(b[1])), Math.min(this.width, Math.ceil(b[2])), Math.min(this.height, Math.ceil(b[3]))] : [0, 0, this.width, this.height];
         const w = box[2] - box[0], h = box[3] - box[1];
         if (!(w > 0 && h > 0)) { this.setStatus("The selection is empty."); return null; }
-        if (w * h > FREQ_MAX_PX) { this.setStatus(`Frequency separation works on up to ${Math.round(FREQ_MAX_PX / 1e6)} MP (this is ${Math.round(w * h / 1e5) / 10} MP): select the area first, a face or a patch of skin.`); return null; }
+        if (w * h > FREQ_MAX_PX) { this.setStatus(`Frequency separation works on up to ${Math.round(FREQ_MAX_PX / 1e6)} MP (this is ${Math.round(w * h / 1e5) / 10} MP): select the area first, a face or a patch of skin.`, "warn"); return null; }
         const r = radius > 0 ? Math.max(1, Math.min(200, Math.round(radius))) : Math.max(2, Math.round(Math.min(this.width, this.height) * 0.004));
         this.setStatus(`Frequency separation (${r} px) ...`);
         const src = await this.readBoxBytes(box, { forRun: true });
@@ -15082,7 +15161,7 @@ class InpaintEditor {
             layer.params.limit = { ...prev.limit };
             if (FILTERS[id] && FILTERS[id].over && layer.params.limit.source !== "depth") {
                 delete layer.params.limit;
-                this.setStatus("Fill layers take a depth limit only: non-depth limit dropped.");
+                this.setStatus("Fill layers take a depth limit only: non-depth limit dropped.", "warn");
             }
         }
         if (seed && id === "fill") layer.params.color = seed;
@@ -15157,7 +15236,7 @@ class InpaintEditor {
             this.setStatus(`${file.name} loaded (${lut.size}³ LUT).`);
         } catch (err) {
             console.error(err);
-            this.setStatus("Could not load the LUT: " + (err.message || err));
+            this.setStatus("Could not load the LUT: " + (err.message || err), failKind(err));
         }
     }
 
@@ -15178,7 +15257,7 @@ class InpaintEditor {
             this.setStatus(`${file.name} loaded as grain plate (${img.naturalWidth} × ${img.naturalHeight}, mean ${layer.plate.mean}, noise ${layer.plate.std}).`);
         } catch (err) {
             console.error(err);
-            this.setStatus("Could not load the plate: " + (err.message || err));
+            this.setStatus("Could not load the plate: " + (err.message || err), failKind(err));
         }
     }
 
@@ -16076,7 +16155,7 @@ class InpaintEditor {
         if (this.resizingRun()) { this.setStatus(RUN_GOING_TEXT); return false; }
         const availCut = availableCutoutBackends();
         const backend = availCut.find((b) => b.id === this.cutoutSettings.backend) || availCut[0];
-        if (!backend) { this.setStatus(hostText("noCutoutBackend", "No background removal model: download one in Settings › Helpers, or install comfyui-rmbg on the server.")); return false; }
+        if (!backend) { this.setStatus(hostText("noCutoutBackend", "No background removal model: download one in Settings › Helpers, or install comfyui-rmbg on the server."), "warn"); return false; }
         if (this.cutoutPending) { this.setStatus(`Still removing the background of ${this.cutoutPending.layer.name} ...`); return false; }
         try {
             this.cutoutPending = { layer, backend };
@@ -16102,7 +16181,7 @@ class InpaintEditor {
             console.error(err);
             this.cutoutPending = null;
             this.renderLayers();
-            this.setStatus("Background removal failed: " + (err.message || err));
+            this.setStatus("Background removal failed: " + (err.message || err), failKind(err));
             return false;
         }
     }
@@ -16118,7 +16197,7 @@ class InpaintEditor {
             await this.applyCutoutImage(img, pending);
         } catch (err) {
             console.error(err);
-            this.setStatus("Could not apply the cutout: " + (err.message || err));
+            this.setStatus("Could not apply the cutout: " + (err.message || err), failKind(err));
             if (this.cutoutPending === pending) this.cutoutPending = null;
             this.renderLayers();
         }
@@ -16151,7 +16230,7 @@ class InpaintEditor {
             return true;
         } catch (err) {
             console.error(err);
-            this.setStatus("Could not apply the cutout: " + (err.message || err));
+            this.setStatus("Could not apply the cutout: " + (err.message || err), failKind(err));
             return false;
         } finally {
             // cleared only now: the mask is applied before the row's spinner state goes away
@@ -16354,7 +16433,7 @@ class InpaintEditor {
             const l = this.layers.find((x) => x.id === id);
             if (l) {
                 const res = this.maskOp(l, op, opts);
-                if (res && typeof res.catch === "function") res.catch((err) => this.setStatus(String(err.message || err)));
+                if (res && typeof res.catch === "function") res.catch((err) => this.setStatus(String(err.message || err), failKind(err)));
             } else {
                 this.setStatus("That layer is gone.");
             }
@@ -16377,7 +16456,7 @@ class InpaintEditor {
                     if (!l) { this.setStatus("That layer is gone."); return; }
                     const src = this.maskClip ? this.layers.find((x) => x.id === this.maskClip.id) : null;
                     const res = this.maskOp(l, "from_layer", { source: src });
-                    if (res && typeof res.catch === "function") res.catch((err) => this.setStatus(String(err.message || err)));
+                    if (res && typeof res.catch === "function") res.catch((err) => this.setStatus(String(err.message || err), failKind(err)));
                 } },
                 { sep: true },
                 act("invert", "Invert mask", "invert", "What the mask shows is hidden and the other way round", !has),
@@ -16468,7 +16547,7 @@ class InpaintEditor {
         this.visibilityChanged();
         const base = want ? this.clipBaseOf(change[0]) : null;
         this.setStatus(want ? (base ? `${change.length > 1 ? `${change.length} layers` : change[0].name} clipped to ${base.name}: shown only where it is. Alt+click the line between the rows releases it.` : `${change[0].name} is clipped, but the layer below is a filter layer: the clip has no effect until a picture layer is below.`)
-            : `${change.length > 1 ? `${change.length} layers` : change[0].name} released: drawn as a layer of its own again.`);
+            : `${change.length > 1 ? `${change.length} layers` : change[0].name} released: drawn as a layer of its own again.`, want && !base ? "warn" : "info");
         return true;
     }
 
@@ -16564,7 +16643,7 @@ class InpaintEditor {
         if (layer.maskEdit && this.tool !== "paint" && this.tool !== "erase") this.setTool("paint");
         this.renderLayers();
         this.draw();
-        this.setStatus(layer.maskEdit ? `${layer.name}: editing the mask. Paint (P) reveals, erase (E) hides, Shift+F reveals the selection.` : `${layer.name}: editing pixels again.`);
+        this.setStatus(layer.maskEdit ? `${layer.name}: editing the mask. Paint (P) reveals, erase (E) hides, Shift+F reveals the selection.` : `${layer.name}: editing pixels again.`, "info");
     }
 
     // ---- reference images -----------------------------------------------------------
@@ -16624,7 +16703,7 @@ class InpaintEditor {
                     } finally { this.holdGroups--; }
                     this.renderLayers();
                     if (last) this.activeLayerId = last.id;
-                    this.setStatus(`${doc.layers.length} layer${doc.layers.length === 1 ? "" : "s"} of ${file.name || "the file"} added.${doc.notes.length ? " " + doc.notes.join("; ") + "." : ""}`);
+                    this.setStatus(`${doc.layers.length} layer${doc.layers.length === 1 ? "" : "s"} of ${file.name || "the file"} added.${doc.notes.length ? " " + doc.notes.join("; ") + "." : ""}`, doc.lossy ? "warn" : "info");
                     layeredFiles++;
                     continue;
                 }
@@ -16668,7 +16747,7 @@ class InpaintEditor {
                 n++;
             } catch (err) {
                 console.error(err);
-                this.setStatus(String(err.message || err));
+                this.setStatus(String(err.message || err), failKind(err));
             }
         }
         if (last && layeredFiles < files.length) {
@@ -16936,7 +17015,7 @@ class InpaintEditor {
             } catch (err) {
                 if (!pushed) this.releaseSnapshot(before);
                 console.error(err);
-                this.setStatus(String(err.message || err));
+                this.setStatus(String(err.message || err), failKind(err));
             }
             return;
         }
@@ -16948,7 +17027,7 @@ class InpaintEditor {
         this.activeLayerId = below.id;
         this.layerSel = new Set();
         this.renderLayers(); this.renderHistory(); this.draw();
-        this.setStatus(`${layer.name} merged into ${below.name}${this.matchActive(layer) ? " (its colour match was not baked)" : ""}.`);
+        this.setStatus(`${layer.name} merged into ${below.name}${this.matchActive(layer) ? " (its colour match was not baked)" : ""}.`, this.matchActive(layer) ? "warn" : "info");
     }
 
     /**
@@ -16978,7 +17057,7 @@ class InpaintEditor {
         this.activeLayerId = top.id;
         this.layerSel = new Set();
         this.renderLayers(); this.renderHistory(); this.draw();
-        this.setStatus(`${sel.length} layers merged into ${top.name}${unbaked ? " (a colour match was not baked)" : ""}. Ctrl+Z takes it back.`);
+        this.setStatus(`${sel.length} layers merged into ${top.name}${unbaked ? " (a colour match was not baked)" : ""}. Ctrl+Z takes it back.`, unbaked ? "warn" : "info");
         return true;
     }
 
@@ -17135,7 +17214,7 @@ class InpaintEditor {
         layer._maskedValid = false;
         const { turn: _turn, flip: _flip, angle: _angle, box: _box, ...style } = layer.text;   // a new text layer starts upright
         this.textDefaults = { ...style, content: TEXT_DEFAULTS.content };
-        if (missing) this.setStatus(`Font "${layer.text.font}" is not available here; a fallback was used.`);
+        if (missing) this.setStatus(`Font "${layer.text.font}" is not available here; a fallback was used.`, "warn");
         this.markLayerChanged(layer);
         this.draw();
     }
@@ -17316,7 +17395,7 @@ class InpaintEditor {
                 if (!first) first = entry;
             } catch (err) {
                 console.error(err);
-                this.setStatus(String(err.message || err));
+                this.setStatus(String(err.message || err), failKind(err));
             }
         }
         if (!first) return;
@@ -17646,9 +17725,9 @@ class InpaintEditor {
             const stem = (l.name || "layer").replace(/[^a-z0-9._ -]/gi, "_");
             const saved = await host.saveExport(blob, `${stem}.png`, { editor: this });
             if (!saved) { this.setStatus("Save cancelled."); return null; }
-            this.setStatus(`Saved ${saved.path} (${l.name}, ${this.width} × ${this.height} with transparency).`);
+            this.setStatus(`Saved ${saved.path} (${l.name}, ${this.width} × ${this.height} with transparency).`, "info");
             return saved;
-        } catch (err) { console.error(err); this.setStatus("Save failed: " + (err.message || err)); return null; }
+        } catch (err) { console.error(err); this.setStatus("Save failed: " + (err.message || err), failKind(err)); return null; }
     }
 
     /** The selection as a black and white mask PNG, into the output folder. */
@@ -17659,9 +17738,9 @@ class InpaintEditor {
             const stem = ((this.saveNameInput && this.saveNameInput.value) || "inpaint_canvas").trim().replace(/\.[a-z0-9]+$/i, "").replace(/[^a-z0-9._ -]/gi, "_") || "inpaint_canvas";
             const saved = await host.saveExport(blob, `${stem}_mask.png`, { editor: this });
             if (!saved) { this.setStatus("Save cancelled."); return null; }
-            this.setStatus(`Saved ${saved.path} (mask, white = selected).`);
+            this.setStatus(`Saved ${saved.path} (mask, white = selected).`, "info");
             return saved;
-        } catch (err) { console.error(err); this.setStatus("Save failed: " + (err.message || err)); return null; }
+        } catch (err) { console.error(err); this.setStatus("Save failed: " + (err.message || err), failKind(err)); return null; }
     }
 
     async exportImage({ download = false } = {}) {
@@ -17717,11 +17796,11 @@ class InpaintEditor {
             const saved = await host.saveExport(blob, `${stem}.${fmt === "tiff" ? "tif" : fmt}`, { editor: this, download });
             if (!saved) { this.setStatus("Save cancelled."); return null; }
             const kb = Math.round(blob.size / 1024);
-            this.setStatus(`Saved ${saved.path} (${canvas.width} × ${canvas.height}, ${kb >= 1024 ? (kb / 1024).toFixed(1) + " MB" : kb + " kB"}${fmt === "png" && embedded ? ", " + hostText("pngEmbedded", "recipe embedded") : ""}${note}).`);
+            this.setStatus(`Saved ${saved.path} (${canvas.width} × ${canvas.height}, ${kb >= 1024 ? (kb / 1024).toFixed(1) + " MB" : kb + " kB"}${fmt === "png" && embedded ? ", " + hostText("pngEmbedded", "recipe embedded") : ""}${note}).`, "info");
             return saved;
         } catch (err) {
             console.error(err);
-            this.setStatus("Save failed: " + (err.message || err));
+            this.setStatus("Save failed: " + (err.message || err), failKind(err));
             return null;
         }
     }
@@ -17752,7 +17831,7 @@ class InpaintEditor {
             if (this.cleanupInfo) this.cleanupInfo.textContent = `${res.removed} deleted, ${fmt(res.bytes)}`;
         } catch (err) {
             console.error(err);
-            this.setStatus("Cleanup failed: " + (err.message || err));
+            this.setStatus("Cleanup failed: " + (err.message || err), failKind(err));
         }
     }
 
@@ -18174,7 +18253,7 @@ class InpaintEditor {
             await this.setBase(ref, img, { keepLayers: false });
         } catch (err) {
             console.error(err);
-            this.setStatus(String(err.message || err));
+            this.setStatus(String(err.message || err), failKind(err));
         } finally {
             // another picture (open, drag and drop, paste, load_image) is not the canvas a preset was made for: Generate
             // new's preset (`genSettings.target`, item 34) goes with the old one, even at the same size
@@ -18200,7 +18279,7 @@ class InpaintEditor {
         if (later()) { px.release(); return; }
         await this.setBasePixels(ref, px, { keepLayers: false });
         const notes = ((got && got.notes) || info.notes || []).filter(Boolean);
-        this.setStatus(`Opened ${name}: ${info.width} × ${info.height}${notes.length ? "; " + notes.join("; ") : ""}.`);
+        this.setStatus(`Opened ${name}: ${info.width} × ${info.height}${notes.length ? "; " + notes.join("; ") : ""}.`, notes.length ? "warn" : "info");
     }
 
     /**
@@ -18267,7 +18346,7 @@ class InpaintEditor {
         this.renderLayers();
         this.draw();
         const n = layers.length;
-        this.setStatus(`Opened ${file.name || "the file"}: ${W} × ${H}, ${n} layer${n === 1 ? "" : "s"}${basePx === b?.px ? ` over "${b.name}" as the base` : ""}.${doc.notes.length ? " " + doc.notes.join("; ") + "." : ""}`);
+        this.setStatus(`Opened ${file.name || "the file"}: ${W} × ${H}, ${n} layer${n === 1 ? "" : "s"}${basePx === b?.px ? ` over "${b.name}" as the base` : ""}.${doc.notes.length ? " " + doc.notes.join("; ") + "." : ""}`, doc.lossy ? "warn" : "info");
     }
 
     /** The pixel size an SVG is rasterised at: the caller's `size` ([w, h], one of them may be 0 for
@@ -18380,7 +18459,7 @@ class InpaintEditor {
         const want = new Set(ids);
         const hit = this.layers.filter((l) => want.has(l.id));
         const locked = hit.filter((l) => this.isLocked(l)), gone = hit.filter((l) => !this.isLocked(l));
-        if (!gone.length) { this.setStatus(locked.length ? `${locked.map((l) => l.name).join(", ")} ${locked.length > 1 ? "are" : "is"} locked. Unlock first.` : "No layer to delete."); return 0; }
+        if (!gone.length) { this.setStatus(locked.length ? `${locked.map((l) => l.name).join(", ")} ${locked.length > 1 ? "are" : "is"} locked. Unlock first.` : "No layer to delete.", "info"); return 0; }
         if (this.pending && gone.includes(this.pending.layer)) this.cancelPending();
         this.pushUndo({ kind: "layers", label: gone.length > 1 ? `Delete ${gone.length} layers` : "Delete layer" });
         this.layers = this.layers.filter((l) => !gone.includes(l));
@@ -18449,14 +18528,20 @@ class InpaintEditor {
                 const n = this.history.length + 1;
                 const layer = this.addLayer({ name: "Result " + n, kind: "result", ref, px: this.pixels.Layer.fromImage(img), x: r.x || 0, y: r.y || 0, w: r.width || img.naturalWidth, h: r.height || img.naturalHeight });
                 // a provider run says which seed the model got (null: none went, FLUX 3 Image); a local result is the editor's
-                this.history.push({ key, name: layer.name, ref, x: layer.x, y: layer.y, w: layer.w, h: layer.h, prompt: this.promptText, layerId: layer.id, time: Date.now(),
-                    seed: r.seed !== undefined ? r.seed : this.genSettings.seed, mode: this.genSettings.mode, denoise: this.genSettings.denoise });
+                // the texts of the click when the host kept them (S4), else the field's as the result lands (the node)
+                const refsNow = () => { const o = {}; for (const [id, k] of this.refLabels()) o["img" + k] = id; return Object.keys(o).length ? o : null; };
+                this.history.push({ key, name: layer.name, ref, x: layer.x, y: layer.y, w: layer.w, h: layer.h, layerId: layer.id, time: Date.now(),
+                    prompt: r.prompt !== undefined ? String(r.prompt || "") : this.promptText,
+                    negative: r.negative !== undefined ? String(r.negative || "") : this.negativeText || "",
+                    refs: r.refs !== undefined ? r.refs : refsNow(),
+                    seed: r.seed !== undefined ? r.seed : this.genSettings.seed, mode: r.mode !== undefined ? r.mode : this.genSettings.mode,
+                    denoise: r.denoise !== undefined ? r.denoise : this.genSettings.denoise });
                 this.renderHistory();
                 const al = r.align && r.align.aligned ? ` · aligned (shift ${r.align.shift[0]}, ${r.align.shift[1]} px, scale ${r.align.scale[0]}, ${r.align.scale[1]})` : "";
                 this.setStatus(`Result ${n} added (${r.width} × ${r.height} at ${r.x}, ${r.y})${al}`);
             } catch (err) {
                 console.error(err);
-                this.setStatus(String(err.message || err));
+                this.setStatus(String(err.message || err), failKind(err));
             }
         }
     }
@@ -20433,7 +20518,14 @@ class InpaintEditor {
             } else if (h.seed === null && h.mode) {
                 text.appendChild(el("span", null, `${h.mode} · no seed sent`));
             }
-            if (h.prompt) { const p = el("span", null, h.prompt); p.title = h.prompt; text.appendChild(p); }
+            if (h.prompt) {
+                // like the seed: a click puts the prompt back in the field, Ctrl+click copies it (node issue #1, ask 4)
+                const p = el("span", "ipc-hprompt", h.prompt);
+                p.title = h.prompt + "\n(click: use this prompt again; Ctrl+click: copy it)";
+                p.style.cursor = "pointer";
+                p.addEventListener("click", (e) => { e.stopPropagation(); this.reusePrompt(h, { copy: e.ctrlKey || e.metaKey }); });
+                text.appendChild(p);
+            }
             item.appendChild(text);
             if (layer) {
                 item.appendChild(miniButton("solo", "Solo: show only this result", () => this.soloResult(h)));
@@ -20443,6 +20535,55 @@ class InpaintEditor {
             }
             list.appendChild(item);
         }
+    }
+
+    /**
+     * A result's prompt (S4; node issue #1, ask 4): back into the prompt field, its @img tokens written for the references
+     * shown now (h.refs says which layer each one named at the click; one that is not shown waits as @img?), Revert
+     * holding the prompt before; `copy`: to the clipboard instead. Refused while an upsample's answer is on its way.
+     */
+    async reusePrompt(h, { copy = false } = {}) {
+        if (!h || !h.prompt) return false;
+        let text = String(h.prompt);
+        // an entry from before 0.1.48 kept no refs: its numbered tokens stay as they are, and the line says to check them
+        const legacy = !(h.refs && typeof h.refs === "object") && parse(text).some((s) => s.type === "token" && s.n != null);
+        if (host.refTokens) {
+            const before = new Map();
+            if (h.refs && typeof h.refs === "object") for (const [k, id] of Object.entries(h.refs)) { const m = /^img(\d+)$/.exec(k); if (m) before.set(id, +m[1]); }
+            // also with no refs: a parked token (@img?<id>) whose layer is shown again gets its number
+            text = remap(text, before, this.refLabels());
+        }
+        if (copy) {
+            try {
+                if (navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(text);
+                else {
+                    // the node opened over plain http on another machine has no clipboard API: the old way
+                    const ta = document.createElement("textarea");
+                    ta.value = text;
+                    ta.style.cssText = "position:fixed;left:-9999px;top:0;opacity:0";
+                    document.body.appendChild(ta);
+                    ta.select();
+                    const ok = document.execCommand("copy");
+                    ta.remove();
+                    if (!ok) throw new Error("the browser refused it");
+                }
+                this.setStatus(`The prompt of ${h.name} is on the clipboard.`, "info");
+                return true;
+            } catch (err) {
+                this.setStatus(`The prompt could not be copied: ${(err && err.message) || err}`, "error");
+                return false;
+            }
+        }
+        if (this.upsamplePending) { this.setStatus("Wait for the upsampling to finish: its answer would replace the prompt.", "info"); return false; }
+        this.promptBackup = this.promptText;
+        if (this.upRevertBtn) this.upRevertBtn.disabled = false;
+        this.setPromptText(text);
+        this.notifyChanged();
+        const parked = new Set(parse(text).filter((s) => s.type === "token" && s.id != null).map((s) => s.id)).size;
+        this.setStatus(`The prompt of ${h.name} is back in the field; Revert puts the one before back.`
+            + (parked ? ` ${parked} of its reference${parked > 1 ? "s are" : " is"} not shown now: ${parked > 1 ? "their tokens wait" : "its token waits"} as @img? until shown again.` : "")
+            + (legacy ? " It was saved before results kept their references: check that its @img chips name the pictures you mean." : ""), parked || legacy ? "warn" : "info");
+        return true;
     }
 
     drawHistoryThumb(canvas, h) {
@@ -20504,7 +20645,7 @@ class InpaintEditor {
         this.draw();
         this.drawThumb();
         this.notifyChanged();
-        this.setStatus(layer ? `Showing only ${h.name}.` : `${h.name} is discarded; restore it first.`);
+        this.setStatus(layer ? `Showing only ${h.name}.` : `${h.name} is discarded; restore it first.`, "info");
     }
 
     /**
@@ -20710,7 +20851,7 @@ class InpaintEditor {
             if (answer == null) { this.setStatus("New canvas cancelled."); return; }
             w = answer.width; h = answer.height;
         }
-        if (!(w >= 16) || !(h >= 16)) { this.setStatus("Width and height must be at least 16 pixels."); return; }
+        if (!(w >= 16) || !(h >= 16)) { this.setStatus("Width and height must be at least 16 pixels.", "warn"); return; }
         w = Math.min(16384, Math.round(w)); h = Math.min(16384, Math.round(h));
         try {
             this.setStatus(`Creating a ${w} × ${h} canvas ...`);
@@ -20751,7 +20892,7 @@ class InpaintEditor {
                     this.notifyChanged();
                     this.setStatus(failed
                         ? `New ${w} \u00d7 ${h} canvas, but its model could not be selected: ${failed.message || failed}`
-                        : `New ${w} \u00d7 ${h} canvas ${preset.about}.`);
+                        : `New ${w} \u00d7 ${h} canvas ${preset.about}.`, failed ? "warn" : "info");
                 } else {
                     if (this.genSettings.target) { delete this.genSettings.target; this.notifyChanged(); }
                     // the next New opens on "Any size", as this one was made
@@ -20762,7 +20903,7 @@ class InpaintEditor {
             }
         } catch (err) {
             console.error(err);
-            this.setStatus("Could not create the canvas: " + (err.message || err));
+            this.setStatus("Could not create the canvas: " + (err.message || err), failKind(err));
         }
     }
 
@@ -20804,7 +20945,7 @@ class InpaintEditor {
             this.setStatus(`${h.name} restored.`);
         } catch (err) {
             console.error(err);
-            this.setStatus(String(err.message || err));
+            this.setStatus(String(err.message || err), failKind(err));
         }
     }
 
@@ -22293,7 +22434,7 @@ class InpaintEditor {
         } catch (err) {
             if (!pushed) this.releaseSnapshot(before);
             console.error(err);
-            this.setStatus(String(err.message || err));
+            this.setStatus(String(err.message || err), failKind(err));
         }
     }
 
@@ -23867,7 +24008,7 @@ class InpaintEditor {
             this.setStatus(`Freed ${mb} MB of caches; the helper models are out of VRAM too.`);
         } catch (err) {
             console.warn("Inpaint Canvas: could not free models", err);
-            this.setStatus("Could not free the helper models: " + (err.message || err));
+            this.setStatus("Could not free the helper models: " + (err.message || err), failKind(err));
         }
     }
 
@@ -23883,7 +24024,7 @@ class InpaintEditor {
         // above 1×), whose result would land in the old geometry. The node's host has no slot.
         if (this.providerPending && (this.resultInputState().provider || this.providerPending.resizes)) {
             this.lastRunError = new Error(RUN_GOING_TEXT);
-            this.setStatus(this.lastRunError.message);
+            this.setStatus(this.lastRunError.message, "info");
             return { error: this.lastRunError };
         }
         // the prompt and the references as they are at the click (docs/PLAN_REFS.md C3): a later hide or move does not
@@ -23904,7 +24045,7 @@ class InpaintEditor {
             console.error(err);
             // kept for the app's generate command, which throws it at once; also returned, so a caller gets its own run's
             this.lastRunError = err instanceof Error ? err : new Error(String(err));
-            this.setStatus(String(err.message || err));
+            this.setStatus(String(err.message || err), failKind(err));
             return { error: this.lastRunError };
         } finally {
             this.generateBtn.disabled = false;
@@ -24008,6 +24149,7 @@ class InpaintEditor {
                 ...(l.relightOf ? { relightOf: l.relightOf } : {}),
             })),
             history: this.history.slice(-100).map((h) => ({ key: h.key, name: h.name, ref: h.ref, x: h.x, y: h.y, w: h.w, h: h.h, prompt: h.prompt, layerId: h.layerId, time: h.time, seed: h.seed, mode: h.mode, denoise: h.denoise,
+                ...(h.negative ? { negative: h.negative } : {}), ...(h.refs && typeof h.refs === "object" ? { refs: { ...h.refs } } : {}),
                 ...(orientIsUp(h.orient) ? {} : { orient: { ...h.orient } }), ...(validXf(h.xf) ? { xf: h.xf.slice() } : {}) })),
             selection: this.selectionDataUrl,
             // E5: where the selection's PNG goes when it holds a box of the mask and not all of it ([x, y, w, h])
@@ -24258,14 +24400,14 @@ class InpaintEditor {
                         if (map) {
                             this.maps[kind] = map;
                             if (kind === "depth" && j.guide && !map.guide) {
-                                this.setStatus("the depth map's guide is missing; Recompute restores the edges");
+                                this.setStatus("the depth map's guide is missing; Recompute restores the edges", "warn");
                             }
                         } else {
-                            this.setStatus(`Map "${kind}" could not be loaded.`);
+                            this.setStatus(`Map "${kind}" could not be loaded.`, "warn");
                         }
                     } catch (err) {
                         console.warn(`Inpaint Canvas: map "${kind}" missing`, j.ref, err);
-                        this.setStatus(`Map "${kind}" missing: ${err.message || err}`);
+                        this.setStatus(`Map "${kind}" missing: ${err.message || err}`, failKind(err));
                     }
                 }
             }
@@ -24278,7 +24420,7 @@ class InpaintEditor {
             this.drawThumb();
         } catch (err) {
             console.error(err);
-            this.setStatus("Could not restore canvas: " + (err.message || err));
+            this.setStatus("Could not restore canvas: " + (err.message || err), failKind(err));
         } finally {
             if (!stale()) this._loading = false;
         }
@@ -24545,6 +24687,7 @@ class InpaintEditor {
 
     destroy() {
         this._destroyed = true;
+        if (this.runProgress) this.runProgress.clear();   // its one-second ticker
         this._mapUndoPending = null;
         clearTimeout(this._refLayTimer);
         if (this._compositor) { try { this._compositor.dispose(); } catch (_) { /* context gone */ } this._compositor = null; }
