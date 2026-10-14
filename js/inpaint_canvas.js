@@ -422,12 +422,17 @@ vec4 shade(vec4 color, vec2 uv) {
 `,
 };
 const ROLES = ["none", "reference", "scribble", "lineart", "depth", "pose", "canny", "other"];
-// Outputs after the setting slots (none at the moment). The backend would declare
-// them after setting_8, the frontend shows them right after the connected settings
-// (see syncSettingOutputs) and the queuePrompt wrapper maps the visible slot to the
+// Outputs after the setting slots, in the node's order (only the node shows outputs). The
+// backend declares them after setting_8, the frontend shows them right after the connected
+// settings (see syncSettingOutputs) and the queuePrompt wrapper maps the visible slot to the
 // backend slot. Outputs that are neither fixed, setting nor tail (e.g. the former
-// reference_images) are removed from loaded workflows.
-const TAIL_OUTPUTS = [];
+// reference_images) are removed from loaded workflows. box_prompt: the prompt with FLUX 3's
+// box rows and caption (the plain prompt without boxes); elements: the New and Text boxes in
+// ComfyUI core's bounding-box shape (docs/PLAN_NODE_BOXES.md D2-D4).
+const TAIL_OUTPUTS = [
+    { name: "box_prompt", type: "STRING", label: "box_prompt" },
+    { name: "elements", type: "ARRAY", label: "elements" },
+];
 const REF_DEFAULTS = { fit: "pad" };
 const REF_FITS = ["pad", "crop", "stretch"];
 

@@ -387,6 +387,22 @@ def apply_boxes(prompt, boxes, frame=None, names=None, text=False):
     return {"prompt": f"{caption} {dumps(rows)}", "rows": rows, "notes": [note] if note else []}
 
 
+FLUX3_MAX_PROMPT = 15000   # core's Flux 3 Image refuses a longer prompt (rows included)
+FLUX3_MAX_IMAGES = 10      # and more pictures than this
+SMALL_PX = 48              # a box under this many pixels a side as sent "often did not appear" (BFL's docs)
+
+
+def element_name(n):
+    return "Box" if n == 1 else "Boxes"
+
+
+def small_note(ids):
+    if not ids:
+        return None
+    one = len(ids) == 1
+    return f"{element_name(len(ids))} {', '.join(ids)} {'is' if one else 'are'} small (under {SMALL_PX} px a side as sent): the model may not place anything there."
+
+
 def elements_core(boxes):
     """The New and Text boxes as ComfyUI core's bounding-box elements (``{type, bbox, text?, desc}``, the grid of the
     frame), for Flux 3 Image's ``bounding_boxes``, Create Bounding Boxes and the Ideogram JSON prompt builder. Core
@@ -401,3 +417,212 @@ def elements_core(boxes):
         else:
             out.append({"type": "obj", "bbox": grid(b["rect"]), "desc": desc})
     return out
+
+
+# ---- the node's side: the editor's boxes measured against the crop run() built ---------------------------------------
+# While the editor's Boxes switch is on (gen.boxes), canvas_state carries the boxes in document pixels:
+#   {"id", "kind", "rect": [l, t, r, b],
+#    "src": [l, t, r, b] (keep / move / remove: document pixels) | [fl, ft, fr, fb] (from: fractions of its layer's
+#           picture) | None,
+#    "ref": j (from: the index into "references"), "desc", "text"}
+# beside "referenceIds" (the layer ids of "references", same order) and "selectionBoxId" (the id the editor gives the
+# selection's box). Only run() knows the frame (padding, auto context, the span fitted to multiple_of) and the batch as
+# it built it (the Original or not, a reference that failed to load, the reference fit), so the rows are written here.
+
+def to_frame(rect, frame):
+    """A rectangle in pixels ([l, t, r, b]) as fractions of ``frame`` ((x, y, w, h)), clamped to 0..1; None when it lies
+    outside or is thinner than 1/1000 on a side (the app's toFrame)."""
+    if not isinstance(rect, (list, tuple)) or len(rect) != 4 or not frame or len(frame) != 4:
+        return None
+    x, y, w, h = frame
+    if not (_is_num(w) and w > 0 and _is_num(h) and h > 0 and _is_num(x) and _is_num(y)):
+        return None
+    if not all(_is_num(v) for v in rect):
+        return None
+    l, t, r, b = rect
+
+    def c(v):
+        return max(0, min(1, v))
+    out = [c((l - x) / w), c((t - y) / h), c((r - x) / w), c((b - y) / h)]
+    if out[2] - out[0] < 0.001 or out[3] - out[1] < 0.001:
+        return None
+    return out
+
+
+def fit_point(x, y, w, h, W, H, fit):
+    """Where nodes.py's _fit_image puts the point (x, y) of a w x h picture when it brings it to W x H: ``stretch``
+    scales each axis, ``pad`` scales to fit and centres (``int(round(..))`` sizes, ``//`` offsets), ``crop`` cuts the
+    centre as comfy.utils.common_upscale(.., crop="center") does (Python's round), then scales."""
+    if w == W and h == H:
+        return x, y
+    if fit == "stretch":
+        return x * W / w, y * H / h
+    if fit == "crop":
+        oa, na = w / h, W / H
+        cx = round((w - w * (na / oa)) / 2) if oa > na else 0
+        cy = round((h - h * (oa / na)) / 2) if oa < na else 0
+        if w - 2 * cx <= 0 or h - 2 * cy <= 0:
+            return None
+        return (x - cx) * W / (w - 2 * cx), (y - cy) * H / (h - 2 * cy)
+    s = min(W / w, H / h)
+    nw, nh = max(1, int(round(w * s))), max(1, int(round(h * s)))
+    return x * nw / w + (W - nw) // 2, y * nh / h + (H - nh) // 2
+
+
+def fit_src(src, size, crop_size, fit):
+    """A From box's source, fractions of its picture as loaded (``size`` = (w, h)), as fractions of that reference as
+    the batch carries it (fitted to ``crop_size`` = (W, H)); None when the fit keeps nothing of it."""
+    w, h = size
+    W, H = crop_size
+    a = fit_point(src[0] * w, src[1] * h, w, h, W, H, fit)
+    b = fit_point(src[2] * w, src[3] * h, w, h, W, H, fit)
+    if a is None or b is None:
+        return None
+    return to_frame([a[0], a[1], b[0], b[1]], (0, 0, W, H))
+
+
+def _px_rect(r):
+    return isinstance(r, (list, tuple)) and len(r) == 4 and all(_is_num(v) for v in r) and r[0] < r[2] and r[1] < r[3]
+
+
+def check_payload_box(b, i):
+    """None when a box of canvas_state has its shape, else why not (the box is left out with that note)."""
+    who = who_of(b, i)
+    if not isinstance(b, dict):
+        return f"{who}: not an object"
+    bid = b.get("id")
+    if not isinstance(bid, str) or not BOX_ID.match(bid):
+        return f"{who}: the id is not lowercase words and a number joined by underscores (knight_1, red_scarf_2)"
+    kind = _get(b, "kind")
+    if not (isinstance(kind, str) and kind in KINDS):
+        return f'{who}: the kind "{cut16(_js_string(kind), 20)}" is not new, keep, move, remove or from'
+    if not _px_rect(b.get("rect")):
+        return f"{who}: rect is not [l, t, r, b] in image pixels with l < r and t < b"
+    desc, text, src = b.get("desc"), b.get("text"), b.get("src")
+    if desc is not None and not isinstance(desc, str):
+        return f"{who}: desc is not a string"
+    if text is not None and not isinstance(text, str):
+        return f"{who}: text is not a string"
+    if text is not None and kind != "new":
+        return f"{who}: only a new box renders text"
+    if kind == "from":
+        ref = b.get("ref")
+        if not (_is_int(ref) and ref >= 0):
+            return f"{who}: a from box needs ref, the reference's index"
+        if src is not None and not _fracs(src):
+            return f"{who}: src is not [l, t, r, b] in fractions 0..1 of its layer with l < r and t < b"
+    else:
+        if b.get("ref") is not None:
+            return f"{who}: only a from box has a ref"
+        if kind == "new":
+            if src is not None:
+                return f"{who}: a new box has no src"
+        elif not _px_rect(src):
+            return f"{who}: src is not [l, t, r, b] in image pixels with l < r and t < b"
+    return None
+
+
+def _overlaps(r, s):
+    return r[0] < s[2] and r[2] > s[0] and r[1] < s[3] and r[3] > s[1]
+
+
+_ID_TAIL = re.compile(r"(.*_)([1-9][0-9]*)\Z")
+
+
+def _free_id(bid, used):
+    """``bid`` or, when it is taken, the next free number (edit_1 -> edit_2), as the app's pluginBoxes renames."""
+    if bid not in used:
+        return bid
+    m = _ID_TAIL.match(bid)
+    n = int(m.group(2)) + 1
+    while f"{m.group(1)}{n}" in used:
+        n += 1
+    return f"{m.group(1)}{n}"
+
+
+def node_outputs(state, prompt, frame, crop_size, original=False, loaded=(), fit="pad", selection=None, fill=False):
+    """The node's two box outputs and its notes: ``(box_prompt, elements, notes)``.
+
+    ``frame`` (x, y, w, h) is the crop in document pixels (stitch_info's bbox), ``crop_size`` (W, H) the size of the
+    crop_image batch's pictures, ``original`` whether the untouched crop went second (ref_image_1), ``loaded`` the
+    references that loaded, in batch order, as (index into state["references"], width, height of the picture as
+    loaded), ``fit`` how they were fitted (pad, crop, stretch), ``selection`` the selection's exact bounds
+    (x0, y0, x1, y1, x1 and y1 exclusive) or None, ``fill`` whether crop_image shows the selection filled.
+
+    The plain prompt and no elements while the switch is off, without a box, or when none is left. The selection
+    becomes one New box (the app's S1) only when the document holds no box. Never raises: a box that fails a check is
+    left out with a note, anything else gives the plain prompt, no elements and the note "Boxes were not written: ..".
+    """
+    plain = "" if prompt is None else str(prompt)
+    gen = state.get("gen") if isinstance(state, dict) else None
+    if not (isinstance(gen, dict) and gen.get("boxes")):
+        return plain, [], []
+    notes = []
+    try:
+        raw = state.get("boxes")
+        if raw is not None and not isinstance(raw, list):
+            raise BoxError("the canvas state's boxes are not a list")
+        if not raw:
+            if not selection:
+                return plain, [], []
+            sid = state.get("selectionBoxId")
+            raw = [{"id": sid if isinstance(sid, str) and BOX_ID.match(sid) else "edit_1", "kind": "new",
+                    "rect": list(selection), "desc": fold(plain)}]
+        o = 1 if original else 0
+        names, slots = {}, {}
+        for k, (j, w, h) in enumerate(loaded):
+            slots[int(j)] = (k, w, h)
+            names[k] = f"ref_image_{1 + o + k}"
+        boxes, used = [], set()
+        for i, b in enumerate(raw):
+            err = check_payload_box(b, i)
+            if err:
+                notes.append(f"{err}, so the box was not sent.")
+                continue
+            who, kind = f"Box {b['id']}", b["kind"]
+            src = ref = None
+            if kind == "from":
+                j = int(b["ref"])
+                if j not in slots:
+                    notes.append(f"{who}: its reference layer (reference {j + 1} of the run) was not loaded, so the box was not sent.")
+                    continue
+                ref, w, h = slots[j]
+                src = fit_src(b.get("src") or [0, 0, 1, 1], (w, h), crop_size, fit)
+                if src is None:
+                    notes.append(f"{who}: its source lies outside what the reference fit ({fit}) keeps of the picture, so the box was not sent.")
+                    continue
+            elif kind != "new":
+                src = to_frame(b["src"], frame)
+                if src is None:
+                    notes.append(f"{who}: its source lies outside the crop, so the box was not sent.")
+                    continue
+            rect = to_frame(b["rect"], frame)
+            if rect is None:
+                notes.append(f"{who} lies outside the crop and was not sent.")
+                continue
+            if fill and selection and kind in ("keep", "move", "remove") and _overlaps(b["src"], selection):
+                notes.append(f"{who}: its source lies in the selection, which the crop shows filled: the model sees the fill there, not the picture.")
+            bid = _free_id(b["id"], used)
+            used.add(bid)
+            box = {"id": bid, "kind": kind, "rect": rect, "src": src, "ref": ref, "desc": fold(b.get("desc"))}
+            if b.get("text") is not None:
+                box["text"] = fold(b["text"])
+            boxes.append(box)
+        if not boxes:
+            return plain, [], notes
+        a = apply_boxes(plain, boxes, "ref_image_0", names)
+        notes.extend(a["notes"])
+        W, H = crop_size
+        small = small_note([b["id"] for b in boxes if b["kind"] in ("new", "from", "move")
+                            and ((b["rect"][2] - b["rect"][0]) * W < SMALL_PX or (b["rect"][3] - b["rect"][1]) * H < SMALL_PX)])
+        if small:
+            notes.append(small)
+        if len(a["prompt"]) > FLUX3_MAX_PROMPT:
+            notes.append(f"The prompt with the box rows is {len(a['prompt'])} characters long: Flux 3 Image refuses more than {FLUX3_MAX_PROMPT}.")
+        pictures = 1 + o + len(loaded)
+        if pictures > FLUX3_MAX_IMAGES:
+            notes.append(f"crop_image holds {pictures} pictures: Flux 3 Image takes at most {FLUX3_MAX_IMAGES} and refuses the run.")
+        return a["prompt"], elements_core(boxes), notes
+    except Exception as err:   # never fail the queued prompt from the box path
+        notes.append(f"Boxes were not written: {err}")
+        return plain, [], notes

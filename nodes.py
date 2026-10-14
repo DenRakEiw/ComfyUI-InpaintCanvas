@@ -638,8 +638,10 @@ class InpaintCanvas:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "MASK", "STRING", "INT", "INT", "STRING", "IMAGE", "FLOAT", "INT", "STRING", "STRING") + ("*",) * SETTING_SLOTS
-    RETURN_NAMES = ("crop_image", "crop_mask", "image", "mask", "stitch_info", "crop_width", "crop_height", "prompt", "control_image", "denoise", "seed", "mode", "negative") + tuple(f"setting_{i}" for i in range(1, SETTING_SLOTS + 1))
+    # Outputs are only ever appended (links are by index): the tail outputs box_prompt and elements come after setting_8,
+    # and the editor's TAIL_OUTPUTS lists them in this order (the frontend shows them after the connected settings).
+    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "MASK", "STRING", "INT", "INT", "STRING", "IMAGE", "FLOAT", "INT", "STRING", "STRING") + ("*",) * SETTING_SLOTS + ("STRING", "ARRAY")
+    RETURN_NAMES = ("crop_image", "crop_mask", "image", "mask", "stitch_info", "crop_width", "crop_height", "prompt", "control_image", "denoise", "seed", "mode", "negative") + tuple(f"setting_{i}" for i in range(1, SETTING_SLOTS + 1)) + ("box_prompt", "elements")
     OUTPUT_TOOLTIPS = (
         "Selected region plus padding, scaled to target_size. Inpaint this. It becomes a batch when there is more to send: the untouched crop after the filled one (Crop option \"Original\" with a fill mode), then every visible reference layer fitted to the crop size (multi-reference editing with Flux.2 / Kontext, which flatten the batch into their image inputs).",
         "Selection mask matching crop_image (grown and feathered when the editor's Feather is auto).",
@@ -654,7 +656,10 @@ class InpaintCanvas:
         "Seed from the editor (random per run or fixed). Wire it into your local sampler.",
         "\"api\" or \"local\": which result input the editor expects the result on.",
         "Negative prompt from the editor (shown in local mode; for SDXL-class models).",
-    ) + tuple("Editor-driven setting: wire it into any widget input (lora_name, ckpt_name, steps, ...) and a matching control appears in the editor. The next free slot shows up once this one is connected." for _ in range(SETTING_SLOTS))
+    ) + tuple("Editor-driven setting: wire it into any widget input (lora_name, ckpt_name, steps, ...) and a matching control appears in the editor. The next free slot shows up once this one is connected." for _ in range(SETTING_SLOTS)) + (
+        "The prompt with FLUX 3's box rows: the boxes drawn in the editor (tool X, the Boxes switch on) as a caption and the JSON rows FLUX 3 reads (New, Keep, Move, Remove, From a reference). Wire it into the prompt of a FLUX 3 node, with crop_image whole into its first image. The plain prompt when there is no box.",
+        "The New and Text boxes as bounding-box elements, for Flux 3 Image's bounding_boxes on a new image, Create Bounding Boxes or a JSON prompt builder. On an edit, wire box_prompt instead: both at once give the rows twice.",
+    )
     FUNCTION = "run"
     CATEGORY = "image/inpaint"
     OUTPUT_NODE = True
@@ -762,9 +767,12 @@ class InpaintCanvas:
         ref_settings = state.get("refs") or {}
         ref_fit = ref_settings.get("fit") if ref_settings.get("fit") in REFERENCE_FITS else "pad"
         refs = []
-        for entry in state.get("references") or []:
+        loaded = []   # (index in references, width, height as loaded) per reference in the batch: the box rows name them
+        for j, entry in enumerate(state.get("references") or []):
             try:
-                refs.append(_fit_image(_load_rgb(entry, background=(255, 255, 255)), int(crop.shape[2]), int(crop.shape[1]), ref_fit))
+                picture = _load_rgb(entry, background=(255, 255, 255))
+                refs.append(_fit_image(picture, int(crop.shape[2]), int(crop.shape[1]), ref_fit))
+                loaded.append((j, int(picture.shape[2]), int(picture.shape[1])))
             except (ValueError, FileNotFoundError, OSError) as err:
                 print(f"[Inpaint Canvas] reference skipped: {err}")
         if refs:
@@ -790,9 +798,23 @@ class InpaintCanvas:
         settings = state.get("settings") or {}
         setting_values = tuple(_cast_setting(settings.get(str(i))) for i in range(1, SETTING_SLOTS + 1))
 
+        # FLUX 3's box rows (boxes_rows.py): measured against this crop and this batch, never raising (a box that
+        # cannot be placed is left out with a note; anything else gives the plain prompt)
+        plain_prompt = str(state.get("prompt", "") or "")
+        try:
+            box_prompt, elements, box_notes = boxes_rows.node_outputs(
+                state, plain_prompt, (x0, y0, x1 - x0, y1 - y0), (int(crop.shape[2]), int(crop.shape[1])),
+                original=bool(has_selection and fill_mode != "none" and with_original), loaded=loaded, fit=ref_fit,
+                selection=(sx0, sy0, sx1, sy1) if has_selection else None, fill=bool(has_selection and fill_mode != "none"))
+        except Exception as err:
+            box_prompt, elements, box_notes = plain_prompt, [], [f"Boxes were not written: {err}"]
+        for note in box_notes:
+            print(f"[Inpaint Canvas] boxes: {note}")
+
         outputs = (crop, crop_mask[None], image, mask[None], stitch_info,
-                   int(crop.shape[2]), int(crop.shape[1]), str(state.get("prompt", "") or ""),
-                   control_crop, denoise, seed, mode, str(state.get("negative", "") or "")) + setting_values
+                   int(crop.shape[2]), int(crop.shape[1]), plain_prompt,
+                   control_crop, denoise, seed, mode, str(state.get("negative", "") or "")) + setting_values + (box_prompt, elements)
+        ui = {"ui": {"inpaint_boxes": list(box_notes)}} if box_notes else {}
 
         if result_source:
             # "id:slot"; inside a subgraph the id itself is "parent:child", so split at the last colon
@@ -803,9 +825,9 @@ class InpaintCanvas:
             graph.node("InpaintCanvasStitch",
                        result=[str(src_id), int(src_slot or 0)],
                        stitch_info=stitch_info)
-            return {"result": outputs, "expand": graph.finalize()}
+            return {**ui, "result": outputs, "expand": graph.finalize()}
 
-        return {"result": outputs}
+        return {**ui, "result": outputs}
 
 
 class InpaintCanvasStitch:
