@@ -12,7 +12,7 @@
 // From the part of the reference layer (in image pixels where the layer sits; null = the whole layer); layer: From's
 // reference layer id; text: a Text box's words (a New box), else null; colour: the box's slot in boxes_tool.js PALETTE.
 
-import { BOX_ID, KINDS, DESC_MAX, toFrame, idWords, smallBox, smallNote } from "./boxes.js";
+import { BOX_ID, KINDS, DESC_MAX, toFrame, idWords, foldDesc, smallBox, smallNote } from "./boxes.js";
 import { fold } from "./boxes_format.js";
 import { colourSlot, nextColour } from "./boxes_tool.js";
 
@@ -239,6 +239,42 @@ export function runDesc(b, labels) {
 export function clipDesc(b) {
     const words = b.text != null ? `text reading "${b.text}"${b.desc ? ", " + b.desc : ""}` : b.desc || "";
     return words.replace(TOKEN, (m, n) => `<ref_image_${n}>`);
+}
+
+// ---- what a prompt carries (canvas_state, docs/PLAN_NODE_BOXES.md §4) ------------------------------------------------
+
+/** The id the selection's box gets (the app's S1): the prompt's telling words, else "edit", then "_1". */
+export const selectionBoxIdOf = (prompt) => `${idWords(foldDesc(prompt)) || "edit"}_1`;
+
+/**
+ * The document's boxes as canvas_state carries them while the Boxes switch is on: `rect` in document pixels; `src` of a
+ * Keep, Move or Remove box in document pixels, of a From box in fractions of its layer's frame as shown
+ * ({ x: l.x, y: l.y, w: l.w, h: l.h }: a layer the transform tool scaled keeps its pixels, so the fraction is one of its
+ * picture as uploaded; [0, 0, 1, 1] without a src), with `ref` the index of that layer among `refs` (the reference
+ * layers this run sends, in order); `desc` folded and cut at DESC_MAX; `text` on a New box only. A From box whose layer
+ * is not among `refs`, or whose part lies outside its layer, is left out with a note. Returns { boxes, notes }.
+ */
+export function promptPayload(list, refs, { where = "references this run sends" } = {}) {
+    const notes = [];
+    const ids = (refs || []).map((l) => l.id);
+    const out = [];
+    for (const b of list || []) {
+        if (!b || typeof b.id !== "string" || !Array.isArray(b.rect)) continue;
+        const o = { id: b.id, kind: b.kind, rect: b.rect.slice() };
+        if (b.kind === "from") {
+            const k = ids.indexOf(b.layer);
+            if (k < 0) { notes.push(`Box ${b.id}: its reference layer is not among the ${where}, so the box was not sent.`); continue; }
+            const l = refs[k];
+            const src = Array.isArray(b.src) ? toFrame(b.src, { x: l.x, y: l.y, w: l.w, h: l.h }) : [0, 0, 1, 1];
+            if (!src) { notes.push(`Box ${b.id}: its source lies outside the reference layer, so the box was not sent.`); continue; }
+            o.src = src;
+            o.ref = k;
+        } else if (b.kind !== "new") o.src = Array.isArray(b.src) ? b.src.slice() : null;
+        o.desc = foldDesc(b.desc);
+        if (b.kind === "new" && b.text != null) o.text = String(b.text);
+        out.push(o);
+    }
+    return { boxes: out, notes };
 }
 
 // ---- the commands' fields ------------------------------------------------------------------------------------------

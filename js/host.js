@@ -165,7 +165,13 @@ export const host = {
     removeSupported: false,   // the Remove tool (LaMa in-app) is not built into the node's tool column
     refTokens: false,         // @img tokens for reference layers are a Scumble feature (docs/PLAN_REFS.md); the node keeps "ref N"
     async refLayout() { return null; },   // what a provider route calls each reference is a Scumble feature (item 26 step 26c2)
-    boxSwitch() { return null; },         // boxes in the prompt are a Scumble feature (item 28 S3d): the Boxes row stays hidden
+    // Boxes for FLUX 3 (docs/PLAN_NODE_BOXES.md in the scumble repo): the editor owns them (tool X, the Boxes section, the
+    // boxes in the workflow) and nodes.py writes them into the box_prompt output, so the switch under the prompt always shows
+    boxesInEditor: true,
+    boxSwitch(editor) {
+        const d = editor && editor.pluginData && editor.pluginData.boxes;
+        return { takes: true, count: d && Array.isArray(d.boxes) ? d.boxes.length : 0, schema: "flux3" };
+    },
     removeModel() { return null; },
     async removeInApp() { throw new Error("Remove is a Scumble feature"); },
     async warmRemove() { return null; },

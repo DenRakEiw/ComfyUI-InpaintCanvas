@@ -41,6 +41,7 @@ import { XF_IDENTITY, xfMul, xfInv, xfApply, xfBox, xfTranslate, xfScale, xfRota
 import { removeCrop, toModelImage, toModelMask, fromModel } from "./inpaint_remove.js";
 import { LiquifyField, gridStep, previewBlock, liquifyFalloff } from "./inpaint_liquify.js";
 import { labelMap, sameLabels, remap, mapOffset, namesFor, parse, normalize, compare, checkNote, referencesText, referencesRule } from "./reftokens.js";
+import { promptPayload, selectionBoxIdOf } from "./boxes_model.js";
 import { fitLayerRGBA, workScale } from "./edgefit.js";
 import { STALE_DIFF, GUIDE, RANGE_BAND_ROWS, WORK_MAX, modelSize, workSize, disparityRange } from "./inpaint_depth.js";
 import { packRG16, mapToJSON, mapFromJSON, fingerprint, fingerprintDiff, passToMap, makeMap, sampleMap, deriveMap, selectionOnMap, editMap } from "./inpaint_maps.js";
@@ -1287,6 +1288,8 @@ function objectBackendAvailable() {
 
 const ICONS = {
     text: '<path d="M5 5h14"/><path d="M12 5v14"/><path d="M9 19h6"/>',
+    // the Boxes tool (boxes_tool.js's icon; the node's tool column, docs/PLAN_NODE_BOXES.md B4)
+    boxes: '<rect x="3" y="5" width="11" height="9" rx="1"/><rect x="10" y="10" width="11" height="9" rx="1" stroke-dasharray="3 2"/>',
     ruler: '<path d="M3 17L17 3l4 4L7 21z"/><path d="M8 12l2 2M11 9l2 2M14 6l2 2"/>',
     grid: '<rect x="3" y="3" width="18" height="18"/><path d="M9 3v18M15 3v18M3 9h18M3 15h18"/>',
     peek: '<path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><path d="M12 5v14" stroke-dasharray="2 2"/>',
@@ -1735,6 +1738,21 @@ const STYLE = `
 .ipc-boxes { padding-top:0; }
 .ipc-boxes label { display:flex; align-items:center; gap:6px; }
 .ipc-boxes .ipc-hint { color:var(--sc-muted, #888); }
+.ipc-bx-help, .ipc-bx-note, .ipc-bx-empty { font-size:11px; color:var(--sc-muted, #888); margin:2px 0 4px; }
+.ipc-bx-list { display:flex; flex-direction:column; gap:6px; width:100%; }
+.ipc-bx-row { display:flex; flex-direction:column; gap:3px; padding:5px 6px; border:1px solid var(--sc-line, #3a3a3a); border-left-width:3px; border-radius:4px; background:var(--sc-well, #161616); }
+.ipc-bx-row.ipc-bx-sel { border-color:var(--sc-accent, #ffd166); box-shadow:0 0 0 1px var(--sc-accent, #ffd166); }
+.ipc-bx-head { display:flex; gap:4px; align-items:center; }
+.ipc-bx-head .ipc-bx-id { flex:1; min-width:0; }
+.ipc-bx-head .ipc-bx-select { max-width:120px; }
+.ipc-bx-field { background:var(--sc-field, #161616); color:var(--sc-fg, #ccc); border:1px solid var(--sc-line, #3a3a3a); border-radius:4px; padding:2px 5px; font:11px system-ui, sans-serif; width:100%; box-sizing:border-box; min-width:0; }
+.ipc-bx-field:focus { outline:none; border-color:var(--sc-accent, #ffd166); }
+.ipc-bx-geo { display:grid; grid-template-columns:40px 1fr; gap:4px; align-items:center; font-size:11px; }
+.ipc-bx-label { color:var(--sc-muted, #888); }
+.ipc-bx-buttons { display:flex; flex-wrap:wrap; gap:4px; margin:4px 0; }
+.ipc-bx-warn { display:flex; flex-direction:column; gap:4px; }
+.ipc-bx-warn:empty { display:none; }
+.ipc-bx-warn-row { display:flex; flex-wrap:wrap; gap:4px 6px; align-items:center; font-size:11px; color:var(--sc-warn, #f0c674); }
 .ipc-gen input[type=range] { width:120px; margin:0; }
 .ipc-gen b { min-width:32px; font-weight:500; color:var(--sc-fg-2, #ccc); }
 .ipc-settings { display:grid; grid-template-columns:auto 1fr; gap:4px 10px; align-items:center; }
@@ -3049,6 +3067,7 @@ class InpaintEditor {
                         this.setStatus("Light deselected.");
                     }
                 }
+                else if (this.boxes && this.boxes.key(e, "escape")) { /* the Boxes tool let go of its box */ }
                 else if (!host.pluginKey(this, e, "escape")) host.onEscape(this);
                 return;
             }
@@ -3442,6 +3461,8 @@ class InpaintEditor {
         // the popover hangs from the tip thumbnail, which only the brushes show
         if (this.tipPicker && this.tipPicker.isOpen && !(this.tipLabel && (this.tipLabel.dataset.for || "").split(" ").includes(tool))) this.closeTipPicker();
         host.toolChanged(this, tool, prevTool);
+        if (this.boxes && prevTool === "boxes" && tool !== "boxes") this.boxes.deselect();
+        if (this.boxes && tool === "boxes" && prevTool !== "boxes") this.boxes.selected();
         if (this.hardCtl) {
             const v = Math.round(this.activeHardness() * 100);
             this.hardCtl.input.value = v;
@@ -3512,6 +3533,8 @@ class InpaintEditor {
                     this.draw();
                     this.setStatus("Light deselected.");
                 }
+            } else if (this.boxes && this.boxes.key(e, k)) {
+                // the Boxes tool let go of its box
             } else if (!host.pluginKey(this, e, k)) {
                 host.onEscape(this);
             }
@@ -3625,6 +3648,8 @@ class InpaintEditor {
         if (e.key === "\\") { e.preventDefault(); if (!e.repeat && !this.peekBase) { this.peekBase = true; this.peekHold = true; this.peekCode = e.code || null; this.draw(); } return; }
         // the Canvas tool's own X before the plugins' keys (the Boxes tool is X)
         if (k === "x" && this.tool === "canvas") { this.swapFrameAspect(); this.setStatus(this.frameStatus()); return; }
+        // the editor's own Boxes tool (the node): X picks it, and its keys come before the editor's (D, Delete, arrows)
+        if (this.boxes && this.boxes.key(e, k)) return;
         if (host.pluginKey(this, e, k)) return;
         switch (k) {
             case "1": this.zoomTo(1); break;
@@ -4662,10 +4687,12 @@ class InpaintEditor {
             ctx.save();
             this.applyTilt(ctx);
             host.pluginOverlay(this, ctx);
+            if (this.boxes) this.boxes.draw(ctx);
             if (this.tool === "lights" && this.isRelightActive()) this.drawLightsOverlay(ctx);
             ctx.restore();
         } else {
             host.pluginOverlay(this, ctx);
+            if (this.boxes) this.boxes.draw(ctx);
             if (this.tool === "lights" && this.isRelightActive()) this.drawLightsOverlay(ctx);
         }
         ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -5358,6 +5385,9 @@ class InpaintEditor {
                 }
             }
         }
+        // the editor's own boxes follow (the node; the app's Boxes plugin hears the geometry event instead): an undo puts
+        // the snapshot's data back, so it never maps
+        if (this.boxes && kind !== "undo") this.boxes.mapGeometry(A);
         const e = this._export;   // the app's export settings (host.js); the node has none
         if (e && kind === "turn" && o && (o.turn & 1)) {
             [e.width, e.height] = [e.height, e.width];
@@ -6030,6 +6060,7 @@ class InpaintEditor {
             this.handlePickOnce(this._pendingPick, ix, iy);
             return;
         }
+        if (this.boxes && this.boxes.pointer("down", e, ix, iy)) return;
         if (host.pluginPointer(this, "down", e, ix, iy)) return;
         if (this.base) {
             const [cx, cy] = this.toCanvasPx(e);
@@ -6422,6 +6453,7 @@ class InpaintEditor {
         if (!this.width) return;
         const [ix, iy] = this.toImage(e);
         this.hover = [ix, iy];
+        if (this.boxes && this.boxes.pointer("move", e, ix, iy)) return;
         if (host.pluginPointer(this, "move", e, ix, iy)) return;
         const p = this.pointer;
         if (!p || p.healing) {
@@ -6647,6 +6679,7 @@ class InpaintEditor {
         this.pointer = null;
         this.viewEl.classList.remove("ipc-panning");
         try { this.canvas.releasePointerCapture(e.pointerId); } catch (_) { /* ignore */ }
+        if (p.kind === "boxes") { if (this.boxes) this.boxes.pointer("up", e, ...this.toImage(e)); return; }
         if (p.kind === "plugin") { host.pluginPointer(this, "up", e, ...this.toImage(e), p); return; }
         if (p.kind === "rect") {
             if (p.startPx && !p.moved) {
@@ -23886,7 +23919,8 @@ class InpaintEditor {
     /**
      * The Boxes switch under the prompt field (item 28 S3d): shown while the recipe sends boxes (host.boxSwitch), its
      * label counting the document's boxes; the hint says what goes while it is on (the selection, with no boxes) and
-     * that the boxes stay home while it is off. The node has no boxes: its host answers null and the row stays hidden.
+     * that the boxes stay home while it is off. The node always shows it (its host answers takes: the canvas output
+     * box_prompt carries the boxes; the editor owns them there, inpaint_boxes.js).
      */
     syncBoxesRow() {
         if (!this.boxesRow) return;
@@ -24061,6 +24095,7 @@ class InpaintEditor {
     // ---- persistence -------------------------------------------------------
 
     notifyChanged() {
+        if (this.boxes) this.boxes.refresh();   // a box written, an undo or redo of one, a restored workflow
         host.changed(this);
     }
 
@@ -24169,6 +24204,8 @@ class InpaintEditor {
             settings: this.settings,
             refs: this.refSettings,
             cutout: this.cutoutSettings,
+            // the node keeps its boxes in the workflow (the app saves pluginData beside the state: host.js)
+            ...(host.boxesInEditor && this.pluginData && this.pluginData.boxes && Array.isArray(this.pluginData.boxes.boxes) && this.pluginData.boxes.boxes.length ? { boxes: this.pluginData.boxes } : {}),
             depth: this.depth ? {
                 w: this.depth.w,
                 h: this.depth.h,
@@ -24240,6 +24277,12 @@ class InpaintEditor {
             this.upsampleSettings = { useCase: "auto", backend: "auto", ...(state.upsample || {}) };
             this.refreshSegmentBackends();
             this.genSettings = { ...GEN_DEFAULTS, seed: randomSeed(), ...(state.gen || {}) };
+            if (host.boxesInEditor) {
+                // the node's boxes come back with the workflow (getValue); a state without them has none
+                if (!this.pluginData || typeof this.pluginData !== "object") this.pluginData = {};
+                if (state.boxes && typeof state.boxes === "object" && Array.isArray(state.boxes.boxes)) this.pluginData.boxes = JSON.parse(JSON.stringify(state.boxes));
+                else delete this.pluginData.boxes;
+            }
             this.setNegativeText(state.negative || "");
             this.settings = state.settings && typeof state.settings === "object" ? { ...state.settings } : {};
             this.refSettings = { ...REF_DEFAULTS, ...(state.refs || {}) };
@@ -24421,6 +24464,7 @@ class InpaintEditor {
             this.renderHistory();
             this.renderInfo();
             this.renderDepthRow();
+            if (this.boxes) this.boxes.refresh(true);
             this.draw();
             this.drawThumb();
         } catch (err) {
@@ -24474,7 +24518,8 @@ class InpaintEditor {
         // Reference layers at their native size: the uploaded file itself when it is
         // untouched, otherwise the pixels with the mask applied (cached per layer).
         const references = [];
-        for (const l of this.refLayersFor(opts.refIds)) {
+        const refLayers = this.refLayersFor(opts.refIds);
+        for (const l of refLayers) {
             if (!l.maskPx && l.ref && !l.dirty) { references.push(l.ref); continue; }
             if (!l.exportRef) {
                 const up = await uploadCanvas(this.layerPixels(l), `n${id}_ref`);
@@ -24482,8 +24527,20 @@ class InpaintEditor {
             }
             references.push(l.exportRef);
         }
+        // the Boxes switch on and a run that takes boxes (docs/PLAN_NODE_BOXES.md §4): the document's boxes, the
+        // references' layer ids and the id of the selection's box, for the node's nodes.py to write FLUX 3's rows (an older
+        // node ignores them). The app's local recipes take none (its boxes go with provider runs), so nothing changes there.
+        const promptSent = opts.prompt != null ? opts.prompt : this.promptText;
+        let boxPart = {}, boxNote = "";
+        const boxSwitch = this.genSettings.boxes ? host.boxSwitch(this) : null;
+        if (boxSwitch && boxSwitch.takes) {
+            const list = this.pluginData && this.pluginData.boxes && Array.isArray(this.pluginData.boxes.boxes) ? this.pluginData.boxes.boxes : [];
+            const p = promptPayload(list, refLayers);
+            boxPart = { selectionBoxId: selectionBoxIdOf(promptSent), referenceIds: refLayers.map((l) => l.id), ...(list.length ? { boxes: p.boxes } : {}) };
+            boxNote = p.notes.join(" ");
+        }
         const [x, y, w, h] = this.cropRect();
-        this.setStatus(`Queued crop ${w} × ${h} at ${x}, ${y}${references.length ? `, ${references.length} reference${references.length > 1 ? "s" : ""}` : ""}. Waiting for the result ...`);
+        this.setStatus(`Queued crop ${w} × ${h} at ${x}, ${y}${references.length ? `, ${references.length} reference${references.length > 1 ? "s" : ""}` : ""}. Waiting for the result ...${boxNote ? " " + boxNote : ""}`, boxNote ? "warn" : undefined);
         return JSON.stringify({
             width: this.width,
             height: this.height,
@@ -24499,6 +24556,7 @@ class InpaintEditor {
             settings: this.settings,
             references,
             refs: this.refSettings,
+            ...boxPart,
         });
     }
 

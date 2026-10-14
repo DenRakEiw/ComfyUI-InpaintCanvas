@@ -1,6 +1,6 @@
 # Development notes
 
-> **js/ is generated** (build b0914759af1d06d5 from scumble 66ce3b8): every file in js/ except host.js, inpaint_node.js and inpaint_bridge.js comes from `renderer/editor/` in DenRakEiw/scumble through its `tools/build_node.py`. Edit the editor there, build, commit both repos.
+> **js/ is generated** (build 1dbc92efa6f6d83d from scumble ec19c19): every file in js/ except host.js, inpaint_node.js and inpaint_bridge.js comes from `renderer/editor/` in DenRakEiw/scumble through its `tools/build_node.py`. Edit the editor there, build, commit both repos.
 
 Everything that is not obvious from the code. Written so a fresh session can
 continue without the chat history. Dates are 2026-09-04 unless stated.
@@ -1453,3 +1453,46 @@ The registry package is `git ls-files` minus `.comfyignore` (comfy-cli's `zip_fi
 (`docs/shots.py`, `DEVELOPMENT.md` line 233, `mcp/inpaint_canvas_mcp.py`). Check the package
 with `python -c "from comfy_cli.file_utils import zip_files; zip_files('node.zip')"` in the repo
 root (writes `node.zip` only). Tests: `python -m unittest discover -s tests -v`.
+
+## 25. Boxes for FLUX 3: box_prompt and elements (2026-10-14, after 0.3.4)
+
+ComfyUI core's *Flux 3 Image* takes `bounding_boxes` (core's elements `{type, bbox, text?, desc}`) and writes
+new-image rows only (`{id: "box_N", bbox, desc}`): no Keep, Move, Remove or From, no `src_bbox` / `tgt_bbox`, no
+`ref_image_k`. The node writes FLUX 3's **edit rows and caption** itself. Plan and decisions: `docs/PLAN_NODE_BOXES.md`
+in the scumble repo (D1-D12).
+
+- **The editor** owns the boxes (`js/inpaint_boxes.js`, built from scumble's `renderer/editor/`; the app keeps its
+  Boxes plugin, the host member `boxesInEditor` decides): tool X, the Boxes section in the Generate pane, the Boxes
+  switch under the prompt (`gen.boxes`; `host.boxSwitch` answers `takes: true, schema: "flux3"`). The tool, the model
+  and the clipboard formatter are shared with the app: `js/boxes_tool.js`, `js/boxes_model.js`, `js/boxes_format.js`,
+  `js/boxes.js`. The boxes live in `editor.pluginData.boxes` (`{version: 1, boxes: [{id, kind, rect, src, layer, desc,
+  text, colour}]}`, image pixels), one undo step of kind `data` per change; `getValue()` carries them as `boxes` (the
+  workflow keeps them), `setValue()` reads them. They follow a crop, extend, resize, turn and straighten
+  (`mapExtras`); the geometry step's own undo puts the old ones back.
+- **canvas_state** (`serializeForPrompt`, only while the switch is on): `boxes` (only when the document holds some; an
+  empty list means the editor had to leave every box out), `referenceIds` (the layer ids of `references`, same order),
+  `selectionBoxId` (`idWords(prompt) || "edit"` + `_1`). A box: `{id, kind, rect: [l, t, r, b] document pixels, src
+  (keep / move / remove: document pixels; from: fractions of its layer's frame as shown), ref (from: index into
+  references), desc, text?}`.
+- **nodes.py** (`run()`, after the frame and the batch) calls `boxes_rows.node_outputs`: the frame is stitch_info's
+  bbox; each box is checked (pluginBoxes' texts), measured (`to_frame`, a side under 1/1000 dropped), named from the
+  batch as built (`ref_image_0` the crop, `ref_image_1` the Original when it went, then the references that loaded),
+  a From box's source mapped through the reference fit (`fit_point`: pad / crop / stretch as `_fit_image` and
+  `comfy.utils.common_upscale` do it, Python's `round`); the selection becomes one New box (S1) only when `boxes` is
+  absent. It never raises: a box that cannot go is left out with a note, anything else gives the plain prompt and the
+  note "Boxes were not written: ..". The notes go back as `ui: {"inpaint_boxes": [...]}` only when there are some
+  (`inpaint_node.js` `onExecuted` shows them as a warn line) and to the console.
+- **boxes_rows.py** is a line-by-line port of scumble's `electron/main/providers/boxes.js` (the caption's sentences,
+  the rows, the grid): `tests/boxes_vectors.json` is a copy of scumble's `tools/boxes_vectors.json`, computed by that
+  file; `tests/test_boxes.py` holds the port to every vector. Where Python and JavaScript differ the JavaScript side
+  is copied: `Math.round` (not half to even), the ECMAScript whitespace set, lengths in UTF-16 units, ASCII `\b`,
+  compact JSON with `ensure_ascii=False`; a character the 400-unit cut would split is dropped whole.
+- **Outputs** `box_prompt` (STRING) and `elements` (ARRAY) are appended after `setting_8` (indices 21 and 22); the
+  frontend shows them after the connected settings (`TAIL_OUTPUTS`) and the queuePrompt wrapper maps the visible slot
+  to the backend's, by name, through `graphNodeOf` (a canvas in a subgraph: "92:7", unverified live).
+- **Bridge / MCP**: `boxes_list`, `boxes_add`, `boxes_set`, `boxes_remove`, `boxes_from_selection`, `boxes_clear`;
+  `set_generation(boxes)`; `status` carries the switch and the ids (52 MCP tools).
+- **Example**: `examples/inpaint_canvas_flux3_boxes.json` (not yet loaded in a real ComfyUI).
+- Tests: `tests/test_boxes.py` (the vectors, the Python-only cases, `run()` per kind, the Original, a reference that
+  fails to load, the three fits, S1, the notes, the expand path); scumble's `tools/node_test.py` (the tool, undo,
+  Delete / D, getValue / setValue, a resize, serializeForPrompt, the tail remap).

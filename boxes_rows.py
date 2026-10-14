@@ -550,7 +550,8 @@ def node_outputs(state, prompt, frame, crop_size, original=False, loaded=(), fit
     (x0, y0, x1, y1, x1 and y1 exclusive) or None, ``fill`` whether crop_image shows the selection filled.
 
     The plain prompt and no elements while the switch is off, without a box, or when none is left. The selection
-    becomes one New box (the app's S1) only when the document holds no box. Never raises: a box that fails a check is
+    becomes one New box (the app's S1) only when the document holds no box: ``boxes`` absent (the editor sends the key,
+    an empty list too, whenever the document holds boxes, so a list it emptied never turns into S1). Never raises: a box that fails a check is
     left out with a note, anything else gives the plain prompt, no elements and the note "Boxes were not written: ..".
     """
     plain = "" if prompt is None else str(prompt)
@@ -562,7 +563,10 @@ def node_outputs(state, prompt, frame, crop_size, original=False, loaded=(), fit
         raw = state.get("boxes")
         if raw is not None and not isinstance(raw, list):
             raise BoxError("the canvas state's boxes are not a list")
-        if not raw:
+        if raw is not None and not raw:
+            # the document holds boxes, none of which could go (the editor said why in its status line): never S1
+            return plain, [], []
+        if raw is None:
             if not selection:
                 return plain, [], []
             sid = state.get("selectionBoxId")

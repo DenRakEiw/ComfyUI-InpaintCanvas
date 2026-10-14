@@ -350,10 +350,13 @@ class RunTests(unittest.TestCase):
         self.assertEqual(d["rows"], [{"id": "night_1", "from": None, "src_bbox": None, "tgt_bbox": self.g(self.SEL, f), "desc": "make it night"}])
         self.assertEqual(d["box_prompt"].split(" [{")[0], "make it night. In <ref_image_0>, the change goes in <night_1> in the middle. Leave the rest of the picture as it is.")
         self.assertEqual(d["elements"], [{"type": "obj", "bbox": self.g(self.SEL, f), "desc": "make it night"}])
-        # an empty list too; without a usable selectionBoxId the id is edit_1
+        # without a usable selectionBoxId the id is edit_1
         for sid in (None, "Bad id", "ref_image_1"):
-            d = self.run_node(self.state([], selectionBoxId=sid))
+            d = self.run_node(self.state(None, selectionBoxId=sid))
             self.assertEqual(d["rows"][0]["id"], "edit_1", sid)
+        # an empty list is a document whose boxes the editor left out: no selection's box, no note of the node's
+        d = self.run_node(self.state([], selectionBoxId="night_1"))
+        self.assertEqual((d["box_prompt"], d["elements"], d["ui"]), ("make it night", [], None))
         # boxes that were all dropped give notes and the plain prompt, never the selection's box
         d = self.run_node(self.state([{"id": "far_1", "kind": "new", "rect": [0, 0, 20, 20]}]))
         self.assertEqual((d["box_prompt"], d["elements"]), ("make it night", []))

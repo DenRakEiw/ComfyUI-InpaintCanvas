@@ -9,6 +9,7 @@ import { el, iconButton, miniButton, selectInput, numberInput, hostText, REF_FIT
 import { selModeOf } from "./inpaint_raster.js";
 import { PromptField, RefBar } from "./prompt_field.js";
 import { buildRangeBar } from "./inpaint_rangebar.js";
+import { EditorBoxes, BOXES_TOOL_TITLE } from "./inpaint_boxes.js";
 
 /**
  * The whole dialog of one editor. The order is the one the method had, and the two joints it kept
@@ -73,6 +74,11 @@ export function buildEditorModal(ed) {
     ed.renderInfo();
     ed.resizeObserver = new ResizeObserver(() => ed.resizeCanvas());
     ed.resizeObserver.observe(ed.viewEl);
+    // the editor's own Boxes where no plugin owns them (the node; docs/PLAN_NODE_BOXES.md B4): the app's plugin keeps them there
+    if (host.boxesInEditor) {
+        ed.boxes = new EditorBoxes(ed);
+        ed.boxes.buildPanel();
+    }
     host.editorBuilt(ed);
 }
 
@@ -305,6 +311,7 @@ function buildTools(ed, body) {
     if (host.depthSupported !== false) {
         addTool("lights", "Lights (L): place and drag lights on the active Relight layer. Alt+drag changes Close/Far, wheel adjusts diffusion (Shift: intensity). Click empty canvas to add a light, Delete removes.");
     }
+    if (host.boxesInEditor) addTool("boxes", BOXES_TOOL_TITLE);
     addTool("hand", "Pan (H, Space or middle mouse)");
     addTool("canvas", "Canvas (C): drag the frame's edges or corners outward to extend the canvas (outpainting), inward to crop, outside the frame to turn the picture; Ctrl+drag along a horizon straightens it. Aspect presets and lines in the bar above. Enter or a double click inside applies, Esc resets. Snaps to 8 px, Alt for single pixels.");
     tools.appendChild(el("div", "ipc-sep"));
