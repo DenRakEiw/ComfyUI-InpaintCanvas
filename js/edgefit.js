@@ -332,6 +332,23 @@ export function warpRGBA(src, w, h, M) {
 }
 
 /**
+ * How much of each pixel of a `w` x `h` warp through `M` (as warpRGBA reads it) comes from inside the source: 1 where
+ * `M x` falls within the source's outermost pixel centres, 0 a pixel or more beyond them, a ramp between. warpRGBA repeats the
+ * edge pixels there, which a caller must not show (an answer shifted up by 18 px read its last row 18 times over the
+ * crop's bottom edge, seen live 2026-10-19).
+ */
+export function warpCoverage(w, h, M) {
+    const out = new Float32Array(w * h);
+    const [a00, a01, tx, a10, a11, ty] = M;
+    for (let y = 0, i = 0; y < h; y++) for (let x = 0; x < w; x++, i++) {
+        const X = a00 * x + a01 * y + tx, Y = a10 * x + a11 * y + ty;
+        const d = Math.min(X, w - 1 - X, Y, h - 1 - Y) + 1;
+        out[i] = d >= 1 ? 1 : d <= 0 ? 0 : d;
+    }
+    return out;
+}
+
+/**
  * The fit of a layer against the composite under it, both as straight-alpha RGBA bytes of the same box (`fullW` x
  * `fullH`, already at the working size `w` x `h` or larger: they are shrunk here when larger). The ring is the layer's
  * own edge: its opaque-enough pixels within `ringWidth` working px (default 6 % of the short side, at least 6) of its

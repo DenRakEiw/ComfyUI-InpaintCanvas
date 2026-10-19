@@ -12332,7 +12332,8 @@ class InpaintEditor {
         const cur = this.segBackendSel.value;
         this.segBackendSel.innerHTML = "";
         for (const b of avail) { const o = document.createElement("option"); o.value = b.id; o.textContent = b.label; this.segBackendSel.appendChild(o); }
-        if (!avail.length) { const o = document.createElement("option"); o.value = ""; o.textContent = "no segmentation nodes installed"; this.segBackendSel.appendChild(o); }
+        // no ComfyUI at all (the app on a machine without one): the route needs a server, not a node pack (review F25)
+        if (!avail.length) { const o = document.createElement("option"); o.value = ""; o.textContent = host.connected ? "no segmentation nodes installed" : "needs a ComfyUI (none connected)"; this.segBackendSel.appendChild(o); }
         if (avail.some((b) => b.id === cur)) this.segBackendSel.value = cur;
         this.segBtn.disabled = !avail.length;
         this.updateSegQuality();
@@ -12368,7 +12369,10 @@ class InpaintEditor {
         if (!text && !fromPrompt) { this.setStatus("Type what to select, e.g. \"shirt\", or write a prompt and press Go to select what it is about."); this.segInput.focus(); return; }
         if (fromPrompt && !llm) { this.setStatus("Type what to select: no language model nodes installed to derive it from the prompt.", "warn"); this.segInput.focus(); return; }
         const backend = SEGMENT_BACKENDS.find((b) => b.id === this.segBackendSel.value) || availableSegmentBackends()[0];
-        if (!backend) { this.setStatus("No segmentation nodes installed (comfyui_segment_anything or comfyui-rmbg).", "warn"); return; }
+        if (!backend) {
+            if (!host.connected) { this.setStatus("Selection by text runs on your ComfyUI (SAM3 or segment-anything there), and none is connected: connect one in the top bar, or select with the object tool, which needs no ComfyUI.", "warn"); return; }
+            this.setStatus("No segmentation nodes installed (comfyui_segment_anything or comfyui-rmbg).", "warn"); return;
+        }
         try {
             this.segBtn.disabled = true;
             this.setStatus(fromPrompt ? `Asking ${llm.label} what the prompt is about, then segmenting with ${backend.label} ...` : `Segmenting "${text}" with ${backend.label} ...`);
@@ -18573,10 +18577,12 @@ class InpaintEditor {
                     negative: r.negative !== undefined ? String(r.negative || "") : this.negativeText || "",
                     refs: r.refs !== undefined ? r.refs : refsNow(),
                     seed: r.seed !== undefined ? r.seed : this.genSettings.seed, mode: r.mode !== undefined ? r.mode : this.genSettings.mode,
-                    denoise: r.denoise !== undefined ? r.denoise : this.genSettings.denoise });
+                    denoise: r.denoise !== undefined ? r.denoise : this.genSettings.denoise,
+                    // what the host says of the run (the app: model, route, seconds); shown, never stored (getValue lists its fields)
+                    via: r.via ? String(r.via) : null });
                 this.renderHistory();
                 const al = r.align && r.align.aligned ? ` · aligned (shift ${r.align.shift[0]}, ${r.align.shift[1]} px, scale ${r.align.scale[0]}, ${r.align.scale[1]})` : "";
-                this.setStatus(`Result ${n} added (${r.width} × ${r.height} at ${r.x}, ${r.y})${al}`);
+                this.setStatus(`Result ${n} added (${r.width} × ${r.height} at ${r.x}, ${r.y})${r.via ? " · " + r.via : ""}${al}`);
             } catch (err) {
                 console.error(err);
                 this.setStatus(String(err.message || err), failKind(err));
@@ -18625,7 +18631,8 @@ class InpaintEditor {
             top.addEventListener("dragstart", (e) => {
                 this.dragLayerId = layer.id; this.dragGroupId = null;
                 e.dataTransfer.effectAllowed = "move";
-                try { e.dataTransfer.setData("text/plain", layer.id); } catch (_) { /* ignore */ }
+                // its own type: the prompt field takes plain text, and a row dropped there would write its id
+                try { e.dataTransfer.setData("application/x-scumble-layer", layer.id); } catch (_) { /* ignore */ }
                 row.classList.add("ipc-dragging");
             });
             top.addEventListener("dragend", () => {
@@ -18801,7 +18808,7 @@ class InpaintEditor {
         top.addEventListener("dragstart", (e) => {
             this.dragGroupId = g.id; this.dragLayerId = null;
             e.dataTransfer.effectAllowed = "move";
-            try { e.dataTransfer.setData("text/plain", g.id); } catch (_) { /* ignore */ }
+            try { e.dataTransfer.setData("application/x-scumble-group", g.id); } catch (_) { /* ignore */ }
             row.classList.add("ipc-dragging");
         });
         top.addEventListener("dragend", () => {
@@ -18967,6 +18974,45 @@ class InpaintEditor {
             const row = el("div", "ipc-layer ipc-refrow" + (layer.id === this.activeLayerId ? " ipc-selected" : ""));
             row.dataset.layer = layer.id;
             row.addEventListener("click", () => { if (this.pending) this.cancelPending(); this.activeLayerId = layer.id; this.renderLayers(); this.updateSubbar(); this.draw(); });
+            // a row dragged onto another takes its place in the batch (QW7, node issue #1 ask 3): above it on its upper
+            // half, below it on the lower; the same move as the arrows (reorderLayer: one undo step, the @img tokens follow)
+            row.draggable = true;
+            row.addEventListener("dragstart", (e) => {
+                this.dragRefId = layer.id;
+                row.classList.add("ipc-dragging");
+                // a type of its own, not text/plain: the prompt field takes plain text dropped on it, and a row dragged
+                // there by mistake would write its layer id into the prompt
+                if (e.dataTransfer) { e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("application/x-scumble-reference", layer.id); }
+            });
+            row.addEventListener("dragend", () => {
+                this.dragRefId = null;
+                row.classList.remove("ipc-dragging");
+                for (const r of list.querySelectorAll(".ipc-drop-above, .ipc-drop-below")) r.classList.remove("ipc-drop-above", "ipc-drop-below");
+            });
+            const upperHalf = (e) => { const b = row.getBoundingClientRect(); return e.clientY < b.top + b.height / 2; };
+            row.addEventListener("dragover", (e) => {
+                if (!this.dragRefId || this.dragRefId === layer.id) return;
+                e.preventDefault();
+                e.stopPropagation();   // not a picture dropped on the list (the list's own drop adds references)
+                if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+                const above = upperHalf(e);
+                // no marker on the half next to where the dragged row already is: a drop there moves nothing
+                const moves = this.reorderMoves(this.dragRefId, layer.id, above);
+                row.classList.toggle("ipc-drop-above", moves && above);
+                row.classList.toggle("ipc-drop-below", moves && !above);
+            });
+            row.addEventListener("dragleave", () => row.classList.remove("ipc-drop-above", "ipc-drop-below"));
+            row.addEventListener("drop", (e) => {
+                const src = this.dragRefId;
+                this.dragRefId = null;
+                row.classList.remove("ipc-drop-above", "ipc-drop-below");
+                if (!src || src === layer.id) return;
+                e.preventDefault();
+                e.stopPropagation();
+                const moved = this.layers.find((l) => l.id === src);
+                if (!moved || !this.isReference(moved)) return;
+                this.reorderLayer(src, layer.id, upperHalf(e));
+            });
             const top = el("div", "ipc-row");
             const hideTip = host.refTokens ? " Hiding renumbers the others; its @img tokens in the prompt wait as @img? until it is shown again." : "";
             top.appendChild(miniButton(layer.visible ? "eye" : "eyeOff", layer.visible ? "Shown and sent with crop_image. Click to hide: a hidden reference is not sent." + hideTip : "Hidden: not sent. Click to show", () => {
@@ -19746,8 +19792,10 @@ class InpaintEditor {
             const pObj = LIGHT_PRESETS.find((x) => x.id === pid);
             const pLabel = pObj ? pObj.label : pid;
             this.pushUndo({ kind: "filter", id: layer.id, label: `Light preset: ${pLabel}` });
-            const w = this.doc ? this.doc.width : 1024;
-            const h = this.doc ? this.doc.height : 1024;
+            // the picture's own size, as the relight command and the toolbar place lights (review F28: the editor has no
+            // `doc`, which put every preset into the top-left 1024 px square)
+            const w = this.width || 1024;
+            const h = this.height || 1024;
             const newLights = applyLightPreset(pid, { width: w, height: h });
             if (newLights && newLights.length > 0) {
                 layer.params.lights = newLights;
@@ -19767,8 +19815,8 @@ class InpaintEditor {
         const addBtn = iconButton("plus", count >= LIGHT_MAX ? "Maximum 4 lights reached" : "Add a new light", () => {
             if (layer.params.lights.length >= LIGHT_MAX) return;
             this.pushUndo({ kind: "filter", id: layer.id, label: "Add light" });
-            const w = this.doc ? this.doc.width : 1024;
-            const h = this.doc ? this.doc.height : 1024;
+            const w = this.width || 1024;
+            const h = this.height || 1024;
             let n = 1;
             while (layer.params.lights.some((l) => l && l.id === `light_${n}`)) n++;
             const nl = defaultLight(n - 1, { width: w, height: h });
@@ -19858,8 +19906,8 @@ class InpaintEditor {
             const resetBtn = miniButton("restore", "Reset light to defaults", (e) => {
                 stop(e);
                 this.pushUndo({ kind: "filter", id: layer.id, label: "Reset light" });
-                const w = this.doc ? this.doc.width : 1024;
-                const h = this.doc ? this.doc.height : 1024;
+                const w = this.width || 1024;
+                const h = this.height || 1024;
                 const def = defaultLight(i, { width: w, height: h });
                 Object.assign(l, def, { id: l.id });
                 this.markFilterChanged(layer);
@@ -20547,6 +20595,7 @@ class InpaintEditor {
             const title = el("b", null, h.name + (layer ? "" : " (discarded)"));
             text.appendChild(title);
             text.appendChild(el("span", null, `${h.w} × ${h.h} at ${h.x}, ${h.y}`));
+            if (h.via) text.appendChild(el("span", "ipc-hvia", h.via));
             if (h.seed != null) {
                 const meta = el("span", null, `${h.mode || "api"} · seed ${h.seed}` + (h.mode === "local" && h.denoise != null ? ` · denoise ${h.denoise}` : ""));
                 meta.title = "Click to use this seed again";
@@ -21798,7 +21847,6 @@ class InpaintEditor {
         if (!tLayer && !tGroup) return false;
         if (tLayer && block.includes(tLayer)) return false;
         if (g && tGroup && (tGroup === g || this.inGroup(tGroup, g.id))) return false;
-        this.pushUndo({ kind: "layers", label: "Layer order" });
         const rest = this.layers.filter((l) => !block.includes(l));
         let at, parent;
         if (tLayer) {
@@ -21810,11 +21858,37 @@ class InpaintEditor {
             at = mem.length ? rest.indexOf(mem[mem.length - 1]) + 1 : rest.length;
             parent = above ? (tGroup.parent || null) : tGroup.id;
         }
+        const next = [...rest.slice(0, at), ...block, ...rest.slice(at)];
+        // a drop next to where it already is changes nothing that shows: no step, no change (review F26)
+        const sameParent = g ? (g.parent || null) === parent : this.isReference(src) || (src.group || null) === parent;
+        if (sameParent && this.sameStackOrder(src, next)) return false;
+        this.pushUndo({ kind: "layers", label: "Layer order" });
         if (g) g.parent = parent;
         else if (!this.isReference(src)) src.group = parent;
-        this.layers = [...rest.slice(0, at), ...block, ...rest.slice(at)];
+        this.layers = next;
         this.layersRestacked();
         return true;
+    }
+
+    /**
+     * Whether the stack `next` shows the layers in the order they have now: the whole stack, or only the references'
+     * order when `moved` is a reference (they are no part of the picture, so their place among the other layers is not).
+     */
+    sameStackOrder(moved, next) {
+        const seen = (arr) => (moved && this.isReference(moved) ? arr.filter((l) => this.isReference(l)) : arr);
+        const a = seen(next), b = seen(this.layers);
+        return a.length === b.length && a.every((l, k) => l === b[k]);
+    }
+
+    /** Whether reorderLayer(srcId, targetId, above) would move anything (a reference row's drop marker). */
+    reorderMoves(srcId, targetId, above) {
+        const src = this.layers.find((l) => l.id === srcId), t = this.layers.find((l) => l.id === targetId);
+        if (!src || !t || src === t) return false;
+        // where dropInLayers puts it: next to the target in the stack without it
+        const rest = this.layers.filter((l) => l !== src);
+        const at = rest.indexOf(t) + (above ? 1 : 0);
+        const next = [...rest.slice(0, at), src, ...rest.slice(at)];
+        return !this.sameStackOrder(src, next) || (!this.isReference(src) && (src.group || null) !== (t.group || null));
     }
 
     /**
@@ -24477,7 +24551,10 @@ class InpaintEditor {
 
     /**
      * Called when the prompt is built: upload flattened image, mask and control, return the prompt JSON. `opts` (the
-     * app): `refIds` the click's references (refLayersFor), `prompt` / `negative` the texts to send instead of the fields'.
+     * app): `refIds` the click's references (refLayersFor), `prompt` / `negative` the texts to send instead of the fields';
+     * `boxes` ({ boxes, notes }, promptPayload's shape; `boxes` null: none, the selection goes as one) the boxes a run
+     * sends while the Boxes switch is on, measured by the caller, instead of the document's (Generate new measures them
+     * on the picture they were drawn on, before its fresh canvas replaces it).
      */
     async serializeForPrompt(opts = {}) {
         if (!this.base) return "{}";
@@ -24529,17 +24606,19 @@ class InpaintEditor {
         }
         // the Boxes switch on and a run that takes boxes (docs/PLAN_NODE_BOXES.md §4): the document's boxes, the
         // references' layer ids and the id of the selection's box, for the node's nodes.py to write FLUX 3's rows (an older
-        // node ignores them). The app's local recipes take none (its boxes go with provider runs), so nothing changes there.
+        // node ignores them). In the app a local recipe takes them only when it declares the input its rows go to (its
+        // `boxes`): the app's host wires that input to the node's box_prompt for the run.
         const promptSent = opts.prompt != null ? opts.prompt : this.promptText;
         let boxPart = {}, boxNote = "";
         const boxSwitch = this.genSettings.boxes ? host.boxSwitch(this) : null;
         if (boxSwitch && boxSwitch.takes) {
-            const list = this.pluginData && this.pluginData.boxes && Array.isArray(this.pluginData.boxes.boxes) ? this.pluginData.boxes.boxes : [];
-            const p = promptPayload(list, refLayers);
+            const given = opts.boxes && typeof opts.boxes === "object" ? opts.boxes : null;
+            const list = given ? (given.boxes || []) : this.pluginData && this.pluginData.boxes && Array.isArray(this.pluginData.boxes.boxes) ? this.pluginData.boxes.boxes : [];
+            const p = given ? { boxes: list, notes: Array.isArray(given.notes) ? given.notes : [] } : promptPayload(list, refLayers);
             // each reference's @img label (img1 ..), so nodes.py can name a token in a description or the prompt as the
             // picture the batch holds ("image 3")
             const labels = this.refLabels();
-            boxPart = { selectionBoxId: selectionBoxIdOf(promptSent), referenceIds: refLayers.map((l) => l.id), referenceLabels: refLayers.map((l) => (labels.has(l.id) ? `img${labels.get(l.id)}` : null)), ...(list.length ? { boxes: p.boxes } : {}) };
+            boxPart = { selectionBoxId: selectionBoxIdOf(promptSent), referenceIds: refLayers.map((l) => l.id), referenceLabels: refLayers.map((l) => (labels.has(l.id) ? `img${labels.get(l.id)}` : null)), ...((given ? Array.isArray(given.boxes) : list.length) ? { boxes: p.boxes } : {}) };
             boxNote = p.notes.join(" ");
         }
         const [x, y, w, h] = this.cropRect();

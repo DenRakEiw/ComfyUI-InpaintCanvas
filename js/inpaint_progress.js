@@ -4,6 +4,10 @@
 // seconds of a run the app waits for (an API run, a pass on the whole picture). No DOM and no imports: the editor
 // draws the state it is handed, so the node's build and a plain-Node test use the same code.
 //
+// A provider's run whose live events carry no sampler steps (Comfy Cloud: the share done of all nodes, how many are
+// whole, docs/PLAN_COMFY_SDK.md section 4) comes in as `fraction` events under the timed run's id: it shows "node k/n"
+// and fills with the running node's part.
+//
 // One state at a time: a local prompt that runs (the latest execution_start), else one that waits ("Queued"), else
 // the timed run. A timed run whose own prompt runs (a pass on ComfyUI: `promptId`) shows that prompt's steps under its
 // label; a local Generate beside an API run of the same tab shows as "Generating", the API run's seconds after it. Every change calls onChange(state) with null (nothing to show) or
@@ -81,6 +85,19 @@ export class RunProgress {
             if (run.stepped[run.stepped.length - 1] !== key || (prev && value < prev.value)) run.stepped.push(key);
             run.node = key.split(".")[0];
             run.stepNode = key;
+        } else if (type === "fraction") {
+            // value: the share done of nodes_total nodes, nodes_done of them whole; the rest is the running node's part.
+            // A local prompt that runs keeps the bar (the provider's run shows beside it, as its timed run)
+            if (!run.started) {
+                run.started = this.now();
+                const local = this.active && this.runs.get(this.active);
+                if (!(local && local.started && !local.share)) this.active = id;
+            }
+            const total = Math.max(1, Math.round(+d.nodes_total) || run.nodes || 1);
+            const whole = Math.max(0, Math.min(total, Math.round(+d.nodes_done) || 0));
+            const value = Math.max(0, Math.min(1, +d.value || 0));
+            run.nodes = total;
+            run.share = { whole, total, part: Math.max(0, Math.min(1, value * total - whole)) };
         } else if (type === "execution_success" || type === "execution_error" || type === "execution_interrupted") {
             return this.done(id);
         } else {
@@ -110,14 +127,14 @@ export class RunProgress {
         return true;
     }
 
-    /** The queue is empty: no prompt of this document waits any more. */
-    idle() {
-        if (!this.runs.size) return;
+    /** The queue is empty: no prompt of this document waits any more (but those in `keep`, a provider's runs). */
+    idle(keep = null) {
+        const going = Array.from(this.runs.keys()).filter((id) => !(keep && keep.has(id)));
+        if (!going.length) return;
         const at = this.now();
-        for (const [id, run] of this.runs) this.dropped.set(id, { at, run });
+        for (const id of going) { this.dropped.set(id, { at, run: this.runs.get(id) }); this.runs.delete(id); }
         for (const [id, v] of this.dropped) if (at - v.at > 60000) this.dropped.delete(id);
-        this.runs.clear();
-        this.active = null;
+        if (this.active && !this.runs.has(this.active)) this.active = null;
         this.changed();
     }
 
@@ -143,10 +160,15 @@ export class RunProgress {
     state() {
         const secs = (t0) => Math.max(0, Math.floor((this.now() - t0) / 1000));
         let id = this.active && this.runs.has(this.active) ? this.active : null;
+        // no latest start known (idle() let it go, the prompt came back by its own event or revive()): a local prompt
+        // that runs before a provider's run, which then shows beside it as its timed run
+        if (!id) for (const [k, r] of this.runs) if (r.started && !r.share) { id = k; break; }
         if (!id) for (const [k, r] of this.runs) if (r.started) { id = k; break; }
         if (!id && this.runs.size) id = this.runs.keys().next().value;
         const run = id ? this.runs.get(id) : null;
-        const queued = Math.max(0, this.runs.size - (run ? 1 : 0));
+        // a provider's run waits in no queue of this document: it is the run shown, or the timed run beside it
+        let queued = 0;
+        for (const [k, r] of this.runs) if (k !== id && !r.share) queued++;
         const more = queued ? ` · ${queued} more queued` : "";
         if (run && run.started) {
             const total = Math.max(run.seen.size, run.nodes - run.cached);
@@ -158,6 +180,12 @@ export class RunProgress {
                 parts.push(`step ${step.value}/${step.max}${run.stepped.length > 1 ? ` (pass ${run.stepped.length})` : ""}`);
             }
             if (run.seen.size) parts.push(`node ${Math.min(run.seen.size, total)}/${total}`);
+            else if (run.share) {
+                // a provider's run: the node that runs is the one after the whole ones; it fills once it moves
+                const s = run.share;
+                parts.push(`node ${Math.min(s.whole + 1, s.total)}/${s.total}`);
+                if (fraction == null && s.whole < s.total && s.part > 0.001) fraction = s.part;
+            }
             // the timed run's label only over its own prompt; another timed run (an API run beside a local Generate) after it
             const own = !!this.timed && this.timed.promptId === id;
             const label = own ? this.timed.label : "Generating";

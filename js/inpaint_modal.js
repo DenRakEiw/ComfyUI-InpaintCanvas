@@ -461,7 +461,9 @@ function buildReferences(ed) {
     refHead.appendChild(miniButton("refImage", "Add reference images (one per file). Shift+drop on the canvas or a drop on this list does the same.", () => ed.refInput.click()));
     ed.panes.image.appendChild(refHead);
     ed.refList = el("div", "ipc-list ipc-reflist");
-    ed.refList.addEventListener("dragover", (e) => { e.preventDefault(); e.stopPropagation(); ed.refList.classList.add("ipc-dropping"); });
+    // a reference row dragged in the list (QW7) is no file drop: no highlight, and a row dropped on itself or between
+    // rows is refused
+    ed.refList.addEventListener("dragover", (e) => { if (ed.dragRefId) return; e.preventDefault(); e.stopPropagation(); ed.refList.classList.add("ipc-dropping"); });
     ed.refList.addEventListener("dragleave", () => ed.refList.classList.remove("ipc-dropping"));
     ed.refList.addEventListener("drop", (e) => {
         e.preventDefault(); e.stopPropagation();
