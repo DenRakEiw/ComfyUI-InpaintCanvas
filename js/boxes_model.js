@@ -188,18 +188,27 @@ export function cropCheck(boxes, crop, sel) {
 
 /** The New boxes (not Text) without a description: the model would have to guess what goes there (S3e). */
 export const bareOf = (boxes) => boxes.filter((b) => b.kind === "new" && b.text == null && !b.desc).map((b) => b.id);
-/** The boxes a run of the recipe leaves out by their kind: Ideogram 4's caption has no Move, Remove or From (main's boxes.js). */
-export const unplacedOf = (boxes, schema) => (schema === "ideogram4" ? boxes.filter((b) => b.kind === "move" || b.kind === "remove" || b.kind === "from").map((b) => b.id) : []);
+/**
+ * The boxes a run of the recipe leaves out by their kind: Ideogram 4's caption has no Move, Remove or From (main's
+ * boxes.js); MOSS-Image's layout (a new picture, written from the Inpaint Canvas node's elements) has New and Text only.
+ */
+export const unplacedOf = (boxes, schema) => (schema === "ideogram4" ? boxes.filter((b) => b.kind === "move" || b.kind === "remove" || b.kind === "from").map((b) => b.id)
+    : schema === "moss" ? boxes.filter((b) => b.kind !== "new").map((b) => b.id) : []);
+/** Why a format leaves boxes out, after "Box x_1 does not go with <recipe>: ". */
+const UNPLACED_WHY = {
+    ideogram4: "Ideogram 4 places New, Text and Keep boxes only (Keep on an edit).",
+    moss: "MOSS-Image makes a new picture and places New and Text boxes only.",
+};
 
 const names = (ids) => `${ids.length === 1 ? "Box" : "Boxes"} ${ids.join(", ")}`;
 
 /**
  * The panel's warning lines, [text, offersPasteWholeCrop] each: the boxes a recipe's format leaves out (`unplaced`,
- * `name` the recipe), the New boxes without a description, and cropCheck's findings (`chk`, or null).
+ * `name` the recipe, `schema` its format), the New boxes without a description, and cropCheck's findings (`chk`, or null).
  */
-export function warningLines(chk, bare, unplaced = [], name = "") {
+export function warningLines(chk, bare, unplaced = [], name = "", schema = "ideogram4") {
     const lines = [];
-    if (unplaced.length) lines.push([`${names(unplaced)} ${unplaced.length === 1 ? "does" : "do"} not go with ${name}: Ideogram 4 places New, Text and Keep boxes only (Keep on an edit).`, false]);
+    if (unplaced.length) lines.push([`${names(unplaced)} ${unplaced.length === 1 ? "does" : "do"} not go with ${name}: ${UNPLACED_WHY[schema] || UNPLACED_WHY.ideogram4}`, false]);
     if (bare.length) lines.push([`${names(bare)} ${bare.length === 1 ? "has" : "have"} no description: the model does not know what goes there. Describe ${bare.length === 1 ? "it in its row" : "them in their rows"}.`, false]);
     if (chk && chk.small.length) lines.push([smallNote(chk.small), false]);
     if (chk && chk.out.length) lines.push([`${names(chk.out)} ${chk.out.length === 1 ? "lies" : "lie"} outside the crop Generate sends and ${chk.out.length === 1 ? "is" : "are"} left out.`, false]);

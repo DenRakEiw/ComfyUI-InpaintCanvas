@@ -91,6 +91,38 @@ const LAYER_PENDING_KEYS = ["_undoPending", "_textUndo", "_matchUndo", "_hoverSn
     "_flushNudge", "_flushWheel", "_nudgeRelightTimer", "_wheelRelightTimer"];
 /** Said when a run holds the document (the app's host; the node's sets no `providerPending`). */
 const RUN_GOING_TEXT = "A run is still going on this document: wait for it, or Cancel.";
+/**
+ * The layer kinds this version reads (getValue writes them). A layer of another kind with a file loads as pixels and
+ * keeps its kind; one without a file can only come from a newer version, and setValue leaves it out with a word.
+ */
+const LAYER_KINDS = new Set(["result", "paint", "image", "text", "filter"]);
+/**
+ * A load's note (setValue: layers left out) rides on the next LOAD_NOTE_LINES plain status lines, for LOAD_NOTE_MS at
+ * most and until the user acts: the host's own lines right after a load ("Last session restored.", then "Opened ..." or
+ * "Reopened ...") would otherwise write over it unseen. An error or warning line stays as it is (and keeps the carry
+ * for the line after it), so a caller that compares its own line (generate's Realism Pass sentence) still finds it.
+ */
+const LOAD_NOTE_LINES = 2;
+const LOAD_NOTE_MS = 20000;
+/** The Relight panel's Style choices on the Magnific route (commands.js relight takes the same). */
+export const RELIGHT_STYLES = ["standard", "darker_but_realistic", "clean", "smooth", "brighter", "contrasted_n_hdr", "just_composition"];
+/** The Relight panel's Light type choices on the Bria route; none picked is "From the lights" (commands.js relight takes the same). */
+export const RELIGHT_LIGHT_TYPES = [
+    "soft overcast daylight lighting", "midday", "blue hour light", "low-angle sunlight", "sunrise light", "spotlight on subject", "overcast light",
+    "cloud-filtered lighting", "fog-diffused lighting", "moonlight lighting", "starlight nighttime", "soft bokeh lighting", "harsh studio lighting",
+];
+
+/** The status line of a load that left layers out: `newer` of a kind this version does not know, `failed` filter layers that would not load. */
+function leftOutText(newer, failed) {
+    const parts = [];
+    if (newer > 0) {
+        const one = newer === 1;
+        // neutral words, so the node's build says nothing wrong; a host may name itself (text.newerApp)
+        parts.push(`${newer} layer${one ? "" : "s"} saved by ${hostText("newerApp", "a newer version")} ${one ? "was" : "were"} left out: this version cannot show ${one ? "it" : "them"}, and the next save drops ${one ? "it" : "them"}.`);
+    }
+    if (failed > 0) parts.push(`${failed} filter layer${failed === 1 ? "" : "s"} could not be read and ${failed === 1 ? "was" : "were"} left out.`);
+    return parts.join(" ");
+}
 /** What an undo step is called in the Undo history when its site gives no label of its own. */
 const UNDO_LABELS = {
     layerrect: "Layer pixels", layer: "Layer pixels", layerfull: "Layer", selection: "Selection", transform: "Transform", transforms: "Transform layers",
@@ -1001,6 +1033,33 @@ function drawMesh(ctx, img, dst, nx, ny) {
 // ---------------------------------------------------------------------------
 // text segmentation backends (each builds a small standalone prompt)
 // ---------------------------------------------------------------------------
+
+/**
+ * A helper prompt with every required widget input its builder left out set to the server's own default for it (the
+ * node's spec in /object_info: a combo's default or its first option, a value's default). Node packs add required
+ * inputs: comfyui-rmbg's SAM3Segment got `model_name` (sam3.1_multiplex_fp16 / sam3) in 2026-10, and a prompt without
+ * it fails validation (DenRakEiw/scumble#7); an older pack without the input is sent nothing more. Links (IMAGE, MASK,
+ * ...) have no default and stay as they are. Changes and returns `nodes`.
+ */
+function withSpecDefaults(nodes) {
+    const types = host.nodeTypes() || {};
+    for (const node of Object.values(nodes)) {
+        const t = node && types[node.class_type];
+        const req = t && t.nodeData && t.nodeData.input && t.nodeData.input.required;
+        if (!req || !node.inputs) continue;
+        for (const [name, spec] of Object.entries(req)) {
+            if (name in node.inputs || !Array.isArray(spec)) continue;
+            const opts = spec[1] && typeof spec[1] === "object" ? spec[1] : {};
+            if (Array.isArray(spec[0])) {
+                const v = opts.default !== undefined && spec[0].includes(opts.default) ? opts.default : spec[0][0];
+                if (v !== undefined) node.inputs[name] = v;
+            } else if (opts.default !== undefined && ["INT", "FLOAT", "STRING", "BOOLEAN", "COMBO"].includes(spec[0])) {
+                node.inputs[name] = opts.default;
+            }
+        }
+    }
+    return nodes;
+}
 
 const SEGMENT_BACKENDS = [
     {
@@ -3170,7 +3229,9 @@ class InpaintEditor {
         }, { passive: false });
         // Keys are handled by the window capture listener (see open()); here we
         // only keep them from bubbling to the graph canvas.
-        root.addEventListener("keydown", (e) => e.stopPropagation());
+        root.addEventListener("keydown", (e) => { this._loadNote = null; e.stopPropagation(); });
+        // the user acts: a load's note (setValue) stops riding on the next lines
+        root.addEventListener("pointerdown", () => { this._loadNote = null; }, true);
         root.addEventListener("paste", (e) => {
             if (this.promptInput && e.target && this.promptInput.contains(e.target)) return;
             const items = e.clipboardData && e.clipboardData.items;
@@ -3407,7 +3468,15 @@ class InpaintEditor {
      * decides (inpaint_status.js statusKindOf). `status` stays the plain text, `statusKind` the kind ("" for a plain line).
      */
     setStatus(text, opts) {
-        const kind = statusKindFor(text, opts);
+        let kind = statusKindFor(text, opts);
+        // a load that left layers out (setValue) says so on the plain lines written right after it too (LOAD_NOTE_LINES)
+        const carry = this._loadNote;
+        if (carry && Date.now() > carry.until) this._loadNote = null;
+        else if (carry && !kind && !String(text).includes(carry.note)) {
+            text = `${text} ${carry.note}`;
+            kind = "warn";
+            if (--carry.lines <= 0) this._loadNote = null;
+        }
         this.status = text;
         this.statusKind = kind;
         for (const node of [this.statusEl, this.nodeStatus]) {
@@ -12393,7 +12462,7 @@ class InpaintEditor {
                 prompt.term_run = prompt.up_run; delete prompt.up_run;
                 text = ["term_run", llm.textOut[1]];
             }
-            Object.assign(prompt, backend.build("seg_load", text, threshold, { quality: this.segQuality.checked }, backend));
+            Object.assign(prompt, withSpecDefaults(backend.build("seg_load", text, threshold, { quality: this.segQuality.checked }, backend)));
             prompt.seg_out = { class_type: "InpaintCanvasMaskOut", inputs: { mask: backend.maskOut, canvas_node: String(this.node.id), purpose: "segment", ...(fromPrompt ? { label: text } : {}) } };
             this.helperUsed = true;   // a helper model (SAM2 / SAM3 / RMBG / Qwen-VL) may now sit in VRAM outside ComfyUI's model management
             const res = await api.queuePrompt(-1, { output: prompt, workflow: { nodes: [], links: [], version: 0.4, extra: { inpaint_canvas_helper: true } } });
@@ -12548,7 +12617,7 @@ class InpaintEditor {
             const prompt = {
                 up_load: { class_type: "InpaintCanvasLoadRef", inputs: { ref: JSON.stringify(ref) } },
                 // the ComfyUI helper gets the names and the rule, no pictures (26d2: until a node release)
-                ...backend.build("up_load", upsampleInstruction(useCase, text, region, this.getBounds() ? this.selectionLabel : "", refs)),
+                ...withSpecDefaults(backend.build("up_load", upsampleInstruction(useCase, text, region, this.getBounds() ? this.selectionLabel : "", refs))),
                 up_out: { class_type: "InpaintCanvasTextOut", inputs: { text: backend.textOut, canvas_node: String(this.node.id), purpose: "upsample" } },
             };
             this.helperUsed = true;   // a helper model (SAM2 / SAM3 / RMBG / Qwen-VL) may now sit in VRAM outside ComfyUI's model management
@@ -12644,7 +12713,7 @@ class InpaintEditor {
     /** Make sure the object map matches the current source; run SAM2 if not. */
     async ensureObjects() {
         if (!this.base || this.objectsPending) return;
-        if (this.resizingRun()) { if (this.status !== RUN_GOING_TEXT) this.setStatus(RUN_GOING_TEXT); return; }
+        if (this.resizingRun()) { if (!String(this.status || "").startsWith(RUN_GOING_TEXT)) this.setStatus(RUN_GOING_TEXT); return; }
         if (!objectBackendAvailable()) {
             // asked on every pointer move while the tool hovers: write (and log) the line once
             const t = hostText("noObjectBackend", "Object selection needs a SAM2 model: download one in Settings › Helpers, or install ComfyUI-segment-anything-2 (Kijai) on the server.");
@@ -16208,7 +16277,7 @@ class InpaintEditor {
             const up = await uploadCanvas(layer.px.toCanvas(), `n${this.node.id}_cutsrc`);
             const prompt = {
                 cut_load: { class_type: "InpaintCanvasLoadRef", inputs: { ref: JSON.stringify(up.ref) } },
-                ...backend.build("cut_load"),
+                ...withSpecDefaults(backend.build("cut_load")),
                 cut_out: { class_type: "InpaintCanvasMaskOut", inputs: { mask: backend.maskOut, canvas_node: String(this.node.id), purpose: "cutout" } },
             };
             this.helperUsed = true;   // a helper model (SAM2 / SAM3 / RMBG / Qwen-VL) may now sit in VRAM outside ComfyUI's model management
@@ -20231,8 +20300,7 @@ class InpaintEditor {
             styLabel.style.width = "40px";
             const styleSel = document.createElement("select");
             styleSel.className = "ipc-sel";
-            const styles = ["standard", "darker_but_realistic", "clean", "smooth", "brighter", "contrasted_n_hdr", "just_composition"];
-            for (const st of styles) {
+            for (const st of RELIGHT_STYLES) {
                 const opt = document.createElement("option");
                 opt.value = st;
                 opt.textContent = st.replace(/_/g, " ");
@@ -20384,22 +20452,7 @@ class InpaintEditor {
             fromLights.value = "";
             fromLights.textContent = "From the lights";
             ltSel.appendChild(fromLights);
-            const briaTypes = [
-                "soft overcast daylight lighting",
-                "midday",
-                "blue hour light",
-                "low-angle sunlight",
-                "sunrise light",
-                "spotlight on subject",
-                "overcast light",
-                "cloud-filtered lighting",
-                "fog-diffused lighting",
-                "moonlight lighting",
-                "starlight nighttime",
-                "soft bokeh lighting",
-                "harsh studio lighting"
-            ];
-            for (const bt of briaTypes) {
+            for (const bt of RELIGHT_LIGHT_TYPES) {
                 const opt = document.createElement("option");
                 opt.value = bt;
                 opt.textContent = bt;
@@ -24371,6 +24424,11 @@ class InpaintEditor {
             this.activeGroupId = null;
             // a list drawn while a layer loads (an await below) must not drop a group whose layers are not in yet
             this.holdGroups = (this.holdGroups || 0) + 1;
+            // what is left out says so (docs/PLAN_0_1_50.md Q4): a layer of a kind a newer version wrote without a file,
+            // and a filter layer that would not load
+            let newer = 0, failed = 0;
+            this.leftOut = null;
+            this._loadNote = null;
             try {
                 for (const l of state.layers || []) {
                     if (l.kind === "filter") {
@@ -24404,6 +24462,7 @@ class InpaintEditor {
                             this.filterCounter += 1;
                         } catch (err) {
                             console.warn("Inpaint Canvas: filter layer skipped", l, err);
+                            failed += 1;
                         }
                         continue;
                     }
@@ -24415,7 +24474,10 @@ class InpaintEditor {
                         textToRender.push(layer);
                         continue;
                     }
-                    if (!l.ref) continue;
+                    if (!l.ref) {
+                        if (typeof l.kind === "string" && l.kind && !LAYER_KINDS.has(l.kind)) newer += 1;
+                        continue;
+                    }
                     try {
                         const got = await streamed(l.ref, this.pixels.Layer);
                         if (stale()) { if (got && got.px) got.px.release(); return; }
@@ -24446,6 +24508,11 @@ class InpaintEditor {
                     }
                 }
             } finally { this.holdGroups--; }
+            if (newer || failed) {
+                this.leftOut = { newer, failed, note: leftOutText(newer, failed) };
+                this.setStatus(this.leftOut.note, "warn");
+                this._loadNote = { note: this.leftOut.note, lines: LOAD_NOTE_LINES, until: Date.now() + LOAD_NOTE_MS };
+            }
             this.normalizeGroups();   // a layer that failed to load may leave a group empty
             if (textToRender.length) {
                 await loadFontList();
