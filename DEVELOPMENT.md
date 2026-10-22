@@ -154,7 +154,12 @@ no layer is visible), `mask` the selection as grayscale PNG, `control` the
 control layers on black (or null), `references` the list of file refs of the
 visible reference layers (top of the list first). Files are named `n{nodeId}_{base|mask|control|layer}_{sha1[:12]}.png`
 and uploaded with `overwrite=true`; unchanged content is not re-uploaded
-(`this.uploaded.*Hash`).
+(`this.uploaded.*Hash`). A reference that does not load is left out of the
+batch with a print, and the later ones move up; Scumble adds `named_refs: true`
+when its prompt names a reference by its place in the batch (`@img1` sent as
+`<image3>` ..), and then `run()` raises instead ("reference 2 (@img2) could
+not be loaded ..."), so a name never lands on the wrong picture
+(`tests/test_refs.py`). The node's own editor does not send it.
 
 In memory each layer has `canvas` (HTMLCanvasElement, its own pixel size) drawn
 at `(x, y, w, h)`; result layers are patch-sized, paint layers are canvas-sized.

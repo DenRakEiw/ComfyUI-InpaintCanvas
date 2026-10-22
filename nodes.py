@@ -768,12 +768,24 @@ class InpaintCanvas:
         ref_fit = ref_settings.get("fit") if ref_settings.get("fit") in REFERENCE_FITS else "pad"
         refs = []
         loaded = []   # (index in references, width, height as loaded) per reference in the batch: the box rows name them
+        # named_refs (sent by Scumble when the prompt names a reference, @img1 written as the batch's "<image3>" ..):
+        # the names count places in the batch, so a reference left out would move every later one up and the prompt
+        # would name the wrong pictures. Then the run stops; without it a reference that does not load is left out.
+        named_refs = state.get("named_refs") is True
         for j, entry in enumerate(state.get("references") or []):
             try:
                 picture = _load_rgb(entry, background=(255, 255, 255))
                 refs.append(_fit_image(picture, int(crop.shape[2]), int(crop.shape[1]), ref_fit))
                 loaded.append((j, int(picture.shape[2]), int(picture.shape[1])))
             except (ValueError, FileNotFoundError, OSError) as err:
+                if named_refs:
+                    why = str(err)
+                    if why.startswith("Inpaint Canvas: "):
+                        why = why[len("Inpaint Canvas: "):]
+                    raise ValueError(
+                        f"Inpaint Canvas: reference {j + 1} (@img{j + 1}) could not be loaded ({why}). The prompt "
+                        "names the references by their place in the batch, so the run stops instead of sending the "
+                        "names onto the wrong pictures. Replace or hide that reference layer, then run again.") from err
                 print(f"[Inpaint Canvas] reference skipped: {err}")
         if refs:
             crop = torch.cat([crop] + refs, dim=0)
