@@ -472,7 +472,7 @@ export class PromptField {
         el.dataset.placeholder = String(placeholder || "");
         this.el = el;
         this.defineApi();
-        this.listen();
+        this.bindEvents();
         this.render();
     }
 
@@ -936,7 +936,7 @@ export class PromptField {
 
     // ---- events ------------------------------------------------------------------------------------------------------
 
-    listen() {
+    bindEvents() {
         const el = this.el;
         el.addEventListener("beforeinput", (e) => this.onBeforeInput(e));
         el.addEventListener("input", (e) => this.onInput(e));

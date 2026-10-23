@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-inpaintcanvas"
 description = "Inpainting with layers inside ComfyUI: one node holds the image, the layers, the selection and the prompt. The selected region goes out as a crop to any inpaint chain and the result comes back as a new layer. Selection tools (brush, lasso, polygon, magic wand, SAM2 objects, SAM3 text), reference layers for Flux.2 multi-reference editing, boxes in the prompt (FLUX 3's edit rows on a box_prompt output, core bounding-box elements for FLUX 3 Image and MOSS-Image), RMBG cutouts, film grain and LUT filter layers, prompt upsampling, PSD and ORA export. The same editor is also a standalone desktop app, Scumble (https://github.com/DenRakEiw/scumble), which renders through ComfyUI with this pack or through API providers."
-version = "0.4.0"
+version = "0.4.1"
 license = { file = "LICENSE" }
 dependencies = []
 
