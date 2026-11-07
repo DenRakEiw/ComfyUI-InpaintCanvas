@@ -352,17 +352,27 @@ export function warpCoverage(w, h, M) {
  * The fit of a layer against the composite under it, both as straight-alpha RGBA bytes of the same box (`fullW` x
  * `fullH`, already at the working size `w` x `h` or larger: they are shrunk here when larger). The ring is the layer's
  * own edge: its opaque-enough pixels within `ringWidth` working px (default 6 % of the short side, at least 6) of its
- * transparent part or of the box's border.
+ * transparent part or of the box's border. `laps` (the K0b harness, docs/PLAN_WASM_BUILD.md 4.10): an object the
+ * milliseconds of the three steps are added to, "shrink" (the working planes), "ring" (`edgeRing`) and "fit" (`fitEdges`).
  */
-export function fitLayerRGBA({ baseRGBA, layerRGBA, w, h, fullW = w, fullH = h, ringWidth = 0 }) {
+export function fitLayerRGBA({ baseRGBA, layerRGBA, w, h, fullW = w, fullH = h, ringWidth = 0, laps = null }) {
+    const now = () => (laps ? performance.now() : 0);
+    const add = (key, t0) => { if (laps) laps[key] = (laps[key] || 0) + (performance.now() - t0); };
     const s = workScale(fullW, fullH);
     const tw = Math.max(1, Math.round(fullW * s)), th = Math.max(1, Math.round(fullH * s));
+    let t0 = now();
     let base, lay;
     if (w === tw && h === th) { base = grayOf(baseRGBA); lay = { gray: grayOf(layerRGBA), alpha: alphaOf(layerRGBA) }; }
     else { base = shrinkRGBA(baseRGBA, w, h, tw, th).gray; lay = shrinkRGBA(layerRGBA, w, h, tw, th); }
     const valid = new Uint8Array(tw * th);
     for (let i = 0; i < valid.length; i++) valid[i] = lay.alpha[i] >= 0.25 ? 1 : 0;
+    add("shrink", t0);
     const width = ringWidth || Math.max(6, Math.round(0.06 * Math.min(tw, th)));
+    t0 = now();
     const ring = edgeRing(lay.alpha, tw, th, width);
-    return fitEdges({ base, layer: lay.gray, ring, valid, w: tw, h: th, fullW, fullH });
+    add("ring", t0);
+    t0 = now();
+    const fit = fitEdges({ base, layer: lay.gray, ring, valid, w: tw, h: th, fullW, fullH });
+    add("fit", t0);
+    return fit;
 }

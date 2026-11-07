@@ -4,7 +4,7 @@
  * growing, colour parsing, mask-to-canvas. Pure functions on typed arrays, no
  * DOM state, kept out of inpaint_canvas.js so the tools stay small.
  */
-import { distTransform, rustPx, releaseIfLarge } from "./px/kernels.js";
+import { distTransform, rustPx, releaseIfLarge, floodScan, recovered } from "./px/kernels.js";
 
 /** A 2D canvas in the window or in a worker. */
 export function makeRasterCanvas(w, h) {
@@ -137,13 +137,16 @@ export function growMask(d, W, H, n, { dist = distTransform, ms = null } = {}) {
 
 /**
  * `growMask` and the bounds of its result, in one pass through the Rust kernel when it has loaded (the scans around
- * the distance transform run there too); `ms.kernel` collects its time.
+ * the distance transform run there too); `ms.kernel` collects its time. After a trap or an out-of-memory the instance
+ * is replaced and the JS path below makes it: the kernel writes `d` only after its call, so it starts from the same bytes.
  */
 export function growMaskBounds(d, W, H, n, { ms = null } = {}) {
     const p = rustPx();
     if (p) {
         const t = ms ? performance.now() : 0;
-        try { return p.growMask(d, W, H, n); } finally { if (ms) ms.kernel = (ms.kernel || 0) + performance.now() - t; releaseIfLarge(); }
+        try { return p.growMask(d, W, H, n); }
+        catch (err) { if (!recovered(p, err, "grow_mask")) throw err; }
+        finally { if (ms) ms.kernel = (ms.kernel || 0) + performance.now() - t; releaseIfLarge(); }
     }
     growMask(d, W, H, n, { ms });
     const t = ms ? performance.now() : 0;
@@ -180,53 +183,18 @@ export function rgbToHex(r, g, b) {
  * counts (Photoshop's "contiguous" checkbox).
  *
  * The Rust flood (px/kernels.js) runs when it has loaded: the same mask, 1.3 to 1.4× faster on a
- * whole 15k picture (docs/PERFORMANCE.md §12). The JS below is the fallback, and faster than
- * the flood twin in px/kernels_js.js.
+ * whole 15k picture (docs/PERFORMANCE.md §12). The fallback is `floodScan` (px/kernels_js.js: the
+ * loop that stood here, moved so the flood job's twin runs it too), faster than the flood twin
+ * beside it; it also runs below the `flood` route's size and after a trap.
  */
 export function floodMask(data, W, H, sx, sy, tolerance = 32, contiguous = true) {
-    const p = rustPx();
+    const p = rustPx("flood", W * H);
     if (p) {
-        try { return p.flood(data, W, H, sx | 0, sy | 0, Math.max(0, tolerance | 0), contiguous); } finally { releaseIfLarge(); }
+        try { return p.flood(data, W, H, sx | 0, sy | 0, Math.max(0, tolerance | 0), contiguous); }
+        catch (err) { if (!recovered(p, err, "flood")) throw err; }
+        finally { releaseIfLarge(); }
     }
-    const out = new Uint8Array(W * H);
-    sx = Math.max(0, Math.min(W - 1, sx | 0));
-    sy = Math.max(0, Math.min(H - 1, sy | 0));
-    const i0 = (sy * W + sx) * 4;
-    const r0 = data[i0], g0 = data[i0 + 1], b0 = data[i0 + 2], a0 = data[i0 + 3];
-    const tol = Math.max(0, tolerance | 0);
-    const similar = (i) => {
-        const d = Math.abs(data[i] - r0), e = Math.abs(data[i + 1] - g0), f = Math.abs(data[i + 2] - b0), g = Math.abs(data[i + 3] - a0);
-        return d <= tol && e <= tol && f <= tol && g <= tol;
-    };
-    if (!contiguous) {
-        for (let p = 0, i = 0; p < W * H; p++, i += 4) if (similar(i)) out[p] = 1;
-        return out;
-    }
-    // scanline flood fill with an explicit stack of spans
-    const stack = [sx, sy];
-    while (stack.length) {
-        const y = stack.pop(), x = stack.pop();
-        let p = y * W + x;
-        if (out[p] || !similar(p * 4)) continue;
-        let xl = x, xr = x;
-        while (xl > 0 && !out[p - 1] && similar((p - 1) * 4)) { xl--; p--; }
-        p = y * W + x;
-        while (xr < W - 1 && !out[p + 1] && similar((p + 1) * 4)) { xr++; p++; }
-        const row = y * W;
-        for (let i = xl; i <= xr; i++) out[row + i] = 1;
-        for (const ny of [y - 1, y + 1]) {
-            if (ny < 0 || ny >= H) continue;
-            const nrow = ny * W;
-            let inSpan = false;
-            for (let i = xl; i <= xr; i++) {
-                const q = nrow + i;
-                const ok = !out[q] && similar(q * 4);
-                if (ok && !inSpan) { stack.push(i, ny); inSpan = true; }
-                else if (!ok) inSpan = false;
-            }
-        }
-    }
-    return out;
+    return floodScan(data, W, H, sx, sy, tolerance, contiguous);
 }
 
 /** Draw a W×H mask (1 = set) as `color` (hex) into a new canvas; alpha from the mask. */
@@ -396,16 +364,35 @@ export function selectionGco(mode) {
     }
 }
 
+// ---- AlphaSource views (docs/PLAN_WASM_BUILD.md §4.3, K5) ---------------------------------------------------------------
+// `view(rx, ry, rw, rh)` beside `read`: the same alpha without a copy, `{ kind, data, off, stride }` with `off` and
+// `stride` in pixels of `data` (kinds as px/kernels_js.js takes them: 0 nothing covered, 1 an alpha byte a pixel, 2 all
+// covered, 4 RGBA8 and its alpha; `data` null for 0 and 2), or null when the region needs `read` (it straddles the
+// source's edge or two of its tiles). TileMaskPixels.combine reads a tile's source through it.
+
+/** @typedef {{ kind: number, data: Uint8Array | Uint8ClampedArray | null, off: number, stride: number }} AlphaView */
+
+const VIEW_NONE = Object.freeze({ kind: 0, data: null, off: 0, stride: 0 });
+const VIEW_FULL = Object.freeze({ kind: 2, data: null, off: 0, stride: 0 });
+
+/** Bytes over a tile's buffer as tilesSource takes it (an ArrayBuffer or a view). */
+const bytesView = (b) => (b instanceof ArrayBuffer ? new Uint8Array(b) : (ArrayBuffer.isView(b) ? new Uint8Array(b.buffer, b.byteOffset, b.byteLength) : new Uint8Array(b)));
+
 /**
  * An AlphaSource covering a rectangle with full alpha (255).
  * @param {number[]} box [x0, y0, x1, y1]
- * @returns {{ box: number[], read(rx: number, ry: number, rw: number, rh: number): Uint8Array }}
+ * @returns {{ box: number[], read(rx: number, ry: number, rw: number, rh: number): Uint8Array, view(rx: number, ry: number, rw: number, rh: number): AlphaView | null }}
  */
 export function rectSource(box) {
     const b = [box[0] | 0, box[1] | 0, box[2] | 0, box[3] | 0];
     const [bx0, by0, bx1, by1] = b;
     return {
         box: b,
+        view(rx, ry, rw, rh) {
+            if (bx0 >= bx1 || by0 >= by1 || rx >= bx1 || rx + rw <= bx0 || ry >= by1 || ry + rh <= by0) return VIEW_NONE;
+            if (rx >= bx0 && ry >= by0 && rx + rw <= bx1 && ry + rh <= by1) return VIEW_FULL;
+            return null;
+        },
         read(rx, ry, rw, rh) {
             const out = new Uint8Array(rw * rh);
             const ix0 = Math.max(rx, bx0), iy0 = Math.max(ry, by0);
@@ -424,12 +411,18 @@ export function rectSource(box) {
 
 /**
  * An AlphaSource reading from a contiguous w * h Uint8Array of alpha bytes placed at (x0, y0).
- * @returns {{ box: number[], read(rx: number, ry: number, rw: number, rh: number): Uint8Array }}
+ * @returns {{ box: number[], read(rx: number, ry: number, rw: number, rh: number): Uint8Array, view(rx: number, ry: number, rw: number, rh: number): AlphaView | null }}
  */
 export function bytesSource(alpha, x0, y0, w, h) {
     const box = [x0 | 0, y0 | 0, (x0 + w) | 0, (y0 + h) | 0];
     return {
         box,
+        view(rx, ry, rw, rh) {
+            if (w <= 0 || h <= 0 || rx >= x0 + w || rx + rw <= x0 || ry >= y0 + h || ry + rh <= y0) return VIEW_NONE;
+            if (rx < x0 || ry < y0 || rx + rw > x0 + w || ry + rh > y0 + h) return null;
+            if ((x0 | 0) !== x0 || (y0 | 0) !== y0 || (w | 0) !== w || !ArrayBuffer.isView(alpha) || alpha.length < w * h) return null;
+            return { kind: 1, data: alpha, off: (ry - y0) * w + (rx - x0), stride: w };
+        },
         read(rx, ry, rw, rh) {
             const out = new Uint8Array(rw * rh);
             const ix0 = Math.max(rx, x0), iy0 = Math.max(ry, y0);
@@ -454,7 +447,7 @@ export function bytesSource(alpha, x0, y0, w, h) {
  * @param {Array|Map|Set} tiles
  * @param {number[]} [at=[0,0]] tile 0,0 origin [x, y]
  * @param {number[]} [box=null] bounding box [x0, y0, x1, y1]
- * @returns {{ box: number[], read(rx: number, ry: number, rw: number, rh: number): Uint8Array }}
+ * @returns {{ box: number[], read(rx: number, ry: number, rw: number, rh: number): Uint8Array, view(rx: number, ry: number, rw: number, rh: number): AlphaView | null }}
  */
 export function tilesSource(tiles, at = [0, 0], box = null) {
     const [ox, oy] = at;
@@ -479,6 +472,27 @@ export function tilesSource(tiles, at = [0, 0], box = null) {
     const b = box ? [box[0] | 0, box[1] | 0, box[2] | 0, box[3] | 0] : (computedBox || [ox, oy, ox, oy]);
     return {
         box: b,
+        // one of its tiles only, read as `read` reads it (full, then alpha, then data; anything else holds nothing)
+        view(rx, ry, rw, rh) {
+            // a fractional origin or region start gives a fractional offset: `read` takes such a region, as bytesSource
+            if ((ox | 0) !== ox || (oy | 0) !== oy || (rx | 0) !== rx || (ry | 0) !== ry) return null;
+            const tx = Math.floor((rx - ox) / 256), ty = Math.floor((ry - oy) / 256);
+            const tileX = ox + tx * 256, tileY = oy + ty * 256;
+            if (rw <= 0 || rh <= 0 || rx + rw > tileX + 256 || ry + rh > tileY + 256) return null;
+            const t = tileMap.get(`${tx},${ty}`);
+            if (!t || t.empty) return VIEW_NONE;
+            if (t.full) return VIEW_FULL;
+            const off = (ry - tileY) * 256 + (rx - tileX);
+            if (t.alpha) {
+                const a = bytesView(t.alpha);
+                return a.length >= 65536 ? { kind: 1, data: a, off, stride: 256 } : null;
+            }
+            if (t.data) {
+                const d = bytesView(t.data);
+                return d.length >= 262144 ? { kind: 4, data: d, off, stride: 256 } : null;
+            }
+            return VIEW_NONE;
+        },
         read(rx, ry, rw, rh) {
             const out = new Uint8Array(rw * rh);
             const tx0 = Math.floor((rx - ox) / 256);

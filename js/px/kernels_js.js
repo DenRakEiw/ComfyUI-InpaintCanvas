@@ -328,6 +328,91 @@ function similarAt(d, i, r0, g0, b0, a0, tol) {
     return e <= tol;
 }
 
+/**
+ * The JS flood users run: `floodMask`'s own loop in inpaint_raster.js, moved here verbatim (K1, docs/PLAN_WASM_K1.md)
+ * so the flood route's twin is the code users run, not `flood` above, which it beats. The same set as `flood`; a
+ * new Uint8Array, no `count`.
+ */
+export function floodScan(data, W, H, sx, sy, tolerance = 32, contiguous = true) {
+    const out = new Uint8Array(W * H);
+    sx = Math.max(0, Math.min(W - 1, sx | 0));
+    sy = Math.max(0, Math.min(H - 1, sy | 0));
+    const i0 = (sy * W + sx) * 4;
+    const r0 = data[i0], g0 = data[i0 + 1], b0 = data[i0 + 2], a0 = data[i0 + 3];
+    const tol = Math.max(0, tolerance | 0);
+    const similar = (i) => {
+        const d = Math.abs(data[i] - r0), e = Math.abs(data[i + 1] - g0), f = Math.abs(data[i + 2] - b0), g = Math.abs(data[i + 3] - a0);
+        return d <= tol && e <= tol && f <= tol && g <= tol;
+    };
+    if (!contiguous) {
+        for (let p = 0, i = 0; p < W * H; p++, i += 4) if (similar(i)) out[p] = 1;
+        return out;
+    }
+    // scanline flood fill with an explicit stack of spans
+    const stack = [sx, sy];
+    while (stack.length) {
+        const y = stack.pop(), x = stack.pop();
+        let p = y * W + x;
+        if (out[p] || !similar(p * 4)) continue;
+        let xl = x, xr = x;
+        while (xl > 0 && !out[p - 1] && similar((p - 1) * 4)) { xl--; p--; }
+        p = y * W + x;
+        while (xr < W - 1 && !out[p + 1] && similar((p + 1) * 4)) { xr++; p++; }
+        const row = y * W;
+        for (let i = xl; i <= xr; i++) out[row + i] = 1;
+        for (const ny of [y - 1, y + 1]) {
+            if (ny < 0 || ny >= H) continue;
+            const nrow = ny * W;
+            let inSpan = false;
+            for (let i = xl; i <= xr; i++) {
+                const q = nrow + i;
+                const ok = !out[q] && similar(q * 4);
+                if (ok && !inSpan) { stack.push(i, ny); inSpan = true; }
+                else if (!ok) inSpan = false;
+            }
+        }
+    }
+    return out;
+}
+
+/**
+ * `Px.floodShape`'s twin (px.js; jobs.rs `flood_shape`) on `floodScan`: the region around (sx, sy) clipped to `sel`
+ * (RGBA8 of the same size, selected where alpha >= 128, or null), drawn as `rgb` (0xRRGGBB), opaque where the region
+ * is and transparent black elsewhere. `use(view, count, bounds)` gets the shape, its pixels and its bounds
+ * [x0, y0, x1, y1] (right and bottom exclusive, null when empty), and its result is returned. The shape is a new
+ * array: Rust draws over its own copy in wasm memory, while the caller's `rgba` may be a view over the job's
+ * SharedArrayBuffer, which an ImageData refuses.
+ */
+export function floodShape(rgba, w, h, sx, sy, tolerance, contiguous, sel, rgb, use) {
+    const mask = floodScan(rgba, w, h, sx | 0, sy | 0, Math.max(0, tolerance | 0), contiguous);
+    const out = new Uint8ClampedArray(w * h * 4);
+    const s = sel ? bytesOf(sel) : null;
+    rgb >>>= 0;
+    const r = (rgb >>> 16) & 255, g = (rgb >>> 8) & 255, b = rgb & 255;
+    // a word per pixel where the byte order allows it (the array is new, so it starts on a word)
+    const words = LITTLE ? new Uint32Array(out.buffer, 0, w * h) : null;
+    const word = ((255 << 24) | (b << 16) | (g << 8) | r) >>> 0;
+    let count = 0, x0 = w, y0 = h, x1 = 0, y1 = 0;
+    for (let y = 0, p = 0; y < h; y++) {
+        let first = -1, last = 0;
+        for (let x = 0; x < w; x++, p++) {
+            if (!mask[p] || (s !== null && s[p * 4 + 3] < 128)) continue;
+            if (words !== null) words[p] = word;
+            else { const o = p * 4; out[o] = r; out[o + 1] = g; out[o + 2] = b; out[o + 3] = 255; }
+            count++;
+            if (first < 0) first = x;
+            last = x;
+        }
+        if (first >= 0) {
+            if (first < x0) x0 = first;
+            if (last + 1 > x1) x1 = last + 1;
+            if (y < y0) y0 = y;
+            y1 = y + 1;
+        }
+    }
+    return use(out, count, count > 0 ? [x0, y0, x1, y1] : null);
+}
+
 // ---- composite ---------------------------------------------------------------------------------
 
 /**
@@ -1639,3 +1724,129 @@ export function shadowMarch(depth, w, h, scale, light, radius, taps, steps, bias
     return dst;
 }
 
+
+// ---- the selection's combine (docs/PLAN_WASM_BUILD.md §4.3, K5) -------------------------------------------------------
+
+/** The kinds of an AlphaSource view (inpaint_raster.js): nothing covered, an alpha byte a pixel, all covered, RGBA8. */
+export const SEL_NONE = 0, SEL_ALPHA = 1, SEL_FULL = 2, SEL_RGBA = 4;
+
+let SEL_TABLES = null;
+
+/** T[mode][(d << 8) | s]: the combined alpha of inpaint_raster.js `combineAlpha`, one table per mode of SEL_MODES. */
+function selTables() {
+    if (SEL_TABLES) return SEL_TABLES;
+    const mul255 = (x, y) => { const t = x * y + 128; return (t + (t >> 8)) >> 8; };
+    const t = [new Uint8Array(65536), new Uint8Array(65536), new Uint8Array(65536), new Uint8Array(65536)];
+    for (let d = 0; d < 256; d++) {
+        for (let s = 0; s < 256; s++) {
+            const i = (d << 8) | s, m = mul255(d, s);
+            t[0][i] = s;
+            t[1][i] = d + s - m;
+            t[2][i] = Math.max(0, d - m);
+            t[3][i] = m;
+        }
+    }
+    SEL_TABLES = t;
+    return t;
+}
+
+/** Arguments selCombine refuses (sel.rs answers REFUSED for the same): a message, or "" when they are in range. */
+function selRefused(dst, size, src, off, stride, kind, bw, bh, mode) {
+    if (!(mode >= 0 && mode <= 3) || (mode | 0) !== mode) return `mode ${mode}`;
+    if (kind !== SEL_NONE && kind !== SEL_ALPHA && kind !== SEL_FULL && kind !== SEL_RGBA) return `source kind ${kind}`;
+    if (!(size > 0 && size <= 4096) || !(bw >= 0 && bw <= size) || !(bh >= 0 && bh <= size)) return `${bw} x ${bh} in a tile of ${size}`;
+    if (!dst || dst.length < size * size * 4) return "a tile too small";
+    if ((kind === SEL_ALPHA || kind === SEL_RGBA) && bw > 0 && bh > 0) {
+        const bpp = kind === SEL_RGBA ? 4 : 1;
+        if (!(stride >= bw) || !(off >= 0) || !src || src.length < (off + (bh - 1) * stride + bw) * bpp) return "a source too small";
+    }
+    return "";
+}
+
+/**
+ * Whether the `bw` x `bh` source region holds any alpha above 0 (`off` and `stride` in pixels, `kind` as selCombine
+ * takes it). kernels.js asks it on the twins' route before it makes a missing tile; the Rust route asks the combine
+ * itself (sel_combine reports whether the tile holds a pixel), so it has no Rust twin.
+ */
+export function alphaAny(src, off, stride, kind, bw, bh) {
+    if (!(bw > 0 && bh > 0)) return false;
+    if (kind === SEL_FULL) return true;
+    if (kind !== SEL_ALPHA && kind !== SEL_RGBA) return false;
+    const s = bytesOf(src), bpp = kind === SEL_RGBA ? 4 : 1, a = kind === SEL_RGBA ? 3 : 0;
+    for (let y = 0; y < bh; y++) {
+        for (let p = (off + y * stride) * bpp + a, e = p + bw * bpp; p < e; p += bpp) if (s[p]) return true;
+    }
+    return false;
+}
+
+/**
+ * One tile of the selection (`size`² RGBA8, straight alpha, in place) combined with an alpha source under `mode` (0
+ * replace, 1 add, 2 subtract, 3 intersect: inpaint_raster.js SEL_MODES), the maths of inpaint_raster.js `combineRows`:
+ * a covered pixel (combined alpha above 0) gets the colour `rgb` (0xRRGGBB) and that alpha, the others 0, 0, 0, 0; only
+ * the `bw` x `bh` pixels from the tile's corner, the rest of the tile kept. The source region starts at pixel `off` of
+ * `src`, `stride` pixels a row: SEL_ALPHA a byte a pixel, SEL_RGBA four (its alpha read), SEL_NONE all 0 and SEL_FULL all
+ * 255 (`src` unread). Returns the extent of the whole tile afterwards as inpaint_tiles.js `tileExtent` finds it, [x0,
+ * y0, x1, y1] in the tile's pixels, or null when no pixel of the tile has alpha. Throws for arguments out of range. Rust
+ * twin: crates/px/src/sel.rs (px.js `selCombine`, which takes a missing tile as `dst` null).
+ */
+export function selCombine(dst, size, src, off, stride, kind, bw, bh, mode, rgb) {
+    const refused = selRefused(dst, size, src, off, stride, kind, bw, bh, mode);
+    if (refused) throw new Error("selCombine: " + refused);
+    const d8 = bytesOf(dst);
+    const T = selTables()[mode];
+    // no buffer read when no pixel is combined (bw or bh 0), as sel.rs, which then needs no source
+    const s = (kind === SEL_ALPHA || kind === SEL_RGBA) && bw > 0 && bh > 0 ? bytesOf(src) : null;
+    const sa = kind === SEL_FULL ? 255 : 0;   // the source alpha without a buffer
+    const bpp = kind === SEL_RGBA ? 4 : 1, sOff = kind === SEL_RGBA ? 3 : 0;
+    const r = (rgb >>> 16) & 255, g = (rgb >>> 8) & 255, b = rgb & 255;
+    let x0 = size, y0 = -1, x1 = -1, y1 = -1;
+    const words = LITTLE && (d8.byteOffset & 3) === 0;
+    const d32 = words ? new Uint32Array(d8.buffer, d8.byteOffset, size * size) : null;
+    const RGB = ((b << 16) | (g << 8) | r) >>> 0;
+    for (let y = 0; y < size; y++) {
+        let first = -1, last = -1, from = 0;
+        if (y < bh && bw > 0) {
+            from = bw;
+            let sp = (off + y * stride) * bpp + sOff;
+            if (words) {
+                const row = y * size;
+                for (let x = 0, o = row; x < bw; x++, o++, sp += bpp) {
+                    const a = T[((d32[o] >>> 24) << 8) | (s === null ? sa : s[sp])];
+                    if (a) {
+                        d32[o] = ((a << 24) | RGB) >>> 0;
+                        if (first < 0) first = x;
+                        last = x;
+                    } else d32[o] = 0;
+                }
+            } else {
+                for (let x = 0, o = y * size * 4; x < bw; x++, o += 4, sp += bpp) {
+                    const a = T[(d8[o + 3] << 8) | (s === null ? sa : s[sp])];
+                    if (a) {
+                        d8[o] = r; d8[o + 1] = g; d8[o + 2] = b; d8[o + 3] = a;
+                        if (first < 0) first = x;
+                        last = x;
+                    } else {
+                        d8[o] = 0; d8[o + 1] = 0; d8[o + 2] = 0; d8[o + 3] = 0;
+                    }
+                }
+            }
+        }
+        // the rest of the row, read for the extent only: its first and its last pixel with alpha
+        const at = y * size * 4 + 3;
+        let x = from;
+        while (x < size && !d8[at + x * 4]) x++;
+        if (x < size) {
+            if (first < 0) first = x;
+            let e = size - 1;
+            while (e > x && !d8[at + e * 4]) e--;
+            last = e;
+        }
+        if (first >= 0) {
+            if (y0 < 0) y0 = y;
+            y1 = y;
+            if (first < x0) x0 = first;
+            if (last > x1) x1 = last;
+        }
+    }
+    return y0 < 0 ? null : [x0, y0, x1 + 1, y1 + 1];
+}

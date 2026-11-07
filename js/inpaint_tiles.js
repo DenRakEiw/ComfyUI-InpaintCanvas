@@ -37,11 +37,11 @@
 
 import { CANVAS_MAX_PIXELS, CANVAS_MAX_SIDE } from "./inpaint_sizelimit.js";
 import { LayerPixels, MaskPixels, pixelRect, WHOLE_CANVAS_OPS, BLIT_MARGIN } from "./inpaint_pixels.js";
-import { mipChain, mipChainBytes, clampExtend, compositeTile, resampleBlock } from "./px/kernels.js";
+import { mipChain, mipChainBytes, clampExtend, compositeTile, resampleBlock, selCombine, SEL_NONE, SEL_ALPHA, SEL_FULL } from "./px/kernels.js";
 import { allocTileBytes, isShared } from "./inpaint_arena.js";
 import { canvasRoundTrip, resampleOptions, resampleStore, toFixed, preimage } from "./inpaint_resample.js";
 import { liquifyStore, liquifyBox } from "./inpaint_liquify.js";
-import { combineRows } from "./inpaint_raster.js";
+import { SEL_MODES } from "./inpaint_raster.js";
 
 export const TILE_SIZE = 256;
 const TILE_BYTES = TILE_SIZE * TILE_SIZE * 4;
@@ -2508,7 +2508,8 @@ export class TileMaskPixels extends tiled(MaskPixels) {
     invert(color = [255, 0, 0]) {
         this._guard();
         const cols = Math.ceil(this._w / TILE_SIZE), rows = Math.ceil(this._h / TILE_SIZE);
-        const [cr, cg, cb] = color;
+        // the channels clamped and rounded as a tile's bytes store them, as combine() takes them
+        const [cr, cg, cb] = Uint8ClampedArray.of(color[0], color[1], color[2]);
         // the colour without alpha and at full alpha, as words (little-endian: R is the low byte)
         const RGB = ((cb << 16) | (cg << 8) | cr) >>> 0;
         const SEL = (0xFF000000 | RGB) >>> 0;
@@ -2557,6 +2558,9 @@ export class TileMaskPixels extends tiled(MaskPixels) {
      * Combine this mask with an AlphaSource under `mode` ("replace", "add", "subtract", "intersect").
      * Operates tile by tile. Drops empty tiles, drops tiles outside `src.box` for replace and intersect,
      * skips absent tiles for subtract and intersect, and allocates for add only where the source is non-zero.
+     * Each tile is read through the source's `view` where it has one (no copy) and combined by px/kernels.js
+     * `selCombine` (Rust, or its twin by the route), which also gives the tile's extent, kept for `bounds()`;
+     * full coverage under replace or add is the colour at 255, one fill (docs/PLAN_WASM_BUILD.md §4.3, K5).
      */
     combine(src, mode, color = [255, 0, 0]) {
         this._guard();
@@ -2566,6 +2570,7 @@ export class TileMaskPixels extends tiled(MaskPixels) {
         const by0 = Math.max(0, Math.min(this._h, sby0));
         const bx1 = Math.max(0, Math.min(this._w, sbx1));
         const by1 = Math.max(0, Math.min(this._h, sby1));
+        const m = SEL_MODES.indexOf(mode);
 
         // Outside src.box: drop tiles for replace and intersect
         if (mode === "replace" || mode === "intersect") {
@@ -2578,7 +2583,7 @@ export class TileMaskPixels extends tiled(MaskPixels) {
             }
         }
 
-        if (bx0 >= bx1 || by0 >= by1) {
+        if (bx0 >= bx1 || by0 >= by1 || m < 0) {   // an unknown mode combines nothing, as combineRows did
             this._version = ++pixelSeq;
             if (this._mirror) this._mirror._dispVer = this._version;
             return;
@@ -2588,6 +2593,11 @@ export class TileMaskPixels extends tiled(MaskPixels) {
         const ty0 = Math.max(0, Math.floor(by0 / TILE_SIZE));
         const tx1 = Math.min(cols - 1, Math.floor((bx1 - 1) / TILE_SIZE));
         const ty1 = Math.min(rows - 1, Math.floor((by1 - 1) / TILE_SIZE));
+        // the channels as a tile's bytes stored them before (clamped, rounded), then packed into words
+        const [cr, cg, cb] = Uint8ClampedArray.of(color[0], color[1], color[2]);
+        const rgb = ((cr << 16) | (cg << 8) | cb) >>> 0;
+        const SEL = (0xFF000000 | (cb << 16) | (cg << 8) | cr) >>> 0;   // the colour at full alpha, as a word
+        const view = typeof src.view === "function";
 
         for (let ty = ty0; ty <= ty1; ty++) {
             const oy = ty << 8;
@@ -2596,27 +2606,34 @@ export class TileMaskPixels extends tiled(MaskPixels) {
                 const ox = tx << 8;
                 const bw = Math.min(TILE_SIZE, this._w - ox);
                 const key = (ty << 16) | tx;
-                const had = this._tiles.has(key);
+                const had = this._tiles.get(key) || null;
 
                 if (!had && (mode === "subtract" || mode === "intersect")) {
                     continue;
                 }
 
-                const srcAlpha = src.read(ox, oy, bw, bh);
+                let v = view ? src.view(ox, oy, bw, bh) : null;
+                if (!v) v = { kind: SEL_ALPHA, data: src.read(ox, oy, bw, bh), off: 0, stride: bw };
+                if (!had && v.kind === SEL_NONE) continue;   // nothing over nothing
 
-                if (!had) {
-                    let nonZero = false;
-                    for (let i = 0; i < srcAlpha.length; i++) {
-                        if (srcAlpha[i]) { nonZero = true; break; }
-                    }
-                    if (!nonZero) continue;
+                if (v.kind === SEL_FULL && m <= 1 && LITTLE) {
+                    // replace or add under full coverage: the colour at 255 wherever the image is, one fill
+                    const t = this.writable(tx, ty);
+                    const w = u32Of(t);
+                    if (bw === TILE_SIZE) w.fill(SEL, 0, bh * TILE_SIZE);
+                    else for (let y = 0; y < bh; y++) w.fill(SEL, y * TILE_SIZE, y * TILE_SIZE + bw);
+                    // a new tile is 0 beyond the image; a kept one may hold pixels there (its extent is then found later)
+                    const ext = !had ? [0, 0, bw, bh] : (bw === TILE_SIZE && bh === TILE_SIZE ? [0, 0, TILE_SIZE, TILE_SIZE] : null);
+                    if (ext) { t.ext = ext; t.extVersion = t.version; }
+                    continue;
                 }
 
-                const t = this.writable(tx, ty);
-                combineRows(t.data, 0, TILE_SIZE * 4, srcAlpha, 0, bw, bw, bh, mode, color);
-                if (tileEmpty(t)) {
-                    this._dropTile(key);
-                }
+                let t = null;
+                const ext = selCombine(had ? had.data : null, () => (t = this.writable(tx, ty)).data,
+                    v.data, v.off, v.stride, v.kind, bw, bh, m, rgb, TILE_SIZE);
+                if (!ext) { this._dropTile(key); continue; }
+                t.ext = ext;
+                t.extVersion = t.version;
             }
         }
         this._version = ++pixelSeq;

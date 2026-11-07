@@ -216,6 +216,14 @@ export async function readPng(blob, { onHeader = null, onRows, rowsPerBand = 256
     const texts = {};
     if (onHeader) await onHeader({ width, height, bitDepth, colorType });
 
+    // Milliseconds of the read's parts. The feeding side: `parse` the chunk walker's own time (its awaits left out),
+    // `read` awaiting the file's next piece, `write` awaiting the inflater's back-pressure (every IDAT write and the
+    // final close). The draining side: `wait` awaiting inflated bytes, `copy` those bytes copied into the band's lines,
+    // `unfilter` the filters undone (and the rows made RGBA8), `deliver` inside `onRows`. Feed and drain run
+    // concurrently, so the keys overlap and do not add up to the whole read.
+    const spent = { parse: 0, read: 0, write: 0, wait: 0, copy: 0, unfilter: 0, deliver: 0 };
+    const clock = () => (typeof performance !== "undefined" ? performance.now() : Date.now());
+
     const ds = new DecompressionStream("deflate");
     const writer = ds.writable.getWriter();
     const reader = ds.readable.getReader();
@@ -228,9 +236,14 @@ export async function readPng(blob, { onHeader = null, onRows, rowsPerBand = 256
         let type = "", left = 0, skipCrc = 0;           // payload bytes left of the current chunk, CRC bytes to skip
         let small = null, smallAt = 0;                  // a PLTE / tRNS / tEXt payload being collected
         let done = false;
+        let tp = clock();                               // the walker's own time runs from here, paused over each await
         try {
             while (!done) {
+                const tr = clock();
+                spent.parse += tr - tp;
                 const { value, done: end } = await src.read();
+                tp = clock();
+                spent.read += tp - tr;
                 if (end) break;
                 let o = 0;
                 while (o < value.length && !done) {
@@ -248,8 +261,13 @@ export async function readPng(blob, { onHeader = null, onRows, rowsPerBand = 256
                     }
                     const n = Math.min(left, value.length - o);
                     const piece = value.subarray(o, o + n);
-                    if (type === "IDAT") await writer.write(piece);
-                    else if (small) { small.set(piece, smallAt); smallAt += n; }
+                    if (type === "IDAT") {
+                        const tw = clock();
+                        spent.parse += tw - tp;
+                        await writer.write(piece);
+                        tp = clock();
+                        spent.write += tp - tw;
+                    } else if (small) { small.set(piece, smallAt); smallAt += n; }
                     left -= n; o += n;
                     if (left === 0) {
                         if (type === "PLTE") palette = small;
@@ -260,9 +278,12 @@ export async function readPng(blob, { onHeader = null, onRows, rowsPerBand = 256
                     }
                 }
             }
+            spent.parse += clock() - tp;
         } finally {
             try { src.cancel(); } catch (_) { /* ignore */ }
+            const tc = clock();
             try { await writer.close(); } catch (_) { /* the reading side reports it */ }
+            spent.write += clock() - tc;
         }
     })();
 
@@ -315,8 +336,6 @@ export async function readPng(blob, { onHeader = null, onRows, rowsPerBand = 256
     // A band of lines is collected and its filters are undone in one call of the kernel (px/kernels.js: Rust, or the
     // twin); an 8-bit RGB or RGBA picture comes out of that call as RGBA8, any other kind row by row through `toRgba`.
     let lines = null, held = 0, bandY = 0;
-    const spent = { unfilter: 0, deliver: 0 };   // milliseconds: the filters undone, and inside `onRows`; the rest is the inflater
-    const clock = () => (typeof performance !== "undefined" ? performance.now() : Date.now());
     const emit = async () => {
         if (!held) return;
         const n = held, at = bandY;
@@ -335,7 +354,9 @@ export async function readPng(blob, { onHeader = null, onRows, rowsPerBand = 256
     };
     const drainRows = async () => {
         for (;;) {
+            const tw = clock();
             const { value, done } = await reader.read();
+            spent.wait += clock() - tw;
             if (done) break;
             let o = 0;
             while (o < value.length && y < height) {
@@ -344,7 +365,9 @@ export async function readPng(blob, { onHeader = null, onRows, rowsPerBand = 256
                 // as much of the band as this piece holds, in one copy
                 const room = Math.min(rowsPerBand, height - bandY) * stride - (held * stride + lineAt);
                 const n = Math.min(room, value.length - o);
+                const tc = clock();
                 lines.set(value.subarray(o, o + n), held * stride + lineAt);
+                spent.copy += clock() - tc;
                 o += n;
                 const total = lineAt + n;
                 const whole = Math.floor(total / stride);

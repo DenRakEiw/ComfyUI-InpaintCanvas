@@ -35,6 +35,9 @@ const MAX_VALUES = 1 << 24;        // entries of one tag's array (a strip table 
 const TRUNCATED = "the file ends early (it is truncated, or not a TIFF)";
 const truncated = (what = "") => new Error(TRUNCATED + (what ? ": " + what : ""));
 
+const CODEC = { 1: "none", 5: "lzw", 8: "deflate", 32773: "packbits", 32946: "deflate" };   // `readTiff`'s `spent.codec`
+const clock = () => (typeof performance !== "undefined" ? performance.now() : Date.now());
+
 /** Does the file start like a TIFF (classic or BigTIFF, either byte order)? */
 export function isTiff(head) {
     if (!head || head.length < 4) return false;
@@ -49,7 +52,10 @@ export const TIFF_EXT = /\.tiff?$/i;
 
 /** Random access to a Blob in pieces, with the byte order of the file. */
 class Source {
-    constructor(blob) { this.blob = blob; this.size = blob.size; this.le = true; this.big = false; }
+    constructor(blob) {
+        this.blob = blob; this.size = blob.size; this.le = true; this.big = false;
+        this.spent = { wait: 0, decode: 0, copy: 0, unpredict: 0, pieces: 0 };   // the pixel reads' laps; readTiff puts its caller's here
+    }
     async bytes(off, len) {
         if (!(off >= 0) || !(len >= 0) || off + len > this.size) throw truncated(`${len} bytes at ${off} of ${this.size}`);
         return new Uint8Array(await this.blob.slice(off, off + len).arrayBuffer());
@@ -356,14 +362,20 @@ function lzwDecoder() {
     };
 }
 
-/** The pieces of a ReadableStream, and the stream cancelled when the caller stops early. */
-async function* piecesOf(stream) {
+/**
+ * The pieces of a ReadableStream, and the stream cancelled when the caller stops early. Each await of the next piece
+ * adds to `spent.wait` (the blob read, and for deflate the inflater too), each piece to `spent.pieces`.
+ */
+async function* piecesOf(stream, spent) {
     const r = stream.getReader();
     let done = false;
     try {
         for (;;) {
+            const t0 = clock();
             const x = await r.read();
+            spent.wait += clock() - t0;
             if (x.done) { done = true; return; }
+            spent.pieces++;
             yield x.value;
         }
     } finally {
@@ -374,15 +386,23 @@ async function* piecesOf(stream) {
 /** The uncompressed bytes of one strip or tile, piece by piece. */
 async function* unpacked(src, off, count, compression, name) {
     if (!(off >= 0) || !(count >= 0) || off + count > src.size) throw truncated(`${name} lies past the end of the file`);
+    const sp = src.spent;
     const raw = src.blob.slice(off, off + count).stream();
-    if (compression === 1) { yield* piecesOf(raw); return; }
+    if (compression === 1) { yield* piecesOf(raw, sp); return; }
     if (compression === 8 || compression === 32946) {
-        try { yield* piecesOf(raw.pipeThrough(new DecompressionStream("deflate"))); } catch (err) { throw new Error(`${name} of the TIFF is damaged or cut off (${(err && err.message) || err})`); }
+        try { yield* piecesOf(raw.pipeThrough(new DecompressionStream("deflate")), sp); } catch (err) { throw new Error(`${name} of the TIFF is damaged or cut off (${(err && err.message) || err})`); }
         return;
     }
     const dec = compression === 5 ? lzwDecoder() : packBitsDecoder();
-    for await (const piece of piecesOf(raw)) { const o = dec.push(piece); if (o.length) yield o; }
+    for await (const piece of piecesOf(raw, sp)) {
+        const t0 = clock();
+        const o = dec.push(piece);
+        sp.decode += clock() - t0;
+        if (o.length) yield o;
+    }
+    const t1 = clock();
     const tail = dec.end();
+    sp.decode += clock() - t1;
     if (tail.length) yield tail;
 }
 
@@ -421,7 +441,7 @@ class StripRows {
         this.piece = null; this.at = 0;
     }
     async read(n) {
-        const L = this.L, out = new Uint8Array(n * L.rowBytes);
+        const L = this.L, sp = this.src.spent, out = new Uint8Array(n * L.rowBytes);
         let filled = 0;
         while (filled < out.length) {
             if (this.need === 0) await this.open();
@@ -432,11 +452,17 @@ class StripRows {
                 continue;
             }
             const take = Math.min(this.piece.length - this.at, this.need, out.length - filled);
+            const t0 = clock();
             out.set(this.piece.subarray(this.at, this.at + take), filled);
+            sp.copy += clock() - t0;
             filled += take; this.at += take; this.need -= take;
             if (this.need === 0) { await this.close(); }   // what a strip holds past its rows is padding
         }
-        if (this.info.predictor === 2) unpredict(out, n, L.rowBytes, this.info.width, L.perPixel, this.info.bits, this.src.le);
+        if (this.info.predictor === 2) {
+            const t1 = clock();
+            unpredict(out, n, L.rowBytes, this.info.width, L.perPixel, this.info.bits, this.src.le);
+            sp.unpredict += clock() - t1;
+        }
         return out;
     }
     async close() {
@@ -452,24 +478,30 @@ class TileRows {
         this.band = null; this.bandAt = 0; this.bandRows = 0; this.ty = -1;
     }
     async tile(k) {
-        const L = this.L, tileRow = Math.ceil((L.tw * L.perPixel * this.info.bits) / 8), want = tileRow * L.tl;
+        const L = this.L, sp = this.src.spent, tileRow = Math.ceil((L.tw * L.perPixel * this.info.bits) / 8), want = tileRow * L.tl;
         const buf = new Uint8Array(want);
         let got = 0;
         const it = unpacked(this.src, L.offsets[k], L.counts[k], this.info.compression, `tile ${k + 1}`);
         try {
             for await (const piece of it) {
                 const take = Math.min(piece.length, want - got);
+                const t0 = clock();
                 buf.set(piece.subarray(0, take), got);
+                sp.copy += clock() - t0;
                 got += take;
                 if (got >= want) break;
             }
         } finally { try { await it.return(); } catch (_) { /* closed */ } }
         if (got < want) throw truncated(`tile ${k + 1} holds ${got} of ${want} bytes`);
-        if (this.info.predictor === 2) unpredict(buf, L.tl, tileRow, L.tw, L.perPixel, this.info.bits, this.src.le);
+        if (this.info.predictor === 2) {
+            const t1 = clock();
+            unpredict(buf, L.tl, tileRow, L.tw, L.perPixel, this.info.bits, this.src.le);
+            sp.unpredict += clock() - t1;
+        }
         return { buf, tileRow };
     }
     async nextBand() {
-        const L = this.L, ty = ++this.ty;
+        const L = this.L, sp = this.src.spent, ty = ++this.ty;
         if (ty >= L.down) throw truncated("more rows asked for than the tiles hold");
         const rows = Math.min(L.tl, this.info.height - ty * L.tl);
         const band = new Uint8Array(rows * L.rowBytes);
@@ -478,16 +510,20 @@ class TileRows {
             const { buf, tileRow } = await this.tile(this.plane * L.across * L.down + ty * L.across + tx);
             const px = Math.min(L.tw, this.info.width - tx * L.tw);
             const bytes = Math.ceil(px * per), at = Math.floor(tx * L.tw * per);
+            const t0 = clock();   // the tile's rows scattered into the band: one lap per tile
             for (let r = 0; r < rows; r++) band.set(buf.subarray(r * tileRow, r * tileRow + bytes), r * L.rowBytes + at);
+            sp.copy += clock() - t0;
         }
         this.band = band; this.bandAt = 0; this.bandRows = rows;
     }
     async read(n) {
-        const L = this.L, out = new Uint8Array(n * L.rowBytes);
+        const L = this.L, sp = this.src.spent, out = new Uint8Array(n * L.rowBytes);
         for (let r = 0; r < n;) {
             if (!this.band || this.bandAt >= this.bandRows) await this.nextBand();
             const take = Math.min(n - r, this.bandRows - this.bandAt);
+            const t0 = clock();
             out.set(this.band.subarray(this.bandAt * L.rowBytes, (this.bandAt + take) * L.rowBytes), r * L.rowBytes);
+            sp.copy += clock() - t0;
             this.bandAt += take; r += take;
         }
         return out;
@@ -571,9 +607,20 @@ function converter(info, layout, le) {
  * `rowsPerBand` rows, in order (`rgba` a fresh Uint8Array of `rows * width * 4` bytes, straight alpha). Resolves to
  * `info`: `{ width, height, bits, samples, photometric, compression, predictor, planar, tiled, bigtiff, alpha, pages,
  * notes }`. Throws the refusal for a file that is not read, before any row.
+ *
+ * `spent` (optional, the caller's object) is filled with the milliseconds of the read's parts: `parse` the header and
+ * the directories, `wait` awaiting the next piece of a strip or tile (the blob read, and for deflate the browser's
+ * inflater), `decode` the LZW and PackBits decoders, `copy` piece bytes copied into band rows (a tiled file's scatter
+ * included), `unpredict`, `convert` the rows made RGBA8, `deliver` inside `onRows`; the counts `bands` and `pieces`; and
+ * `codec` ("none", "lzw", "packbits" or "deflate"). A planar file reads its planes concurrently, so their laps overlap.
  */
-export async function readTiff(blob, { onHeader = null, onRows, rowsPerBand = 256 } = {}) {
+export async function readTiff(blob, { onHeader = null, onRows, rowsPerBand = 256, spent = null } = {}) {
+    const sp = Object.assign(spent || {}, { parse: 0, wait: 0, decode: 0, copy: 0, unpredict: 0, convert: 0, deliver: 0, bands: 0, pieces: 0 });
+    const t0 = clock();
     const { src, info, layout } = await parse(blob);
+    sp.parse = clock() - t0;
+    sp.codec = CODEC[info.compression];
+    src.spent = sp;
     if (onHeader) await onHeader(info);
     const Rows = layout.tiled ? TileRows : StripRows;
     const planes = Array.from({ length: layout.planes }, (_, p) => new Rows(src, info, layout, p));
@@ -584,8 +631,13 @@ export async function readTiff(blob, { onHeader = null, onRows, rowsPerBand = 25
             const n = Math.min(band, info.height - y);
             const bufs = await Promise.all(planes.map((p) => p.read(n)));
             const out = new Uint8Array(n * info.width * 4);
+            const t1 = clock();
             convert(bufs, n, out);
+            const t2 = clock();
+            sp.convert += t2 - t1;
             if (onRows) await onRows(out, y, n);
+            sp.deliver += clock() - t2;
+            sp.bands++;
         }
     } finally {
         for (const p of planes) await p.close();
@@ -606,12 +658,14 @@ export function tiffStripRows(width) {
 
 /**
  * One strip: `rows` rows of RGBA8 `w` wide, differenced horizontally (Predictor 2, on a copy) and compressed by
- * `deflate` (bytes -> a zlib stream). `{ chunk, raw }`.
+ * `deflate` (bytes -> a zlib stream). `{ chunk, raw }`. `laps` (optional): `predict` (the copy and the differencing)
+ * and `deflate` (the call) in milliseconds are added to its fields.
  */
-export async function tiffPart({ rgba, w, rows, predictor = 2 }, deflate) {
+export async function tiffPart({ rgba, w, rows, predictor = 2 }, deflate, laps = null) {
     const n = w * rows * 4;
     const src = rgba instanceof Uint8Array ? rgba.subarray(0, n) : new Uint8Array(rgba, 0, n);
     let bytes = src;
+    const t0 = clock();
     if (predictor === 2) {
         bytes = new Uint8Array(src);
         const row = w * 4;
@@ -620,7 +674,12 @@ export async function tiffPart({ rgba, w, rows, predictor = 2 }, deflate) {
             for (let i = o + row - 1; i >= o + 4; i--) bytes[i] = (bytes[i] - bytes[i - 4]) & 255;
         }
     }
+    const t1 = clock();
     const z = await deflate(bytes);
+    if (laps) {
+        laps.predict = (laps.predict || 0) + (t1 - t0);
+        laps.deflate = (laps.deflate || 0) + (clock() - t1);
+    }
     const chunk = z.byteOffset === 0 && z.byteLength === z.buffer.byteLength ? z.buffer : z.slice().buffer;
     return { chunk, raw: n };
 }

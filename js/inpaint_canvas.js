@@ -22,7 +22,7 @@ import { setKernels, kernelsMode, OPS, deflate, smudgeDab as smudgeDabKernel, SM
 import { floodMask, maskToColorCanvas, clipMaskToSelection, rgbToHex, hexToRgb, growMask, invertMask, maskBounds, selModeOf, selectionGco, tilesSource, bytesSource, rectSource } from "./inpaint_raster.js";
 import { GLCompositor, BLEND_FN_GLSL } from "./inpaint_compositor.js";
 import { LayerPixels, MaskPixels, canvasOf, displayCanvasIfMade, installLayerAliases, deprecatedPixels, pixelsOptions, BLIT_MARGIN, resetContext } from "./inpaint_pixels.js";
-import { INTERACTIVE, NORMAL, EXPORT } from "./inpaint_pool.js";
+import { INTERACTIVE, NORMAL, EXPORT, CancelledError } from "./inpaint_pool.js";
 import { pngHeader, asciiJson, pngWithChunks, SRGB_CHUNK } from "./inpaint_png.js";
 import { tileRows, bandRows, stackRows, stackArgs, storeArgs, stackInArena, PsdBandWriter, OraBandWriter, writeTiff } from "./inpaint_bands.js";
 import { compositeBox, releaseBoxBuffers } from "./inpaint_boxstack.js";
@@ -31,7 +31,7 @@ import { TipPicker, noteRecentTip } from "./inpaint_tippicker.js";
 import { isTiff, TIFF_EXT, tiffInfo, readTiff, tiffPart } from "./inpaint_tiff.js";
 import { arenaEnabled } from "./inpaint_arena.js";
 import { pixelsBackend, isTilePixels, scratchStats, TILE_SIZE, MIP_LEVELS, CANVAS_MAX_PIXELS, chainScheduler } from "./inpaint_tiles.js";
-import { JOB_TIMINGS, editorWorker, workerCall, editorPool, buildLayered } from "./inpaint_jobs.js";
+import { JOB_TIMINGS, STEP_MARKS, markStep, editorWorker, workerCall, editorPool, buildLayered, measureGen, pendingJobs, resetPool } from "./inpaint_jobs.js";
 import { buildEditorModal } from "./inpaint_modal.js";
 import { encodeCanvas, canvasToBlob, partsUsable, partsRun, partsFlights, bandPause, partsFailed, nextPartsSeq, encodeTilePixels, encodeBands, encodeRows } from "./inpaint_encode.js";
 import { SUBFOLDER, uploadBlob, uploadCanvas, uploadPixels } from "./inpaint_upload.js";
@@ -50,11 +50,11 @@ import { normalizeLimit, u16Bilinear, rangeWeight, opp, colourSimilarity, hexToR
 import { limitAlphaRows } from "./inpaint_limit.js";
 import { buildRangeBar } from "./inpaint_rangebar.js";
 import { BLENDS, BLEND_GROUPS, BLEND_MODES, EMULATED_BLENDS, BLEND_OPS, canvasOp, normalBlend, seedOfLayer, hash32, mul255 } from "./blend_modes.js";
-import { heightNormals, shadowMarch } from "./px/kernels.js";
+import { heightNormals, shadowMarch, pxCalls, kernelRoutes, setRoute as setKernelRoute, route as kernelRoute, pxTimed, pxSplit, pxInstances } from "./px/kernels.js";
 import { statusKindFor, failKind, refusal } from "./inpaint_status.js";
 import { RunProgress } from "./inpaint_progress.js";
 import { canvasSizeRefusal, CANVAS_MAX_SIDE } from "./inpaint_sizelimit.js";
-import { lightToMap, defaultLight, KELVIN_PRESETS, LIGHT_MAX, lightColorHex, LIGHT_PRESETS, SPOT_GOBOS, applyLightPreset, loraPercent, relightMapKey, relightDepthScale, relightVisKey, relightVisCurrent } from "./inpaint_relight.js";
+import { lightToMap, defaultLight, KELVIN_PRESETS, LIGHT_MAX, lightColorHex, LIGHT_PRESETS, SPOT_GOBOS, applyLightPreset, loraPercent, relightMapKey, relightDepthScale, relightVisKey, relightVisCurrent, marchOnPool, cancelMarch, STRIPES_PER_WORKER } from "./inpaint_relight.js";
 
 /**
  * The pixel backend a new editor takes (docs/PLAN_BCE.md §C2 step b): the host's choice when it made
@@ -537,13 +537,16 @@ async function isTiffFile(file) {
 /**
  * The pixels of a TIFF (inpaint_tiff.js `readTiff`, docs/PLAN_0_1_29.md 3d), decoded as a stream in a pool worker (in
  * the window without one) and written into this backend's pixels band by band: `{ px, info }`. The caller has read the
- * header (`tiffInfo`) and checked the size, so a file that is refused allocates nothing.
+ * header (`tiffInfo`) and checked the size, so a file that is refused allocates nothing. `writeMs` beside them: the
+ * milliseconds of the bands' `writeRect` calls (the K0a harness).
  */
 async function pixelsFromTiff(blob, Cls, progress = null) {
-    let px = null, W = 0, H = 0, info = null;
+    let px = null, W = 0, H = 0, info = null, writeMs = 0;
     const header = (h) => { W = h.width; H = h.height; px = Cls.empty(W, H); };
     const rows = (rgba, y0, n) => {
+        const t0 = performance.now();
         px.writeRect({ data: new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, n * W * 4), width: W, height: n }, 0, y0);
+        writeMs += performance.now() - t0;
         if (progress) progress((y0 + n) / H);
     };
     try {
@@ -559,7 +562,16 @@ async function pixelsFromTiff(blob, Cls, progress = null) {
         throw err;
     }
     if (!px) throw new Error("the TIFF gave no pixels");
-    return { px, info };
+    return { px, info, writeMs };
+}
+
+/**
+ * D0 (docs/PLAN_WASM_BUILD.md §7): a PSD goes to a pool worker (`readPsdOnPool`) unless `InpaintEditor.psdOnPool` is
+ * false (a harness's twin of the window's reader), the pool is off or there is none, or the file is not a Blob the job
+ * can take; the window's reader is the fallback.
+ */
+function psdOnPool(file) {
+    return InpaintEditor.psdOnPool !== false && typeof Worker === "function" && typeof Blob === "function" && file instanceof Blob && !editorPool().off;
 }
 
 /** zlib ("deflate") or raw ("deflate-raw") bytes inflated by the browser. */
@@ -2141,6 +2153,7 @@ class InpaintEditor {
         this._solo = null;           // { ids, visible }: the layers shown alone, and what was visible before the first solo
         this.sel = null;             // MaskPixels WxH (red, alpha = selected); null before an image is loaded
         this._relightPending = new Set();
+        this._relightMarches = 0;    // relight_shadow marches in flight over all layers (`relightMarching`, the K0b harness)
         this.history = [];           // { key, ref, x, y, w, h, prompt, layerId, thumb }
         this.view = { scale: 1, x: 0, y: 0, angle: 0 };
         this.guides = { x: [], y: [] };
@@ -3081,6 +3094,7 @@ class InpaintEditor {
             const t = e.target;
             if (this.askOpen) return;   // the question dialog has its own keys
             if (t && t.closest && t.closest("dialog[open]")) return;   // a key inside an open <dialog> (a host settings dialog, a plugin's) stays with the dialog: Escape has to reach its native close
+            if (t && t.closest && t.closest("[data-own-keys]")) return;   // a host's own floating panel (a shadow root's host: its keys arrive retargeted to it) keeps its keys, as a dialog does
             if (document.querySelector("dialog:modal")) return;        // the rest of the page is inert under a modal dialog (the app's questions)
             const inField = t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable);
             if (e.key === "Escape") {
@@ -7289,7 +7303,15 @@ class InpaintEditor {
 
         const t0 = performance.now();
         const W = this.width, H = this.height;
-        if (W <= 0 || H <= 0) return { bounds: null, seconds: 0, tiles: 0 };
+        if (W <= 0 || H <= 0) return { bounds: null, seconds: 0, ms: 0, tiles: 0 };
+        // the K0b harness (docs/PLAN_WASM_BUILD.md §4.8): the steps of the run as marks; `snap` once the depth branch has read it
+        const start = markStep("range", "start", { source: limit.source, mode, snap: false });
+        // a run cancelled on the way (an undo, a new picture, the panel's Cancel) gets its end mark too
+        const cancelled = () => {
+            markStep("range", "done", { cancelled: true, ms: Math.round((performance.now() - t0) * 10) / 10 });
+            return { bounds: null, seconds: 0, ms: 0, tiles: 0 };
+        };
+        let readMs = 0, loopMs = 0, combineMs = 0, t1 = 0;
 
         const seq = nextPartsSeq();
         const group = "range" + seq;
@@ -7325,6 +7347,7 @@ class InpaintEditor {
                     const snap = (map.guide && strength > 0) ? snapParams(strength) : null;
                     const sigmaR = snap ? snap[0] : 0;
                     const tau = snap ? snap[1] : SNAP_TAU;
+                    start.snap = !!snap;
 
                     let edgeFlags = null;
                     if (sigmaR > 0 && map.guide) {
@@ -7335,9 +7358,11 @@ class InpaintEditor {
                         }
                         edgeFlags = edgeTiles(map, rmax, m, W, H, tau, 256);
                     }
+                    markStep("range", "edges");
 
                     const tileCols = Math.ceil(W / 256);
                     const tileRows = Math.ceil(H / 256);
+                    let pictureTiles = 0;
 
                     const guideMsg = (map.guide && sigmaR > 0) ? {
                         sab: (typeof SharedArrayBuffer !== "undefined" && map.guide.buffer instanceof SharedArrayBuffer) ? map.guide.buffer : null,
@@ -7377,6 +7402,8 @@ class InpaintEditor {
 
                             let picture = null;
                             if (minTx !== -1) {
+                                t1 = performance.now();
+                                pictureTiles += maxTx - minTx + 1;
                                 const minX = minTx * 256;
                                 const maxX = Math.min(W, (maxTx + 1) * 256);
                                 const bw = maxX - minX;
@@ -7414,6 +7441,7 @@ class InpaintEditor {
                                     w: bw,
                                     h: bh,
                                 };
+                                readMs += performance.now() - t1;
                             }
 
                             const msg = {
@@ -7441,16 +7469,19 @@ class InpaintEditor {
                             scratchCtx = null;
                         }
                     }
+                    markStep("range", "posted", { readMs, pictureTiles, jobs: bandPromises.length });
 
                     for (const p of bandPromises) {
                         const { y0, y1, res } = await p;
-                        if (this.rangePending !== pendingRecord) return { bounds: null, seconds: 0, tiles: 0 };
+                        if (this.rangePending !== pendingRecord) return cancelled();
 
                         totalAlpha += res.alphaSum || 0;
                         if (res.tiles && res.tiles.length > 0) {
                             totalTiles += res.tiles.length;
+                            t1 = performance.now();
                             const src = tilesSource(res.tiles, [0, 0], [0, y0, W, y1]);
                             this.sel.combine(src, bandMode);
+                            combineMs += performance.now() - t1;
                         }
                         if (res.bounds) {
                             if (!unionBounds) {
@@ -7463,6 +7494,7 @@ class InpaintEditor {
                             }
                         }
                     }
+                    markStep("range", "combined", { combineMs });
                 } else {
                     // Luma or color source on tiles: hold stack and at most 2 bands in flight
                     try {
@@ -7470,13 +7502,17 @@ class InpaintEditor {
                     } catch (_) {
                         held = null;
                     }
+                    markStep("range", "held", { program: !!(held && held.steps) });
+                    let bands = 0;
 
                     const consumeBand = (by0, by1, res) => {
                         totalAlpha += res.alphaSum || 0;
                         if (res.tiles && res.tiles.length > 0) {
                             totalTiles += res.tiles.length;
+                            const tc = performance.now();
                             const src = tilesSource(res.tiles, [0, 0], [0, by0, W, by1]);
                             this.sel.combine(src, bandMode);
+                            combineMs += performance.now() - tc;
                         }
                         if (res.bounds) {
                             if (!unionBounds) {
@@ -7493,6 +7529,8 @@ class InpaintEditor {
                     const runBand = async (y0, y1) => {
                         const bh = y1 - y0;
                         const bandBox = [0, y0, W, y1];
+                        const tr = performance.now();   // the band's read, summed over the bands (two run side by side)
+                        bands++;
                         let sab = null;
                         let filled = false;
                         if (typeof SharedArrayBuffer !== "undefined") {
@@ -7512,6 +7550,7 @@ class InpaintEditor {
                                 }
                             }
                         }
+                        readMs += performance.now() - tr;
                         const msg = {
                             op: "range_select",
                             W, H, y0, y1,
@@ -7540,6 +7579,7 @@ class InpaintEditor {
                         if (this.rangePending !== pendingRecord) break;
                         consumeBand(item.y0, item.y1, item.res);
                     }
+                    markStep("range", "combined", { readMs, combineMs, bands });
                 }
             } else {
                 // Canvas backend (or pool worker off): main-thread loop over bands
@@ -7554,6 +7594,7 @@ class InpaintEditor {
                     const snap = (map.guide && strength > 0) ? snapParams(strength) : null;
                     const sigmaR = snap ? snap[0] : 0;
                     const tau = snap ? snap[1] : SNAP_TAU;
+                    start.snap = !!snap;
 
                     let edgeFlags = null;
                     if (sigmaR > 0 && map.guide) {
@@ -7564,6 +7605,7 @@ class InpaintEditor {
                         }
                         edgeFlags = edgeTiles(map, rmax, m, W, H, tau, 256);
                     }
+                    markStep("range", "edges");
 
                     const tileCols = Math.ceil(W / 256);
                     const tileRows = Math.ceil(H / 256);
@@ -7573,7 +7615,7 @@ class InpaintEditor {
 
                     try {
                         for (let ty = 0; ty < tileRows; ty++) {
-                            if (this.rangePending !== pendingRecord) return { bounds: null, seconds: 0, tiles: 0 };
+                            if (this.rangePending !== pendingRecord) return cancelled();
                             const y0 = ty * 256;
                             const y1 = Math.min(y0 + 256, H);
                             const bh = y1 - y0;
@@ -7591,13 +7633,14 @@ class InpaintEditor {
                             }
 
                             let picData = null, picX0 = 0, picX1 = 0, picW = 0;
+                            t1 = performance.now();
                             if (minTx !== -1) {
                                 picX0 = minTx * 256;
                                 picX1 = Math.min(W, (maxTx + 1) * 256);
                                 picW = picX1 - picX0;
                                 const box = [picX0, y0, picX1, y1];
                                 const regCanvas = await this.sampleRegionSettled("image", box, 1, { forRun: true, skipFilters: true });
-                                if (this.rangePending !== pendingRecord) return { bounds: null, seconds: 0, tiles: 0 };
+                                if (this.rangePending !== pendingRecord) return cancelled();
 
                                 if (!scratchCanvas) {
                                     scratchCanvas = document.createElement("canvas");
@@ -7611,6 +7654,8 @@ class InpaintEditor {
                                 scratchCtx.drawImage(regCanvas, 0, 0);
                                 picData = scratchCtx.getImageData(0, 0, picW, bh).data;
                             }
+                            readMs += performance.now() - t1;
+                            t1 = performance.now();
 
                             let bX0 = Infinity, bY0 = Infinity, bX1 = -Infinity, bY1 = -Infinity;
                             for (let py = 0; py < bh; py++) {
@@ -7655,9 +7700,12 @@ class InpaintEditor {
                                     unionBounds[3] = Math.max(unionBounds[3], bandBounds[3]);
                                 }
                             }
+                            loopMs += performance.now() - t1;
 
+                            t1 = performance.now();
                             const src = bytesSource(alpha, 0, y0, W, bh);
                             this.sel.combine(src, bandMode);
+                            combineMs += performance.now() - t1;
                             totalTiles += Math.ceil(W / 256) * Math.ceil(bh / 256);
                         }
                     } finally {
@@ -7668,9 +7716,11 @@ class InpaintEditor {
                             scratchCtx = null;
                         }
                     }
+                    markStep("range", "combined", { readMs, loopMs, combineMs });
                 } else {
                     const flat = this.flattenToCanvas({ forRun: true });
                     const flatCtx = flat.getContext("2d");
+                    markStep("range", "flattened");
                     let colorRef = null, colorTol = 30;
                     if (limit.source === "color") {
                         const rgbRef = hexToRgb01(limit.color || "#ffffff");
@@ -7679,13 +7729,16 @@ class InpaintEditor {
                     }
 
                     for (let y0 = 0; y0 < H; y0 += RANGE_BAND_ROWS) {
-                        if (this.rangePending !== pendingRecord) return { bounds: null, seconds: 0, tiles: 0 };
+                        if (this.rangePending !== pendingRecord) return cancelled();
                         const y1 = Math.min(y0 + RANGE_BAND_ROWS, H);
                         const bh = y1 - y0;
                         const alpha = new Uint8Array(W * bh);
 
                         let bX0 = Infinity, bY0 = Infinity, bX1 = -Infinity, bY1 = -Infinity;
+                        t1 = performance.now();
                         const imgData = flatCtx.getImageData(0, y0, W, bh);
+                        readMs += performance.now() - t1;
+                        t1 = performance.now();
                         const d = imgData.data;
                         const isLuma = limit.source === "luma";
                         for (let py = 0; py < bh; py++) {
@@ -7723,15 +7776,19 @@ class InpaintEditor {
                                 unionBounds[3] = Math.max(unionBounds[3], bandBounds[3]);
                             }
                         }
+                        loopMs += performance.now() - t1;
 
+                        t1 = performance.now();
                         const src = bytesSource(alpha, 0, y0, W, bh);
                         this.sel.combine(src, bandMode);
+                        combineMs += performance.now() - t1;
                         totalTiles += Math.ceil(W / 256) * Math.ceil(bh / 256);
                     }
+                    markStep("range", "combined", { readMs, loopMs, combineMs });
                 }
             }
 
-            if (this.rangePending !== pendingRecord) return { bounds: null, seconds: 0, tiles: 0 };
+            if (this.rangePending !== pendingRecord) return cancelled();
 
             let hint;
             if (mode === "replace") {
@@ -7751,15 +7808,19 @@ class InpaintEditor {
             this.draw();
 
             const pct = Math.round(100 * totalAlpha / (Math.max(1, W * H) * 255));
-            const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+            const wall = performance.now() - t0;
+            const elapsed = (wall / 1000).toFixed(1);
             const rangeStr = limit.source === "depth"
                 ? `near ${limit.lo.toFixed(2)} – far ${limit.hi.toFixed(2)}`
                 : `${limit.lo.toFixed(2)} – ${limit.hi.toFixed(2)}`;
             this.setStatus(`Selected ${pct} % of the picture by ${limit.source} (${rangeStr}) in ${elapsed} s`);
+            const ms = Math.round(wall * 10) / 10;
+            markStep("range", "done", { ms, tiles: totalTiles, pct });
 
             return {
                 bounds: this.getBounds(),
                 seconds: +elapsed,
+                ms,
                 tiles: totalTiles,
             };
         } catch (err) {
@@ -8678,7 +8739,7 @@ class InpaintEditor {
         return { box, sab, bytes, w, h, kl, kt, px0, py0, pw, ph, lead, first, composite };
     }
 
-    async programFinish(prog, s, into = null) {
+    async programFinish(prog, s, into = null, { timing = null } = {}) {
         const W = this.width, H = this.height;
         const { sab, bytes, w, h, kl, kt, px0, py0, pw, ph } = s;
         const A = new Uint8Array(sab, 0, bytes);
@@ -8691,8 +8752,9 @@ class InpaintEditor {
             try { cx.globalCompositeOperation = "copy"; cx.drawImage(v, -x, -y); out.set(cx.getImageData(0, 0, rw, rh).data); } finally { c.width = 1; c.height = 1; }
         };
         let gpu = null;   // the picture so far while it is with the filters (a surface, or a filter's canvas); else it is in A
-        // where a band's time goes, summed over the bands (ms): waiting for the pool, the upload and the filters' calls, the reads
-        const T = prog.timing, now = () => performance.now();
+        // where a band's time goes, summed over the bands (ms): waiting for the pool, the upload and the filters' calls, the
+        // reads; into the reader's own `timing` when it has one (fillBoxFromStack's, the K0b harness), else the program's
+        const T = timing || prog.timing, now = () => performance.now();
         const timed = (key, fn) => { const t0 = now(); try { return fn(); } finally { T[key] += now() - t0; } };
         const readT = (...a) => timed("read", () => read(...a));
         T.bands++;
@@ -8951,14 +9013,25 @@ class InpaintEditor {
     async fillBoxFromStack(held, box, sab, { priority = INTERACTIVE, group = null } = {}) {
         const [bx, by, bx1, by1] = box, w = bx1 - bx;
         if (held.steps) {
-            // B item 7 part 2: filter layers in the stack: band by band through the GPU, each band's rows into the buffer
+            // B item 7 part 2: filter layers in the stack: band by band through the GPU, each band's rows into the buffer.
+            // The K0b harness (docs/PLAN_WASM_BUILD.md §4.12): this box's split as marks, from the reader's own timing
+            markStep("program", "start");
+            const timing = { bands: 0, pool: 0, upload: 0, filter: 0, read: 0 };
             const rows = this.programRows(held, w);
-            if (!rows) return false;
-            const reader = this.programReader(held, { priority, group });
-            for (let yy = by; yy < by1; yy += rows) {
-                const y1 = Math.min(by1, yy + rows);
-                await reader.read([bx, yy, bx1, y1], new Uint8Array(sab, (yy - by) * w * 4, (y1 - yy) * w * 4), y1 < by1 ? [bx, y1, bx1, Math.min(by1, y1 + rows)] : null);
+            if (!rows) { markStep("program", "done", { ...timing, rows }); return false; }
+            const reader = this.programReader(held, { priority, group, timing });
+            const done = (extra) => markStep("program", "done", { ...Object.fromEntries(Object.entries(timing).map(([k, v]) => [k, Math.round(v)])), rows, ...extra });
+            try {
+                for (let yy = by; yy < by1; yy += rows) {
+                    const y1 = Math.min(by1, yy + rows);
+                    await reader.read([bx, yy, bx1, y1], new Uint8Array(sab, (yy - by) * w * 4, (y1 - yy) * w * 4), y1 < by1 ? [bx, y1, bx1, Math.min(by1, y1 + rows)] : null);
+                }
+            } catch (err) {
+                // the callers fall back to the canvases and return normally: the run still gets its end
+                done({ failed: true });
+                throw err;
             }
+            done(null);
             return true;
         }
         const pool = editorPool(), args = stackArgs(held.stores);
@@ -15074,11 +15147,14 @@ class InpaintEditor {
         if (!(w > 0 && h > 0)) { this.setStatus("The selection is empty."); return null; }
         if (w * h > FREQ_MAX_PX) { this.setStatus(`Frequency separation works on up to ${Math.round(FREQ_MAX_PX / 1e6)} MP (this is ${Math.round(w * h / 1e5) / 10} MP): select the area first, a face or a patch of skin.`, "warn"); return null; }
         const r = radius > 0 ? Math.max(1, Math.min(200, Math.round(radius))) : Math.max(2, Math.round(Math.min(this.width, this.height) * 0.004));
+        markStep("freqsep", "start", { w, h, radius: r });   // the K0b harness (docs/PLAN_WASM_BUILD.md §4.9): read, blur, split, written
         this.setStatus(`Frequency separation (${r} px) ...`);
         const src = await this.readBoxBytes(box, { forRun: true });
         const I = new Uint8ClampedArray(w * h * 4);
         I.set(src.data.subarray ? src.data.subarray(0, w * h * 4) : src.data);
+        markStep("freqsep", "read");
         const L = blurRGBA(I, w, h, r), Hi = new Uint8ClampedArray(w * h * 4);
+        markStep("freqsep", "blur");
         for (let i = 0; i < I.length; i += 4) {
             for (let c = 0; c < 3; c++) {
                 const v = I[i + c], l = L[i + c], t = v - l + 255;
@@ -15088,6 +15164,7 @@ class InpaintEditor {
             }
             L[i + 3] = I[i + 3]; Hi[i + 3] = I[i + 3];
         }
+        markStep("freqsep", "split");
         this.pushUndo({ kind: "layers", label: "Frequency separation" });
         const make = (bytes, name, blend) => {
             const px = this.pixels.Layer.empty(w, h);
@@ -15099,10 +15176,12 @@ class InpaintEditor {
         };
         const low = make(L, `Low frequency (${r} px)`, "normal");
         const high = make(Hi, "High frequency", "linear-light");
+        markStep("freqsep", "written");
         this.activeLayerId = high.id;
         this.renderLayers();
         this.draw();
         this.setStatus(`Frequency separation: ${low.name} and ${high.name} (linear light) on top, ${w} \u00d7 ${h}. Soften colour on the low layer, retouch texture on the high one.`);
+        markStep("freqsep", "done");
         return { low: low.id, high: high.id, radius: r, box };
     }
 
@@ -16799,6 +16878,7 @@ class InpaintEditor {
                 if (layered) {
                     // a PSD / ORA dropped on a document: every layer of it, where the file has it, the bottom one included
                     const doc = await this.readLayered(file, layered);
+                    if (doc.compositePx) { doc.compositePx.release(); doc.compositePx = null; }   // a flat PSD adds no layer
                     // each new reference goes below the others (addLayer): top first keeps the file's stacking order
                     const order = host.refTokens && role === "reference" ? [...doc.layers].reverse() : doc.layers;
                     // its groups come along as groups (PLAN_0_1_31 §6.5), with ids of this document; references are in none
@@ -17529,6 +17609,12 @@ class InpaintEditor {
     static get kernels() { return kernelsMode(); }
     static set kernels(mode) { setKernels(mode); }
 
+    /** The window's kernel routes, defaults and overrides merged (px/kernels.js `kernelRoutes`; docs/PLAN_WASM_K1.md §1.3). */
+    static get routes() { return kernelRoutes(); }
+
+    /** Override one route on the window and in every job sent after it (`null` removes the override; a bad name or value throws). */
+    static setRoute(name, value) { return setKernelRoute(name, value); }
+
     static workerJob(op, args = {}, transfer = []) {
         return workerCall(op, args, transfer);
     }
@@ -17578,6 +17664,48 @@ class InpaintEditor {
         const out = JOB_TIMINGS.slice();
         if (reset) JOB_TIMINGS.length = 0;
         return out;
+    }
+
+    /** The window's step marks (inpaint_jobs.js `markStep`): a copy; `reset` clears them. */
+    static stepMarks(reset = false) {
+        const out = STEP_MARKS.slice();
+        if (reset) STEP_MARKS.length = 0;
+        return out;
+    }
+
+    /** The window thread's px kernel calls by export name (px/kernels.js `pxCalls`, the K0b harness): a copy; `reset` clears them. */
+    static pxCalls(reset = false) {
+        return pxCalls(reset);
+    }
+
+    /** The window's px clocks on or off (no argument: the current state); while on, every job asks its worker for a split (K1). */
+    static pxTimed(on) {
+        return on === undefined ? pxTimed() : pxTimed(on);
+    }
+
+    /** The window thread's split since the last `pxCalls(true)` (px/kernels.js `pxSplit`); `since` a split taken before. */
+    static pxSplit(since = null) {
+        return pxSplit(since);
+    }
+
+    /** The window thread's px instance: its serial, bytes, holds and renewals by cause (px/kernels.js `pxInstances`). */
+    static pxInstances() {
+        return pxInstances();
+    }
+
+    /** The measurement generation the jobs carry (inpaint_jobs.js `measureGen`); `next` starts a new one. */
+    static measureGen(next = false) {
+        return measureGen(next);
+    }
+
+    /** The worker jobs sent and not answered yet, the pool's queue included (a harness's settle waits for 0). */
+    static pendingJobs() {
+        return pendingJobs();
+    }
+
+    /** Stop the pool's workers so the next job starts new ones (a harness's fresh pool). */
+    static resetPool() {
+        resetPool();
     }
 
     static referencedFiles() {
@@ -17856,9 +17984,12 @@ class InpaintEditor {
 
     async exportImage({ download = false } = {}) {
         if (!this.base) { this.setStatus("Nothing to save yet."); return null; }
+        const start = markStep("export", "start");   // its fmt once it is read below
         if (this.removePending || this.healPending || this.liquifyPending) { this.setStatus("Waiting for the stroke to land..."); await this.heldEdit(); }
         await this.relightSettled();   // every format: the layered and TIFF writers read bands that do not wait by themselves (F2.7)
+        markStep("export", "ready");
         const fmt = ["png", "jpg", "webp", "tiff", "psd", "ora"].includes(this.saveFormatSel && this.saveFormatSel.value) ? this.saveFormatSel.value : "png";
+        start.fmt = fmt;
         const stem = ((this.saveNameInput && this.saveNameInput.value) || "inpaint_canvas").trim().replace(/\.[a-z0-9]+$/i, "").replace(/[^a-z0-9._ -]/gi, "_") || "inpaint_canvas";
         try {
             this.setStatus("Saving ...");
@@ -17904,7 +18035,9 @@ class InpaintEditor {
             if (fmt === "png" && !banded) {
                 try { blob = pngWithChunks(await blob.arrayBuffer(), { texts: pngTexts, chunks: pngChunks }); embedded = !!pngTexts; } catch (err) { console.warn("Inpaint Canvas: could not embed the workflow", err); }
             }
+            markStep("export", "encoded", { MB: blob ? blob.size / 1048576 : 0 });
             const saved = await host.saveExport(blob, `${stem}.${fmt === "tiff" ? "tif" : fmt}`, { editor: this, download });
+            markStep("export", "saved");
             if (!saved) { this.setStatus("Save cancelled."); return null; }
             const kb = Math.round(blob.size / 1024);
             this.setStatus(`Saved ${saved.path} (${canvas.width} × ${canvas.height}, ${kb >= 1024 ? (kb / 1024).toFixed(1) + " MB" : kb + " kB"}${fmt === "png" && embedded ? ", " + hostText("pngEmbedded", "recipe embedded") : ""}${note}).`, "info");
@@ -18332,7 +18465,8 @@ class InpaintEditor {
         // an open that is still decoding (a large file in a worker takes seconds, the window stays usable) must not land
         // over a later one: the last file asked for is the base
         const token = (this._openToken = (this._openToken || 0) + 1);
-        const later = () => this._openToken !== token;
+        // a closed tab's open is over too: its read stops at its next band and nothing reaches the local store
+        const later = () => this._destroyed || this._openToken !== token;
         const before = this.base;
         try {
             const layered = await layeredKind(file);
@@ -18378,48 +18512,179 @@ class InpaintEditor {
      * PNG, so the autosave, a document and ComfyUI never see the TIFF.
      */
     async loadTiff(file, later = () => false) {
+        const start = markStep("tiff_open", "start");   // its w and h once the header is read
         const name = file.name || "the TIFF";
         const info = await tiffInfo(file);
+        start.w = info.width; start.h = info.height;
         this.checkBaseSize(info.width, info.height);
+        markStep("tiff_open", "info");
         if (later()) return;
-        const { px, info: got } = await pixelsFromTiff(file, this.pixels.Layer, (f) => { if (!later()) this.setStatus(`Reading ${info.width} × ${info.height} px ... ${Math.round(f * 100)} %`); });
+        const { px, info: got, writeMs } = await pixelsFromTiff(file, this.pixels.Layer, (f) => { if (!later()) this.setStatus(`Reading ${info.width} × ${info.height} px ... ${Math.round(f * 100)} %`); });
+        markStep("tiff_open", "pixels", { writeMs });
         if (later()) { px.release(); return; }
         const stem = (file.name || "image").replace(/\.[a-z0-9]+$/i, "").replace(/[^a-z0-9._-]/gi, "_") || "image";
         this.setStatus(`Storing ${name} ...`);
         const { ref } = await uploadPixels(px, stem);
+        markStep("tiff_open", "stored");
         if (later()) { px.release(); return; }
         await this.setBasePixels(ref, px, { keepLayers: false });
+        markStep("tiff_open", "base");
         const notes = ((got && got.notes) || info.notes || []).filter(Boolean);
         this.setStatus(`Opened ${name}: ${info.width} × ${info.height}${notes.length ? "; " + notes.join("; ") : ""}.`, notes.length ? "warn" : "info");
     }
 
     /**
      * A PSD or ORA file read into pixels (inpaint_layered.js): `{ width, height, layers, composite, notes }`, each
-     * layer with `px` (this backend's pixels) in place of its bytes, bottom first.
+     * layer with `px` (this backend's pixels) in place of its bytes, bottom first. `later()` true: the open is over (a
+     * later one, a closed tab), and a PSD read in a worker stops at its next band (a CancelledError).
      */
-    async readLayered(file, kind) {
+    async readLayered(file, kind, later = () => false) {
+        markStep("layered_open", "start", { kind });
         this.setStatus(`Reading the layers of ${file.name || "the file"} ...`);
+        if (kind === "psd" && psdOnPool(file)) {
+            const got = await this.readPsdOnPool(file, later);
+            if (got) {
+                const t = got.timing || {};
+                markStep("layered_open", "parsed", { route: "pool", inflateMs: t.inflate || 0, inflates: t.inflates || 0 });
+                markStep("layered_open", "layers", { maskMs: got.maskMs, rgbaMs: got.rgbaMs, bitmapMs: 0, fromImageMs: 0 });
+                return got.doc;
+            }
+        }
         const bytes = new Uint8Array(await file.arrayBuffer());
-        const doc = kind === "psd" ? await readPsd(bytes, { inflate: (b) => inflateBytes(b, "deflate") }) : await readOra(bytes, { inflateRaw: (b) => inflateBytes(b, "deflate-raw") });
-        this.checkBaseSize(doc.width, doc.height);
-        if (doc.width * doc.height > CANVAS_MAX_PIXELS) throw new Error(`${doc.width} × ${doc.height} px is larger than a layered file can be opened at (268 MP); save it as PNG`);
+        markStep("layered_open", "read", { MB: bytes.length / 1048576 });
+        // the K0a harness: the inflates' time (they run one after another), and the layer loop's parts below
+        let inflateMs = 0, inflates = 0, maskMs = 0, rgbaMs = 0, bitmapMs = 0, fromImageMs = 0, t0 = 0;
+        const timed = async (b, format) => {
+            const t = performance.now();
+            try { return await inflateBytes(b, format); } finally { inflateMs += performance.now() - t; inflates++; }
+        };
+        const doc = kind === "psd" ? await readPsd(bytes, { inflate: (b) => timed(b, "deflate") }) : await readOra(bytes, { inflateRaw: (b) => timed(b, "deflate-raw") });
+        markStep("layered_open", "parsed", { inflateMs, inflates });
+        this.checkLayeredSize(doc.width, doc.height);
         for (const L of doc.layers) {
             // a PSD mask (docs/PLAN_0_1_31.md 3e): one value per pixel of the layer, as the mask's alpha
             if (L.mask && L.mask.data) {
+                t0 = performance.now();
                 const m = new ImageData(L.w, L.h), d = m.data, v = L.mask.data;
                 for (let i = 0, o = 0; i < v.length; i++, o += 4) { d[o] = 255; d[o + 1] = 255; d[o + 2] = 255; d[o + 3] = v[i]; }
                 L.maskPx = this.pixels.Mask.fromImageData(m);
                 L.maskOff = !!L.mask.disabled;
+                maskMs += performance.now() - t0;
             }
             L.mask = null;
-            if (L.rgba) { L.px = this.pixels.Layer.fromImageData(new ImageData(L.rgba, L.w, L.h)); L.rgba = null; continue; }
+            if (L.rgba) {
+                t0 = performance.now();
+                L.px = this.pixels.Layer.fromImageData(new ImageData(L.rgba, L.w, L.h)); L.rgba = null;
+                rgbaMs += performance.now() - t0;
+                continue;
+            }
+            t0 = performance.now();
             const bmp = await createImageBitmap(new Blob([L.png], { type: "image/png" }), { premultiplyAlpha: "none", colorSpaceConversion: "none" });
+            bitmapMs += performance.now() - t0;
             L.w = bmp.width; L.h = bmp.height;
+            t0 = performance.now();
             L.px = this.pixels.Layer.fromImage(bmp, bmp.width, bmp.height);
+            fromImageMs += performance.now() - t0;
             bmp.close();
             L.png = null;
         }
+        markStep("layered_open", "layers", { maskMs, rgbaMs, bitmapMs, fromImageMs });
         return doc;
+    }
+
+    /** A layered file's size against what this document can open: the document's bounds, then the canvas limit. */
+    checkLayeredSize(w, h) {
+        this.checkBaseSize(w, h);
+        if (w * h > CANVAS_MAX_PIXELS) throw new Error(`${w} × ${h} px is larger than a layered file can be opened at (268 MP); save it as PNG`);
+    }
+
+    /**
+     * D0 (docs/PLAN_WASM_BUILD.md §7): a PSD read by a pool worker (`psd_read`, inpaint_layered.js `readPsdStream`), its
+     * layers and masks written into this backend's pixels band by band as they arrive, so the window never runs the
+     * reader's loops and makes no array of the file. `{ doc, rgbaMs, maskMs, timing }`, `doc` as readLayered answers
+     * it (each layer with `px`, a masked one with `maskPx` and `maskOff`; a file without layers with `compositePx`, the
+     * merged picture, which is read only then), or null when the pool could not take the job before any band came: the
+     * caller reads the file on this thread. The size is checked here from the header's 26 bytes before the job is
+     * queued, so a file too large costs no worker and no read; a file the reader refuses throws its message as the
+     * window's reader would; `later()` true stops the job at its next band (a CancelledError, the worker counted as
+     * stopped, not lost).
+     */
+    async readPsdOnPool(file, later = () => false) {
+        const head = new Uint8Array(await file.slice(0, 26).arrayBuffer());
+        if (head.length >= 26) {
+            // the reader's order of checks: signature and version, mode, depth, then the size (a refusal of the first
+            // three is the worker's, in the reader's own words)
+            const v = new DataView(head.buffer, head.byteOffset, head.length);
+            const mode = v.getUint16(24), depth = v.getUint16(22);
+            if (v.getUint32(0) === 0x38425053 && v.getUint16(4) === 1 && (mode === 3 || mode === 1) && (depth === 8 || depth === 16)) this.checkLayeredSize(v.getUint32(18), v.getUint32(14));
+        }
+        if (later()) throw new CancelledError("psd_read");
+        const Layer = this.pixels.Layer, Mask = this.pixels.Mask;
+        const made = new Map();   // stream index -> { px, maskPx }
+        const name = file.name || "the file";
+        let refused = null, stopped = false, bands = 0, rgbaMs = 0, maskMs = 0;
+        const drop = () => { for (const e of made.values()) for (const p of [e.px, e.maskPx]) if (p) p.release(); made.clear(); };
+        let r;
+        try {
+            // "fail": a harness's way to see the fallback (an op no worker knows)
+            r = await editorPool().run(InpaintEditor.psdOnPool === "fail" ? "psd_read_refused" : "psd_read", { blob: file }, [], {
+                timeout: 600000,
+                onProgress: (m) => {
+                    if (later()) { stopped = true; throw new CancelledError("psd_read"); }
+                    try {
+                        const t0 = performance.now();
+                        let e = made.get(m.index);
+                        if (!e) made.set(m.index, (e = { px: null, maskPx: null }));
+                        const key = m.mask ? "maskPx" : "px";
+                        if (!e[key]) e[key] = (m.mask ? Mask : Layer).empty(m.w, m.h);
+                        e[key].writeRect({ data: new Uint8ClampedArray(m.rgba), width: m.w, height: m.rows }, 0, m.y0);
+                        if (m.mask) maskMs += performance.now() - t0; else rgbaMs += performance.now() - t0;
+                        bands++;
+                        if (!m.mask) this.setStatus(`Reading the layers of ${name} ... layer ${made.size}, ${Math.round(((m.y0 + m.rows) / m.h) * 100)} %`);
+                    } catch (err) { refused = err; throw err; }
+                },
+            });
+        } catch (err) {
+            drop();
+            if (stopped) throw new CancelledError("psd_read");
+            if (refused) throw refused;
+            // the job could not run (no pool, an op no worker knows): the window's reader. A worker lost after bands
+            // came (most likely out of memory at this size) is not read again here, which needs more memory still
+            if (bands) throw new Error(`reading ${name} failed in its worker: ${(err && err.message) || err}`);
+            console.warn("Inpaint Canvas: reading the PSD in a worker failed, reading it here:", (err && err.message) || err);
+            return null;
+        }
+        if (r && r.failed) { drop(); throw new Error(r.failed); }
+        if (!r || !r.doc) { drop(); throw new Error(`reading ${name} failed in its worker: no answer`); }
+        const doc = r.doc, taken = [];
+        const take = (i, what) => {
+            const e = made.get(i);
+            if (!e || !e.px) throw new Error(`the PSD worker sent no pixels for ${what}`);
+            made.delete(i);
+            taken.push(e);
+            return e;
+        };
+        try {
+            for (const L of doc.layers) {
+                const e = take(L.index, `layer "${L.name}"`);
+                L.px = e.px;
+                if (L.mask) {
+                    if (!e.maskPx) throw new Error(`the PSD worker sent no mask for layer "${L.name}"`);
+                    L.maskPx = e.maskPx;
+                    L.maskOff = !!L.mask.disabled;
+                } else if (e.maskPx) { e.maskPx.release(); e.maskPx = null; }
+                L.mask = null;
+                delete L.index;
+            }
+            if (doc.composite != null) doc.compositePx = take(doc.composite, "the merged picture").px;
+            doc.composite = null;
+        } catch (err) {
+            for (const e of taken) for (const p of [e.px, e.maskPx]) if (p) p.release();
+            drop();
+            throw err;
+        }
+        drop();   // bands the answer names no layer for
+        return { doc, rgbaMs, maskMs, timing: r.timing || null };
     }
 
     /**
@@ -18428,8 +18693,14 @@ class InpaintEditor {
      * base is transparent and every layer stays a layer. A flat PSD opens from its merged picture.
      */
     async loadLayered(file, kind, later = () => false) {
-        const doc = await this.readLayered(file, kind);
-        if (later()) return;
+        let doc;
+        try { doc = await this.readLayered(file, kind, later); } catch (err) { if (later()) return; throw err; }
+        // an open that is over (a later one, a closed tab) lets go of what its read made
+        const dropDoc = (also = null) => {
+            const seen = new Set();
+            for (const p of [...doc.layers.flatMap((L) => [L.px, L.maskPx]), doc.compositePx, also]) if (p && !seen.has(p)) { seen.add(p); p.release(); }
+        };
+        if (later()) { dropDoc(); return; }
         const W = doc.width, H = doc.height;
         const layers = doc.layers.slice();
         let basePx = null;
@@ -18437,13 +18708,17 @@ class InpaintEditor {
         if (b && b.x === 0 && b.y === 0 && b.w === W && b.h === H && b.visible && b.opacity >= 0.999 && b.blend === "normal" && !b.maskPx) { basePx = b.px; layers.shift(); }
         // a layer clipped to what became the base would show "clipped without effect": the base covers the picture anyway
         if (basePx) for (const L of layers) { if (!L.clip) break; L.clip = false; }
+        else if (!layers.length && doc.compositePx) basePx = doc.compositePx;   // D0's pool route: already pixels
         else if (!layers.length && doc.composite) basePx = this.pixels.Layer.fromImageData(new ImageData(doc.composite, W, H));
         else basePx = this.pixels.Layer.empty(W, H);
+        if (doc.compositePx && basePx !== doc.compositePx) { doc.compositePx.release(); doc.compositePx = null; }
         const stem = (file.name || "layered").replace(/\.[a-z0-9]+$/i, "").replace(/[^a-z0-9._-]/gi, "_") || "layered";
         this.setStatus(`Storing ${file.name || "the file"} ...`);
         const { ref } = await uploadPixels(basePx, stem);
-        if (later()) return;
+        markStep("layered_open", "stored");
+        if (later()) { dropDoc(basePx); return; }
         await this.setBasePixels(ref, basePx, { keepLayers: false });
+        markStep("layered_open", "base");
         let top = null;
         // PSD groups as folders (PLAN_0_1_31 §6.5), with ids of this document
         this.groupCounter = (this.groupCounter || 0) + 1;
@@ -18456,6 +18731,7 @@ class InpaintEditor {
         if (top) this.activeLayerId = top.id;
         this.renderLayers();
         this.draw();
+        markStep("layered_open", "added");
         const n = layers.length;
         this.setStatus(`Opened ${file.name || "the file"}: ${W} × ${H}, ${n} layer${n === 1 ? "" : "s"}${basePx === b?.px ? ` over "${b.name}" as the base` : ""}.${doc.notes.length ? " " + doc.notes.join("; ") + "." : ""}`, doc.lossy ? "warn" : "info");
     }
@@ -22899,7 +23175,10 @@ class InpaintEditor {
      * Downsample 16-bit depth map for quarter-size shadow march.
      */
     downsampleDepth(src, srcW, srcH, dstW, dstH) {
-        const dst = new Uint16Array(dstW * dstH);
+        // on a SharedArrayBuffer where the page is isolated, as the depth map itself (inpaint_maps.js `makeMap`): the quick
+        // march reads it in stripes where it lies (K12, inpaint_relight.js `marchOnPool`)
+        const shared = typeof SharedArrayBuffer === "function" && typeof crossOriginIsolated !== "undefined" && crossOriginIsolated;
+        const dst = shared ? new Uint16Array(new SharedArrayBuffer(dstW * dstH * 2)) : new Uint16Array(dstW * dstH);
         for (let dy = 0; dy < dstH; dy++) {
             const sy = Math.min(srcH - 1, Math.floor(((dy + 0.5) / dstH) * srcH));
             const sRow = sy * srcW;
@@ -22940,6 +23219,11 @@ class InpaintEditor {
             if (!jobs.length) return;
             await Promise.all(jobs);
         }
+    }
+
+    /** The relight_shadow marches in flight over all layers, quick and full (the K0b harness waits on it). */
+    relightMarching() {
+        return this._relightMarches || 0;
     }
 
     isRelightActive() {
@@ -23296,11 +23580,35 @@ class InpaintEditor {
         }
         const scaleFactor = targetW / depthMap.w;
         const marchScale = scaleZ * scaleFactor;
+        // the K0b harness (docs/PLAN_WASM_BUILD.md §4.5): a "start" mark for a call that posts marches, made at its first;
+        // "landed" for each answer, "idle" when the layer's last march in flight has answered
+        let run = null;
+        // K12 (§4.5): each march is a pool group of its own (a page-wide sequence number: a layer's id and its cache's
+        // tickets repeat in a second tab of the same document and after a deep release; then the layer, the channel, the
+        // size, the ticket), cut into stripes by marchOnPool. A full march of a channel supersedes the one still on its way for it (the light moved on,
+        // went off, or came back to the key the channel holds): the older one's queued stripes are cancelled and its
+        // pending key is freed at once, so the light can march there again. A quick march is never cancelled: the quick
+        // map trails the pointer, an older answer still lands over an older one. K12b: a full march's stripes go through
+        // the pool's feed (at most the route relightFeed, else the pool's size + 1, stripes of all full marches posted at
+        // once), so other NORMAL pool work waits for about one stripe; a quick march's go at once (INTERACTIVE).
+        const fullMarches = cache.fullMarches || (cache.fullMarches = [null, null, null, null]);
+        const supersede = (i) => {
+            const m = fullMarches[i];
+            if (!m) return;
+            fullMarches[i] = null;
+            m.superseded = true;
+            cache.pending.delete(m.pendingKey);
+            const pool = editorPool();
+            if (pool && !pool.off) cancelMarch(pool, m.group);   // its stripes in the feed too (K12b)
+        };
+        // the depth map's name for the workers' resident copy of it (px.js `_slot`): its data, the march's size
+        const depthKey = `${mapKey}:${quick ? "q" : "f"}:${targetW}x${targetH}`;
 
         for (let i = 0; i < 4; i++) {
             const l = lights[i];
             const vKey = relightVisKey(l, depthScale, mapKey, quick);
             if (vKey === null) {
+                if (!quick) supersede(i);
                 if (targetVis.keys[i] !== null) {
                     for (let idx = 0; idx < targetW * targetH; idx++) {
                         targetVis.data[idx * 4 + i] = 255;
@@ -23313,10 +23621,21 @@ class InpaintEditor {
             }
 
             const pendingKey = `v:${quick ? "q" : "f"}:${i}:${vKey}`;
-            if (targetVis.keys[i] === vKey || cache.pending.has(pendingKey)) continue;
+            if (targetVis.keys[i] === vKey) {
+                if (!quick && fullMarches[i] && fullMarches[i].pendingKey !== pendingKey) supersede(i);
+                continue;
+            }
+            if (cache.pending.has(pendingKey)) continue;
+            if (!quick) supersede(i);
             cache.pending.add(pendingKey);
             const chan = i;
             const ticket = stamp();
+            const march = { group: `relight${nextPartsSeq()}:${layer.id}:${chan}:${targetW}x${targetH}:${ticket}`, pendingKey, superseded: false };
+            if (!quick) fullMarches[chan] = march;
+            if (!run) run = markStep("relight_maps", "start", { quick, lights: 0, w: targetW, h: targetH });
+            run.lights++;
+            cache.marching = (cache.marching || 0) + 1;
+            this._relightMarches++;
             const p = (async () => {
                 try {
                     const lm = lightToMap(l, depthMap, { depth_scale: depthScale });
@@ -23334,8 +23653,10 @@ class InpaintEditor {
 
                     let vChan;
                     const pool = editorPool();
+                    const posted = performance.now();
                     if (pool && !pool.off) {
-                        const res = await pool.run("relight_shadow", {
+                        const stripes = kernelRoute("relightStripes"), feed = kernelRoute("relightFeed");
+                        vChan = await marchOnPool(pool, {
                             depth: marchDepth,
                             w: targetW,
                             h: targetH,
@@ -23345,10 +23666,13 @@ class InpaintEditor {
                             taps,
                             steps,
                             bias,
-                            row0: 0,
-                            rows: targetH,
-                        }, [], { priority: quick ? INTERACTIVE : NORMAL });
-                        vChan = new Uint8Array(res.vis);
+                            key: depthKey,
+                        }, {
+                            priority: quick ? INTERACTIVE : NORMAL,
+                            group: march.group,
+                            stripes: stripes === undefined ? STRIPES_PER_WORKER * pool.size : stripes,
+                            budget: quick ? 0 : (feed === undefined ? pool.size + 1 : feed),
+                        });
                     } else {
                         vChan = shadowMarch(marchDepth, targetW, targetH, marchScale, lightVec, radius, taps, steps, bias, 0, targetH);
                     }
@@ -23359,6 +23683,7 @@ class InpaintEditor {
                     // waiting for it to stop. pickVis tells current from trailing by the keys.
                     const tv = quick ? cache.visQuick : cache.vis;
                     const current = vKey === this.relightChannelKey(layer, chan, quick);
+                    markStep("relight_maps", "landed", { chan, quick, current, ms: Math.round((performance.now() - posted) * 10) / 10 });
                     if (tv && tv.w === targetW && tv.h === targetH && tv.keys[chan] !== vKey) {
                         const tickets = tv.tickets || (tv.tickets = [0, 0, 0, 0]);
                         if (current || (quick && ticket > (tickets[chan] || 0))) {
@@ -23373,9 +23698,14 @@ class InpaintEditor {
                         }
                     }
                 } catch (err) {
-                    console.warn(`relight_shadow channel ${chan} failed:`, err);
+                    // a superseded march's cancelled stripes (the pool's CancelledError): a newer march of the channel took over
+                    if (!(err && err.cancelled)) console.warn(`relight_shadow channel ${chan} failed:`, err);
                 } finally {
-                    cache.pending.delete(pendingKey);
+                    cache.marching--;
+                    this._relightMarches--;
+                    if (!cache.marching) markStep("relight_maps", "idle", { quick });
+                    if (!march.superseded) cache.pending.delete(pendingKey);   // a superseded one's key was freed when it was, and may be a newer march's now
+                    if (fullMarches[chan] === march) fullMarches[chan] = null;
                     // the channel still lacks the key it wants now and no march for that key is on its way (a light turned
                     // off and on while its march ran, a march for a key left behind): ask for one
                     const want = this.relightChannelKey(layer, chan, quick);

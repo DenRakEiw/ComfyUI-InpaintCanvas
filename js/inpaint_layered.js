@@ -19,6 +19,10 @@
  * CMYK, Lab, indexed and 32-bit files are refused with their name. `inflate(bytes)` (async, zlib) is only needed
  * for ZIP-compressed channels (Photoshop writes RLE unless told otherwise).
  *
+ * `readPsdStream(bytes, { inflate, rowsPerBand, onHeader, onRows })` is the same parse for the pool job `psd_read`
+ * (docs/PLAN_WASM_BUILD.md §7 D0): each layer's pixels and mask go out as RGBA bands once its channels are read, the
+ * answer names them by index; readPsd stays the window's reader and its twin (tools/layered_test.js).
+ *
  * `readOra(bytes, { inflateRaw })` answers `{ width, height, layers, notes }`, each layer with its PNG as `png`
  * (bytes) instead of `rgba`, for the caller to decode; nested stacks are flattened: their visibility and opacity go
  * into their layers.
@@ -242,6 +246,97 @@ function listNames(names, max = 6) {
 }
 
 export async function readPsd(input, { inflate = null } = {}) {
+    return decodePsd(input, inflate, null);
+}
+
+/**
+ * The worker's reader (the pool job `psd_read`, docs/PLAN_WASM_BUILD.md §7 D0): readPsd's parse, but each layer's pixels
+ * go out as soon as its channels are read, `rowsPerBand` rows at a time, and its channels are dropped, so one layer's
+ * planes are held at a time. `onHeader({ width, height, depth, mode, channels })` once the header is accepted; then
+ * `onRows(index, kind, rgba, w, h, y0, rows)` per band, a layer's "rgba" bands (readPsd's `rgba` rows) before its "mask"
+ * bands (the mask as white with the mask as alpha: what the editor's Mask is made from); `index` the layer's number in
+ * the stream. The answer is readPsd's with `index` in place of a layer's `rgba` and its `mask` without `data`; the
+ * merged picture is read only when no layer has pixels (the one case the editor shows it), `composite` then its index,
+ * else null. `spent` (optional) gets the milliseconds of channels (the reads and unpacks), interleave, mask, deliver
+ * (inside `onRows`) and the count of bands.
+ */
+export async function readPsdStream(input, { inflate = null, rowsPerBand = 256, onHeader = null, onRows = null, spent = null } = {}) {
+    if (typeof onRows !== "function") throw new Error("readPsdStream needs onRows");
+    const sp = Object.assign(spent || {}, { channels: 0, interleave: 0, mask: 0, deliver: 0, bands: 0 });
+    return decodePsd(input, inflate, { rows: Math.max(1, rowsPerBand | 0), onHeader, onRows, sp, next: 0 });
+}
+
+const clock = () => (typeof performance !== "undefined" ? performance.now() : Date.now());
+
+/** Does readPsd's layer loop make a layer with pixels of this record? Its own tests, in its order. */
+function pixelRecord(L, w, h) {
+    if (L.section === 3 || L.section === 1 || L.section === 2) return false;
+    if (Object.keys(L.info).some((k) => ADJUSTMENTS.has(k))) return false;
+    return w > 0 && h > 0 && !!L.ch[0];
+}
+
+/**
+ * Planes (readPsd's `ch`: 0, 1, 2, -1; gray 0 and -1) out through the stream as straight RGBA bands, gray replicated, a
+ * missing alpha opaque; then `maskData` (w * h bytes, or null) as bands of white with that alpha. Its stream index.
+ */
+function streamPixels(stream, ch, w, h, gray, maskData) {
+    const index = stream.next++, per = stream.rows, sp = stream.sp;
+    const R = ch[0], G = gray ? ch[0] : ch[1], B = gray ? ch[0] : ch[2], A = ch[-1];
+    const send = (kind, out, y0, n) => {
+        const t = clock();
+        stream.onRows(index, kind, out, w, h, y0, n);
+        sp.deliver += clock() - t;
+        sp.bands++;
+    };
+    for (let y0 = 0; y0 < h; y0 += per) {
+        const n = Math.min(per, h - y0), t = clock();
+        const out = new Uint8ClampedArray(n * w * 4);
+        for (let i = y0 * w, end = (y0 + n) * w, o = 0; i < end; i++, o += 4) {
+            out[o] = R ? R[i] : 0; out[o + 1] = G ? G[i] : 0; out[o + 2] = B ? B[i] : 0; out[o + 3] = A ? A[i] : 255;
+        }
+        sp.interleave += clock() - t;
+        send("rgba", out, y0, n);
+    }
+    if (maskData) {
+        for (let y0 = 0; y0 < h; y0 += per) {
+            const n = Math.min(per, h - y0), t = clock();
+            const out = new Uint8ClampedArray(n * w * 4);
+            for (let i = y0 * w, end = (y0 + n) * w, o = 0; i < end; i++, o += 4) { out[o] = 255; out[o + 1] = 255; out[o + 2] = 255; out[o + 3] = maskData[i]; }
+            sp.mask += clock() - t;
+            send("mask", out, y0, n);
+        }
+    }
+    return index;
+}
+
+/**
+ * The merged picture's channels at 8 bits (`{ 0, 1, 2, -1 }`, gray `{ 0, -1 }`) from `r` at the section's start, or null
+ * when the file has none it can read; a damaged one throws (the caller drops it).
+ */
+function mergedPlanes(r, bytes, width, height, channels, depth, gray) {
+    if (r.p + 2 > bytes.length) return null;
+    const comp = r.u16();
+    const planes = {};
+    const n = Math.min(channels, gray ? 2 : 4);
+    if (comp === 1) {
+        const lens = [];
+        for (let i = 0; i < height * channels; i++) lens.push(r.u16());
+        for (let c = 0; c < n; c++) {
+            const rowLens = lens.slice(c * height, (c + 1) * height);
+            const out = new Uint8Array(width * height * depth / 8);
+            r.p = unpackRows(bytes, r.p, rowLens, width * depth / 8, out);
+            planes[c] = out;
+        }
+    } else if (comp === 0) {
+        for (let c = 0; c < n; c++) planes[c] = r.bytes(width * height * depth / 8).slice();
+    }
+    if (!planes[0]) return null;
+    const to8 = (p) => { if (!p || depth === 8) return p; const o = new Uint8Array(width * height); for (let i = 0; i < o.length; i++) o[i] = Math.round(((p[2 * i] << 8) | p[2 * i + 1]) / 257); return o; };
+    return gray ? { 0: to8(planes[0]), "-1": to8(planes[1]) } : { 0: to8(planes[0]), 1: to8(planes[1]), 2: to8(planes[2]), "-1": to8(planes[3]) };
+}
+
+/** readPsd (`stream` null) and readPsdStream (`stream` its state) on one parse. */
+async function decodePsd(input, inflate, stream) {
     const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
     const r = new Reader(bytes);
     if (r.ascii(4) !== "8BPS") throw new Error("not a PSD file");
@@ -252,6 +347,7 @@ export async function readPsd(input, { inflate = null } = {}) {
     const channels = r.u16(), height = r.u32(), width = r.u32(), depth = r.u16(), mode = r.u16();
     if (mode !== 3 && mode !== 1) throw new Error(`this PSD is in ${PSD_MODES[mode] || "mode " + mode} colour; only RGB and grayscale are read (convert it in Photoshop: Image > Mode > RGB)`);
     if (depth !== 8 && depth !== 16) throw new Error(`this PSD has ${depth} bits per channel; only 8 and 16 are read`);
+    if (stream && stream.onHeader) stream.onHeader({ width, height, depth, mode, channels });
     const gray = mode === 1;
     r.skip(r.u32());   // colour mode data
     r.skip(r.u32());   // image resources
@@ -293,6 +389,7 @@ export async function readPsd(input, { inflate = null } = {}) {
             for (const L of records) {
                 const w = L.right - L.left, h = L.bottom - L.top;
                 L.ch = {};
+                const t0 = stream ? clock() : 0;
                 for (const c of L.channels) {
                     const end = r.p + c.len;
                     const isMask = c.id === -2 || c.id === -3;
@@ -305,35 +402,26 @@ export async function readPsd(input, { inflate = null } = {}) {
                     if (cw > 0 && chh > 0) L.ch[c.id] = await readChannel(r, comp, cw, chh, depth, c.len - 2, inflate);
                     r.p = end;
                 }
+                if (stream) {
+                    stream.sp.channels += clock() - t0;
+                    // D0: a layer's pixels and mask go out now and its planes are dropped (`L.ch[0]` stays set for the loop below)
+                    if (pixelRecord(L, w, h)) {
+                        const mask = layerMask(L, w, h);
+                        L.streamed = { index: streamPixels(stream, L.ch, w, h, gray, mask ? mask.data : null), mask: mask ? { defaultColor: mask.defaultColor, disabled: mask.disabled } : null };
+                        L.ch = { 0: EMPTY };
+                    } else L.ch = {};   // not read below: a section or an adjustment is skipped first, the empty test answers alike
+                }
             }
         }
         r.p = liEnd;
     }
     r.p = lmEnd;
-    // the merged picture
+    // the merged picture (the stream reads it after the layers, and only when none has pixels)
     let composite = null;
-    if (r.p + 2 <= bytes.length) {
+    if (!stream) {
         try {
-            const comp = r.u16();
-            const planes = {};
-            const n = Math.min(channels, gray ? 2 : 4);
-            if (comp === 1) {
-                const lens = [];
-                for (let i = 0; i < height * channels; i++) lens.push(r.u16());
-                for (let c = 0; c < n; c++) {
-                    const rowLens = lens.slice(c * height, (c + 1) * height);
-                    const out = new Uint8Array(width * height * depth / 8);
-                    r.p = unpackRows(bytes, r.p, rowLens, width * depth / 8, out);
-                    planes[c] = out;
-                }
-            } else if (comp === 0) {
-                for (let c = 0; c < n; c++) planes[c] = r.bytes(width * height * depth / 8).slice();
-            }
-            if (planes[0]) {
-                const to8 = (p) => { if (!p || depth === 8) return p; const o = new Uint8Array(width * height); for (let i = 0; i < o.length; i++) o[i] = Math.round(((p[2 * i] << 8) | p[2 * i + 1]) / 257); return o; };
-                const ch = gray ? { 0: to8(planes[0]), "-1": to8(planes[1]) } : { 0: to8(planes[0]), 1: to8(planes[1]), 2: to8(planes[2]), "-1": to8(planes[3]) };
-                composite = interleave(ch, width, height, gray);
-            }
+            const ch = mergedPlanes(r, bytes, width, height, channels, depth, gray);
+            if (ch) composite = interleave(ch, width, height, gray);
         } catch (_) { composite = null; }
     }
     // records are bottom first; groups are a bounding divider (3) below their layers and a folder record (1 / 2) above.
@@ -367,8 +455,9 @@ export async function readPsd(input, { inflate = null } = {}) {
         if (Object.keys(L.info).some((k) => ADJUSTMENTS.has(k))) { adjust.push(L.name); if (!L.clipping) baseKept = false; continue; }
         if (!(w > 0 && h > 0) || !L.ch[0]) { if (L.name) empty.push(L.name); if (!L.clipping) baseKept = false; continue; }
         if (L.info && L.info.iOpa && L.info.iOpa.length > 0 && L.info.iOpa[0] < 255) fillOpa++;
-        const rgba = interleave(L.ch, w, h, gray);
-        const mask = layerMask(L, w, h);
+        if (stream && !L.streamed) throw new Error(`readPsdStream: the pixels of layer "${L.name}" were not sent`);
+        const rgba = stream ? null : interleave(L.ch, w, h, gray);
+        const mask = stream ? L.streamed.mask : layerMask(L, w, h);
         if (mask) { masks++; if (mask.disabled) masksOff++; }
         let blend = PSD_BLENDS[L.blendKey];
         if (!blend) { blends.push(`${L.name} (${L.blendKey.trim()})`); blend = "normal"; }
@@ -377,10 +466,18 @@ export async function readPsd(input, { inflate = null } = {}) {
         if (clip) clips++;
         if (!L.clipping) baseKept = true;
         const layer = { name: L.name || "Layer", x: L.left, y: L.top, w, h, opacity: L.opacity, visible: !(L.flags & 2), blend, rgba, group: stack.length ? stack[stack.length - 1].id : null };
+        if (stream) { delete layer.rgba; layer.index = L.streamed.index; }
         if (clip) layer.clip = true;
         if (mask) layer.mask = mask;
         layers.push(layer);
     }
+    if (stream && !layers.length && width > 0 && height > 0) {   // a header of no area has no merged picture to send
+        r.p = lmEnd;
+        let ch = null;
+        try { ch = mergedPlanes(r, bytes, width, height, channels, depth, gray); } catch (_) { ch = null; }
+        if (ch) composite = streamPixels(stream, ch, width, height, gray, null);
+    }
+    const hasComposite = composite != null;
     if (adjust.length) notes.push(`${adjust.length} adjustment or fill layer${adjust.length > 1 ? "s" : ""} left out (${listNames(adjust)}): the picture can look different`);
     if (clips) notes.push(`${clips} clipped layer${clips > 1 ? "s" : ""} kept clipped`);
     if (clipped.length) notes.push(`clipping to a group or a left-out layer is not kept (${listNames(clipped)} now cover${clipped.length > 1 ? "" : "s"} more)`);
@@ -392,9 +489,9 @@ export async function readPsd(input, { inflate = null } = {}) {
     if (groupBlends.length) notes.push(`groups are folders here, their blend modes became pass through: ${listNames(groupBlends)}`);
     if (fillOpa) notes.push(`fill opacity below 100 % read as 100 % (${fillOpa} layer${fillOpa > 1 ? "s" : ""})`);
     if (depth === 16) notes.push("16 bits per channel rounded to 8");
-    if (empty.length && !layers.length && !composite) notes.push("no layer has pixels");
+    if (empty.length && !layers.length && !hasComposite) notes.push("no layer has pixels");
     // a note that says something was lost or changed (not one that says what was kept): the status line shows it red
-    const lossy = !!(adjust.length || clipped.length || blends.length || groupBlends.length || fillOpa || depth === 16 || (empty.length && !layers.length && !composite));
+    const lossy = !!(adjust.length || clipped.length || blends.length || groupBlends.length || fillOpa || depth === 16 || (empty.length && !layers.length && !hasComposite));
     return { width, height, layers, groups, composite, notes, lossy };
 }
 

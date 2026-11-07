@@ -6,7 +6,7 @@
  * In a cycle with inpaint_canvas.js for the switches on the class (`InpaintEditor.mipsOnPool`, `mipsOnSharedWorker`):
  * they are read inside functions only, never while this module is evaluated.
  */
-import { kernelsMode } from "./px/kernels.js";
+import { kernelsMode, routeOverrides, pxTimed } from "./px/kernels.js";
 import { buildPsd, buildOra } from "./inpaint_export.js";
 import { WorkerPool, poolSize, INTERACTIVE, NORMAL } from "./inpaint_pool.js";
 import { setChainTransport, setResampleTransport, setLiquifyTransport } from "./inpaint_tiles.js";
@@ -34,6 +34,34 @@ function keepTiming(msg) {
     if (!msg.timing) return;
     JOB_TIMINGS.push(msg.timing);
     if (JOB_TIMINGS.length > 5000) JOB_TIMINGS.splice(0, JOB_TIMINGS.length - 5000);
+}
+
+// What every job carries besides its own arguments (docs/PLAN_WASM_K1.md §1.6): the kernels mode, the route overrides
+// (px/kernels.js `routeOverrides`; the worker adopts them wholesale), the measurement generation and, while the window's
+// clocks run (`pxTimed`), `split: 1` for the worker's split of the job. A harness starts a row with `measureGen(true)`
+// and counts only the timings of its generation, so a job queued before the row cannot land in it; the pool takes
+// these fields when a job is queued, not when it is sent (inpaint_pool.js `run`).
+let GEN = 0;
+
+const jobFields = () => ({ kernels: kernelsMode(), routes: routeOverrides(), gen: GEN, ...(pxTimed() ? { split: 1 } : null) });
+
+/** The measurement generation the jobs carry; `next` starts a new one first. */
+function measureGen(next = false) {
+    if (next) GEN++;
+    return GEN;
+}
+
+// The window's own steps of a long operation (opening a TIFF, an export, a save; docs/PLAN_WASM_BUILD.md K0a), marked as
+// they pass and kept beside the workers' timings (`InpaintEditor.stepMarks(true)` reads and clears them). A harness
+// takes each mark's `t` minus the previous mark's of the same `op`; a "start" step opens a new run of that op.
+const STEP_MARKS = [];
+
+/** Mark that `op` reached `step` now; `extra`'s keys go flat into the mark. Returns the mark (a later step may add to it). */
+function markStep(op, step, extra = null) {
+    const mark = { op, step, t: performance.now(), ...extra };
+    STEP_MARKS.push(mark);
+    if (STEP_MARKS.length > 5000) STEP_MARKS.splice(0, STEP_MARKS.length - 5000);
+    return mark;
 }
 
 function editorWorker() {
@@ -80,7 +108,7 @@ function workerCall(op, args = {}, transfer = []) {
             reject: (e) => { clearTimeout(timer); reject(e); },
         });
         try {
-            w.postMessage({ id, op, kernels: kernelsMode(), ...args }, transfer);
+            w.postMessage({ id, op, ...jobFields(), ...args }, transfer);
         } catch (err) {
             clearTimeout(timer);
             workerJobs.delete(id);
@@ -130,11 +158,23 @@ let POOL = null;
 function editorPool() {
     if (!POOL) POOL = new WorkerPool({
         create: () => new Worker(new URL("./inpaint_worker.js", import.meta.url), { type: "module" }),
-        defaults: () => ({ kernels: kernelsMode() }),
+        defaults: jobFields,
         onTiming: keepTiming,
         timeout: WORKER_TIMEOUT,
     });
     return POOL;
+}
+
+/** The jobs sent and not answered yet, in the shared worker, the mips worker and the pool (queued ones included). */
+function pendingJobs() {
+    return workerJobs.size + mipsJobs.size + (POOL ? POOL.pending : 0);
+}
+
+/** Stop the pool's workers; the next job starts new ones (a harness's fresh pool, tools/px_jobs.py `--fresh-pool`). */
+function resetPool() {
+    if (!POOL) return;
+    POOL.terminate();
+    POOL = null;
 }
 
 /**
@@ -152,7 +192,7 @@ function mipsTransport(tiles) {
         const timer = setTimeout(() => { if (jobs.delete(id)) reject(new Error("mips job timed out")); }, WORKER_TIMEOUT);
         jobs.set(id, { resolve: (v) => { clearTimeout(timer); resolve(v); }, reject: (e) => { clearTimeout(timer); reject(e); } });
         try {
-            w.postMessage({ id, op: "mips", kernels: kernelsMode(), tiles }, transfer);
+            w.postMessage({ id, op: "mips", ...jobFields(), tiles }, transfer);
         } catch (err) {
             clearTimeout(timer);
             jobs.delete(id);
@@ -220,4 +260,4 @@ async function buildLayered(format, { width, height, layers, composite }) {
     return format === "psd" ? buildPsd({ width, height, layers, composite }) : buildOra({ width, height, layers, composite });
 }
 
-export { JOB_TIMINGS, editorWorker, workerCall, editorPool, buildLayered };
+export { JOB_TIMINGS, STEP_MARKS, markStep, editorWorker, workerCall, editorPool, buildLayered, measureGen, pendingJobs, resetPool };
