@@ -845,13 +845,9 @@ export function applyHsl(src, p) {
 // curves
 // ---------------------------------------------------------------------------
 
-function applyCurves(src, p, info) {
+function applyCurves(src, p) {
     const tables = curvesToTables(p.curves);
     const { out, octx, img, px } = openPixels(src);
-    // luma histogram of the input for the curve editor (every 4th pixel is plenty)
-    const hist = new Uint32Array(256);
-    for (let i = 0; i < px.length; i += 16) hist[(LR * px[i] + LG * px[i + 1] + LB * px[i + 2] + 0.5) | 0]++;
-    if (info && info.cache) info.cache.histogram = hist;
     if (!tables) return out;
     const tr = tables.r, tg = tables.g, tb = tables.b;
     for (let i = 0; i < px.length; i += 4) { px[i] = tr[px[i]]; px[i + 1] = tg[px[i + 1]]; px[i + 2] = tb[px[i + 2]]; }
@@ -859,8 +855,13 @@ function applyCurves(src, p, info) {
     return out;
 }
 
+/**
+ * The curve editor. Its luma histogram is the picture below the layer, from the editor's `belowHistogram` (cached per
+ * composite below, as the range bars read it; `callbacks.histogram`), P8: the filter passes no longer read a thumbnail
+ * of their input back on every view pass for it, and the panel has one on the tile backend and the GPU chain too.
+ */
 function curvesControl(layer, param, callbacks) {
-    return buildCurvesControl(layer, param, callbacks, { histogram: () => (layer._fxCache && layer._fxCache.histogram) || null });
+    return buildCurvesControl(layer, param, callbacks, { histogram: typeof callbacks.histogram === "function" ? callbacks.histogram : null });
 }
 
 // ---------------------------------------------------------------------------
@@ -968,7 +969,8 @@ export const FILTERS = {
             { key: "size", label: "Size", min: 0.5, max: 6, step: 0.1, default: 1.5, unit: "px", notWithPlate: true },
             { key: "speckle", label: "Speckle", min: 0, max: 100, step: 1, default: 25, unit: "%", notWithPlate: true },
             { key: "chroma", label: "Colour", min: 0, max: 100, step: 1, default: 0, unit: "%", notWithPlate: true },
-            { key: "plate_scale", label: "Plate", min: 0.25, max: 4, step: 0.05, default: 1, unit: "×", onlyWithPlate: true, keepPreset: true },
+            // plate pixels per image pixel: a resize scales it as it scales a length (`scalesWithPicture`)
+            { key: "plate_scale", label: "Plate", min: 0.25, max: 4, step: 0.05, default: 1, unit: "×", onlyWithPlate: true, keepPreset: true, scales: true },
         ],
         presets: GRAIN_PRESETS,
         plate: true,
@@ -1328,6 +1330,47 @@ export function filterDefaults(id) {
         } else {
             out[p.key] = p.default;
         }
+    }
+    return out;
+}
+
+/**
+ * Item 57: whether a filter parameter is a length in image pixels, which a resize of the picture scales. `scales: true`
+ * says it is one (the grain's plate scale, plate pixels per image pixel), `scales: false` that it is not; otherwise a
+ * number parameter is one when its unit is "px", what its slider shows (a radius, a grain size, a shift, a pattern size).
+ * Percentages of the picture, angles, colours and levels are not.
+ */
+export function scalesWithPicture(p) {
+    if (!p || (p.type && p.type !== "number")) return false;
+    return p.scales != null ? !!p.scales : p.unit === "px";
+}
+
+/**
+ * A filter layer's parameters after the picture was resized by `sx` x `sy` (Resize image, a whole-picture upscale, the
+ * Realism Pass above 1x; resizeImageNow), so the effect keeps its size on the picture: every length in image pixels
+ * (`scalesWithPicture`) times sqrt(sx * sy), the geometric mean (a radius, a cell or a shift is one length, none of them
+ * is per axis; the film pack's control points scale their radii by the same factor), and kept within its min and max.
+ * Not rounded to the slider's step: every renderer of these takes fractions (blur sigmas, bilinear shifts, pattern
+ * periods), a step would turn a small length into 0 for good and a resize there and back would drift; only float noise
+ * is trimmed (ten significant digits, so 1 px at 40 % and then 250 % is 1 px again). The row shows the value on its
+ * step. Returns a new object when a value changed (the resize's undo step holds the old one), else null; null too for a
+ * filter that is not installed (its plugin off), whose values stay as they are.
+ */
+export function scaleFilterParams(id, params, sx, sy) {
+    const def = FILTERS[id];
+    const k = Math.sqrt(sx * sy);
+    if (!def || !Number.isFinite(k) || !(k > 0) || k === 1) return null;
+    let out = null;
+    for (const p of def.params || []) {
+        if (!scalesWithPicture(p)) continue;
+        const cur = params && params[p.key] != null ? +params[p.key] : +p.default;
+        if (!Number.isFinite(cur)) continue;
+        let v = +(cur * k).toPrecision(10);
+        if (p.max != null && Number.isFinite(+p.max)) v = Math.min(+p.max, v);
+        if (p.min != null && Number.isFinite(+p.min)) v = Math.max(+p.min, v);
+        if (v === cur) continue;
+        if (!out) out = { ...(params || {}) };
+        out[p.key] = v;
     }
     return out;
 }

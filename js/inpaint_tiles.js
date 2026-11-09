@@ -37,7 +37,7 @@
 
 import { CANVAS_MAX_PIXELS, CANVAS_MAX_SIDE } from "./inpaint_sizelimit.js";
 import { LayerPixels, MaskPixels, pixelRect, WHOLE_CANVAS_OPS, BLIT_MARGIN } from "./inpaint_pixels.js";
-import { mipChain, mipChainBytes, clampExtend, compositeTile, resampleBlock, selCombine, SEL_NONE, SEL_ALPHA, SEL_FULL } from "./px/kernels.js";
+import { mipChain, mipChainBytes, clampExtend, compositeMaskedTile, resampleBlock, liquifyBlock, selCombine, maskInvert, SEL_NONE, SEL_ALPHA, SEL_FULL } from "./px/kernels.js";
 import { allocTileBytes, isShared } from "./inpaint_arena.js";
 import { canvasRoundTrip, resampleOptions, resampleStore, toFixed, preimage } from "./inpaint_resample.js";
 import { liquifyStore, liquifyBox } from "./inpaint_liquify.js";
@@ -82,16 +82,16 @@ const BLOCK = 4096;                // a big scratch is read back in blocks of th
 const DISPLAY_RECT_MAX_PX = 4 * 1024 * 1024;   // displayRectSource: above this the mirror is the source
 const LITTLE = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
 const ALPHA = 0x1000000;           // a word >= this has a non-zero alpha byte (little-endian)
+const RUN_MIN = 16;                // tileWithGutter: a run of opaque or transparent words this long goes as one set / fill
 
 let tileSeq = 0;                   // tile versions are unique across all tiles
-let STROKE_SCRATCH = null;         // compositeStroke's tile, kept
 // Pixels versions are unique across all pixels objects (docs/PLAN_BCE.md §C6 a). A cache that keys on
 // `version` then cannot mistake one object for another: a new mask started at 0 and was 1 after its first
 // touch, exactly what the mask it replaced had, and the atlas's instances and the region view kept
 // drawing the old mask.
 let pixelSeq = 0;
 
-function newTile() {
+function newTile(zero = true) {
     const t = {
         data: null,                                // allocTileBytes below: an arena slot, or its own ArrayBuffer
         version: ++tileSeq,
@@ -108,7 +108,7 @@ function newTile() {
         arenaChunk: -1, arenaSlot: -1,             // where `data` lives when the arena holds it (inpaint_arena.js)
     };
     // either way the bytes start on a page (§B3, 4K aliasing)
-    t.data = allocTileBytes(t);
+    t.data = allocTileBytes(t, zero);
     return t;
 }
 
@@ -964,21 +964,26 @@ const tiled = (Base) => class extends Base {
 
     // -- tiles --
 
-    /** The tile at (tx, ty), made writable: allocated when missing (with `create`), copied when shared. */
-    writable(tx, ty, create = true) {
+    /**
+     * The tile at (tx, ty), made writable: allocated when missing (with `create`), copied when shared. When `whole` is
+     * true the caller overwrites every byte of `t.data` right away (wasm `_out` or a full-tile `w.fill`), so a frozen
+     * tile is not copied into the new slot first and a reused arena slot is not zeroed first (K5, K11,
+     * docs/PLAN_WASM_BUILD.md §4.3, §7 K5).
+     */
+    writable(tx, ty, create = true, whole = false) {
         this._guard();
         const key = (ty << 16) | tx;
         let t = this._tiles.get(key);
         if (!t) {
             if (!create) return null;
-            t = newTile();
+            t = newTile(!whole);
             this._tiles.set(key, t);
         } else if (t.frozen > 0) {
             // the copy first: at the renderer's memory limit newTile throws (PixelMemoryError, inpaint_arena.js), and a
             // count taken down before that would let the next write go into the tile the other holders still read
-            const c = newTile();
+            const c = newTile(!whole);
             t.frozen--;
-            c.data.set(t.data);
+            if (!whole) c.data.set(t.data);
             // the original's chains as the copy's stale picture until its own are built (C6 b): read, never written
             // (`mipsOwn` false), because the other holders of the original read the same buffers. The original gives
             // up owning them too: its last holder writes into it in place, and a rebuild into the buffer the copy reads
@@ -1124,10 +1129,18 @@ const tiled = (Base) => class extends Base {
         if (!own) return null;
         const side = TILE_SIZE >> level, S = side + 2;
         if (!out || out.length < S * S * 4) out = new Uint8Array(S * S * 4);
+        // P10: an opaque or a transparent pixel is one 32-bit word (little-endian: alpha in the high byte), as in
+        // `coarseSlot`; null (a view off a 4-byte boundary, or big-endian) keeps the byte path for every pixel
+        const o32 = words(out);
         const near = [];
         const infoAt = (dx, dy) => {
             const k = (dy + 1) * 3 + (dx + 1);
-            if (near[k] === undefined) near[k] = !dx && !dy ? own : this._levelBytes(tx + dx, ty + dy, level, display);
+            if (near[k] === undefined) {
+                const info = !dx && !dy ? own : this._levelBytes(tx + dx, ty + dy, level, display);
+                // the word view of each source made once per slot (a view per row or per put would eat the gain)
+                if (info && o32) info.w32 = info.coarse ? u32Of(info.t) : info.off & 3 ? null : words(info.data);
+                near[k] = info;
+            }
             return near[k];
         };
         // which neighbour each gutter pixel comes from, and its row / column there; at the image's
@@ -1139,12 +1152,18 @@ const tiled = (Base) => class extends Base {
         const P = premulTable();
         const put = (info, sx, sy, n, o) => {
             if (!info) { out.fill(0, o, o + n * 4); return; }
+            const s32 = info.w32;
             if (info.coarse) {
                 // a tile whose chain is on its way and that has none: its bytes sampled nearest, only the pixels put here (C6 b)
                 const d = info.t.data, f = 1 << level, half = f >> 1, lastX = info.vw - 1;
                 const row = Math.min(sy * f + half, info.vh - 1) * TILE_SIZE;
                 for (let k = 0; k < n; k++, o += 4) {
-                    const i = (row + Math.min((sx + k) * f + half, lastX)) * 4;
+                    const j = row + Math.min((sx + k) * f + half, lastX), i = j * 4;
+                    if (s32) {
+                        const w = s32[j];
+                        if (w >= 0xFF000000) { o32[o >> 2] = w; continue; }
+                        if (w < ALPHA) { o32[o >> 2] = 0; continue; }
+                    }
                     const a = d[i + 3];
                     if (a === 255) { out[o] = d[i]; out[o + 1] = d[i + 1]; out[o + 2] = d[i + 2]; out[o + 3] = 255; continue; }
                     if (!a) { out[o] = 0; out[o + 1] = 0; out[o + 2] = 0; out[o + 3] = 0; continue; }
@@ -1155,6 +1174,41 @@ const tiled = (Base) => class extends Base {
             }
             const d = info.data;
             let i = info.off + (sy * side + sx) * 4;
+            if (s32) {
+                // the same pixels a word at a time: an opaque word copied whole, a transparent one written as 0 (what the
+                // byte path below writes for them), the rest premultiplied into one word, the table's values computed
+                // (little-endian: R in the low byte, A in the high one)
+                let j = i >> 2, q = o >> 2;
+                const end = j + n;
+                while (j < end) {
+                    const w = s32[j], a = w >>> 24;
+                    if (a === 255) {
+                        // a run of opaque words: found, then copied as one block (a short one word by word)
+                        let r = j + 1;
+                        while (r < end && s32[r] >>> 24 === 255) r++;
+                        if (r - j < RUN_MIN) { while (j < r) o32[q++] = s32[j++]; continue; }
+                        o32.set(s32.subarray(j, r), q);
+                        q += r - j; j = r;
+                        continue;
+                    }
+                    if (!a) {
+                        // a run of transparent words, zeroed
+                        let r = j + 1;
+                        while (r < end && s32[r] < ALPHA) r++;
+                        if (r - j < RUN_MIN) { while (j < r) { o32[q++] = 0; j++; } continue; }
+                        o32.fill(0, q, q + r - j);
+                        q += r - j; j = r;
+                        continue;
+                    }
+                    // SkMulDiv255Round of every channel, (x + (x >> 8)) >> 8 with x = c * a + 128, as the table holds it:
+                    // R and B side by side in the 16-bit halves of one word (no half overflows: x + (x >> 8) <= 65,407),
+                    // G alone, A kept
+                    const rb = Math.imul(w & 0xFF00FF, a) + 0x800080, g = ((w >>> 8) & 255) * a + 128;
+                    o32[q++] = (((rb + ((rb >>> 8) & 0xFF00FF)) >>> 8) & 0xFF00FF) | (((g + (g >> 8)) >> 8) << 8) | (w & 0xFF000000);
+                    j++;
+                }
+                return;
+            }
             for (let k = 0; k < n; k++, i += 4, o += 4) {
                 const a = d[i + 3];
                 if (a === 255) { out[o] = d[i]; out[o + 1] = d[i + 1]; out[o + 2] = d[i + 2]; out[o + 3] = 255; continue; }
@@ -1357,7 +1411,7 @@ const tiled = (Base) => class extends Base {
 
     /**
      * A stroke store's tiles (`stroke`: pixels of the same size, so the same grid) composited into these pixels in place,
-     * a tile at a time through the compositing kernel (`compositeTile`): `op` an OPS number (source-over,
+     * a tile at a time through the compositing kernel (`compositeMaskedTile`, K36): `op` an OPS number (source-over,
      * destination-out, source-atop), `alpha` the opacity 0..255, `coverage(tx, ty)` what of the tile may change: true
      * for all of it, null for none, or 65,536 bytes of coverage (the selection's clip, the stroke's box). A stroke's
      * release through canvases held the window up to 0.3 s at 15000 x 10000 (docs/BUGS.md). Only the pixels the stroke
@@ -1366,8 +1420,6 @@ const tiled = (Base) => class extends Base {
      */
     compositeStroke(stroke, op, alpha, coverage = null) {
         this._guard();
-        const scratch = STROKE_SCRATCH || (STROKE_SCRATCH = new Uint8Array(TILE_BYTES));
-        const w32 = new Uint32Array(scratch.buffer, 0, TILE_SIZE * TILE_SIZE);
         let written = 0;
         for (const key of stroke.tileKeys()) {
             const tx = key & 0xFFFF, ty = key >>> 16;
@@ -1377,18 +1429,10 @@ const tiled = (Base) => class extends Base {
             let cov = coverage ? coverage(tx, ty) : true;
             if (!cov) continue;
             if (cov === true) cov = null;
-            if (old) scratch.set(old.data); else scratch.fill(0);
-            compositeTile(scratch, [s.data], [op], [alpha], [cov]);
-            const s32 = u32Of(s), o32 = old ? u32Of(old) : null;
-            let changed = false;
-            for (let i = 0; i < w32.length; i++) {
-                if (s32[i] < ALPHA || (cov && !cov[i])) w32[i] = o32 ? o32[i] : 0;
-                else if (!changed && w32[i] !== (o32 ? o32[i] : 0)) changed = true;
-            }
-            if (!changed) continue;
-            const t = this.writable(tx, ty);
-            t.data.set(scratch);
-            if (tileEmpty(t)) this._dropTile(key);
+            const r = compositeMaskedTile(old ? old.data : null, (whole) => this.writable(tx, ty, true, whole && TILE_SIZE === 256).data,
+                s.data, op, alpha, cov, TILE_SIZE * TILE_SIZE);
+            if (!r) continue;
+            if (r === 2) this._dropTile(key);
             written++;
         }
         return written;
@@ -1868,7 +1912,7 @@ const tiled = (Base) => class extends Base {
             share: (tx, ty) => out.push({ key: (ty << 16) | tx, share: true }),
             tile: () => { cur = new Uint8Array(TILE_BYTES); return [cur, 0, TILE_SIZE * 4]; },
             done: (tx, ty, count) => out.push(count ? { key: (ty << 16) | tx, bytes: cur } : { key: (ty << 16) | tx, empty: true }),
-        }, blockMax);
+        }, blockMax, liquifyBlock);
         return out;
     }
 
@@ -2510,41 +2554,41 @@ export class TileMaskPixels extends tiled(MaskPixels) {
         const cols = Math.ceil(this._w / TILE_SIZE), rows = Math.ceil(this._h / TILE_SIZE);
         // the channels clamped and rounded as a tile's bytes store them, as combine() takes them
         const [cr, cg, cb] = Uint8ClampedArray.of(color[0], color[1], color[2]);
-        // the colour without alpha and at full alpha, as words (little-endian: R is the low byte)
-        const RGB = ((cb << 16) | (cg << 8) | cr) >>> 0;
-        const SEL = (0xFF000000 | RGB) >>> 0;
+        const rgb = ((cr << 16) | (cg << 8) | cb) >>> 0;
+        // the colour at full alpha, as a word (little-endian: R is the low byte)
+        const SEL = (0xFF000000 | (cb << 16) | (cg << 8) | cr) >>> 0;
         for (let ty = 0; ty < rows; ty++) {
             const bh = Math.min(TILE_SIZE, this._h - (ty << 8));
             for (let tx = 0; tx < cols; tx++) {
                 const key = (ty << 16) | tx;
                 const bw = Math.min(TILE_SIZE, this._w - (tx << 8));
                 const had = this._tiles.get(key);
-                const t = this.writable(tx, ty);
                 if (!had && LITTLE) {
                     // nothing was selected here, so all of it is now: one fill, no reading
+                    const whole = bw === TILE_SIZE && bh === TILE_SIZE;
+                    const t = this.writable(tx, ty, true, whole);
                     const w = u32Of(t);
                     if (bw === TILE_SIZE) w.fill(SEL, 0, bh * TILE_SIZE);
                     else for (let y = 0; y < bh; y++) w.fill(SEL, y * TILE_SIZE, y * TILE_SIZE + bw);
-                } else if (LITTLE) {
-                    const w = u32Of(t);
-                    for (let y = 0; y < bh; y++) {
-                        let o = y * TILE_SIZE;
-                        for (let x = 0; x < bw; x++, o++) {
-                            const a = 255 - (w[o] >>> 24);
-                            // a pixel the invert leaves fully transparent carries no colour: a canvas
-                            // stores premultiplied and un-premultiplies such a pixel to 0, 0, 0, and the
-                            // two backends have to agree byte for byte (tools/pixels_test.js)
-                            w[o] = a ? ((a << 24) | RGB) >>> 0 : 0;
-                        }
-                    }
-                } else {
-                    const d = t.data;
-                    for (let y = 0; y < bh; y++) {
-                        let o = y * TILE_SIZE * 4;
-                        for (let x = 0; x < bw; x++, o += 4) {
-                            const a = 255 - d[o + 3];
-                            d[o] = a ? cr : 0; d[o + 1] = a ? cg : 0; d[o + 2] = a ? cb : 0; d[o + 3] = a;
-                        }
+                    t.ext = [0, 0, bw, bh];
+                    t.extVersion = t.version;
+                    continue;
+                }
+                if (LITTLE) {
+                    let t = null;
+                    const ext = maskInvert(had.data, (whole) => (t = this.writable(tx, ty, true, whole && TILE_SIZE === 256)).data, bw, bh, rgb, TILE_SIZE);
+                    if (!ext) { this._dropTile(key); continue; }
+                    t.ext = ext;
+                    t.extVersion = t.version;
+                    continue;
+                }
+                const t = this.writable(tx, ty);
+                const d = t.data;
+                for (let y = 0; y < bh; y++) {
+                    let o = y * TILE_SIZE * 4;
+                    for (let x = 0; x < bw; x++, o += 4) {
+                        const a = 255 - d[o + 3];
+                        d[o] = a ? cr : 0; d[o + 1] = a ? cg : 0; d[o + 2] = a ? cb : 0; d[o + 3] = a;
                     }
                 }
                 if (tileEmpty(t)) this._dropTile(key);
@@ -2618,18 +2662,19 @@ export class TileMaskPixels extends tiled(MaskPixels) {
 
                 if (v.kind === SEL_FULL && m <= 1 && LITTLE) {
                     // replace or add under full coverage: the colour at 255 wherever the image is, one fill
-                    const t = this.writable(tx, ty);
+                    const whole = bw === TILE_SIZE && bh === TILE_SIZE;
+                    const t = this.writable(tx, ty, true, whole);
                     const w = u32Of(t);
                     if (bw === TILE_SIZE) w.fill(SEL, 0, bh * TILE_SIZE);
                     else for (let y = 0; y < bh; y++) w.fill(SEL, y * TILE_SIZE, y * TILE_SIZE + bw);
                     // a new tile is 0 beyond the image; a kept one may hold pixels there (its extent is then found later)
-                    const ext = !had ? [0, 0, bw, bh] : (bw === TILE_SIZE && bh === TILE_SIZE ? [0, 0, TILE_SIZE, TILE_SIZE] : null);
+                    const ext = !had ? [0, 0, bw, bh] : (whole ? [0, 0, TILE_SIZE, TILE_SIZE] : null);
                     if (ext) { t.ext = ext; t.extVersion = t.version; }
                     continue;
                 }
 
                 let t = null;
-                const ext = selCombine(had ? had.data : null, () => (t = this.writable(tx, ty)).data,
+                const ext = selCombine(had ? had.data : null, (whole) => (t = this.writable(tx, ty, true, whole && TILE_SIZE === 256)).data,
                     v.data, v.off, v.stride, v.kind, bw, bh, m, rgb, TILE_SIZE);
                 if (!ext) { this._dropTile(key); continue; }
                 t.ext = ext;

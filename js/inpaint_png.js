@@ -15,23 +15,60 @@
  * Without the Rust kernels in the workers a part fails with `NO_PARTS`, and the caller keeps its canvas path.
  */
 
-import { pngUnfilterRows } from "./px/kernels.js";
+import { pngUnfilterRows, crc32 as kernelCrc32 } from "./px/kernels.js";
 
 export const PNG_LEVEL = 2;               // measured (E2): 84 MB/s a worker and 0.349 of the raw size; level 6 is 13 MB/s for 0.327
 export const PART_BYTES = 8 * 1048576;    // raw bytes of a part: what one worker holds three times over while it runs
 export const NO_PARTS = "png parts need the Rust kernels";
 
-const CRC_TABLE = (() => {
-    const t = new Uint32Array(256);
-    for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
-    return t;
-})();
+// 6 lines kept so `export function crc32` stays at line 30 (docs/PLAN_WASM_BUILD.md §4.2 K3).
+// The byte-wise loop lives in px/kernels_js.js as the twin; inputs from the `crc32` route's cut-off on go to Rust.
+
+
 
 /** CRC-32 of `bytes`, continued from `crc` (the value a former call returned). */
 export function crc32(bytes, crc = 0) {
-    let c = (crc ^ 0xFFFFFFFF) >>> 0;
-    for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
-    return (c ^ 0xFFFFFFFF) >>> 0;
+    return kernelCrc32(bytes, crc);
+}
+
+function gf2MatrixTimes(mat, vec) {
+    let sum = 0, v = vec >>> 0, i = 0;
+    while (v) {
+        if (v & 1) sum ^= mat[i];
+        v >>>= 1;
+        i++;
+    }
+    return sum >>> 0;
+}
+
+function gf2MatrixSquare(square, mat) {
+    for (let n = 0; n < 32; n++) square[n] = gf2MatrixTimes(mat, mat[n]);
+}
+
+const CRC_POW2 = (() => {
+    const odd = new Uint32Array(32), even = new Uint32Array(32);
+    odd[0] = 0xEDB88320;
+    for (let n = 1; n < 32; n++) odd[n] = 1 << (n - 1);
+    gf2MatrixSquare(even, odd);
+    gf2MatrixSquare(odd, even);
+    const mats = [];
+    for (let b = 0; b < 32; b++) {
+        const m = new Uint32Array(32);
+        gf2MatrixSquare(m, b === 0 ? odd : mats[b - 1]);
+        mats.push(m);
+    }
+    return mats;
+})();
+
+/** The CRC-32 of A followed by B from the sums of A (`crc1`) and of B alone (`crc2`), B being `len2` bytes (zlib's GF(2) method). */
+export function crc32Combine(crc1, crc2, len2) {
+    let c1 = crc1 >>> 0;
+    if (!(len2 > 0)) return c1;
+    let n = Math.floor(len2);
+    for (let b = 0; n > 0 && b < 32; b++, n = Math.floor(n / 2)) {
+        if (n & 1) c1 = gf2MatrixTimes(CRC_POW2[b], c1);
+    }
+    return (c1 ^ (crc2 >>> 0)) >>> 0;
 }
 
 /** A chunk: length, type, data, CRC over type and data. */
@@ -167,14 +204,30 @@ export class PngStreamWriter {
         const pieces = [new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]), pngChunk("IHDR", ihdr), ...extraChunks(this.texts, this.chunks)];
         // zlib: deflate with a 32K window, no dictionary; the level bits are a hint (0x9C: the default), FCHECK makes it a multiple of 31
         pieces.push(pngChunk("IDAT", new Uint8Array([0x78, 0x9C])));
+        let crc = 0;
+        for (const p of pieces) crc = crc32(p, crc);
         let adler = 1;
         for (const r of replies) {
-            pieces.push(new Uint8Array(r.chunk));
+            const c = new Uint8Array(r.chunk);
+            pieces.push(c);
             adler = adlerCombine(adler, r.adler, r.raw);
+            if (r.crc !== undefined && c.byteLength >= 8) {
+                crc = crc32(c.subarray(0, 4), crc);
+                crc = crc32Combine(crc, r.crc >>> 0, c.byteLength - 8);
+                crc = crc32(c.subarray(c.byteLength - 4), crc);
+            } else {
+                crc = crc32(c, crc);
+            }
         }
-        pieces.push(pngChunk("IDAT", new Uint8Array([adler >>> 24, (adler >>> 16) & 255, (adler >>> 8) & 255, adler & 255])));
-        pieces.push(pngChunk("IEND", new Uint8Array(0)));
-        return new Blob(pieces, { type: "image/png" });
+        const tail = pngChunk("IDAT", new Uint8Array([adler >>> 24, (adler >>> 16) & 255, (adler >>> 8) & 255, adler & 255]));
+        const iend = pngChunk("IEND", new Uint8Array(0));
+        pieces.push(tail, iend);
+        crc = crc32(tail, crc);
+        crc = crc32(iend, crc);
+        this.crc = crc;
+        const blob = new Blob(pieces, { type: "image/png" });
+        blob.crc = crc;
+        return blob;
     }
 }
 

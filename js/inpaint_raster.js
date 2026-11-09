@@ -83,6 +83,12 @@ const RED_CLEAR = (() => {
     return new Uint32Array(b.buffer)[0];
 })();
 
+const RED_FULL = (() => {
+    const b = new Uint8Array(4);
+    b[0] = 255; b[1] = 0; b[2] = 0; b[3] = 255;
+    return new Uint32Array(b.buffer)[0];
+})();
+
 /**
  * The selection after growing (n > 0) or shrinking (n < 0) by n pixels, as RGBA bytes in
  * place: red where selected, transparent elsewhere, hard edges like Photoshop's Expand.
@@ -95,9 +101,11 @@ const RED_CLEAR = (() => {
  * half the time); `dist` replaces it with another of the same signature, and `ms`, when given,
  * collects the milliseconds of each part.
  */
-export function growMask(d, W, H, n, { dist = distTransform, ms = null } = {}) {
+export function growMask(d, W, H, n, { dist = distTransform, ms = null, cells = null } = {}) {
     const grow = n > 0;
     const r = Math.abs(n);
+    const cols = (W + 255) >> 8, rows = (H + 255) >> 8;
+    if (cells) cells.fill(0, 0, cols * rows);
     let t = ms ? performance.now() : 0;
     const lap = (key) => { if (!ms) return; const now = performance.now(); ms[key] = (ms[key] || 0) + now - t; t = now; };
     const box = maskBounds(d, W, H);
@@ -123,12 +131,42 @@ export function growMask(d, W, H, n, { dist = distTransform, ms = null } = {}) {
     const dsq = dist(feature, bw, bh);
     lap("edt");
     const r2 = r * r;
-    words.fill(RED_CLEAR);
-    for (let y = 0; y < bh; y++) {
-        const dst = (by0 + y) * W + bx0, row = y * bw;
-        for (let x = 0; x < bw; x++) {
-            const inside = grow ? dsq[row + x] <= r2 : dsq[row + x] > r2;
-            if (inside) d[(dst + x) * 4 + 3] = 255;
+    if (cells) {
+        words.fill(RED_CLEAR, 0, by0 * W);
+        words.fill(RED_CLEAR, by1 * W, W * H);
+        const same = new Uint32Array(cols * rows);
+        for (let y = 0; y < bh; y++) {
+            const rowY = by0 + y, rowStart = rowY * W;
+            words.fill(RED_CLEAR, rowStart, rowStart + bx0);
+            words.fill(RED_CLEAR, rowStart + bx1, rowStart + W);
+            const dst = rowStart + bx0, row = y * bw, rowC = (rowY >> 8) * cols;
+            for (let x = 0; x < bw; x++) {
+                const inside = grow ? dsq[row + x] <= r2 : dsq[row + x] > r2;
+                const want = inside ? RED_FULL : RED_CLEAR;
+                const ci = rowC + ((bx0 + x) >> 8);
+                if (words[dst + x] === want) same[ci]++;
+                else words[dst + x] = want;
+                if (inside) cells[ci] = 1;
+            }
+        }
+        for (let ty = 0; ty < rows; ty++) {
+            const ch = Math.min(256, H - ty * 256);
+            for (let tx = 0; tx < cols; tx++) {
+                const ci = ty * cols + tx;
+                if (cells[ci]) {
+                    const cw = Math.min(256, W - tx * 256);
+                    if (same[ci] === cw * ch) cells[ci] = 2;
+                }
+            }
+        }
+    } else {
+        words.fill(RED_CLEAR);
+        for (let y = 0; y < bh; y++) {
+            const dst = (by0 + y) * W + bx0, row = y * bw;
+            for (let x = 0; x < bw; x++) {
+                const inside = grow ? dsq[row + x] <= r2 : dsq[row + x] > r2;
+                if (inside) d[(dst + x) * 4 + 3] = 255;
+            }
         }
     }
     lap("write");
@@ -140,15 +178,15 @@ export function growMask(d, W, H, n, { dist = distTransform, ms = null } = {}) {
  * the distance transform run there too); `ms.kernel` collects its time. After a trap or an out-of-memory the instance
  * is replaced and the JS path below makes it: the kernel writes `d` only after its call, so it starts from the same bytes.
  */
-export function growMaskBounds(d, W, H, n, { ms = null } = {}) {
+export function growMaskBounds(d, W, H, n, { ms = null, cells = null } = {}) {
     const p = rustPx();
     if (p) {
         const t = ms ? performance.now() : 0;
-        try { return p.growMask(d, W, H, n); }
+        try { return p.growMask(d, W, H, n, cells); }
         catch (err) { if (!recovered(p, err, "grow_mask")) throw err; }
         finally { if (ms) ms.kernel = (ms.kernel || 0) + performance.now() - t; releaseIfLarge(); }
     }
-    growMask(d, W, H, n, { ms });
+    growMask(d, W, H, n, { ms, cells });
     const t = ms ? performance.now() : 0;
     const bounds = maskBounds(d, W, H);
     if (ms) ms.resultBounds = (ms.resultBounds || 0) + performance.now() - t;

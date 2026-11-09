@@ -14,11 +14,11 @@
 //   * receive stitched results from the backend and add them as layers
 
 import { api, host } from "./host.js";
-import { FILTERS, FILTER_IDS, filterDefaults, applyFilter, matchCanvas, lutFromCube, lutToCanvas, lutFromImage, plateStats, colourStats, fillPixels, hexRgb } from "./inpaint_filters.js";
+import { FILTERS, FILTER_IDS, filterDefaults, scaleFilterParams, applyFilter, matchCanvas, lutFromCube, lutToCanvas, lutFromImage, plateStats, colourStats, fillPixels, hexRgb } from "./inpaint_filters.js";
 import { isGLSurface, glChainUsable, beginScope, endScope, releaseSurface, surfaceToCanvas, drawSurfaceTo, surfaceFromBytes, readSurfaceBytes, glMaxSide, glReleaseLargeSurfaces, runShader, glToCanvas } from "./inpaint_filters_gl.js";
 import { TEXT_DEFAULTS, FONT_CATEGORIES, loadFontList, fontList, addUserFont, renderText, textAngle, textFrame, fontCss } from "./inpaint_text.js";
 import { readAbr, tipCanvas } from "./inpaint_brushes.js";
-import { setKernels, kernelsMode, OPS, deflate, smudgeDab as smudgeDabKernel, SMUDGE_ALPHA_LOCK, SMUDGE_PICKUP, compositeTile, poissonBlend as poissonBlendKernel, distTransform } from "./px/kernels.js";
+import { setKernels, kernelsMode, OPS, deflate, smudgeDab as smudgeDabKernel, SMUDGE_ALPHA_LOCK, SMUDGE_PICKUP, compositeTile, poissonBlend as poissonBlendKernel, distTransform, blurRGBA, sharpenRGBA, toneRGBA, spongeRGBA, freqSeparate, allocLiquifyWindow, freeLiquifyWindow, liquifyPreview, liquifyDab } from "./px/kernels.js";
 import { floodMask, maskToColorCanvas, clipMaskToSelection, rgbToHex, hexToRgb, growMask, invertMask, maskBounds, selModeOf, selectionGco, tilesSource, bytesSource, rectSource } from "./inpaint_raster.js";
 import { GLCompositor, BLEND_FN_GLSL } from "./inpaint_compositor.js";
 import { LayerPixels, MaskPixels, canvasOf, displayCanvasIfMade, installLayerAliases, deprecatedPixels, pixelsOptions, BLIT_MARGIN, resetContext } from "./inpaint_pixels.js";
@@ -26,7 +26,7 @@ import { INTERACTIVE, NORMAL, EXPORT, CancelledError } from "./inpaint_pool.js";
 import { pngHeader, asciiJson, pngWithChunks, SRGB_CHUNK } from "./inpaint_png.js";
 import { tileRows, bandRows, stackRows, stackArgs, storeArgs, stackInArena, PsdBandWriter, OraBandWriter, writeTiff } from "./inpaint_bands.js";
 import { compositeBox, releaseBoxBuffers } from "./inpaint_boxstack.js";
-import { pressureCurve, Stabiliser, blurRGBA, sharpenRGBA, toneLUT, toneRGBA, spongeRGBA } from "./inpaint_stroke.js";
+import { pressureCurve, Stabiliser, toneLUT } from "./inpaint_stroke.js";
 import { TipPicker, noteRecentTip } from "./inpaint_tippicker.js";
 import { isTiff, TIFF_EXT, tiffInfo, readTiff, tiffPart } from "./inpaint_tiff.js";
 import { arenaEnabled } from "./inpaint_arena.js";
@@ -35,18 +35,18 @@ import { JOB_TIMINGS, STEP_MARKS, markStep, editorWorker, workerCall, editorPool
 import { buildEditorModal } from "./inpaint_modal.js";
 import { encodeCanvas, canvasToBlob, partsUsable, partsRun, partsFlights, bandPause, partsFailed, nextPartsSeq, encodeTilePixels, encodeBands, encodeRows } from "./inpaint_encode.js";
 import { SUBFOLDER, uploadBlob, uploadCanvas, uploadPixels } from "./inpaint_upload.js";
-import { LAYERED_EXT, isPsd, isOra, readPsd, readOra } from "./inpaint_layered.js";
+import { LAYERED_EXT, isPsd, isOra, readPsd, readOra, inflateAtMost } from "./inpaint_layered.js";
 import { THEME } from "./inpaint_theme.js";
 import { XF_IDENTITY, xfMul, xfInv, xfApply, xfBox, xfTranslate, xfScale, xfRotate, pixelMap } from "./inpaint_resample.js";
 import { removeCrop, toModelImage, toModelMask, fromModel } from "./inpaint_remove.js";
-import { LiquifyField, gridStep, previewBlock, liquifyFalloff } from "./inpaint_liquify.js";
+import { LiquifyField, gridStep, liquifyFalloff, thawPlane } from "./inpaint_liquify.js";
 import { labelMap, sameLabels, remap, mapOffset, namesFor, parse, normalize, compare, checkNote, referencesText, referencesRule } from "./reftokens.js";
 import { promptPayload, selectionBoxIdOf } from "./boxes_model.js";
 import { fitLayerRGBA, workScale } from "./edgefit.js";
 import { STALE_DIFF, GUIDE, RANGE_BAND_ROWS, WORK_MAX, modelSize, workSize, disparityRange } from "./inpaint_depth.js";
 import { packRG16, mapToJSON, mapFromJSON, fingerprint, fingerprintDiff, passToMap, makeMap, sampleMap, deriveMap, selectionOnMap, editMap } from "./inpaint_maps.js";
-import { SNAP_DEFAULT, SNAP_TAU, snapParams, snapField, rangeMax, edgeTiles } from "./inpaint_edges.js";
-import { normalizeLimit, u16Bilinear, rangeWeight, opp, colourSimilarity, hexToRgb as hexToRgb01, WEIGHTS_GLSL } from "./inpaint_weights.js";
+import { SNAP_DEFAULT, SNAP_TAU, snapParams, snapField, rangeMax, mapTileStats } from "./inpaint_edges.js";
+import { normalizeLimit, normalizeStoredLimit, u16Bilinear, rangeWeight, rangeTileClass, rangeRowBookkeeping, opp, colourSimilarity, hexToRgb as hexToRgb01, WEIGHTS_GLSL } from "./inpaint_weights.js";
 import { limitAlphaRows } from "./inpaint_limit.js";
 import { buildRangeBar } from "./inpaint_rangebar.js";
 import { BLENDS, BLEND_GROUPS, BLEND_MODES, EMULATED_BLENDS, BLEND_OPS, canvasOp, normalBlend, seedOfLayer, hash32, mul255 } from "./blend_modes.js";
@@ -112,8 +112,12 @@ export const RELIGHT_LIGHT_TYPES = [
     "cloud-filtered lighting", "fog-diffused lighting", "moonlight lighting", "starlight nighttime", "soft bokeh lighting", "harsh studio lighting",
 ];
 
-/** The status line of a load that left layers out: `newer` of a kind this version does not know, `failed` filter layers that would not load. */
-function leftOutText(newer, failed) {
+/**
+ * The status line of a load that left layers out: `newer` of a kind this version does not know, `failed` filter layers
+ * that would not load, `missing` the names of pixel layers whose file would not, `redrawn` those of text layers whose
+ * file would not and that were drawn again from their text.
+ */
+function leftOutText(newer, failed, missing = [], redrawn = []) {
     const parts = [];
     if (newer > 0) {
         const one = newer === 1;
@@ -121,6 +125,18 @@ function leftOutText(newer, failed) {
         parts.push(`${newer} layer${one ? "" : "s"} saved by ${hostText("newerApp", "a newer version")} ${one ? "was" : "were"} left out: this version cannot show ${one ? "it" : "them"}, and the next save drops ${one ? "it" : "them"}.`);
     }
     if (failed > 0) parts.push(`${failed} filter layer${failed === 1 ? "" : "s"} could not be read and ${failed === 1 ? "was" : "were"} left out.`);
+    // a pixel layer whose file would not load (gone from the store, or not a picture): named, the first few
+    if (missing.length) {
+        const n = missing.length, one = n === 1;
+        const names = missing.slice(0, 3).map((s) => `"${s}"`).join(", ") + (n > 3 ? ` and ${n - 3} more` : "");
+        parts.push(`${n} layer${one ? "" : "s"} could not be read and ${one ? "was" : "were"} left out: ${names}.`);
+    }
+    // a text layer whose file would not load: drawn again from its text
+    if (redrawn.length) {
+        const n = redrawn.length, one = n === 1;
+        const names = redrawn.slice(0, 3).map((s) => `"${s}"`).join(", ") + (n > 3 ? ` and ${n - 3} more` : "");
+        parts.push(`${n} text layer${one ? "" : "s"} could not be read and ${one ? "was" : "were"} drawn again from ${one ? "its" : "their"} text: ${names}.`);
+    }
     return parts.join(" ");
 }
 /** What an undo step is called in the Undo history when its site gives no label of its own. */
@@ -482,6 +498,24 @@ function viewUrl(ref) {
     return api.apiURL("/view?" + p.toString());
 }
 
+/** A ref's mirror key ("type/subfolder/filename", as the host's referencedFileKeys and the clean-up write it). */
+function refKey(ref) {
+    return ref && typeof ref.filename === "string" ? `${ref.type || "input"}/${ref.subfolder || ""}/${ref.filename}` : "";
+}
+
+/**
+ * Is this file gone from the store /view reads (the app's local store, which asks a connected ComfyUI for what it lacks;
+ * the node's ComfyUI)? A HEAD request: true only on a 404, so a failed request or another answer leaves the file be.
+ */
+async function fileGone(ref) {
+    try {
+        const r = await fetch(viewUrl(ref), { method: "HEAD", cache: "no-store" });
+        return r.status === 404;
+    } catch (_) {
+        return false;
+    }
+}
+
 /** An undo snapshot's image: the URL may still be encoding when undo is pressed. */
 async function snapImage(u) {
     return loadImageEl(typeof u === "string" ? u : await u);
@@ -572,12 +606,6 @@ async function pixelsFromTiff(blob, Cls, progress = null) {
  */
 function psdOnPool(file) {
     return InpaintEditor.psdOnPool !== false && typeof Worker === "function" && typeof Blob === "function" && file instanceof Blob && !editorPool().off;
-}
-
-/** zlib ("deflate") or raw ("deflate-raw") bytes inflated by the browser. */
-async function inflateBytes(bytes, format) {
-    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream(format));
-    return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
 /** The size an SVG declares: width / height attributes (px, pt, mm, cm, in, pc at 96 dpi), else the viewBox. */
@@ -1927,8 +1955,24 @@ const STROKE_SCRATCH_KEEP_PX = 16 * 1024 * 1024;
 // whole box (a 561 MB scratch read back in blocks, 1.3 s on tiles).
 const STROKE_BAND = 1024;
 
-// WeakMap caching rangeMax(map) keyed by map.data (immutable Uint16Array) for selectRange depth edge tiles (R2-S6)
+// WeakMap caching { rmax, stats: Map } keyed by map.data (immutable Uint16Array) for selectRange depth tile stats (R2-S6, K21)
 const RMAX_CACHE = new WeakMap();
+function cachedMapTileStats(map, m, W, H, snapOn, tau) {
+    let entry = RMAX_CACHE.get(map.data);
+    if (!entry) {
+        entry = { rmax: null, stats: new Map() };
+        RMAX_CACHE.set(map.data, entry);
+    }
+    const thresh = snapOn ? Math.round(tau * 65535) : 0;
+    const key = `${W}x${H}:${m.join(",")}:${snapOn ? 1 : 0}:${thresh}`;
+    let stats = entry.stats.get(key);
+    if (!stats) {
+        if (snapOn && !entry.rmax) entry.rmax = rangeMax(map);
+        stats = mapTileStats(map, snapOn ? entry.rmax : null, m, W, H, tau, 256);
+        entry.stats.set(key, stats);
+    }
+    return stats;
+}
 
 // A pixel source's identity and version as a key part, "-" for none (`belowSignature`): a source replaced by another
 // (an undo, a flip, a new base) is another key even where `pixelVersion` would not tell
@@ -2594,6 +2638,19 @@ class InpaintEditor {
         const sample = selectInput(["image", "layer"], "image", "What the fill looks at: the visible image (all layers) or the active layer alone");
         sample.addEventListener("change", () => { this.fillOpts.sample = sample.value; });
         row("bucket eyedropper wand", "Sample", sample);
+        // item 58: the eyedropper takes the pixel under the cursor or the mean of the 3 x 3 / 5 x 5 around it (pickColor;
+        // Alt+click with the paint brush too), kept like the pressure curve; Point unless the user chose otherwise
+        this.eyedropperSize = 1;
+        try { const n = +localStorage.getItem("ipc.eyedropperSize"); if (n === 3 || n === 5) this.eyedropperSize = n; } catch (_) { /* no storage */ }
+        const dsize = selectInput([{ value: "1", label: "Point" }, { value: "3", label: "3 × 3" }, { value: "5", label: "5 × 5" }], String(this.eyedropperSize),
+            "Size: the one pixel under the cursor, or the average of the 3 × 3 or 5 × 5 pixels around it, so grain or noise does not hand you a stray pixel's colour");
+        dsize.addEventListener("change", () => {
+            this.eyedropperSize = +dsize.value === 3 || +dsize.value === 5 ? +dsize.value : 1;
+            try { localStorage.setItem("ipc.eyedropperSize", String(this.eyedropperSize)); } catch (_) { /* ignore */ }
+            this.root.focus({ preventScroll: true });
+        });
+        this.eyedropperSizeSel = dsize;
+        row("eyedropper", "Size", dsize);
         const gtype = selectInput(["linear", "radial"], "linear", "Gradient shape");
         gtype.addEventListener("change", () => { this.gradientOpts.type = gtype.value; });
         row("gradient", "Type", gtype);
@@ -3117,6 +3174,7 @@ class InpaintEditor {
                     this.setRangePreview(null);
                 }
                 else if (this.pointer && this.pointer.kind === "patchdrag") { const p = this.pointer; this.pointer = null; this.patchDone(p); this.draw(); this.setStatus(`${p.tool === "contentmove" ? "Move" : "Patch"} cancelled.`); }
+                else if (this.pointer && this.pointer.kind === "liquify" && !this.pointer.healing) { const p = this.pointer; this.pointer = null; this.liquifyDrop(p, "Liquify cancelled."); }
                 else if (this.pending) this.cancelPending();
                 else if (this.polyPoints) { this.polyPoints = null; this.draw(); this.setStatus("Polygon cancelled."); }
                 else if (this.shapePoints) { this.cancelShape(); this.draw(); this.setStatus("Shape cancelled."); }
@@ -3197,6 +3255,8 @@ class InpaintEditor {
         this._docKeyUp = null;
         if (this.textEdit) this.endTextEdit(true);
         this.closeFlyout();
+        this.dropFlyoutListener();
+        this.closeAsk();
         this.closeTipPicker();   // its window listener and preview slices go with the editor (8c14eee)
         // a relight nudge or wheel burst still in its 300 ms is dropped, not committed: its timer and flush, the snapshot it
         // would have pushed (the layer's next edit would take it as its own "before") and its preview
@@ -3450,12 +3510,19 @@ class InpaintEditor {
             const finish = (val) => {
                 if (this.askOpen !== wrap) return;
                 this.askOpen = null;
+                if (this._askFinish === finish) this._askFinish = null;
                 window.removeEventListener("keydown", onKey, true);
                 wrap.remove();
                 try { this.root.focus({ preventScroll: true }); } catch (_) { /* ignore */ }
                 resolve(val);
             };
             const onKey = (e) => {
+                // a question no longer on the page (its editor closed or destroyed) takes no key: it lets go of the window
+                if (this._destroyed || !wrap.isConnected) {
+                    window.removeEventListener("keydown", onKey, true);
+                    if (this.askOpen === wrap) finish(null);
+                    return;
+                }
                 if (e.key === "Escape") { e.preventDefault(); e.stopImmediatePropagation(); finish(null); }
                 else if (e.key === "Enter") { e.preventDefault(); e.stopImmediatePropagation(); finish(answer()); }
             };
@@ -3463,6 +3530,8 @@ class InpaintEditor {
             okBtn.addEventListener("click", () => finish(answer()));
             wrap.addEventListener("pointerdown", (e) => { if (e.target === wrap) finish(null); });
             this.askOpen = wrap;
+            // close() and destroy() answer an open question with null: its window listener closes over the editor
+            this._askFinish = finish;
             window.addEventListener("keydown", onKey, true);
             this.root.appendChild(wrap);
             // the first number box that can be typed in, else the first select, else the text input or OK
@@ -3538,6 +3607,7 @@ class InpaintEditor {
         if (this.pending && tool !== "transform") this.cancelPending();
         if (this.polyPoints && tool !== "polygon") this.polyPoints = null;
         if (this.shapePoints && tool !== "shape") this.cancelShape();
+        if (tool !== "liquify" && this.pointer && this.pointer.kind === "liquify") this.freeLiquifyWindow(this.pointer);
         if (this.liq && tool !== "liquify") this.endLiquify();
         const prevTool = this.tool;
         this.tool = tool;
@@ -3605,6 +3675,10 @@ class InpaintEditor {
                 this.cancelRange();
             } else if (this._rangeTint) {
                 this.setRangePreview(null);
+            } else if (this.pointer && this.pointer.kind === "liquify" && !this.pointer.healing) {
+                const p = this.pointer;
+                this.pointer = null;
+                this.liquifyDrop(p, "Liquify cancelled.");
             } else if (this.pending) {
                 this.cancelPending();
             } else if (this.tool === "lights" && this.isRelightActive()) {
@@ -4662,6 +4736,23 @@ class InpaintEditor {
         this._flyClose = setTimeout(() => this.closeFlyout(), 160);
     }
 
+    /**
+     * The window's capturing pointerdown listener the first flyout adds (openFlyout, openChoiceList: a press outside
+     * closes the flyout). It closes over the editor, so one left on the window kept a closed tab's editor with all its
+     * pixels for the rest of the session; close() and destroy() take it off, and the next flyout adds it again.
+     */
+    dropFlyoutListener() {
+        if (this._flyDocDown) window.removeEventListener("pointerdown", this._flyDocDown, true);
+        this._flyDocDown = null;
+    }
+
+    /** An open question (ask) answered with null, as Cancel does: its capturing keydown listener on the window goes. */
+    closeAsk() {
+        const finish = this._askFinish;
+        this._askFinish = null;
+        if (typeof finish === "function") finish(null);
+    }
+
     closeFlyout() {
         clearTimeout(this._flyClose);
         if (!this.flyout) return;
@@ -4949,16 +5040,50 @@ class InpaintEditor {
     }
 
     /**
-     * Snap the edges a scale gesture drags to the canvas edges, its centre and the guides
-     * (within 8 screen px), like a magnet: the pointer is shifted by the snap and the scale
-     * re-applied, so a kept aspect ratio stays consistent and "drag to the full picture" lands
-     * exactly. Rotated layers are not snapped (their edges are not axis-aligned).
+     * What a move or scale snaps to (item 59), `{ x, y }`: the canvas edges and centre and the guides first (for one
+     * edge a tie goes to them), then the left / right edges and the centre, the top / bottom edges and the middle, of
+     * every other layer the screen draws: shown (its own eye and its groups'), with pixels, not a filter layer (it covers
+     * the canvas), and a clipped layer only while its base is shown too. Reference and control layers count while they
+     * are shown: the canvas draws them. Each layer goes by its box, the frame the transform tool draws around it, not by
+     * what is painted in it. While two results are compared (`compare` a and b) the screen draws those two, their eyes
+     * aside, and no other result layer: so do the targets (drawLayersInto's `compareShow` rule). Collected at the
+     * gesture's first snap and kept on the pointer `p` with a stamp of what an outside change moves (an agent's command
+     * runs during a drag: a layer set, hidden or removed, an undo, a resize or an extend, a guide): made again only when
+     * the stamp changes, which the dragged layers' own moves do not do. A compare's draw moves `compositeVersion`, so in
+     * compare mode it is made again at each move (3 us for 50 layers, the editor gate's `list_us_50`). The layers the
+     * gesture moves are left out (`moving`, or a group gesture's members).
+     */
+    snapTargets(p, moving) {
+        const g = this.guides || {};
+        const stamp = `${this.historyGen}|${this.compositeVersion}|${this.width}x${this.height}|${(g.x || []).join()}|${(g.y || []).join()}`;
+        if (p && p.snapTo && p.snapTo.stamp === stamp) return p.snapTo;
+        const x = [0, this.width / 2, this.width, ...(g.x || [])], y = [0, this.height / 2, this.height, ...(g.y || [])];
+        const skip = new Set(p && p.group ? p.group.map((m) => m.layer) : [moving]);
+        const cmp = this.compare && this.compare.a && this.compare.b ? this.compare : null;
+        this.layers.forEach((l, i) => {
+            if (skip.has(l) || l.kind === "filter" || !l.px || !(l.w > 0 && l.h > 0)) return;
+            if (cmp && l.kind === "result" ? l.id !== cmp.a && l.id !== cmp.b : !this.shown(l)) return;
+            const cb = l.clip ? this.clipBaseOf(l, i) : null;
+            if (cb && !this.shown(cb)) return;
+            x.push(l.x, l.x + l.w / 2, l.x + l.w);
+            y.push(l.y, l.y + l.h / 2, l.y + l.h);
+        });
+        const out = { x, y, stamp };
+        if (p) p.snapTo = out;
+        return out;
+    }
+
+    /**
+     * Snap the edges a scale gesture drags to the canvas edges, its centre, the guides and the
+     * other layers' edges and centres (`snapTargets`, within 8 screen px), like a magnet: the
+     * pointer is shifted by the snap and the scale re-applied, so a kept aspect ratio stays
+     * consistent and "drag to the full picture" lands exactly. Rotated layers are not snapped
+     * (their edges are not axis-aligned). Alt held skips the call (the pointer move's caller).
      */
     snapScale(p, ix, iy) {
         const l = p.layer, h = p.handle;
         const th = 8 / this.view.scale;
-        const tx = [0, this.width / 2, this.width, ...((this.guides && this.guides.x) || [])];
-        const ty = [0, this.height / 2, this.height, ...((this.guides && this.guides.y) || [])];
+        const { x: tx, y: ty } = this.snapTargets(p, l);
         const nearest = (edge, targets) => { let best = null; for (const t of targets) { const d = Math.abs(edge - t); if (d <= th && (!best || d < best[0])) best = [d, t - edge, t]; } return best; };
         const edgeX = () => (h.includes("e") ? l.x + l.w : h.includes("w") ? l.x : null);
         const edgeY = () => (h.includes("s") ? l.y + l.h : h.includes("n") ? l.y : null);
@@ -4974,17 +5099,28 @@ class InpaintEditor {
         this.snapGuides = gx.length || gy.length ? { x: gx, y: gy } : null;
     }
 
-    /** Snap a moving layer's edges and centre to the canvas edges and centre (within 8 screen px). */
-    snapLayer(l) {
+    /**
+     * Snap a moving layer's edges and centre to the canvas edges and centre, the guides and the other layers' edges and
+     * centres (`snapTargets`, within 8 screen px). `p`: the gesture's pointer, which keeps the targets; Alt held skips the
+     * call (the pointer move's caller). A layer with a pending rotation snaps what the screen shows: the axis-aligned
+     * bounds of its turned quad and their centre (the layer's own), and the shift moves the layer by the same amount.
+     */
+    snapLayer(l, p = null) {
         const th = 8 / this.view.scale;
         const gx = [], gy = [];
-        const tx = [0, this.width / 2, this.width, ...((this.guides && this.guides.x) || [])];
-        const ty = [0, this.height / 2, this.height, ...((this.guides && this.guides.y) || [])];
+        const { x: tx, y: ty } = this.snapTargets(p, l);
+        let bx = l.x, by = l.y, bw = l.w, bh = l.h;
+        const pr = this.pending;
+        if (pr && pr.mode === "rotate" && pr.layer === l && Math.abs(pr.angle) > 1e-6) {
+            const qs = [[0, 0], [1, 0], [1, 1], [0, 1]].map(([u, v]) => this.pendingDst(pr, u, v));
+            bx = Math.min(...qs.map((q) => q[0])); by = Math.min(...qs.map((q) => q[1]));
+            bw = Math.max(...qs.map((q) => q[0])) - bx; bh = Math.max(...qs.map((q) => q[1])) - by;
+        }
         let best = null;
-        for (const a of [l.x, l.x + l.w / 2, l.x + l.w]) for (const b of tx) { const d = Math.abs(a - b); if (d <= th && (!best || d < best[0])) best = [d, b - a, b]; }
+        for (const a of [bx, bx + bw / 2, bx + bw]) for (const b of tx) { const d = Math.abs(a - b); if (d <= th && (!best || d < best[0])) best = [d, b - a, b]; }
         if (best) { l.x = Math.round(l.x + best[1]); gx.push(best[2]); }
         best = null;
-        for (const a of [l.y, l.y + l.h / 2, l.y + l.h]) for (const b of ty) { const d = Math.abs(a - b); if (d <= th && (!best || d < best[0])) best = [d, b - a, b]; }
+        for (const a of [by, by + bh / 2, by + bh]) for (const b of ty) { const d = Math.abs(a - b); if (d <= th && (!best || d < best[0])) best = [d, b - a, b]; }
         if (best) { l.y = Math.round(l.y + best[1]); gy.push(best[2]); }
         this.snapGuides = gx.length || gy.length ? { x: gx, y: gy } : null;
     }
@@ -5289,6 +5425,8 @@ class InpaintEditor {
 
     /** Why the document cannot be turned now (a job that would land where the picture was), or "". */
     turnBlocked() {
+        // the app's Each area (eacharea.js): its areas were cut from the picture as it is, and the next one goes soon
+        if (this._eachArea) return "Each area is running on this document: its areas were cut from the picture as it is. Wait for it, or stop it.";
         if (this.providerPending || this.segmentPending || this.cutoutPending || this.objectsPending || this._pointPending
             || this._loading || this._docSaving) return "Wait for the running job to finish: it would land where the picture was before the turn.";
         // a render queued on ComfyUI lands in the geometry it was made for (the app's host counts them, host.js)
@@ -6016,6 +6154,8 @@ class InpaintEditor {
         let before = null, pushed = false;
         try {
             this.setStatus(`Resizing to ${nw} × ${nh} ...`);
+            // a filter preview shown goes back first: the sizes scaled below are the committed ones, which the step holds
+            this.cancelPreviews();
             before = this.snapshot({ kind: "canvas" });
             if (this.pending) this.cancelPending();
             const nb = makeCanvas(nw, nh);
@@ -6029,9 +6169,27 @@ class InpaintEditor {
             else this.drawBaseInto(nctx, 0, 0, nw, nh);
             const { ref } = await uploadCanvas(nb, `n${this.node.id}_base`);
             const px = this.pixels.Layer.fromCanvas(nb);
+            // again after the upload's wait, before anything is scaled: a hover or a slider drag begun meanwhile would be
+            // scaled live and its cancel would write the unscaled values back
+            this.cancelPreviews();
+            let scaledFilters = 0, keptFilters = 0;
             for (const l of this.layers) {
                 if (l.kind === "filter") {
                     l.w = nw; l.h = nh; l._fcache = null;
+                    // item 57: its sizes in image pixels follow the picture (a 4 px blur is a 2 px one at half the size), a new
+                    // params object the canvas step does not hold; relight's lights move in followGeometry. A filter of a
+                    // plugin that is off keeps its values (the line says so)
+                    if (!FILTERS[l.filter]) keptFilters++;
+                    const scaled = scaleFilterParams(l.filter, l.params, sx, sy);
+                    if (scaled) { l.params = scaled; l._fcacheView = null; l._fcacheSample = null; l._fxCacheSample = null; scaledFilters++; }
+                    // a "before" an edit in progress still holds (a slider the list was rebuilt under, a hover left over)
+                    // is in the new picture's sizes too, or its step would put the old ones back later
+                    for (const k of ["_undoPending", "_hoverSnap"]) {
+                        const snap = l[k];
+                        if (!snap || snap.kind !== "filter" || !snap.params) continue;
+                        const sp = scaleFilterParams(snap.filter || l.filter, snap.params, sx, sy);
+                        if (sp) snap.params = sp;
+                    }
                     if (l.maskPx) { const m = makeCanvas(nw, nh); const mc = m.getContext("2d"); mc.imageSmoothingEnabled = true; l.maskPx.drawTo(mc, 0, 0, nw, nh); l.maskPx = this.pixels.Mask.fromCanvas(m); l.maskDirty = true; }
                 } else {
                     l.x = Math.round(l.x * sx); l.y = Math.round(l.y * sy);
@@ -6053,7 +6211,9 @@ class InpaintEditor {
             this.selectionDataUrl = null; this.selectionEncoded = false;
             this.followGeometry("resize", xfScale(sx, sy), { width: W, height: H }, { width: nw, height: nh });
             this.renderLayers(); this.renderHistory(); this.renderInfo(); this.fitView(); this.drawThumb(); this.notifyChanged();
-            this.setStatus(`Image ${base ? "upscaled" : "resized"} to ${nw} × ${nh} (Ctrl+Z takes it back). Layers keep their own resolution.`);
+            let scaledNote = scaledFilters ? ` The sizes in pixels of ${scaledFilters} filter layer${scaledFilters === 1 ? "" : "s"} scaled along.` : "";
+            if (keptFilters) scaledNote += keptFilters === 1 ? " 1 filter layer of a plugin that is off kept its sizes." : ` ${keptFilters} filter layers of plugins that are off kept their sizes.`;
+            this.setStatus(`Image ${base ? "upscaled" : "resized"} to ${nw} × ${nh} (Ctrl+Z takes it back). Layers keep their own resolution.${scaledNote}`);
         } catch (err) {
             if (!pushed) this.releaseSnapshot(before);
             console.error(err);
@@ -6122,6 +6282,7 @@ class InpaintEditor {
         if (!this.width) return;
         // a heal stroke is held until its blend lands (`healBlend`): the next gesture waits for it
         if (this.pointer && this.pointer.healing) { this.setStatus(this.heldWord(this.pointer)); return; }
+        if (this.pointer && this.pointer.kind === "liquify") { const p = this.pointer; this.pointer = null; this.liquifyDrop(p, null); }
         // Chrome reports detail = 0 on pointer events, so double-clicks are detected here:
         // a second press within 400 ms and 8 css px of the previous one.
         const nowMs = performance.now();
@@ -6579,7 +6740,8 @@ class InpaintEditor {
                 if (q) { q.hx = ix - q.x; q.hy = iy - q.y; }
             }
         } else if (p.kind === "liquify") {
-            this.liquifyMove(p, this.strokePoints(p, e));
+            try { this.liquifyMove(p, this.strokePoints(p, e)); }
+            catch (err) { if (this.pointer === p) this.pointer = null; this.liquifyDrop(p, null); throw err; }
         } else if (p.kind === "smudge") {
             for (const [x, y, pr] of this.strokePoints(p, e)) {
                 p.pressure = pr;
@@ -6653,7 +6815,7 @@ class InpaintEditor {
             p.layer.x = Math.round(p.orig.x + (ix - p.start[0]));
             p.layer.y = Math.round(p.orig.y + (iy - p.start[1]));
             this.snapGuides = null;
-            if (!e.altKey) this.snapLayer(p.layer);
+            if (!e.altKey) this.snapLayer(p.layer, p);
             if (p.group) this.applyGroupBox(p);
         } else if (p.kind === "scale" && p.group) {
             this.applyScale(p, ix, iy);
@@ -7349,22 +7511,16 @@ class InpaintEditor {
                     const tau = snap ? snap[1] : SNAP_TAU;
                     start.snap = !!snap;
 
-                    let edgeFlags = null;
-                    if (sigmaR > 0 && map.guide) {
-                        let rmax = RMAX_CACHE.get(map.data);
-                        if (!rmax) {
-                            rmax = rangeMax(map);
-                            RMAX_CACHE.set(map.data, rmax);
-                        }
-                        edgeFlags = edgeTiles(map, rmax, m, W, H, tau, 256);
-                    }
+                    const snapOn = !!(sigmaR > 0 && map.guide);
+                    const stats = cachedMapTileStats(map, m, W, H, snapOn, tau);
                     markStep("range", "edges");
 
                     const tileCols = Math.ceil(W / 256);
                     const tileRows = Math.ceil(H / 256);
                     let pictureTiles = 0;
+                    let postedJobs = 0;
 
-                    const guideMsg = (map.guide && sigmaR > 0) ? {
+                    const guideMsg = snapOn ? {
                         sab: (typeof SharedArrayBuffer !== "undefined" && map.guide.buffer instanceof SharedArrayBuffer) ? map.guide.buffer : null,
                         data: (typeof SharedArrayBuffer !== "undefined" && map.guide.buffer instanceof SharedArrayBuffer) ? null : map.guide,
                         w: map.w,
@@ -7389,15 +7545,37 @@ class InpaintEditor {
                             const y1 = Math.min(y0 + 256, H);
                             const bh = y1 - y0;
 
+                            const rowOffset = ty * tileCols;
+                            const rowClasses = new Uint8Array(tileCols);
+                            let hasCompute = false;
+                            let oMin = -1, oMax = -1;
+                            for (let tx = 0; tx < tileCols; tx++) {
+                                const idx = rowOffset + tx;
+                                if (snapOn && stats.edge[idx] === 1) {
+                                    if (oMin === -1) oMin = tx;
+                                    oMax = tx;
+                                }
+                                const cls = rangeTileClass(stats.min[idx] / 65535, stats.max[idx] / 65535, limit, jobInvert);
+                                if (cls === "full") {
+                                    rowClasses[tx] = 1;
+                                } else if (cls === "compute") {
+                                    rowClasses[tx] = 2;
+                                    hasCompute = true;
+                                }
+                            }
                             let minTx = -1, maxTx = -1;
-                            if (edgeFlags) {
-                                const rowOffset = ty * tileCols;
-                                for (let tx = 0; tx < tileCols; tx++) {
-                                    if (edgeFlags[rowOffset + tx] === 1) {
+                            if (oMin !== -1) {
+                                for (let tx = oMin; tx <= oMax; tx++) {
+                                    if (rowClasses[tx] === 2) {
                                         if (minTx === -1) minTx = tx;
                                         maxTx = tx;
                                     }
                                 }
+                            }
+
+                            if (!hasCompute) {
+                                bandPromises.push(Promise.resolve({ y0, y1, res: rangeRowBookkeeping(W, H, ty, rowClasses, 256) }));
+                                continue;
                             }
 
                             let picture = null;
@@ -7420,6 +7598,7 @@ class InpaintEditor {
                                     scratchCanvas.width = bw;
                                     scratchCanvas.height = bh;
                                 }
+                                scratchCtx.clearRect(0, 0, bw, bh);
                                 scratchCtx.drawImage(regCanvas, 0, 0);
                                 const imgData = scratchCtx.getImageData(0, 0, bw, bh);
 
@@ -7454,8 +7633,10 @@ class InpaintEditor {
                                 snap: snap ? [sigmaR, tau] : null,
                                 guide: guideMsg,
                                 picture,
+                                classes: rowClasses,
                             };
 
+                            postedJobs++;
                             bandPromises.push(
                                 editorPool().run("range_select", msg, [], { priority: INTERACTIVE, group })
                                     .then((res) => ({ y0, y1, res }))
@@ -7469,7 +7650,7 @@ class InpaintEditor {
                             scratchCtx = null;
                         }
                     }
-                    markStep("range", "posted", { readMs, pictureTiles, jobs: bandPromises.length });
+                    markStep("range", "posted", { readMs, pictureTiles, jobs: postedJobs });
 
                     for (const p of bandPromises) {
                         const { y0, y1, res } = await p;
@@ -7596,15 +7777,8 @@ class InpaintEditor {
                     const tau = snap ? snap[1] : SNAP_TAU;
                     start.snap = !!snap;
 
-                    let edgeFlags = null;
-                    if (sigmaR > 0 && map.guide) {
-                        let rmax = RMAX_CACHE.get(map.data);
-                        if (!rmax) {
-                            rmax = rangeMax(map);
-                            RMAX_CACHE.set(map.data, rmax);
-                        }
-                        edgeFlags = edgeTiles(map, rmax, m, W, H, tau, 256);
-                    }
+                    const snapOn = !!(sigmaR > 0 && map.guide);
+                    const stats = cachedMapTileStats(map, m, W, H, snapOn, tau);
                     markStep("range", "edges");
 
                     const tileCols = Math.ceil(W / 256);
@@ -7622,12 +7796,22 @@ class InpaintEditor {
                             const alpha = new Uint8Array(W * bh);
 
                             let minTx = -1, maxTx = -1;
-                            if (edgeFlags) {
+                            if (snapOn) {
                                 const rowOffset = ty * tileCols;
+                                let oMin = -1, oMax = -1;
                                 for (let tx = 0; tx < tileCols; tx++) {
-                                    if (edgeFlags[rowOffset + tx] === 1) {
-                                        if (minTx === -1) minTx = tx;
-                                        maxTx = tx;
+                                    if (stats.edge[rowOffset + tx] === 1) {
+                                        if (oMin === -1) oMin = tx;
+                                        oMax = tx;
+                                    }
+                                }
+                                if (oMin !== -1) {
+                                    for (let tx = oMin; tx <= oMax; tx++) {
+                                        const idx = rowOffset + tx;
+                                        if (rangeTileClass(stats.min[idx] / 65535, stats.max[idx] / 65535, limit, jobInvert) === "compute") {
+                                            if (minTx === -1) minTx = tx;
+                                            maxTx = tx;
+                                        }
                                     }
                                 }
                             }
@@ -7651,6 +7835,7 @@ class InpaintEditor {
                                     scratchCanvas.width = picW;
                                     scratchCanvas.height = bh;
                                 }
+                                scratchCtx.clearRect(0, 0, picW, bh);
                                 scratchCtx.drawImage(regCanvas, 0, 0);
                                 picData = scratchCtx.getImageData(0, 0, picW, bh).data;
                             }
@@ -10708,6 +10893,8 @@ class InpaintEditor {
      */
     async heldEdit() {
         for (let h; (h = this.removePending || this.healPending || this.liquifyPending);) await h.catch(() => {});
+        // an undo's restored files, stored again when they had left the store (recheckRestoredFiles; it never rejects)
+        while (this._fileCheck) await this._fileCheck;
     }
 
     /** What the status line says while a held gesture waits (a press or a key meanwhile). */
@@ -10807,6 +10994,7 @@ class InpaintEditor {
             if (s.liqBytes) { s.bytes -= s.liqBytes; this.undoBytes -= s.liqBytes; s.liqBytes = 0; }
         }
         const p = this.pointer;
+        if (p && p.kind === "liquify") this.freeLiquifyWindow(p);
         if (p && p.kind === "liquify" && p.liq === liq) { liq.ended = true; return; }
         liq.orig.release();
     }
@@ -10826,13 +11014,20 @@ class InpaintEditor {
         const fr = this.liquifyFreezeOf(liq.layer), sel = this.getBounds() ? this.liquifySelThaw(liq) : null;
         if (!fr || !fr.cells.size) return sel;
         const n = fr.n, sh = 8 - fr.ls, m = n - 1;
+        const fCell = (key) => fr.cells.get(key) || null;
         let lk = -1, lc = null;
         const free = (i, j) => {
             const key = ((j >> sh) << 16) | (i >> sh);
-            if (key !== lk) { lk = key; lc = fr.cells.get(key) || null; }
+            if (key !== lk) { lk = key; lc = fCell(key); }
             return lc ? 1 - lc[(j & m) * n + (i & m)] / 255 : 1;
         };
-        return sel ? (i, j) => sel(i, j) * free(i, j) : free;
+        if (!sel) {
+            free.planes = (i0, j0, ow, oh) => ({ sel: null, freeze: thawPlane(fCell, n, sh, i0, j0, ow, oh) });
+            return free;
+        }
+        const both = (i, j) => sel(i, j) * free(i, j);
+        both.planes = (i0, j0, ow, oh) => ({ sel: sel.planes(i0, j0, ow, oh).sel, freeze: thawPlane(fCell, n, sh, i0, j0, ow, oh) });
+        return both;
     }
 
     /** The selection's part of `liquifyThaw`. */
@@ -10852,11 +11047,13 @@ class InpaintEditor {
             return c;
         };
         let lk = -1, lc = null;
-        return (i, j) => {
+        const fn = (i, j) => {
             const key = ((j >> sh) << 16) | (i >> sh);
             if (key !== lk) { lk = key; lc = cellOf(key); }
             return lc[(j & m) * n + (i & m)] / 255;
         };
+        fn.planes = (i0, j0, ow, oh) => ({ sel: thawPlane(cellOf, n, sh, i0, j0, ow, oh), freeze: null });
+        return fn;
     }
 
     /** The press: the session, the stroke, and the first dab of the modes that act where they are held. */
@@ -10883,13 +11080,20 @@ class InpaintEditor {
         const x = ix - layer.x - 0.5, y = iy - layer.y - 0.5;
         const p = this.pointer = { kind: "liquify", layer, liq, mode, before: new Map(liq.field.cells), made, last: [ix, iy], at: [x, y], travel: 0,
             pressure, stab: this.newStabiliser(ix, iy, pressure), thaw: this.liquifyThaw(liq), strokeBox: null, dirtyView: null, tick: null, liqWin: null,
-            freeze: mode === "freeze" || mode === "thaw" ? this.liquifyFreezeOf(layer, true) : null };
-        if (p.freeze) { this.liquifyFreezeDab(p, x, y); this.drawSoon(); return; }
-        if (mode !== "push") {
-            this.liquifyDab(p, x, y, null);
-            // they keep acting while the button is held still: a timer, never requestAnimationFrame (it stops in a hidden window)
-            const ms = InpaintEditor.liquifyRateMs;
-            if (ms > 0) p.tick = setInterval(() => { if (this.pointer === p && !p.healing) this.liquifyTick(); }, ms);
+            freeze: mode === "freeze" || mode === "thaw" ? this.liquifyFreezeOf(layer, true) : null,
+            freezeBefore: mode === "freeze" || mode === "thaw" ? new Map() : null };
+        try {
+            if (p.freeze) { this.liquifyFreezeDab(p, x, y); this.drawSoon(); return; }
+            if (mode !== "push") {
+                this.liquifyDab(p, x, y, null);
+                // they keep acting while the button is held still: a timer, never requestAnimationFrame (it stops in a hidden window)
+                const ms = InpaintEditor.liquifyRateMs;
+                if (ms > 0) p.tick = setInterval(() => { if (this.pointer === p && !p.healing) this.liquifyTick(); }, ms);
+            }
+        } catch (err) {
+            if (this.pointer === p) this.pointer = null;
+            this.liquifyDrop(p, null);
+            throw err;
         }
         this.drawSoon();
     }
@@ -10899,7 +11103,7 @@ class InpaintEditor {
         if (p.freeze) { this.liquifyFreezeDab(p, x, y); return; }
         const liq = p.liq, r = Math.max(2 * liq.s, this.brushSize / 2);
         const amount = Math.min(1, ((this.liquifyOpts ? this.liquifyOpts.strength : 50) / 100) * (p.pressure || 1));
-        const box = liq.field.dab(delta ? "push" : p.mode, x, y, r, this.activeHardness(), amount, delta, p.thaw, p.before);
+        const box = liq.field.dab(delta ? "push" : p.mode, x, y, r, this.activeHardness(), amount, delta, p.thaw, p.before, InpaintEditor.liquifyDabKernel);
         if (!box) return;
         const L = p.layer, b = [box[0] + L.x, box[1] + L.y, box[2] + L.x, box[3] + L.y];
         const grow = (a) => (!a ? b.slice() : [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[2], b[2]), Math.max(a[3], b[3])]);
@@ -10913,7 +11117,8 @@ class InpaintEditor {
     liquifyTick() {
         const p = this.pointer;
         if (!p || p.kind !== "liquify" || p.healing || p.mode === "push" || p.freeze) return;
-        this.liquifyDab(p, p.last[0] - p.layer.x - 0.5, p.last[1] - p.layer.y - 0.5, null);
+        try { this.liquifyDab(p, p.last[0] - p.layer.x - 0.5, p.last[1] - p.layer.y - 0.5, null); }
+        catch (err) { if (this.pointer === p) this.pointer = null; this.liquifyDrop(p, null); throw err; }
     }
 
     /**
@@ -10951,18 +11156,25 @@ class InpaintEditor {
     /** The release: the push's carried rest, then the landing. */
     liquifyRelease(p) {
         if (p.tick) { clearInterval(p.tick); p.tick = null; }
-        this.finishStroke(p);
-        if (p.freeze) {
-            // a thaw (or Alt) on the base's fresh copy froze nothing: the copy goes again, as for a stroke that lands nothing
-            if (p.made && !p.froze) { this.liquifyDrop(p, null); return; }
-            if (p.made) { this.pushUndoSnapshot(p.made, { label: "Liquify: copy of the base" }); this.renderLayers(); }
-            if (p.liq.ended) p.liq.orig.release();
-            this.draw();
-            return;
+        try {
+            this.finishStroke(p);
+            if (p.freeze) {
+                // a thaw (or Alt) on the base's fresh copy froze nothing: the copy goes again, as for a stroke that lands nothing
+                if (p.made && !p.froze) { this.liquifyDrop(p, null); return; }
+                if (p.made) { this.pushUndoSnapshot(p.made, { label: "Liquify: copy of the base" }); this.renderLayers(); }
+                if (p.liq.ended) p.liq.orig.release();
+                this.freeLiquifyWindow(p);
+                this.draw();
+                return;
+            }
+            if (p.mode === "push") this.liquifyPushTo(p, p.last[0] - p.layer.x - 0.5, p.last[1] - p.layer.y - 0.5, 4096);
+            const words = { push: "push", grow: "grow", shrink: "shrink", swirlcw: "swirl", swirlccw: "swirl", restore: "restore" };
+            this.liquifyLand(p, "Liquify: " + (words[p.mode] || p.mode));
+        } catch (err) {
+            this.freeLiquifyWindow(p);
+            if (!p.healing) this.liquifyDrop(p, null);
+            throw err;
         }
-        if (p.mode === "push") this.liquifyPushTo(p, p.last[0] - p.layer.x - 0.5, p.last[1] - p.layer.y - 0.5, 4096);
-        const words = { push: "push", grow: "grow", shrink: "shrink", swirlcw: "swirl", swirlccw: "swirl", restore: "restore" };
-        this.liquifyLand(p, "Liquify: " + (words[p.mode] || p.mode));
     }
 
     /** Restore all (the options bar's button): the session's field scaled back to zero (inside the selection), as one step. */
@@ -11011,7 +11223,7 @@ class InpaintEditor {
             let results = null;
             try { results = await liq.orig.liquifiedAsync(liq.s, nodes, opts); }
             catch (err) { console.warn("Inpaint Canvas: the liquify bake failed:", err); }
-            if (this.pointer !== p) return;   // the editor was closed meanwhile: the stroke was dropped there
+            if (this.pointer !== p) { this.freeLiquifyWindow(p); return; }   // the editor was closed meanwhile: the stroke was dropped there
             this.pointer = null;
             if (results) this.liquifyCommit(p, results, keys, "pool", t0, label, true);
             else this.liquifyDrop(p, "Liquify could not bake the stroke: nothing landed.");
@@ -11077,6 +11289,7 @@ class InpaintEditor {
         liq.stamp = clean ? px.version : -1;
         if (isTilePixels(px)) for (const key of keys) { const t = px.tileAt(key & 0xFFFF, key >>> 16); liq.landed.set(key, { tile: t, version: t ? t.version : -1 }); }
         if (liq.ended) liq.orig.release();
+        this.freeLiquifyWindow(p);
         this.releaseStrokeScratch();
         const ms = Math.round(performance.now() - t0);
         this.lastLiquify = { tiles: keys.size, box: [box[0] + layer.x, box[1] + layer.y, box[2] + layer.x, box[3] + layer.y], where, ms, stats: results.stats || null, s: liq.s };
@@ -11093,7 +11306,16 @@ class InpaintEditor {
     liquifyDrop(p, why) {
         const liq = p.liq;
         if (p.tick) { clearInterval(p.tick); p.tick = null; }
+        this.freeLiquifyWindow(p);
         liq.field = new LiquifyField(liq.field.w, liq.field.h, liq.s, new Map(p.before));
+        if (p.freeze && p.freezeBefore && p.freezeBefore.size) {
+            for (const [k, old] of p.freezeBefore) {
+                if (old) p.freeze.cells.set(k, old);
+                else p.freeze.cells.delete(k);
+            }
+            if (!p.freeze.cells.size && this.liqFreezes) this.liqFreezes.delete(p.layer.id);
+            else this.liquifyVeilDirty(p.freeze, null);
+        }
         if (p.made) {
             this.releaseSnapshot(p.made);
             if (this.layers.includes(p.layer)) {
@@ -11185,10 +11407,12 @@ class InpaintEditor {
                 if (!(w > 0)) continue;
                 const key = ((j >> sh) << 16) | (i >> sh);
                 let c = fr.cells.get(key);
-                if (!c) { if (!freeze) continue; c = new Uint8Array(n * n); fr.cells.set(key, c); }
-                const o = (j & m) * n + (i & m), old = c[o];
+                if (!c && !freeze) continue;
+                const o = (j & m) * n + (i & m), old = c ? c[o] : 0;
                 const v = freeze ? Math.max(old, Math.round(255 * w)) : Math.floor(old * (1 - w));
                 if (v === old) continue;
+                if (p.freezeBefore && !p.freezeBefore.has(key)) p.freezeBefore.set(key, c ? c.slice() : null);
+                if (!c) { c = new Uint8Array(n * n); fr.cells.set(key, c); }
                 c[o] = v; touched.add(key);
                 if (i < bi0) bi0 = i; if (i > bi1) bi1 = i; if (j < bj0) bj0 = j; if (j > bj1) bj1 = j;
             }
@@ -11267,6 +11491,14 @@ class InpaintEditor {
         return !!(p && p.kind === "liquify" && p.layer === layer && p.strokeBox);
     }
 
+    /** Release the stroke's window buffer (`liquifyWindow`), when it was allocated in wasm memory. */
+    freeLiquifyWindow(p) {
+        if (!p || !p.liqWin) return;
+        const win = p.liqWin;
+        p.liqWin = null;
+        freeLiquifyWindow(win);
+    }
+
     /**
      * The session's source at the view's level, over the view and a margin the field can reach, as one buffer: built once
      * per stroke (a pan or a zoom builds it again), so a frame samples an array, not the tiles.
@@ -11275,45 +11507,55 @@ class InpaintEditor {
         const L = Math.max(0, Math.min(MIP_LEVELS, Math.floor(Math.log2(1 / vp.sx) + 1e-9)));
         const sig = [vp.x, vp.y, vp.w, vp.h, vp.sx, L].join(",");
         if (p.liqWin && p.liqWin.sig === sig) return p.liqWin;
+        this.freeLiquifyWindow(p);
         const layer = p.layer, liq = p.liq, W = liq.field.w, H = liq.field.h, f = 1 << L;
         const M = Math.min(this.brushSize + liq.field.maxReach() + 64, 2048 * f);
         const lim = (v, hi) => Math.max(0, Math.min(hi, v));
         const x0 = lim(Math.floor(vp.x - layer.x - M), W), x1 = lim(Math.ceil(vp.x + vp.w - layer.x + M), W);
         const y0 = lim(Math.floor(vp.y - layer.y - M), H), y1 = lim(Math.ceil(vp.y + vp.h - layer.y + M), H);
         const lx0 = x0 >> L, ly0 = y0 >> L, w = Math.max(1, ((x1 + f - 1) >> L) - lx0), h = Math.max(1, ((y1 + f - 1) >> L) - ly0);
-        const data = new Uint8Array(w * h * 4);
-        if (isTilePixels(liq.orig)) {
-            const side = 256 >> L;
-            for (let ty = Math.floor(ly0 / side); ty <= Math.floor((ly0 + h - 1) / side); ty++) {
-                for (let tx = Math.floor(lx0 / side); tx <= Math.floor((lx0 + w - 1) / side); tx++) {
-                    const lb = liq.orig._levelBytes(tx, ty, L);
-                    if (!lb || !lb.data) continue;
-                    const a0 = Math.max(lx0, tx * side), a1 = Math.min(lx0 + w, tx * side + side);
-                    const b0 = Math.max(ly0, ty * side), b1 = Math.min(ly0 + h, ty * side + side);
-                    for (let b = b0; b < b1; b++) {
-                        const so = lb.off + ((b - ty * side) * side + (a0 - tx * side)) * 4;
-                        data.set(lb.data.subarray(so, so + (a1 - a0) * 4), ((b - ly0) * w + (a0 - lx0)) * 4);
-                    }
-                }
-            }
-        } else {
-            // the canvas backend: read once, averaged down to the level (premultiplied)
-            const d = liq.orig.readRect(lx0 * f, ly0 * f, w * f, h * f).data, rw = w * f;
-            if (!L) data.set(d);
-            else {
-                for (let b = 0; b < h; b++) {
-                    for (let a = 0; a < w; a++) {
-                        let A = 0, R = 0, G = 0, B = 0;
-                        for (let v = 0; v < f; v++) for (let u = 0, q = ((b * f + v) * rw + a * f) * 4; u < f; u++, q += 4) {
-                            const al = d[q + 3]; A += al; R += al * d[q]; G += al * d[q + 1]; B += al * d[q + 2];
+        const alloc = allocLiquifyWindow(w, h);
+        const view = () => (alloc.px ? alloc.px.u8().subarray(alloc.ptr, alloc.ptr + alloc.bytes) : alloc.data);
+        try {
+            if (isTilePixels(liq.orig)) {
+                const side = 256 >> L;
+                for (let ty = Math.floor(ly0 / side); ty <= Math.floor((ly0 + h - 1) / side); ty++) {
+                    for (let tx = Math.floor(lx0 / side); tx <= Math.floor((lx0 + w - 1) / side); tx++) {
+                        const lb = liq.orig._levelBytes(tx, ty, L);
+                        if (!lb || !lb.data) continue;
+                        const data = view();
+                        const a0 = Math.max(lx0, tx * side), a1 = Math.min(lx0 + w, tx * side + side);
+                        const b0 = Math.max(ly0, ty * side), b1 = Math.min(ly0 + h, ty * side + side);
+                        for (let b = b0; b < b1; b++) {
+                            const so = lb.off + ((b - ty * side) * side + (a0 - tx * side)) * 4;
+                            data.set(lb.data.subarray(so, so + (a1 - a0) * 4), ((b - ly0) * w + (a0 - lx0)) * 4);
                         }
-                        const o = (b * w + a) * 4;
-                        if (A) { data[o] = R / A + 0.5; data[o + 1] = G / A + 0.5; data[o + 2] = B / A + 0.5; data[o + 3] = A / (f * f) + 0.5; }
+                    }
+                }
+            } else {
+                // the canvas backend: read once, averaged down to the level (premultiplied)
+                const d = liq.orig.readRect(lx0 * f, ly0 * f, w * f, h * f).data, rw = w * f;
+                const data = view();
+                if (!L) data.set(d);
+                else {
+                    for (let b = 0; b < h; b++) {
+                        for (let a = 0; a < w; a++) {
+                            let A = 0, R = 0, G = 0, B = 0;
+                            for (let v = 0; v < f; v++) for (let u = 0, q = ((b * f + v) * rw + a * f) * 4; u < f; u++, q += 4) {
+                                const al = d[q + 3]; A += al; R += al * d[q]; G += al * d[q + 1]; B += al * d[q + 2];
+                            }
+                            const o = (b * w + a) * 4;
+                            if (A) { data[o] = R / A + 0.5; data[o + 1] = G / A + 0.5; data[o + 2] = B / A + 0.5; data[o + 3] = A / (f * f) + 0.5; }
+                        }
                     }
                 }
             }
+        } catch (err) {
+            freeLiquifyWindow(alloc);
+            throw err;
         }
-        p.liqWin = { sig, data, w, h, x0: lx0, y0: ly0, L };
+        const data = view();
+        p.liqWin = { sig, data, w, h, x0: lx0, y0: ly0, L, px: alloc.px, ptr: alloc.ptr, bytes: alloc.bytes };
         return p.liqWin;
     }
 
@@ -11324,31 +11566,36 @@ class InpaintEditor {
         const u0 = Math.max(dx0, Math.floor((sb[0] - vp.x) * vp.sx)), v0 = Math.max(dy0, Math.floor((sb[1] - vp.y) * vp.sy));
         const u1 = Math.min(dx1, Math.ceil((sb[2] - vp.x) * vp.sx)), v1 = Math.min(dy1, Math.ceil((sb[3] - vp.y) * vp.sy));
         if (u1 <= u0 || v1 <= v0) return;
-        const win = this.liquifyWindow(p, vp);
-        const bw = u1 - u0, bh = v1 - v0, ox = vp.x + u0 / vp.sx - layer.x, oy = vp.y + v0 / vp.sy - layer.y;
-        // a large box is sampled every f-th pixel and scaled up (a 1000 px brush at 1:1 took 57 ms a frame at full
-        // resolution, measured at 15000 x 10000): softer while the button is down, the landing is the bake's anyway
-        const f = Math.max(1, Math.ceil(Math.sqrt((bw * bh) / InpaintEditor.liquifyPreviewMax)));
-        if (f === 1) {
-            const img = new ImageData(bw, bh);
-            previewBlock(win, p.liq.field, ox, oy, 1 / vp.sx, img.data, bw, bh);
-            // putImageData ignores the transform and the clip: exactly these bytes, inside the part being redrawn
-            ctx.putImageData(img, u0, v0);
-            return;
+        try {
+            const win = this.liquifyWindow(p, vp);
+            const bw = u1 - u0, bh = v1 - v0, ox = vp.x + u0 / vp.sx - layer.x, oy = vp.y + v0 / vp.sy - layer.y;
+            // a large box is sampled every f-th pixel and scaled up (a 1000 px brush at 1:1 took 57 ms a frame at full
+            // resolution, measured at 15000 x 10000): softer while the button is down, the landing is the bake's anyway
+            const f = Math.max(1, Math.ceil(Math.sqrt((bw * bh) / InpaintEditor.liquifyPreviewMax)));
+            if (f === 1) {
+                const img = new ImageData(bw, bh);
+                liquifyPreview(win, p.liq.field, ox, oy, 1 / vp.sx, img.data, bw, bh);
+                // putImageData ignores the transform and the clip: exactly these bytes, inside the part being redrawn
+                ctx.putImageData(img, u0, v0);
+                return;
+            }
+            const sw = Math.ceil(bw / f), sh = Math.ceil(bh / f), img = new ImageData(sw, sh);
+            liquifyPreview(win, p.liq.field, ox, oy, f / vp.sx, img.data, sw, sh);
+            let c = this._liqPreview;
+            if (!c || c.width < sw || c.height < sh) { c = this._liqPreview = makeCanvas(Math.max(sw, c ? c.width : 0), Math.max(sh, c ? c.height : 0)); c._livePreview = true; }
+            c.getContext("2d").putImageData(img, 0, 0);
+            ctx.save();
+            ctx.setTransform(1, 0, 0, 1, 0, 0);
+            ctx.globalAlpha = 1;
+            ctx.globalCompositeOperation = "source-over";
+            ctx.imageSmoothingEnabled = true;
+            ctx.clearRect(u0, v0, bw, bh);
+            ctx.drawImage(c, 0, 0, bw / f, bh / f, u0, v0, bw, bh);
+            ctx.restore();
+        } catch (err) {
+            this.freeLiquifyWindow(p);
+            throw err;
         }
-        const sw = Math.ceil(bw / f), sh = Math.ceil(bh / f), img = new ImageData(sw, sh);
-        previewBlock(win, p.liq.field, ox, oy, f / vp.sx, img.data, sw, sh);
-        let c = this._liqPreview;
-        if (!c || c.width < sw || c.height < sh) { c = this._liqPreview = makeCanvas(Math.max(sw, c ? c.width : 0), Math.max(sh, c ? c.height : 0)); c._livePreview = true; }
-        c.getContext("2d").putImageData(img, 0, 0);
-        ctx.save();
-        ctx.setTransform(1, 0, 0, 1, 0, 0);
-        ctx.globalAlpha = 1;
-        ctx.globalCompositeOperation = "source-over";
-        ctx.imageSmoothingEnabled = true;
-        ctx.clearRect(u0, v0, bw, bh);
-        ctx.drawImage(c, 0, 0, bw / f, bh / f, u0, v0, bw, bh);
-        ctx.restore();
     }
 
     /** The Remove model loaded while the user aims (about 9 s the first time), with a line in the status bar. */
@@ -11669,17 +11916,29 @@ class InpaintEditor {
         return this.compositeCanvas();
     }
 
-    /** Eyedropper: the colour of the visible image under (ix, iy) becomes the paint colour. */
+    /**
+     * Eyedropper (the tool's click and Alt+click with the paint brush): the colour under (ix, iy) becomes the paint colour,
+     * from what the tool bar's Sample says (the visible image or the active layer alone). Its Size (item 58) takes the one
+     * pixel there or the mean of the 3 x 3 / 5 x 5 box around it: at the picture's edge only the pixels inside count, and
+     * each counts by its alpha (sum(c * a) / sum(a), the mean of the premultiplied colours un-premultiplied), so a
+     * transparent pixel adds nothing and a half-transparent one half; the box is "transparent" only when all of it is.
+     * Point is the same rule on one pixel, the colour as it was before the Size row.
+     */
     pickColor(ix, iy) {
         if (!this.width) return;
         const x = Math.max(0, Math.min(this.width - 1, Math.floor(ix))), y = Math.max(0, Math.min(this.height - 1, Math.floor(iy)));
-        // one pixel composited, not the whole image (0.6 s on a 15k document)
-        const d = this.sampleRegion(this.fillOpts && this.fillOpts.sample, [x, y, x + 1, y + 1], 1).getContext("2d").getImageData(0, 0, 1, 1).data;
-        if (d[3] === 0) { this.setStatus("Transparent here, nothing to pick."); return; }
-        const hex = rgbToHex(d[0], d[1], d[2]);
+        const r = this.eyedropperSize === 3 ? 1 : this.eyedropperSize === 5 ? 2 : 0;
+        const x0 = Math.max(0, x - r), y0 = Math.max(0, y - r), x1 = Math.min(this.width, x + r + 1), y1 = Math.min(this.height, y + r + 1);
+        // the box composited, not the whole image (0.6 s on a 15k document)
+        const d = this.sampleRegion(this.fillOpts && this.fillOpts.sample, [x0, y0, x1, y1], 1).getContext("2d").getImageData(0, 0, x1 - x0, y1 - y0).data;
+        let sr = 0, sg = 0, sb = 0, sa = 0;
+        for (let i = 0; i < d.length; i += 4) { const a = d[i + 3]; sr += d[i] * a; sg += d[i + 1] * a; sb += d[i + 2] * a; sa += a; }
+        if (sa === 0) { this.setStatus("Transparent here, nothing to pick."); return; }
+        const hex = rgbToHex(Math.round(sr / sa), Math.round(sg / sa), Math.round(sb / sa));
         this.color = hex;
         if (this.colorInput) this.colorInput.value = hex;
-        this.setStatus(`Colour ${hex} picked.`);
+        const n = (x1 - x0) * (y1 - y0);
+        this.setStatus(n > 1 ? `Colour ${hex} picked, the mean of ${n} pixels.` : `Colour ${hex} picked.`);
     }
 
     /** Bucket: fill the area of similar colour under (ix, iy) on the active layer, within the selection. */
@@ -12581,6 +12840,19 @@ class InpaintEditor {
                 ref = up.ref; this.uploaded.baseHash = up.hash;
             }
             this.uploaded.baseRef = ref;
+        }
+        if (this.base && ref === this.base.ref && typeof host["ensureRefs"] === "function") {
+            const sent = { filename: ref.filename, subfolder: ref.subfolder || "", type: ref.type || "input" };
+            const key = `${sent.type}/${sent.subfolder}/${sent.filename}`;
+            let report = null;
+            try {
+                report = await host["ensureRefs"]([sent]);
+            } catch (err) {
+                if (host.connected) throw err;
+            }
+            if (report && report.missing && report.missing.length) throw new Error("These files are neither on the server nor in the local store: " + report.missing.join(", "));
+            if (report && report.renamed && report.renamed[key]) sent.filename = report.renamed[key];
+            ref = sent;
         }
         return { ref, hash: this.uploaded.baseHash, layer: null };
     }
@@ -14502,6 +14774,9 @@ class InpaintEditor {
             const outgoing = this.layers;
             this.layers = snap.layers.map((l) => installLayerAliases({ ...l, _maskedValid: false, _mcache: null, _fcache: null }, this.pixels));
             this.releaseDroppedEdits(outgoing);
+            // the layers that come back keep their files and are not uploaded again: one whose file left the store meanwhile
+            // (a clean-up, a file removed by hand) is uploaded from its pixels
+            this.recheckRestoredFiles({ layers: this.layers, outgoing });
             this.groups = (snap.groups || []).map((g) => ({ ...g }));
             this.activeLayerId = this.layers.some((l) => l.id === snap.activeLayerId) ? snap.activeLayerId : null;
             this.uploaded.baseHash = null;
@@ -14549,6 +14824,7 @@ class InpaintEditor {
             const resized = snap.width !== this.width || snap.height !== this.height;
             this.restoreGeometry(snap);
             this.groups = (snap.groups || []).map((g) => ({ ...g }));
+            if (snap.base !== this.base) this.recheckRestoredFiles({ base: snap.base });   // the layers below are all uploaded again
             this.base = snap.base;
             this.width = snap.width;
             this.height = snap.height;
@@ -14610,6 +14886,8 @@ class InpaintEditor {
             const selImg = images.selection || null;   // null: its encode failed, an empty selection
             this.restoreGeometry(snap);
             this.groups = (snap.groups || []).map((g) => ({ ...g }));
+            // the base comes back with its file and is not uploaded again (the layers below are, all of them)
+            if (snap.base !== this.base) this.recheckRestoredFiles({ base: snap.base });
             this.base = snap.base;
             this.width = snap.width;
             this.height = snap.height;
@@ -14766,6 +15044,70 @@ class InpaintEditor {
             }
         }
         this.draw();
+    }
+
+    /**
+     * After an undo or redo that put back layers (`layers`: the layers step's, against the `outgoing` ones it replaced) or a
+     * base (`base`: a canvas or turn step's) with the files they had: those steps upload nothing again, so a file that left
+     * the store since (Settings › Local files › Clean up, a file removed by hand) would be named by the next save and the
+     * next start and found by neither. Each file not named by what the document held a moment ago is asked for (a HEAD
+     * request, after this task), and one that is gone is uploaded again from the pixels the document holds: a layer is
+     * marked for the next syncLayers (started at once), the base is uploaded here. `heldEdit()` waits for it, so a
+     * document save does not name the old file. Clean up keeps what the steps hold (heldFileRefs); this is the backstop.
+     */
+    recheckRestoredFiles({ layers = null, outgoing = [], base = null } = {}) {
+        const items = [];
+        if (layers) {
+            // a file the replaced layers named and had stored (clean): a dirty one's upload was still to come (a canvas or
+            // turn undo marks every layer so), and it goes with the layer the step replaces
+            const held = new Set();
+            for (const l of outgoing || []) {
+                if (l && l.ref && !l.dirty) held.add(refKey(l.ref));
+                if (l && l.maskRef && !l.maskDirty) held.add(refKey(l.maskRef));
+            }
+            for (const l of layers) {
+                if (!l) continue;
+                if (l.px && l.ref && !l.dirty && !held.has(refKey(l.ref))) items.push({ layer: l, key: "ref", ref: l.ref });
+                if (l.maskPx && l.maskRef && !l.maskDirty && !held.has(refKey(l.maskRef))) items.push({ layer: l, key: "maskRef", ref: l.maskRef });
+            }
+        }
+        if (base && base.ref && base.px) items.push({ base, ref: base.ref });
+        if (!items.length) return;
+        const run = (this._fileCheck || Promise.resolve())
+            .then(() => this.runFileChecks(items))
+            .catch((err) => console.warn("Inpaint Canvas: a restored file could not be stored again", err));
+        this._fileCheck = run;
+        run.then(() => { if (this._fileCheck === run) this._fileCheck = null; });
+    }
+
+    /** recheckRestoredFiles' requests and uploads, one item after the other; an item changed meanwhile is left alone. */
+    async runFileChecks(items) {
+        let layers = false, base = false;
+        // not the document's any more (another undo, a delete): the step that holds it checks again when it comes back
+        const live = (it) => (it.layer ? this.layers.includes(it.layer) && it.layer[it.key] === it.ref : this.base === it.base && it.base.ref === it.ref);
+        for (const it of items) {
+            if (this._destroyed) return;
+            if (!live(it)) continue;
+            if (!(await fileGone(it.ref))) continue;
+            if (this._destroyed || !live(it)) continue;
+            if (it.layer) {
+                // an edit since marked it already, or the next syncLayers uploads it (the PNG's hash names the file)
+                if (it.key === "ref") it.layer.dirty = true; else it.layer.maskDirty = true;
+                layers = true;
+                console.warn("Inpaint Canvas: a restored layer's file was gone; it is stored again", it.ref.filename);
+            } else {
+                const { ref } = await this.uploadBase(it.base.px);
+                // every step that holds this base names the new file with it (the base is never written, only replaced)
+                if (it.base.ref === it.ref) { it.base.ref = ref; base = true; }
+                // a run or a helper meanwhile took the base itself as its picture (no layer shown): not the gone file again
+                const up = this.uploaded;
+                if (up && up.baseRef && refKey(up.baseRef) === refKey(it.ref)) { up.baseRef = null; up.baseHash = null; }
+                console.warn("Inpaint Canvas: the restored base's file was gone; it is stored again as", ref && ref.filename);
+            }
+        }
+        if (this._destroyed || !(layers || base)) return;
+        if (layers) await this.syncLayers();
+        else this.notifyChanged();   // syncLayers ends with it
     }
 
     /**
@@ -15147,23 +15489,15 @@ class InpaintEditor {
         if (!(w > 0 && h > 0)) { this.setStatus("The selection is empty."); return null; }
         if (w * h > FREQ_MAX_PX) { this.setStatus(`Frequency separation works on up to ${Math.round(FREQ_MAX_PX / 1e6)} MP (this is ${Math.round(w * h / 1e5) / 10} MP): select the area first, a face or a patch of skin.`, "warn"); return null; }
         const r = radius > 0 ? Math.max(1, Math.min(200, Math.round(radius))) : Math.max(2, Math.round(Math.min(this.width, this.height) * 0.004));
-        markStep("freqsep", "start", { w, h, radius: r });   // the K0b harness (docs/PLAN_WASM_BUILD.md §4.9): read, blur, split, written
+        markStep("freqsep", "start", { w, h, radius: r });   // the K0b harness (docs/PLAN_WASM_BUILD.md §4.9): read, split (the blur in it since K27), written
         this.setStatus(`Frequency separation (${r} px) ...`);
         const src = await this.readBoxBytes(box, { forRun: true });
         const I = new Uint8ClampedArray(w * h * 4);
         I.set(src.data.subarray ? src.data.subarray(0, w * h * 4) : src.data);
         markStep("freqsep", "read");
-        const L = blurRGBA(I, w, h, r), Hi = new Uint8ClampedArray(w * h * 4);
-        markStep("freqsep", "blur");
-        for (let i = 0; i < I.length; i += 4) {
-            for (let c = 0; c < 3; c++) {
-                const v = I[i + c], l = L[i + c], t = v - l + 255;
-                let hv = t >> 1;
-                if (t & 1) { if (l < 255) L[i + c] = l + 1; else { L[i + c] = 254; hv += 1; } }
-                Hi[i + c] = hv;
-            }
-            L[i + 3] = I[i + 3]; Hi[i + 3] = I[i + 3];
-        }
+        // the blur and the split (px/kernels.js `freqSeparate`, K26 + K27: Rust in one arena, the twins in
+        // inpaint_stroke.js on the routes "js"), L and Hi copied out of wasm memory before the layers are written
+        const { low: L, high: Hi } = freqSeparate(I, w, h, r);
         markStep("freqsep", "split");
         this.pushUndo({ kind: "layers", label: "Frequency separation" });
         const make = (bytes, name, blend) => {
@@ -15465,7 +15799,7 @@ class InpaintEditor {
      * Cache key for a filtered canvas pass. Centralises key generation so call sites and future
      * map dependencies stay in sync. Produces the legacy string for layers without limit or maps.
      */
-    filterKey(layer, below, forRun, preview, vp = this.viewPass) {
+    filterKey(layer, below, forRun, preview, vp = this.viewPass, plain = false) {
         const baseKey = [
             layer.filter,
             layer.params,
@@ -15473,8 +15807,8 @@ class InpaintEditor {
             layer.plate && layer.plate.ref && layer.plate.ref.filename,
             !!forRun,
             !!preview,
-            below.width,
-            below.height,
+            vp && vp.crop ? vp.crop.bw : below.width,
+            vp && vp.crop ? vp.crop.bh : below.height,
             vp ? [vp.x, vp.y, vp.w, vp.h, vp.sx, vp.sy, !!(vp.screen || vp.display)] : 0,
         ];
         const readsMap = typeof this.mapsOf === "function" ? this.mapsOf(layer).length > 0 : (layer.params && layer.params.limit && (layer.params.limit.source === "depth" || layer.params.limit.source === "map"));
@@ -15483,6 +15817,7 @@ class InpaintEditor {
         }
         const isEffectView = this.effectViewOf(layer, forRun);
         if (isEffectView) baseKey.push(true);
+        if (layer.params && layer.params.limit) baseKey.push(!!plain);
         return JSON.stringify(baseKey);
     }
 
@@ -15531,6 +15866,28 @@ class InpaintEditor {
     }
 
     /**
+     * Crop `below` (a region-pass canvas that reaches past the document) to the document's pixel box `[bx0, by0, bw, bh]`,
+     * clamping any 1-pixel fractional rim from the strictly-inside box `[ix0, iy0, iw, ih]` so a filter that samples
+     * neighbours never reads the empty margin or a subpixel edge pixel.
+     */
+    cropFilterInput(below, { bx0, by0, bw, bh, ix0, iy0, iw, ih }) {
+        const doc = makeCanvas(bw, bh);
+        const dctx = doc.getContext("2d");
+        dctx.imageSmoothingEnabled = false;
+        if (iw > 0 && ih > 0) {
+            const ox = ix0 - bx0, oy = iy0 - by0;
+            dctx.drawImage(below, ix0, iy0, iw, ih, ox, oy, iw, ih);
+            if (ox > 0) dctx.drawImage(doc, ox, oy, 1, ih, 0, oy, ox, ih);
+            if (bw > ox + iw) dctx.drawImage(doc, ox + iw - 1, oy, 1, ih, ox + iw, oy, bw - ox - iw, ih);
+            if (oy > 0) dctx.drawImage(doc, 0, oy, bw, 1, 0, 0, bw, oy);
+            if (bh > oy + ih) dctx.drawImage(doc, 0, oy + ih - 1, bw, 1, 0, oy + ih, bw, bh - oy - ih);
+        } else {
+            dctx.drawImage(below, bx0, by0, bw, bh, 0, 0, bw, bh);
+        }
+        return doc;
+    }
+
+    /**
      * Filtered copy of `below` for a filter layer, cached until the composite or the parameters
      * change. `below` is the composite so far: a canvas, or the GPU surface the filter layer
      * before this one left behind. With `keepSurface` the result stays a surface for the next
@@ -15538,14 +15895,16 @@ class InpaintEditor {
      * stages inside one filter (the film look is colour, halation and grain) always chain on
      * the GPU, which is where most of the canvas round trips were.
      */
-    filteredCanvas(layer, below, forRun, preview, keepSurface = false) {
+    filteredCanvas(layer, below, forRun, preview, keepSurface = false, plain = keepSurface) {
         const vp = this.viewPass;
-        const key = this.filterKey(layer, below, forRun, preview, vp);
+        const key = this.filterKey(layer, below, forRun, preview, vp, plain);
         const slot = vp ? (vp.sample ? "_fcacheSample" : "_fcacheView") : "_fcache";
         const c = layer[slot];
         if (!keepSurface && c && c.version === this.compositeVersion && c.key === key) return c.canvas;
         let input = below, scale = vp ? vp.sx : 1;
-        if (preview) {
+        if (vp && vp.crop && !isGLSurface(below)) {
+            input = this.cropFilterInput(below, vp.crop);
+        } else if (preview) {
             const s = Math.min(1, 1024 / Math.max(below.width, below.height));
             if (s < 1) {
                 input = makeCanvas(Math.round(below.width * s), Math.round(below.height * s));
@@ -15575,10 +15934,10 @@ class InpaintEditor {
             site: "filteredCanvas",
         });
         // A limit's weight goes into the result's alpha whenever the result is drawn over the picture (a
-        // blend mode, an opacity, a mask, or source-over): where the limit is 0 the layer then shows
-        // nothing, like its painted mask. Only a result that becomes the chain's own surface (the next
-        // filter layer reads it as the picture) has to stay opaque and mixes the input back in instead.
-        info.limitOver = !keepSurface;
+        // blend mode, an opacity, a mask, or a clip): where the limit is 0 the layer then shows nothing,
+        // like its painted mask. A plain filter layer stands for the picture (whether it stays a surface
+        // for the next filter layer or replaces the canvas below it) and mixes the input back in instead.
+        info.limitOver = !plain;
         beginScope();
         try { canvas = applyFilter(layer.filter, input, layer.params, info); }
         catch (err) { console.error(err); }
@@ -15587,7 +15946,7 @@ class InpaintEditor {
         // says so; the Limit row reads the flag). Drawn over the picture that is nothing; only as the
         // chain's surface it is the picture.
         layer.limitMissing = !!info.limitMissing;
-        if (info.limitMissing && canvas === input && !keepSurface) canvas = null;
+        if (info.limitMissing && canvas === input && !(keepSurface && isGLSurface(canvas))) canvas = null;
         if (isGLSurface(canvas)) {
             if (keepSurface) return canvas;                    // the next filter layer reads the texture
             const flat = surfaceToCanvas(canvas);
@@ -16182,17 +16541,40 @@ class InpaintEditor {
         // mask, an opacity or a blend mode has to composite it onto the canvas.
         // a fill layer (`over`) goes over the picture as a layer does: its result never stands for the picture
         const limitView = this.effectViewOf(layer, forRun);
-        const plain = !limitView && !this.liveMask(layer) && layer.opacity >= 1 && (!layer.blend || layer.blend === "normal") && !preview && !clip && !this.isFillLayer(layer);
-        const keepSurface = plain && more && !this.filterChainOff && glChainUsable(ctx.canvas.width, ctx.canvas.height);
-        const out = this.filteredCanvas(layer, chain ? chain.surface : ctx.canvas, forRun, preview, keepSurface);
-        const rx = vp ? vp.x : 0, ry = vp ? vp.y : 0;
-        const rw = vp ? vp.w : this.width, rh = vp ? vp.h : this.height;
+        const plain = !limitView && !this.liveMask(layer) && Math.round(layer.opacity * 255) === 255 && (!layer.blend || layer.blend === "normal") && !preview && !clip && !this.isFillLayer(layer);
+        let rx = vp ? vp.x : 0, ry = vp ? vp.y : 0;
+        let rw = vp ? vp.w : this.width, rh = vp ? vp.h : this.height;
+        const margin = !!(vp && (rx < 0 || ry < 0 || rx + rw > this.width || ry + rh > this.height));
+        let fvp = vp;
+        if (margin && !this.isFillLayer(layer)) {
+            const W = ctx.canvas.width, H = ctx.canvas.height;
+            const sx = W / rw, sy = H / rh;
+            const dl = -rx * sx, dt = -ry * sy, dr = (this.width - rx) * sx, db = (this.height - ry) * sy;
+            const bx0 = Math.max(0, Math.floor(dl)), by0 = Math.max(0, Math.floor(dt));
+            const bx1 = Math.min(W, Math.ceil(dr)), by1 = Math.min(H, Math.ceil(db));
+            const bw = bx1 - bx0, bh = by1 - by0;
+            if (bw <= 0 || bh <= 0) return chain;
+            const ix0 = Math.max(bx0, Math.min(bx1, Math.ceil(dl))), iy0 = Math.max(by0, Math.min(by1, Math.ceil(dt)));
+            const ix1 = Math.min(bx1, Math.max(ix0, Math.floor(dr))), iy1 = Math.min(by1, Math.max(iy0, Math.floor(db)));
+            rx += bx0 / sx; ry += by0 / sy;
+            rw = bw / sx; rh = bh / sy;
+            fvp = { ...vp, x: rx, y: ry, w: rw, h: rh, crop: { bx0, by0, bw, bh, ix0, iy0, iw: ix1 - ix0, ih: iy1 - iy0 } };
+        }
+        if (chain && margin && this.isFillLayer(layer)) chain = this.flushFilterChain(ctx, chain);
+        const keepSurface = plain && more && !this.filterChainOff && glChainUsable(fvp && fvp.crop ? fvp.crop.bw : ctx.canvas.width, fvp && fvp.crop ? fvp.crop.bh : ctx.canvas.height);
+        let out;
+        this.viewPass = fvp;
+        try {
+            out = this.filteredCanvas(layer, chain ? chain.surface : ctx.canvas, forRun, preview, keepSurface, plain);
+        } finally {
+            this.viewPass = vp;
+        }
         if (isGLSurface(out)) {
             if (chain && out !== chain.surface) releaseSurface(chain.surface);
             return { surface: out, x: rx, y: ry, w: rw, h: rh };
         }
         chain = this.flushFilterChain(ctx, chain);   // the result goes onto the canvas, so the composite has to be there
-        if (!out) return null;
+        if (!out || (plain && out === ctx.canvas)) return null;
         let src = out;
         if (this.liveMask(layer)) {
             if (!this.filterMaskCanvas || this.filterMaskCanvas.width !== out.width || this.filterMaskCanvas.height !== out.height) this.filterMaskCanvas = makeCanvas(out.width, out.height);
@@ -16212,7 +16594,7 @@ class InpaintEditor {
                 // the mask's display mirror (572 MB at 15000 x 10000, synced per written tile) and a sub-rectangle draw of
                 // it per pass; the stroke a full-size live preview filled from that mirror.
                 const sx = m.width / rw, sy = m.height / rh;
-                const mvp = { ...vp, sx, sy };
+                const mvp = { ...(fvp || vp), sx, sy };
                 const whole = { x: 0, y: 0, w: this.width, h: this.height };
                 mctx.save();
                 try {
@@ -16256,7 +16638,7 @@ class InpaintEditor {
         // view is zoomed out (viewportRegion pads the visible area and clamps nothing), and the fill's bytes there are
         // its clamped ends, so a gradient painted the whole viewport (the user's screenshot, 2026-10-10). The draw is
         // clipped to the document; a filter leaves the transparent outside transparent by itself.
-        const clipDoc = vp && this.isFillLayer(layer) && (rx < 0 || ry < 0 || rx + rw > this.width || ry + rh > this.height);
+        const clipDoc = margin && this.isFillLayer(layer);
         if (clipDoc) { ctx.save(); ctx.beginPath(); ctx.rect(0, 0, this.width, this.height); ctx.clip(); }
         try {
             if (!limitView && (clip || EMULATED_BLENDS.has(layer.blend))) {
@@ -16265,6 +16647,7 @@ class InpaintEditor {
             }
             ctx.globalAlpha = limitView ? 1 : layer.opacity;
             ctx.globalCompositeOperation = limitView ? "source-over" : canvasOp(layer.blend);
+            if (plain) ctx.clearRect(rx, ry, rw, rh);
             ctx.drawImage(src, rx, ry, rw, rh);
             ctx.globalAlpha = 1;
             ctx.globalCompositeOperation = "source-over";
@@ -16279,9 +16662,12 @@ class InpaintEditor {
         if (!chain) return null;
         ctx.globalAlpha = 1;
         ctx.globalCompositeOperation = "source-over";
-        if (!drawSurfaceTo(ctx, chain.surface, chain.x, chain.y, chain.w, chain.h)) {
+        if (!drawSurfaceTo(ctx, chain.surface, chain.x, chain.y, chain.w, chain.h, true)) {
             const flat = surfaceToCanvas(chain.surface);
-            if (flat) ctx.drawImage(flat, chain.x, chain.y, chain.w, chain.h);
+            if (flat) {
+                ctx.clearRect(chain.x, chain.y, chain.w, chain.h);
+                ctx.drawImage(flat, chain.x, chain.y, chain.w, chain.h);
+            }
         }
         releaseSurface(chain.surface);
         return null;
@@ -17654,6 +18040,9 @@ class InpaintEditor {
     /** Grow, shrink, swirl and restore dab this often (ms) while the button is held still; 0 turns the timer off (tests). */
     static liquifyRateMs = 33;
 
+    /** The dense dab kernel `liquifyDab` passes to `LiquifyField.dab` (K30; `null` forces the Map-based reference loop). */
+    static liquifyDabKernel = liquifyDab;
+
     /** Liquify's preview of a box larger than this many pixels is computed at a coarser resolution and scaled up. */
     static liquifyPreviewMax = 256 * 1024;
 
@@ -17718,6 +18107,9 @@ class InpaintEditor {
             scan(JSON.stringify(ed.uploaded));
             scan(JSON.stringify(ed.layers.map((l) => [l.ref, l.maskRef, l.exportRef, l.lut && l.lut.ref, l.plate && l.plate.ref])));
             if (ed.base) scan(JSON.stringify(ed.base.ref));
+            // what the undo and redo steps and the named snapshots hold: an undo puts those files back (not caught: a walk
+            // that fails stops the clean-up)
+            scan(JSON.stringify(ed.heldFileRefs()));
         }
         try { for (let i = 0; i < localStorage.length; i++) scan(localStorage.getItem(localStorage.key(i))); } catch (_) { /* ignore */ }
         return Array.from(keep);
@@ -18411,6 +18803,8 @@ class InpaintEditor {
      * change placed again the way a new reference is (referenceBox), their masks, opacity and visibility unchanged.
      */
     async setBasePixels(ref, px, { keepLayers = true, keep = null } = {}) {
+        // the app's Each area (eacharea.js): its areas were cut from the picture there is now
+        if (this._eachArea) throw refusal("Each area is running on this document: a new picture waits until it is done, or stop it.");
         this.checkBaseSize(px.width, px.height);
         const sizeChanged = px.width !== this.width || px.height !== this.height;
         this.historyGen++;   // a restore still loading must not put the old document over the new image
@@ -18554,11 +18948,15 @@ class InpaintEditor {
         markStep("layered_open", "read", { MB: bytes.length / 1048576 });
         // the K0a harness: the inflates' time (they run one after another), and the layer loop's parts below
         let inflateMs = 0, inflates = 0, maskMs = 0, rgbaMs = 0, bitmapMs = 0, fromImageMs = 0, t0 = 0;
-        const timed = async (b, format) => {
+        // each inflate stops at the bytes the reader keeps (inpaint_layered.js inflateAtMost, the pool's inflater too)
+        const timed = async (b, format, cap) => {
             const t = performance.now();
-            try { return await inflateBytes(b, format); } finally { inflateMs += performance.now() - t; inflates++; }
+            try { return await inflateAtMost(b, format, cap); } finally { inflateMs += performance.now() - t; inflates++; }
         };
-        const doc = kind === "psd" ? await readPsd(bytes, { inflate: (b) => timed(b, "deflate") }) : await readOra(bytes, { inflateRaw: (b) => timed(b, "deflate-raw") });
+        // the size is checked from the header before anything else is read or made (H1 S5), as the pool route does
+        const onHeader = (h) => this.checkLayeredSize(h.width, h.height);
+        const doc = kind === "psd" ? await readPsd(bytes, { inflate: (b, cap) => timed(b, "deflate", cap), onHeader })
+            : await readOra(bytes, { inflateRaw: (b, cap) => timed(b, "deflate-raw", cap), onHeader });
         markStep("layered_open", "parsed", { inflateMs, inflates });
         this.checkLayeredSize(doc.width, doc.height);
         for (const L of doc.layers) {
@@ -19665,6 +20063,7 @@ class InpaintEditor {
                     preview: () => { this.filterPreview = layer.id; this.markFilterChanged(layer, { soon: true }); },
                     commit: (opts) => { this.filterPreview = null; if (layer._undoPending) { this.pushUndoSnapshot(layer._undoPending, { label: (opts && opts.label) || stepLabel(p) }); layer._undoPending = null; } this.markFilterChanged(layer); },
                     stop,
+                    histogram: () => { const h = this.belowHistogram(layer); return h ? h.luma : null; },   // the curves' backdrop (P8)
                 });
                 if (node) { node.style.gridColumn = "1 / -1"; box.appendChild(node); }
                 continue;
@@ -19883,7 +20282,7 @@ class InpaintEditor {
                 colorInput.addEventListener("keydown", stop);
                 colorInput.addEventListener("input", () => {
                     if (!layer._undoPending) layer._undoPending = this.snapshot({ kind: "filter", id: layer.id });
-                    layer.params = { ...layer.params, limit: normalizeLimit({ ...(layer.params.limit || {}), color: colorInput.value }) };
+                    layer.params = { ...layer.params, limit: normalizeStoredLimit({ ...(layer.params.limit || {}), color: colorInput.value }) };
                     this.filterPreview = layer.id;
                     this.markFilterChanged(layer, { soon: true });
                     if (block.rangeBar) block.rangeBar.refresh();
@@ -19894,7 +20293,7 @@ class InpaintEditor {
                         this.pushUndoSnapshot(layer._undoPending, { label: "Filter limit" });
                         layer._undoPending = null;
                     }
-                    layer.params = { ...layer.params, limit: normalizeLimit({ ...(layer.params.limit || {}), color: colorInput.value }) };
+                    layer.params = { ...layer.params, limit: normalizeStoredLimit({ ...(layer.params.limit || {}), color: colorInput.value }) };
                     this.markFilterChanged(layer);
                     if (block.rangeBar) block.rangeBar.refresh();
                 });
@@ -19917,7 +20316,7 @@ class InpaintEditor {
                 tolInput.addEventListener("input", () => {
                     if (!layer._undoPending) layer._undoPending = this.snapshot({ kind: "filter", id: layer.id });
                     const tolVal = Math.max(0, Math.min(100, parseFloat(tolInput.value) || 0));
-                    layer.params = { ...layer.params, limit: normalizeLimit({ ...(layer.params.limit || {}), tol: tolVal }) };
+                    layer.params = { ...layer.params, limit: normalizeStoredLimit({ ...(layer.params.limit || {}), tol: tolVal }) };
                     this.filterPreview = layer.id;
                     this.markFilterChanged(layer, { soon: true });
                     if (block.rangeBar) block.rangeBar.refresh();
@@ -19929,7 +20328,7 @@ class InpaintEditor {
                         layer._undoPending = null;
                     }
                     const tolVal = Math.max(0, Math.min(100, parseFloat(tolInput.value) || 0));
-                    layer.params = { ...layer.params, limit: normalizeLimit({ ...(layer.params.limit || {}), tol: tolVal }) };
+                    layer.params = { ...layer.params, limit: normalizeStoredLimit({ ...(layer.params.limit || {}), tol: tolVal }) };
                     this.markFilterChanged(layer);
                     if (block.rangeBar) block.rangeBar.refresh();
                 });
@@ -19971,7 +20370,7 @@ class InpaintEditor {
                 },
                 preview: (r) => {
                     const cur = layer.params.limit || curLim;
-                    layer.params = { ...layer.params, limit: normalizeLimit({ ...cur, ...r }) };
+                    layer.params = { ...layer.params, limit: normalizeStoredLimit({ ...cur, ...r }) };
                     this.filterPreview = layer.id;
                     this.markFilterChanged(layer, { soon: true });
                 },
@@ -19982,7 +20381,7 @@ class InpaintEditor {
                     }
                     const cur = layer.params.limit || curLim;
                     if (r) {
-                        layer.params = { ...layer.params, limit: normalizeLimit({ ...cur, ...r }) };
+                        layer.params = { ...layer.params, limit: normalizeStoredLimit({ ...cur, ...r }) };
                     }
                     if (layer._undoPending) {
                         this.pushUndoSnapshot(layer._undoPending, { label: "Filter limit" });
@@ -20026,7 +20425,7 @@ class InpaintEditor {
                 }
             } else {
                 const cur = layer.params.limit || {};
-                const nextLimit = normalizeLimit({
+                const nextLimit = normalizeStoredLimit({
                     source: val,
                     lo: cur.lo ?? 0.0,
                     hi: cur.hi ?? (val === "depth" ? 0.5 : 0.7),
@@ -24490,6 +24889,41 @@ class InpaintEditor {
         return out;
     }
 
+    /**
+     * Every file ref (`{ filename, subfolder, type }`) the undo and redo steps and the named snapshots hold: a layer
+     * record's `ref` and `maskRef` (layers, canvas and turn steps), a text's user font (`text.fontRef`, a text step's
+     * too), a filter's LUT and grain plate, a canvas or turn step's base, the document maps' files, the plugins' data a
+     * step keeps. An undo puts these back with their refs and uploads none of them again, so Settings › Local files ›
+     * Clean up keeps them (the host's referencedFileKeys, and the node's referencedFiles); it removed them, and an undo across
+     * the clean-up left a layer, a font or the whole picture naming a file the next start and the next save could not find.
+     */
+    heldFileRefs() {
+        return this.fileRefsOf([...(this.undo || []), ...(this.redo || []), ...(this.snapshots || []).map((s) => s && s.snap)]);
+    }
+
+    /**
+     * The file refs in these steps (undo steps, turn snapshots: the assistant's "Undo this turn" record asks too). Each
+     * step is walked as data: plain objects and arrays, every object with a `filename` string being a ref, so a ref field
+     * a later step adds is found too. Pixels, canvases, images, typed arrays and maps are class instances and are not
+     * entered, nor the layers' `_` caches.
+     */
+    fileRefsOf(steps) {
+        const out = [];
+        const seen = new Set();
+        const walk = (v, depth) => {
+            if (!v || typeof v !== "object" || depth > 40 || seen.has(v)) return;
+            const proto = Object.getPrototypeOf(v);
+            const array = Array.isArray(v);
+            if (!array && proto !== Object.prototype && proto !== null) return;
+            seen.add(v);
+            if (array) { for (const x of v) walk(x, depth + 1); return; }
+            if (typeof v.filename === "string" && v.filename) out.push(v);
+            for (const k of Object.keys(v)) if (k.charCodeAt(0) !== 95) walk(v[k], depth + 1);   // not the "_" caches
+        };
+        for (const st of steps || []) walk(st, 0);
+        return out;
+    }
+
     async freeHelperModels() {
         const freed = this.releaseCaches({ deep: true });
         const mb = Math.round(freed / 1048576);
@@ -24508,7 +24942,12 @@ class InpaintEditor {
         }
     }
 
-    async generate() {
+    /**
+     * Generate with the host's recipe. `opts` (the app's Each area, eacharea.js; the button and Ctrl+Enter pass none):
+     * `refs` a reference snapshot to send instead of the one of now, `area` one area of the selection to run on instead of
+     * the selection itself (the host reads it in place of `this.sel`; the document's selection is never touched).
+     */
+    async generate(opts = {}) {
         this.lastRunError = null;
         if (!this.base) { this.setStatus("Load an image first."); return; }
         // One API run per document: the host holds `providerPending` until its result has landed, and the button stays
@@ -24518,6 +24957,14 @@ class InpaintEditor {
         // queueing (ComfyUI queues on purpose), also while a 1× pass or a selection's upscale holds it; not while a run
         // whose landing resizes the document holds it (`resizes`: an upscale of the whole picture, the Realism Pass
         // above 1×), whose result would land in the old geometry. The node's host has no slot.
+        const area = (opts && opts.area) || null;
+        // the app's Each area (eacharea.js) runs its areas one by one on this document: a Generate of the whole selection
+        // meanwhile would land among them (and on the user's ComfyUI hold up the next area)
+        if (!area && this._eachArea) {
+            this.lastRunError = new Error("Each area is running on this document: wait for it, or stop it.");
+            this.setStatus(this.lastRunError.message, "info");
+            return { error: this.lastRunError };
+        }
         if (this.providerPending && (this.resultInputState().provider || this.providerPending.resizes)) {
             this.lastRunError = new Error(RUN_GOING_TEXT);
             this.setStatus(this.lastRunError.message, "info");
@@ -24525,7 +24972,7 @@ class InpaintEditor {
         }
         // the prompt and the references as they are at the click (docs/PLAN_REFS.md C3): a later hide or move does not
         // change what this run sends
-        const refs = this.refSnapshot();
+        const refs = (opts && opts.refs) || this.refSnapshot();
         if (this.removePending || this.healPending || this.liquifyPending) { this.setStatus("Waiting for the stroke to land..."); await this.heldEdit(); }
         if (this.genSettings.seedRandom) { this.genSettings.seed = randomSeed(); if (this.seedInput) this.seedInput.value = this.genSettings.seed; }
         const { name, wired } = this.resultInputState();
@@ -24536,7 +24983,7 @@ class InpaintEditor {
             // model such as Flux.2 gets the whole card; in API mode they simply stay resident.
             if (this.genSettings.mode === "local" && this.helperUsed) await this.freeHelperModels();
             this.setStatus(wired ? `Queueing (${this.genSettings.mode}, seed ${this.genSettings.seed}, result from ${name}) ...` : `Queueing, but nothing is wired into "result" or "result_local": the result will not come back into the canvas.`);
-            await host.queueGenerate(this, { refs });
+            await host.queueGenerate(this, area ? { refs, area } : { refs });
         } catch (err) {
             console.error(err);
             // kept for the app's generate command, which throws it at once; also returned, so a caller gets its own run's
@@ -24755,10 +25202,18 @@ class InpaintEditor {
             // a list drawn while a layer loads (an await below) must not drop a group whose layers are not in yet
             this.holdGroups = (this.holdGroups || 0) + 1;
             // what is left out says so (docs/PLAN_0_1_50.md Q4): a layer of a kind a newer version wrote without a file,
-            // and a filter layer that would not load
+            // a filter layer that would not load, and a pixel layer whose file would not (by name: `missing`)
             let newer = 0, failed = 0;
+            const missing = [], redrawn = [];
             this.leftOut = null;
             this._loadNote = null;
+            // a text layer drawn again from its description (no file, or one that would not load): rendered after the loop
+            const textLayer = (l, match = { strength: 0, source: "surroundings" }) => {
+                const layer = { id: l.id, name: l.name, kind: "text", role: l.role || "none", blend: normalBlend(l.blend), ref: null, px: this.pixels.Layer.empty(1, 1), x: l.x, y: l.y, w: 1, h: 1, opacity: l.opacity ?? 1, visible: l.visible !== false, dirty: true, locked: !!l.locked, alphaLock: !!l.alphaLock, clip: !!l.clip, group: l.group || null, maskPx: null, maskRef: null, maskDirty: false, maskEdit: false, match, text: { ...TEXT_DEFAULTS, ...l.text } };
+                this.layers.push(installLayerAliases(layer, this.pixels));
+                this.textCounter = (this.textCounter || 0) + 1;
+                textToRender.push(layer);
+            };
             try {
                 for (const l of state.layers || []) {
                     if (l.kind === "filter") {
@@ -24798,10 +25253,7 @@ class InpaintEditor {
                     }
                     if (l.kind === "text" && l.text && !l.ref) {
                         // never uploaded (editor closed without sync): render it again from its description
-                        const layer = { id: l.id, name: l.name, kind: "text", role: l.role || "none", blend: normalBlend(l.blend), ref: null, px: this.pixels.Layer.empty(1, 1), x: l.x, y: l.y, w: 1, h: 1, opacity: l.opacity ?? 1, visible: l.visible !== false, dirty: true, locked: !!l.locked, alphaLock: !!l.alphaLock, clip: !!l.clip, group: l.group || null, maskPx: null, maskRef: null, maskDirty: false, maskEdit: false, match: { strength: 0, source: "surroundings" }, text: { ...TEXT_DEFAULTS, ...l.text } };
-                        this.layers.push(installLayerAliases(layer, this.pixels));
-                        this.textCounter = (this.textCounter || 0) + 1;
-                        textToRender.push(layer);
+                        textLayer(l);
                         continue;
                     }
                     if (!l.ref) {
@@ -24835,11 +25287,19 @@ class InpaintEditor {
                         if (l.kind === "text") this.textCounter = (this.textCounter || 0) + 1;
                     } catch (err) {
                         console.warn("Inpaint Canvas: layer missing", l.ref, err);
+                        const name = String(l.name || l.id || "layer");
+                        if (l.kind === "text" && l.text && typeof l.text === "object") {
+                            // a text layer is drawn again from its description, as one never stored is (its mask, if it had
+                            // one, is not: the mask's size is the rendered pixels')
+                            const match = l.match && typeof l.match === "object" ? { strength: +l.match.strength || 0, source: l.match.source === "underneath" ? "underneath" : "surroundings" } : undefined;
+                            textLayer(l, match);
+                            redrawn.push(name + (l.mask && l.mask.filename ? " (without its mask)" : ""));
+                        } else missing.push(name);
                     }
                 }
             } finally { this.holdGroups--; }
-            if (newer || failed) {
-                this.leftOut = { newer, failed, note: leftOutText(newer, failed) };
+            if (newer || failed || missing.length || redrawn.length) {
+                this.leftOut = { newer, failed, missing: missing.length, names: missing, redrawn: redrawn.length, redrawnNames: redrawn, note: leftOutText(newer, failed, missing, redrawn) };
                 this.setStatus(this.leftOut.note, "warn");
                 this._loadNote = { note: this.leftOut.note, lines: LOAD_NOTE_LINES, until: Date.now() + LOAD_NOTE_MS };
             }
@@ -24951,11 +25411,14 @@ class InpaintEditor {
      * app): `refIds` the click's references (refLayersFor), `prompt` / `negative` the texts to send instead of the fields';
      * `boxes` ({ boxes, notes }, promptPayload's shape; `boxes` null: none, the selection goes as one) the boxes a run
      * sends while the Boxes switch is on, measured by the caller, instead of the document's (Generate new measures them
-     * on the picture they were drawn on, before its fresh canvas replaces it).
+     * on the picture they were drawn on, before its fresh canvas replaces it). `area` (the app's Each area): one area of
+     * the selection, `{ maskCanvas(), crop }`, whose mask goes instead of the selection's (never through the upload cache,
+     * which stays the selection's) and whose crop the status line names.
      */
     async serializeForPrompt(opts = {}) {
         if (!this.base) return "{}";
         const id = this.node.id;
+        const area = opts.area || null;
         await this.syncLayers();
         let baseRef = this.uploaded.baseRef;
         if (!this.uploaded.baseHash || !baseRef) {
@@ -24972,9 +25435,12 @@ class InpaintEditor {
         }
         // the selection the mask below holds, read in the same tick (the app numbers the batch's pictures from it; the
         // node ignores the key)
-        const hasSelection = !!this.getBounds();
+        const hasSelection = area ? true : !!this.getBounds();
         let maskRef = this.uploaded.maskRef;
-        if (!this.uploaded.maskHash || !maskRef) {
+        if (area) {
+            const c = area.maskCanvas();
+            try { maskRef = (await uploadCanvas(c, `n${id}_mask`)).ref; } finally { c.width = 1; c.height = 1; }
+        } else if (!this.uploaded.maskHash || !maskRef) {
             const up = await uploadCanvas(this.maskToCanvas(), `n${id}_mask`);
             maskRef = up.ref;
             this.uploaded.maskHash = up.hash;
@@ -25018,7 +25484,7 @@ class InpaintEditor {
             boxPart = { selectionBoxId: selectionBoxIdOf(promptSent), referenceIds: refLayers.map((l) => l.id), referenceLabels: refLayers.map((l) => (labels.has(l.id) ? `img${labels.get(l.id)}` : null)), ...((given ? Array.isArray(given.boxes) : list.length) ? { boxes: p.boxes } : {}) };
             boxNote = p.notes.join(" ");
         }
-        const [x, y, w, h] = this.cropRect();
+        const [x, y, w, h] = area && Array.isArray(area.crop) ? area.crop : this.cropRect();
         this.setStatus(`Queued crop ${w} × ${h} at ${x}, ${y}${references.length ? `, ${references.length} reference${references.length > 1 ? "s" : ""}` : ""}. Waiting for the result ...${boxNote ? " " + boxNote : ""}`, boxNote ? "warn" : undefined);
         return JSON.stringify({
             width: this.width,
@@ -25234,6 +25700,9 @@ class InpaintEditor {
         clearTimeout(this._refLayTimer);
         if (this._compositor) { try { this._compositor.dispose(); } catch (_) { /* context gone */ } this._compositor = null; }
         this.close();
+        this.closeFlyout();
+        this.dropFlyoutListener();   // close() returns early for an editor that is not open
+        this.closeAsk();
         if (this.promptField) this.promptField.destroy();   // its document listener and the context callback
         // after close(), which commits an open text edit: that step's blob URL is revoked with the rest
         this.clearUndo();   // the blob URLs of the whole-layer steps are revoked, not left behind

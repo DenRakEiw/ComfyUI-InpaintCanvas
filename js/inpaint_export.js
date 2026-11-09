@@ -11,6 +11,7 @@
  */
 
 import { PSD_BLEND, ORA_BLEND } from "./blend_modes.js";
+import { crc32 } from "./inpaint_png.js";
 
 /** A 2D canvas in the window or in a worker. */
 function makeExportCanvas(w, h) {
@@ -256,9 +257,6 @@ export function buildPsd({ width, height, layers, composite }) {
 }
 
 // ---- zip (stored) for ORA ---------------------------------------------------------
-
-const CRC_TABLE = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
-function crc32(bytes) { let c = 0xFFFFFFFF; for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
 
 function le16(v) { return Uint8Array.of(v & 255, (v >> 8) & 255); }
 function le32(v) { return Uint8Array.of(v & 255, (v >>> 8) & 255, (v >>> 16) & 255, (v >>> 24) & 255); }

@@ -16,6 +16,8 @@
 // pixel x of the base to the place in the layer that belongs there, `layer(M x) ~ base(x)`; `warpRGBA` makes
 // `out(x) = src(M x)`. `scale`, `shear` and `shift` are read from M exactly as the node reads them.
 
+import { edgefitShrink, warpRgba, warpCoverage as warpCoveragePx } from "./px/kernels.js";
+
 export const WORK = 512;
 export const LIMITS = { scale: 0.08, shear: 0.03, shift: 0.05, gain: 0.97, minRing: 2000, minRingShare: 0.02 };
 
@@ -61,15 +63,7 @@ export function alphaOf(rgba, n = rgba.length >> 2) {
  * nothing), with its alpha shrunk beside it: `{ gray, alpha }` at `tw` x `th`.
  */
 export function shrinkRGBA(rgba, w, h, tw, th) {
-    const n = w * h, g = new Float32Array(n), a = new Float32Array(n);
-    for (let i = 0, j = 0; i < n; i++, j += 4) {
-        const al = rgba[j + 3] / 255;
-        a[i] = al;
-        g[i] = al * (0.299 * rgba[j] + 0.587 * rgba[j + 1] + 0.114 * rgba[j + 2]) / 255;
-    }
-    const gs = shrinkPlane(g, w, h, tw, th), as = shrinkPlane(a, w, h, tw, th);
-    for (let i = 0; i < gs.length; i++) gs[i] = as[i] > 1e-4 ? gs[i] / as[i] : 0;
-    return { gray: gs, alpha: as };
+    return edgefitShrink(rgba, w, h, tw, th);
 }
 
 /**
@@ -316,19 +310,7 @@ export function fitEdges({ base, layer, ring, valid = null, w, h, fullW = w, ful
  * Uint8ClampedArray. Straight alpha is interpolated as it is; a caller with soft alpha warps before applying it.
  */
 export function warpRGBA(src, w, h, M) {
-    const out = new Uint8ClampedArray(w * h * 4);
-    const [a00, a01, tx, a10, a11, ty] = M;
-    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-        let X = a00 * x + a01 * y + tx, Y = a10 * x + a11 * y + ty;
-        X = Math.min(w - 1, Math.max(0, X)); Y = Math.min(h - 1, Math.max(0, Y));
-        const x0 = Math.min(w - 2, X | 0), y0 = Math.min(h - 2, Y | 0);
-        const fx = w > 1 ? X - x0 : 0, fy = h > 1 ? Y - y0 : 0;
-        const j = (Math.max(0, y0) * w + Math.max(0, x0)) * 4, dx = w > 1 ? 4 : 0, dy = h > 1 ? w * 4 : 0, o = (y * w + x) * 4;
-        for (let c = 0; c < 4; c++) {
-            out[o + c] = (src[j + c] * (1 - fx) + src[j + dx + c] * fx) * (1 - fy) + (src[j + dy + c] * (1 - fx) + src[j + dy + dx + c] * fx) * fy;
-        }
-    }
-    return out;
+    return warpRgba(src, w, h, M);
 }
 
 /**
@@ -338,14 +320,7 @@ export function warpRGBA(src, w, h, M) {
  * crop's bottom edge, seen live 2026-10-19).
  */
 export function warpCoverage(w, h, M) {
-    const out = new Float32Array(w * h);
-    const [a00, a01, tx, a10, a11, ty] = M;
-    for (let y = 0, i = 0; y < h; y++) for (let x = 0; x < w; x++, i++) {
-        const X = a00 * x + a01 * y + tx, Y = a10 * x + a11 * y + ty;
-        const d = Math.min(X, w - 1 - X, Y, h - 1 - Y) + 1;
-        out[i] = d >= 1 ? 1 : d <= 0 ? 0 : d;
-    }
-    return out;
+    return warpCoveragePx(w, h, M);
 }
 
 /**

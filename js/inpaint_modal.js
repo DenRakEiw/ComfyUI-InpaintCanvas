@@ -305,7 +305,8 @@ function buildTools(ed, body) {
         + "clicked point by point (click the first point or press Enter to finish, Backspace takes one back, Esc cancels; on a Bezier "
         + "point, drag while clicking to curve the line); freehand follows the cursor. Kind, fill, outline and corner radius are in the "
         + "bar above the canvas.");
-    addTool("eyedropper", "Eyedropper (I): click to pick the colour under the cursor from the visible image. Alt+click with the brush does the same.");
+    addTool("eyedropper", "Eyedropper (I): click to pick the colour under the cursor from the visible image or the active layer (Sample), "
+        + "the one pixel or the average of the 3 × 3 or 5 × 5 around it (Size). Alt+click with the brush does the same.");
     addTool("transform", "Move / scale / rotate the active layer (T). Drag inside to move, corners scale (Shift: free aspect), edges scale one axis, drag just outside a corner to rotate (Shift snaps to 15°). Rotation is applied with Enter.");
     addTool("text", "Text (Shift+T): click on the canvas to add a text layer, click a text layer to select it, drag to move it, double-click to edit it on the canvas.");
     if (host.depthSupported !== false) {

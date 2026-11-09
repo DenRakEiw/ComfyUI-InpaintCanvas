@@ -44,7 +44,7 @@
  */
 
 import { canvasRoundTrip, resampleOptions, resampleStore } from "./inpaint_resample.js";
-import { resampleBlock } from "./px/kernels.js";
+import { resampleBlock, liquifyBlock } from "./px/kernels.js";
 import { liquifyStore, liquifyBox } from "./inpaint_liquify.js";
 import { combineRows } from "./inpaint_raster.js";
 
@@ -521,7 +521,7 @@ export class LayerPixels {
                 share: (tx, ty) => out.push({ key: (ty << 16) | tx, share: true }),
                 tile: () => { cur = new Uint8Array(256 * 256 * 4); return [cur, 0, 256 * 4]; },
                 done: (tx, ty, count) => out.push(count ? { key: (ty << 16) | tx, bytes: cur } : { key: (ty << 16) | tx, empty: true }),
-            }, blockMax);
+            }, blockMax, liquifyBlock);
         };
         run.keys = keys;
         return run;

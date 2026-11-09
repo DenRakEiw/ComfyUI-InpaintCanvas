@@ -15,6 +15,9 @@
 
 import { BLEND_OPS } from "../blend_modes.js";
 import { gaussRadii } from "../inpaint_edges.js";
+import { unpackStrip, TIFF_JS } from "../inpaint_tiff.js";
+
+export { unpackStrip, unpackStrip as tiffUnpack, TIFF_JS };
 
 export const OPS = Object.freeze({
     "source-over": 0,
@@ -377,28 +380,56 @@ export function floodScan(data, W, H, sx, sy, tolerance = 32, contiguous = true)
 
 /**
  * `Px.floodShape`'s twin (px.js; jobs.rs `flood_shape`) on `floodScan`: the region around (sx, sy) clipped to `sel`
- * (RGBA8 of the same size, selected where alpha >= 128, or null), drawn as `rgb` (0xRRGGBB), opaque where the region
- * is and transparent black elsewhere. `use(view, count, bounds)` gets the shape, its pixels and its bounds
- * [x0, y0, x1, y1] (right and bottom exclusive, null when empty), and its result is returned. The shape is a new
+ * (RGBA8 of the same size, selected where alpha >= 128, or null), drawn as 255 / 0 alpha bytes when `outKind === 1`
+ * (`Uint8Array` of `w * h`) or as `rgb` (0xRRGGBB), opaque where the region is and transparent black elsewhere
+ * (`Uint8ClampedArray` of `w * h * 4`). `use(view, count, bounds, cells)` gets the shape, its pixels, its bounds
+ * [x0, y0, x1, y1] (right and bottom exclusive, null when empty) and its 256² cell occupancy (`Uint8Array` of
+ * `((w + 255) >> 8) * ((h + 255) >> 8)` bytes, 1 occupied, 0 empty), and its result is returned. The shape is a new
  * array: Rust draws over its own copy in wasm memory, while the caller's `rgba` may be a view over the job's
  * SharedArrayBuffer, which an ImageData refuses.
  */
-export function floodShape(rgba, w, h, sx, sy, tolerance, contiguous, sel, rgb, use) {
+export function floodShape(rgba, w, h, sx, sy, tolerance, contiguous, sel, rgb, use, outKind = 4) {
     const mask = floodScan(rgba, w, h, sx | 0, sy | 0, Math.max(0, tolerance | 0), contiguous);
-    const out = new Uint8ClampedArray(w * h * 4);
     const s = sel ? bytesOf(sel) : null;
+    const cols = (w + 255) >> 8, rows = (h + 255) >> 8;
+    const cells = new Uint8Array(cols * rows);
+    let count = 0, x0 = w, y0 = h, x1 = 0, y1 = 0;
+    if (outKind === 1) {
+        const out = new Uint8Array(w * h);
+        for (let y = 0, p = 0; y < h; y++) {
+            let first = -1, last = 0;
+            const rowC = (y >> 8) * cols;
+            for (let x = 0; x < w; x++, p++) {
+                if (!mask[p] || (s !== null && s[p * 4 + 3] < 128)) continue;
+                out[p] = 255;
+                cells[rowC + (x >> 8)] = 1;
+                count++;
+                if (first < 0) first = x;
+                last = x;
+            }
+            if (first >= 0) {
+                if (first < x0) x0 = first;
+                if (last + 1 > x1) x1 = last + 1;
+                if (y < y0) y0 = y;
+                y1 = y + 1;
+            }
+        }
+        return use(out, count, count > 0 ? [x0, y0, x1, y1] : null, cells);
+    }
+    const out = new Uint8ClampedArray(w * h * 4);
     rgb >>>= 0;
     const r = (rgb >>> 16) & 255, g = (rgb >>> 8) & 255, b = rgb & 255;
     // a word per pixel where the byte order allows it (the array is new, so it starts on a word)
     const words = LITTLE ? new Uint32Array(out.buffer, 0, w * h) : null;
     const word = ((255 << 24) | (b << 16) | (g << 8) | r) >>> 0;
-    let count = 0, x0 = w, y0 = h, x1 = 0, y1 = 0;
     for (let y = 0, p = 0; y < h; y++) {
         let first = -1, last = 0;
+        const rowC = (y >> 8) * cols;
         for (let x = 0; x < w; x++, p++) {
             if (!mask[p] || (s !== null && s[p * 4 + 3] < 128)) continue;
             if (words !== null) words[p] = word;
             else { const o = p * 4; out[o] = r; out[o + 1] = g; out[o + 2] = b; out[o + 3] = 255; }
+            cells[rowC + (x >> 8)] = 1;
             count++;
             if (first < 0) first = x;
             last = x;
@@ -410,7 +441,7 @@ export function floodShape(rgba, w, h, sx, sy, tolerance, contiguous, sel, rgb, 
             y1 = y + 1;
         }
     }
-    return use(out, count, count > 0 ? [x0, y0, x1, y1] : null);
+    return use(out, count, count > 0 ? [x0, y0, x1, y1] : null, cells);
 }
 
 // ---- composite ---------------------------------------------------------------------------------
@@ -852,6 +883,103 @@ function blendOp(d, s, o, mask, px, op) {
     }
 }
 
+let MASKED_SCRATCH = null;
+
+function maskedTileRefused(dst, src, mask, px, write) {
+    if (!Number.isInteger(px) || px <= 0 || px > 4096 * 4096) return `refused ${px} pixels`;
+    const n = px * 4;
+    if (!src || !(src.length >= n)) return "a source too small";
+    if (dst && !(dst.length >= n)) return "a tile too small";
+    if (mask && !(mask.length >= px)) return "a mask too small";
+    if (typeof write !== "function") return "no write callback";
+    return "";
+}
+
+/**
+ * One tile of `px` pixels (`src` straight RGBA8, `op` an OPS number, `alpha` 0..255, optional `mask` of `px` coverage
+ * bytes) composited over `dst` (`px * 4` straight RGBA8 bytes, or null when the destination tile does not exist yet),
+ * keeping `dst` (or 0) untouched where `src` has alpha 0 or `mask` is 0 (`compositeStroke` in `inpaint_tiles.js`, K36).
+ * Returns 0 when no pixel changed, 1 when changed and non-empty (calling `write(true)` once for the buffer all `px * 4`
+ * bytes are copied into), 2 when changed and every pixel has alpha 0 afterwards. Rust twin: crates/px/src/composite.rs
+ * `masked_tile` (`px.js` `compositeMaskedTile`).
+ */
+export function compositeMaskedTile(dst, src, op, alpha, mask = null, px = 65536, write = null) {
+    const refused = maskedTileRefused(dst, src, mask, px, write);
+    if (refused) throw new Error("px: composite_masked_tile: " + refused);
+    op = (op | 0) & 255;
+    alpha = (alpha | 0) & 255;
+    if (!dst && op >= 1 && op <= 3) return 0;
+    const s8 = bytesOf(src);
+    const d8 = dst ? bytesOf(dst) : null;
+    const m8 = mask ? bytesOf(mask) : null;
+    let first = -1, last = -1;
+    if (m8) {
+        for (let i = 0; i < px; i++) {
+            if (m8[i] !== 0 && s8[i * 4 + 3] !== 0) { first = i; break; }
+        }
+        if (first < 0) return 0;
+        for (let i = px - 1; i >= first; i--) {
+            if (m8[i] !== 0 && s8[i * 4 + 3] !== 0) { last = i; break; }
+        }
+    } else {
+        for (let i = 0; i < px; i++) {
+            if (s8[i * 4 + 3] !== 0) { first = i; break; }
+        }
+        if (first < 0) return 0;
+        for (let i = px - 1; i >= first; i--) {
+            if (s8[i * 4 + 3] !== 0) { last = i; break; }
+        }
+    }
+    const span = last - first + 1, spanBytes = span * 4;
+    let scratch = MASKED_SCRATCH;
+    if (!scratch || scratch.length < spanBytes) {
+        scratch = MASKED_SCRATCH = new Uint8Array(Math.max(256 * 256 * 4, spanBytes));
+    }
+    const work = scratch.subarray(0, spanBytes);
+    if (d8) work.set(d8.subarray(first * 4, (last + 1) * 4));
+    else work.fill(0);
+    compositeTile(work, [s8.subarray(first * 4, (last + 1) * 4)], [op], [alpha], [m8 ? m8.subarray(first, last + 1) : null]);
+    let changed = false, nonEmpty = false;
+    for (let p = 0, i = first; p < span; p++, i++) {
+        const wo = p * 4, io = i * 4;
+        if (s8[io + 3] === 0 || (m8 !== null && m8[i] === 0)) {
+            if (d8) {
+                work[wo] = d8[io]; work[wo + 1] = d8[io + 1]; work[wo + 2] = d8[io + 2]; work[wo + 3] = d8[io + 3];
+            } else {
+                work[wo] = 0; work[wo + 1] = 0; work[wo + 2] = 0; work[wo + 3] = 0;
+            }
+        } else if (!changed) {
+            if (d8) {
+                if (work[wo] !== d8[io] || work[wo + 1] !== d8[io + 1] || work[wo + 2] !== d8[io + 2] || work[wo + 3] !== d8[io + 3]) changed = true;
+            } else if (work[wo] !== 0 || work[wo + 1] !== 0 || work[wo + 2] !== 0 || work[wo + 3] !== 0) {
+                changed = true;
+            }
+        }
+        if (!nonEmpty && work[wo + 3] !== 0) nonEmpty = true;
+    }
+    if (!changed) return 0;
+    if (!nonEmpty && d8) {
+        for (let i = 3, e = first * 4; i < e; i += 4) if (d8[i] !== 0) { nonEmpty = true; break; }
+        if (!nonEmpty) {
+            for (let i = (last + 1) * 4 + 3, e = px * 4; i < e; i += 4) if (d8[i] !== 0) { nonEmpty = true; break; }
+        }
+    }
+    if (!nonEmpty) return 2;
+    const out = bytesOf(write(true));
+    if (d8) {
+        if (out !== d8) {
+            if (first > 0) out.set(d8.subarray(0, first * 4), 0);
+            if (last + 1 < px) out.set(d8.subarray((last + 1) * 4, px * 4), (last + 1) * 4);
+        }
+        out.set(work, first * 4);
+    } else {
+        if (first > 0) out.fill(0, 0, first * 4);
+        out.set(work, first * 4);
+        if (last + 1 < px) out.fill(0, (last + 1) * 4, px * 4);
+    }
+    return 1;
+}
+
 // ---- colour match (B item 7 part 3) -----------------------------------------------------------
 
 /**
@@ -983,6 +1111,217 @@ export async function deflate(bytes) {
 
 // ---- float masks of a provider run (stitch.js) -------------------------------------------------------------------
 
+/** The alpha channel of RGBA8 bytes `rgba` as a 0..1 Float32Array (`out` when given, else a new one; `stitch.js` `maskFromAlpha`). */
+export function alphaToMask(rgba, out = null) {
+    const n = rgba.length >>> 2;
+    const dst = out || new Float32Array(n);
+    for (let i = 0, j = 3; i < n; i++, j += 4) dst[i] = rgba[j] / 255;
+    return dst;
+}
+
+/**
+ * Element-wise `Math.max(a[i], b[i])` (when `b` is given) and/or `Math.min(1, Math.max(0, x))` (when `clamp` is true)
+ * into `out` (allocated when absent; may be `a`, never `b`).
+ */
+export function maskMaxClamp(a, b = null, clamp = false, out = null) {
+    const n = a.length;
+    const dst = out || new Float32Array(n);
+    if (b && clamp) {
+        for (let i = 0; i < n; i++) dst[i] = Math.min(1, Math.max(0, Math.max(a[i], b[i])));
+    } else if (b) {
+        for (let i = 0; i < n; i++) dst[i] = Math.max(a[i], b[i]);
+    } else if (clamp) {
+        for (let i = 0; i < n; i++) dst[i] = Math.min(1, Math.max(0, a[i]));
+    } else if (dst !== a) {
+        dst.set(a);
+    }
+    return dst;
+}
+
+/** `1 - src[i]` for every float of `src`, into `out` (allocated when absent; may be `src`). */
+export function maskOneMinus(src, out = null) {
+    const n = src.length;
+    const dst = out || new Float32Array(n);
+    for (let i = 0; i < n; i++) dst[i] = 1 - src[i];
+    return dst;
+}
+
+/**
+ * A 0..1 float mask `src` as RGBA8 bytes (`out` when given, else a new `Uint8ClampedArray`):
+ * `mode` 0 white `[255, 255, 255, v]`, 1 luminance `[v, v, v, 255]` (`v = Math.round(clamp01(x) * 255)`,
+ * `stitch.js` `maskToCanvas`), 2 alpha `[0, 0, 0, x > 0.5 ? 0 : 255]` (`stitch.js` `alphaMask`).
+ */
+export function maskToRgba(src, mode = 0, out = null) {
+    const n = src.length;
+    const dst = out || new Uint8ClampedArray(n * 4);
+    if (mode === 2) {
+        for (let i = 0, j = 0; i < n; i++, j += 4) {
+            dst[j] = 0; dst[j + 1] = 0; dst[j + 2] = 0; dst[j + 3] = src[i] > 0.5 ? 0 : 255;
+        }
+    } else if (mode === 1) {
+        for (let i = 0, j = 0; i < n; i++, j += 4) {
+            const v = Math.round(Math.min(1, Math.max(0, src[i])) * 255);
+            dst[j] = v; dst[j + 1] = v; dst[j + 2] = v; dst[j + 3] = 255;
+        }
+    } else {
+        for (let i = 0, j = 0; i < n; i++, j += 4) {
+            const v = Math.round(Math.min(1, Math.max(0, src[i])) * 255);
+            dst[j] = 255; dst[j + 1] = 255; dst[j + 2] = 255; dst[j + 3] = v;
+        }
+    }
+    return dst;
+}
+
+/**
+ * Bounding box `[x0, y0, x1, y1]` (right and bottom exclusive) of the pixels of a `w` x `h` float mask `src` with
+ * `src[y * w + x] > 0.5`, or `null` when none are (`stitch.js` `selectionBbox`).
+ */
+export function maskBoundsF32(src, w, h) {
+    let x0 = w, y0 = h, x1 = -1, y1 = -1;
+    for (let y = 0; y < h; y++) {
+        const row = y * w;
+        for (let x = 0; x < w; x++) {
+            if (!(src[row + x] > 0.5)) continue;
+            if (x < x0) x0 = x;
+            if (x > x1) x1 = x;
+            if (y < y0) y0 = y;
+            y1 = y;
+        }
+    }
+    return x1 < 0 ? null : [x0, y0, x1 + 1, y1 + 1];
+}
+
+/**
+ * Matches the weighted RGB mean and standard deviation of `patch` (`n * 4` RGBA8 bytes, in place) to `reference`
+ * (`n * 4` RGBA8 bytes) under `weight` (`n` f32, `stitch.js` `colorMatch`). Leaves `patch` untouched and returns
+ * `false` when the clamped weight sum is below 64, else `true`.
+ */
+export function colorMatchRgba(patch, reference, weight) {
+    const n = weight.length;
+    let total = 0;
+    for (let i = 0; i < n; i++) total += Math.min(1, Math.max(0, weight[i]));
+    if (total < 64) return false;
+    const p = patch instanceof Uint8ClampedArray ? patch : new Uint8ClampedArray(patch.buffer, patch.byteOffset, n * 4);
+    const stats = (d) => {
+        const mean = [0, 0, 0], v = [0, 0, 0];
+        for (let i = 0, j = 0; i < n; i++, j += 4) {
+            const wt = weight[i];
+            if (wt <= 0) continue;
+            mean[0] += d[j] * wt; mean[1] += d[j + 1] * wt; mean[2] += d[j + 2] * wt;
+        }
+        for (let c = 0; c < 3; c++) mean[c] /= total;
+        for (let i = 0, j = 0; i < n; i++, j += 4) {
+            const wt = weight[i];
+            if (wt <= 0) continue;
+            for (let c = 0; c < 3; c++) { const dd = d[j + c] - mean[c]; v[c] += dd * dd * wt; }
+        }
+        return { mean, std: v.map((x) => Math.sqrt(Math.max(x / total, 1e-6 * 255 * 255))) };
+    };
+    const r = stats(reference), t = stats(p);
+    const scale = [0, 1, 2].map((c) => Math.min(2, Math.max(0.5, r.std[c] / t.std[c])));
+    for (let j = 0, end = n * 4; j < end; j += 4) {
+        for (let c = 0; c < 3; c++) {
+            p[j + c] = Math.min(255, Math.max(0, (p[j + c] - t.mean[c]) * scale[c] + r.mean[c]));
+        }
+    }
+    return true;
+}
+
+/**
+ * The alpha byte of each RGBA8 pixel of `rgba` replaced in `out` (allocated when absent; may be `rgba`) by
+ * `Math.round(clamp01(mask[i]) * (keepAlpha ? rgba[i * 4 + 3] : 255))` (`stitch.js` align copy and final alpha).
+ */
+export function blendAlpha(rgba, mask, keepAlpha = false, out = null) {
+    const n = mask.length;
+    const dst = out || new Uint8ClampedArray(n * 4);
+    if (dst !== rgba) dst.set(rgba.subarray(0, n * 4));
+    const clamped = dst instanceof Uint8ClampedArray ? dst : new Uint8ClampedArray(dst.buffer, dst.byteOffset, n * 4);
+    if (keepAlpha) {
+        for (let i = 0, j = 3; i < n; i++, j += 4) {
+            const a = Math.min(1, Math.max(0, mask[i]));
+            clamped[j] = Math.round(a * clamped[j]);
+        }
+    } else {
+        for (let i = 0, j = 3; i < n; i++, j += 4) {
+            const a = Math.min(1, Math.max(0, mask[i]));
+            clamped[j] = Math.round(a * 255);
+        }
+    }
+    return dst;
+}
+
+function shrinkPlane(src, w, h, tw, th, out = null) {
+    const dst = out || new Float32Array(tw * th);
+    if (tw === w && th === h) {
+        if (dst !== src) dst.set(src.subarray(0, tw * th));
+        return dst;
+    }
+    const fx = w / tw, fy = h / th;
+    for (let y = 0; y < th; y++) {
+        const y0 = Math.floor(y * fy), y1 = Math.max(y0 + 1, Math.min(h, Math.floor((y + 1) * fy)));
+        for (let x = 0; x < tw; x++) {
+            const x0 = Math.floor(x * fx), x1 = Math.max(x0 + 1, Math.min(w, Math.floor((x + 1) * fx)));
+            let s = 0;
+            for (let yy = y0; yy < y1; yy++) { const row = yy * w; for (let xx = x0; xx < x1; xx++) s += src[row + xx]; }
+            dst[y * tw + x] = s / ((y1 - y0) * (x1 - x0));
+        }
+    }
+    return dst;
+}
+
+/**
+ * Area-average shrink of straight-alpha RGBA8 `rgba` (`w * h * 4` bytes) to unpremultiplied grayscale `gray` and
+ * straight alpha `alpha` (`tw * th` Float32Arrays, `edgefit.js` `shrinkRGBA`). `a[i]` is rounded to f32 before
+ * averaging while `g[i]` multiplies by the unrounded double alpha (`edgefit.js:65-67`).
+ */
+export function edgefitShrink(rgba, w, h, tw, th, grayOut = null, alphaOut = null) {
+    const n = w * h, g = new Float32Array(n), a = new Float32Array(n);
+    for (let i = 0, j = 0; i < n; i++, j += 4) {
+        const al = rgba[j + 3] / 255;
+        a[i] = al;
+        g[i] = al * (0.299 * rgba[j] + 0.587 * rgba[j + 1] + 0.114 * rgba[j + 2]) / 255;
+    }
+    const gs = shrinkPlane(g, w, h, tw, th, grayOut), as = shrinkPlane(a, w, h, tw, th, alphaOut);
+    for (let i = 0; i < gs.length; i++) gs[i] = as[i] > 1e-4 ? gs[i] / as[i] : 0;
+    return { gray: gs, alpha: as };
+}
+
+/**
+ * Bilinear inverse-affine warp of RGBA8 `src` (`w * h * 4` bytes) through `m` (`[a00, a01, tx, a10, a11, ty]`,
+ * `edgefit.js` `warpRGBA`), into `out` (allocated as a `Uint8ClampedArray` when absent; must not alias `src`).
+ */
+export function warpRgba(src, w, h, m, out = null) {
+    const dst = out || new Uint8ClampedArray(w * h * 4);
+    const clamped = dst instanceof Uint8ClampedArray ? dst : new Uint8ClampedArray(dst.buffer, dst.byteOffset, w * h * 4);
+    const [a00, a01, tx, a10, a11, ty] = m;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        let X = a00 * x + a01 * y + tx, Y = a10 * x + a11 * y + ty;
+        X = Math.min(w - 1, Math.max(0, X)); Y = Math.min(h - 1, Math.max(0, Y));
+        const x0 = Math.min(w - 2, X | 0), y0 = Math.min(h - 2, Y | 0);
+        const fx = w > 1 ? X - x0 : 0, fy = h > 1 ? Y - y0 : 0;
+        const j = (Math.max(0, y0) * w + Math.max(0, x0)) * 4, dx = w > 1 ? 4 : 0, dy = h > 1 ? w * 4 : 0, o = (y * w + x) * 4;
+        for (let c = 0; c < 4; c++) {
+            clamped[o + c] = (src[j + c] * (1 - fx) + src[j + dx + c] * fx) * (1 - fy) + (src[j + dy + c] * (1 - fx) + src[j + dy + dx + c] * fx) * fy;
+        }
+    }
+    return dst;
+}
+
+/**
+ * Per-pixel source-bounds coverage mask (`w * h` Float32Array, 1 inside, 1 px ramp to 0 outside) for `m`
+ * (`[a00, a01, tx, a10, a11, ty]`, `edgefit.js` `warpCoverage`).
+ */
+export function warpCoverage(w, h, m, out = null) {
+    const dst = out || new Float32Array(w * h);
+    const [a00, a01, tx, a10, a11, ty] = m;
+    for (let y = 0, i = 0; y < h; y++) for (let x = 0; x < w; x++, i++) {
+        const X = a00 * x + a01 * y + tx, Y = a10 * x + a11 * y + ty;
+        const d = Math.min(X, w - 1 - X, Y, h - 1 - Y) + 1;
+        dst[i] = d >= 1 ? 1 : d <= 0 ? 0 : d;
+    }
+    return dst;
+}
+
 /**
  * The running maximum of every row over [x - r, x + r] (clamped to the row), never below 0: a monotonic queue of
  * indices, so a pixel costs the same whatever the radius (a loop over the radius took 1.9 s of a run's crop,
@@ -1023,6 +1362,14 @@ export function dilateMask(data, w, h, r) {
     maxRows(b, a, h, w, r, idx);
     transpose(a, b, h, w);
     return b;
+}
+
+/** Square erosion of a w x h float mask by r pixels (`1 - dilate(1 - m, r)` in f32); a new Float32Array. */
+export function erodeMask(data, w, h, r) {
+    if (r <= 0 || w <= 0 || h <= 0) return Float32Array.from(data);
+    const inv = maskOneMinus(data);
+    const d = dilateMask(inv, w, h, r);
+    return maskOneMinus(d, d);
 }
 
 /** One box blur pass of radius r along rows (clamped edges). */
@@ -1105,6 +1452,177 @@ export function pngUnfilterRows(lines, rows, rowBytes, bpp, prev, rgba = null) {
         }
     }
     return rows;
+}
+
+const CRC_TABLE = (() => {
+    const t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
+    return t;
+})();
+
+/** CRC-32 of `bytes`, continued from `start` (0 for a new checksum). */
+export function crc32(bytes, start = 0) {
+    bytes = bytesOf(bytes);
+    let c = (start ^ 0xFFFFFFFF) >>> 0;
+    for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+    return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+/**
+ * Frame `dataLen` bytes already at `buf[8..8 + dataLen]` as a PNG chunk of 4-byte `kind` (big-endian u32, e.g.
+ * `0x49444154` for `"IDAT"`): length and type in `buf[0..8]`, the CRC-32 over `buf[4..8 + dataLen]` in
+ * `buf[8 + dataLen..12 + dataLen]`. Returns that CRC-32.
+ */
+export function pngChunkFrame(buf, dataLen = buf.byteLength - 12, kind = 0x49444154) {
+    buf = bytesOf(buf);
+    const dv = new DataView(buf.buffer, buf.byteOffset, dataLen + 12);
+    dv.setUint32(0, dataLen >>> 0);
+    dv.setUint32(4, kind >>> 0);
+    const crc = crc32(buf.subarray(4, 8 + dataLen), 0);
+    dv.setUint32(8 + dataLen, crc);
+    return crc;
+}
+
+const ADLER_MOD = 65521;
+const PNG_PART_BYTES = 8 * 1048576;
+const PNG_PART_MAX_ROWS = 2048; // programRows / bandPlan.rows cap (inpaint_program.js / inpaint_bands.js)
+export const PART_NOT_LINES = -4, PART_BAD_FILTER = -5;
+
+/** Adler-32 of `bytes`, continued from `start` (1 for a new checksum). */
+export function adler32(bytes, start = 1) {
+    bytes = bytesOf(bytes);
+    let a = start & 0xFFFF, b = (start >>> 16) & 0xFFFF;
+    for (let i = 0; i < bytes.length; ) {
+        const end = Math.min(bytes.length, i + 5552);
+        for (; i < end; i++) {
+            a += bytes[i];
+            b += a;
+        }
+        a %= ADLER_MOD;
+        b %= ADLER_MOD;
+    }
+    return ((b << 16) | a) >>> 0;
+}
+
+/**
+ * Byte capacity of `lines` for a standard `PART_BYTES` (`8 MB`) part of a `w`-wide 8-bit RGBA PNG
+ * (`partRows(w) * (1 + 4 * w)`), or 0 when `w <= 0` (K7, docs/PLAN_WASM_BUILD.md §4.2).
+ */
+export function pngPartLinesCap(w) {
+    if (!Number.isInteger(w) || w <= 0 || w > 0x3fffffff) return 0;
+    const rowBytes = w * 4;
+    const rows = Math.max(1, Math.min(PNG_PART_MAX_ROWS, Math.floor(PNG_PART_BYTES / rowBytes)));
+    return rows * (rowBytes + 1);
+}
+
+function unfilterPartInto(lines, rows, w, up0, rt, out) {
+    const rowBytes = w * 4, stride = rowBytes + 1;
+    let up = up0;
+    for (let y = 0; y < rows; y++) {
+        const ft = lines[y * stride];
+        const src = lines.subarray(y * stride + 1, (y + 1) * stride);
+        const cur = out.subarray(y * rowBytes, (y + 1) * rowBytes);
+        if (ft === 0) {
+            cur.set(src);
+        } else if (ft === 1) {
+            cur[0] = src[0]; cur[1] = src[1]; cur[2] = src[2]; cur[3] = src[3];
+            for (let i = 4; i < rowBytes; i++) cur[i] = (src[i] + cur[i - 4]) & 255;
+        } else if (ft === 2) {
+            for (let i = 0; i < rowBytes; i++) cur[i] = (src[i] + up[i]) & 255;
+        } else if (ft === 3) {
+            for (let i = 0; i < 4; i++) cur[i] = (src[i] + (up[i] >> 1)) & 255;
+            for (let i = 4; i < rowBytes; i++) cur[i] = (src[i] + ((cur[i - 4] + up[i]) >> 1)) & 255;
+        } else {
+            for (let i = 0; i < 4; i++) cur[i] = (src[i] + up[i]) & 255;
+            for (let i = 4; i < rowBytes; i++) {
+                const a = cur[i - 4], b = up[i], c = up[i - 4];
+                let pa = b - c; if (pa < 0) pa = -pa;
+                let pb = a - c; if (pb < 0) pb = -pb;
+                let pc = a + b - 2 * c; if (pc < 0) pc = -pc;
+                cur[i] = (src[i] + (pa <= pb && pa <= pc ? a : pb <= pc ? b : c)) & 255;
+            }
+        }
+        up = cur;
+    }
+    const lastRow = out.subarray((rows - 1) * rowBytes, rows * rowBytes);
+    const savedLast = up0 ? (up0.set(lastRow), up0) : lastRow.slice();
+    const n = rows * rowBytes;
+    let opaque = true;
+    if (rt) {
+        const t = bytesOf(rt);
+        for (let i = 0; i < n; i += 4) {
+            const a = out[i + 3];
+            if (a < 255) {
+                opaque = false;
+                const row = a << 8;
+                out[i] = t[row | out[i]];
+                out[i + 1] = t[row | out[i + 1]];
+                out[i + 2] = t[row | out[i + 2]];
+            }
+        }
+    } else {
+        for (let i = 3; i < n; i += 4) {
+            if (out[i] < 255) { opaque = false; break; }
+        }
+    }
+    return { opaque, lastRow: savedLast };
+}
+
+/**
+ * Decode one inflated part (`lines`, a whole number of `1 + 4 * w`-byte scanlines) of a `w`-wide 8-bit RGBA PNG (K7,
+ * docs/PLAN_WASM_BUILD.md §4.2). Returns `{ code }` (`-4` not whole lines, `-5` bad filter byte), or
+ * `{ code: rows, rows, adler, firstFilter, opaque, needsPrev, out, prev }`. When `prev` is null and `firstFilter` is
+ * 2, 3, or 4, `lines` is left untouched and `needsPrev` is `true` (`out` and `prev` null); otherwise `out` receives
+ * the `rows * w * 4` RGBA8 bytes (round-tripped through `rt` when given), and `prev` (updated in place when given, or
+ * a new `4 * w`-byte `Uint8Array`) holds the last unfiltered row before `rt`.
+ */
+export function pngPartDecode(lines, w, prev = null, rt = null, out = null) {
+    if (!lines || !Number.isInteger(w) || w <= 0 || w > 0x3fffffff) return { code: PART_NOT_LINES };
+    const l = bytesOf(lines);
+    const rowBytes = w * 4, stride = rowBytes + 1;
+    if (l.length === 0 || l.length % stride !== 0) return { code: PART_NOT_LINES };
+    if (prev != null && bytesOf(prev).length < rowBytes) return { code: PART_NOT_LINES };
+    if (rt != null && bytesOf(rt).length < 65536) return { code: PART_NOT_LINES };
+    const rows = l.length / stride;
+    if (out != null && bytesOf(out).length < rows * rowBytes) return { code: PART_NOT_LINES };
+    for (let y = 0; y < rows; y++) {
+        if (l[y * stride] > 4) return { code: PART_BAD_FILTER };
+    }
+    const firstFilter = l[0];
+    const adler = adler32(l, 1);
+    if (prev == null && firstFilter >= 2) {
+        return { code: rows, rows, adler, firstFilter, opaque: false, needsPrev: true, out: null, prev: null };
+    }
+    const dst = out || new Uint8Array(rows * rowBytes);
+    const dstBytes = bytesOf(dst).subarray(0, rows * rowBytes);
+    const up0 = prev != null ? bytesOf(prev).subarray(0, rowBytes) : null;
+    const { opaque, lastRow } = unfilterPartInto(l, rows, w, up0, rt, dstBytes);
+    return { code: rows, rows, adler, firstFilter, opaque, needsPrev: false, out: dst, prev: prev != null ? prev : lastRow };
+}
+
+/**
+ * Finish a part whose `pngPartDecode` answered `needsPrev: true` once `prev` (`4 * w` unfiltered bytes from the row
+ * above) is ready (K7, docs/PLAN_WASM_BUILD.md §4.2). Updates `prev` to the last unfiltered row of this part (before
+ * `rt`), writes `rows * w * 4` RGBA8 bytes to `out` (applying `rt` when given), and returns
+ * `{ code: rows, rows, firstFilter, opaque, needsPrev: false, out, prev }`, or `{ code }` (`< 0`).
+ */
+export function pngPartFinish(lines, rows, w, prev, rt = null, out = null) {
+    if (!lines || !prev || !Number.isInteger(w) || w <= 0 || w > 0x3fffffff || !Number.isInteger(rows) || rows <= 0) {
+        return { code: PART_NOT_LINES };
+    }
+    const l = bytesOf(lines), p = bytesOf(prev);
+    const rowBytes = w * 4, stride = rowBytes + 1;
+    if (l.length !== rows * stride || p.length < rowBytes) return { code: PART_NOT_LINES };
+    if (rt != null && bytesOf(rt).length < 65536) return { code: PART_NOT_LINES };
+    if (out != null && bytesOf(out).length < rows * rowBytes) return { code: PART_NOT_LINES };
+    for (let y = 0; y < rows; y++) {
+        if (l[y * stride] > 4) return { code: PART_BAD_FILTER };
+    }
+    const firstFilter = l[0];
+    const dst = out || new Uint8Array(rows * rowBytes);
+    const dstBytes = bytesOf(dst).subarray(0, rows * rowBytes);
+    const { opaque } = unfilterPartInto(l, rows, w, p.subarray(0, rowBytes), rt, dstBytes);
+    return { code: rows, rows, firstFilter, opaque, needsPrev: false, out: dst, prev };
 }
 
 // ---- the smudge's dab (PLAN_0_1_31 §4 step 3) ---------------------------------------------------
@@ -1850,3 +2368,726 @@ export function selCombine(dst, size, src, off, stride, kind, bw, bh, mode, rgb)
     }
     return y0 < 0 ? null : [x0, y0, x1 + 1, y1 + 1];
 }
+
+function invertRefused(tile, size, bw, bh) {
+    if (!Number.isInteger(size) || size <= 0 || size > 4096) return true;
+    if (!Number.isInteger(bw) || !Number.isInteger(bh) || bw < 0 || bh < 0 || bw > size || bh > size) return true;
+    return !tile || tile.length < size * size * 4;
+}
+
+/**
+ * One `size`² tile of the selection (`tile`, RGBA8 in place) inverted in its `bw` x `bh` corner (`rgb` 0xRRGGBB;
+ * K11, docs/PLAN_WASM_BUILD.md §4.3). Returns the tile's extent [x0, y0, x1, y1] afterwards, or null when it holds no
+ * pixel. Rust twin: crates/px/src/sel.rs `mask_invert` (`px.js` `maskInvert`).
+ */
+export function maskInvert(tile, size, bw, bh, rgb) {
+    if (invertRefused(tile, size, bw, bh)) {
+        throw new Error(`px: mask_invert refused a tile of ${size} (${bw} x ${bh})`);
+    }
+    const d8 = bytesOf(tile);
+    const r = (rgb >>> 16) & 255, g = (rgb >>> 8) & 255, b = rgb & 255;
+    let x0 = size, y0 = -1, x1 = -1, y1 = -1;
+    const words = LITTLE && (d8.byteOffset & 3) === 0;
+    const d32 = words ? new Uint32Array(d8.buffer, d8.byteOffset, size * size) : null;
+    const RGB = ((b << 16) | (g << 8) | r) >>> 0;
+    for (let y = 0; y < size; y++) {
+        let first = -1, last = -1, from = 0;
+        if (y < bh && bw > 0) {
+            from = bw;
+            if (words) {
+                const row = y * size;
+                for (let x = 0, o = row; x < bw; x++, o++) {
+                    const a = 255 - (d32[o] >>> 24);
+                    if (a) {
+                        d32[o] = ((a << 24) | RGB) >>> 0;
+                        if (first < 0) first = x;
+                        last = x;
+                    } else d32[o] = 0;
+                }
+            } else {
+                for (let x = 0, o = y * size * 4; x < bw; x++, o += 4) {
+                    const a = 255 - d8[o + 3];
+                    if (a) {
+                        d8[o] = r; d8[o + 1] = g; d8[o + 2] = b; d8[o + 3] = a;
+                        if (first < 0) first = x;
+                        last = x;
+                    } else {
+                        d8[o] = 0; d8[o + 1] = 0; d8[o + 2] = 0; d8[o + 3] = 0;
+                    }
+                }
+            }
+        }
+        const at = y * size * 4 + 3;
+        let x = from;
+        while (x < size && !d8[at + x * 4]) x++;
+        if (x < size) {
+            if (first < 0) first = x;
+            let e = size - 1;
+            while (e > x && !d8[at + e * 4]) e--;
+            last = e;
+        }
+        if (first >= 0) {
+            if (y0 < 0) y0 = y;
+            y1 = y;
+            if (first < x0) x0 = first;
+            if (last > x1) x1 = last;
+        }
+    }
+    return y0 < 0 ? null : [x0, y0, x1 + 1, y1 + 1];
+}
+
+/**
+ * Per-tile minimum, maximum, and edge flag over a depth map (`map` and optional `rmax`, `mw` x `mh` u16) for a
+ * `W` x `H` document in `tile`² tiles (K21, docs/PLAN_WASM_BUILD.md §4.8). Rust twin: crates/px/src/range.rs
+ * (`px.js` `mapTileStats`).
+ */
+export function mapTileStats(map, rmax, mw, mh, xf, W, H, thresh = 0, tile = 256) {
+    if (!map || !(mw > 0) || !(mh > 0) || !(W > 0) || !(H > 0) || !(tile > 0) || !Array.isArray(xf) || xf.length < 6) {
+        throw new Error("mapTileStats: bad arguments");
+    }
+    const [m0, m1, m2, m3, m4, m5] = xf;
+    if (!Number.isFinite(m0) || !Number.isFinite(m1) || !Number.isFinite(m2) || !Number.isFinite(m3) || !Number.isFinite(m4) || !Number.isFinite(m5)) {
+        throw new Error("mapTileStats: non-finite xf");
+    }
+    if (map.length < mw * mh) throw new Error("mapTileStats: short map");
+    const hasRmax = rmax != null && rmax.length > 0;
+    if (hasRmax && rmax.length < mw * mh) throw new Error("mapTileStats: short rmax");
+    const thr = hasRmax ? Math.max(0, Math.min(0xffffffff, Math.floor(Number(thresh) || 0))) : 0;
+
+    const cols = Math.ceil(W / tile);
+    const rows = Math.ceil(H / tile);
+    const min = new Uint16Array(cols * rows);
+    const max = new Uint16Array(cols * rows);
+    const edge = new Uint8Array(cols * rows);
+
+    for (let ty = 0; ty < rows; ty++) {
+        const y0 = ty * tile;
+        const y1 = Math.min(H, (ty + 1) * tile);
+        const rowOff = ty * cols;
+        for (let tx = 0; tx < cols; tx++) {
+            const x0 = tx * tile;
+            const x1 = Math.min(W, (tx + 1) * tile);
+
+            const x00 = m0 * x0 + m2 * y0 + m4;
+            const y00 = m1 * x0 + m3 * y0 + m5;
+            const x10 = m0 * x1 + m2 * y0 + m4;
+            const y10 = m1 * x1 + m3 * y0 + m5;
+            const x01 = m0 * x0 + m2 * y1 + m4;
+            const y01 = m1 * x0 + m3 * y1 + m5;
+            const x11 = m0 * x1 + m2 * y1 + m4;
+            const y11 = m1 * x1 + m3 * y1 + m5;
+
+            const mx0 = Math.min(x00, x10, x01, x11);
+            const my0 = Math.min(y00, y10, y01, y11);
+            const mx1 = Math.max(x00, x10, x01, x11);
+            const my1 = Math.max(y00, y10, y01, y11);
+
+            const rx0 = Math.floor(mx0 - 2);
+            const ry0 = Math.floor(my0 - 2);
+            const rx1 = Math.ceil(mx1 + 2);
+            const ry1 = Math.ceil(my1 + 2);
+            const meetsMap = rx0 <= mw - 1 && rx1 >= 0 && ry0 <= mh - 1 && ry1 >= 0;
+
+            const ix0 = Math.max(0, Math.min(mw - 1, rx0));
+            const iy0 = Math.max(0, Math.min(mh - 1, ry0));
+            const ix1 = Math.max(0, Math.min(mw - 1, rx1));
+            const iy1 = Math.max(0, Math.min(mh - 1, ry1));
+
+            let lo = 65535;
+            let hi = 0;
+            let hasEdge = 0;
+
+            for (let my = iy0; my <= iy1; my++) {
+                const row = my * mw;
+                for (let mx = ix0; mx <= ix1; mx++) {
+                    const idx = row + mx;
+                    const v = map[idx];
+                    if (v < lo) lo = v;
+                    if (v > hi) hi = v;
+                    if (meetsMap && !hasEdge && hasRmax && rmax[idx] > thr) {
+                        hasEdge = 1;
+                    }
+                }
+            }
+
+            const outIdx = rowOff + tx;
+            min[outIdx] = lo;
+            max[outIdx] = hi;
+            edge[outIdx] = hasEdge;
+        }
+    }
+
+    return { min, max, edge, cols, rows };
+}
+
+function rangeSstep(a, b, x) {
+    if (b <= a) return x >= b ? 1 : 0;
+    if (x <= a) return 0;
+    if (x >= b) return 1;
+    const t = (x - a) / (b - a);
+    if (t <= 1e-14) return 0;
+    if (t >= 1 - 1e-14) return 1;
+    return t * t * (3 - 2 * t);
+}
+
+function rangeWeightScalar(v, lo, hi, fLo, fHi, limitInvert) {
+    const wLo = fLo > 0 ? rangeSstep(lo - fLo, lo, v) : (v >= lo - 1e-12 ? 1 : 0);
+    const wHi = fHi > 0 ? (1 - rangeSstep(hi, hi + fHi, v)) : (v <= hi + 1e-12 ? 1 : 0);
+    const w = wLo * wHi;
+    return limitInvert ? 1 - w : w;
+}
+
+function rangeU16Bilinear(data, w, h, px, py) {
+    const u = px - 0.5;
+    const v = py - 0.5;
+    const x0 = Math.floor(u);
+    const y0 = Math.floor(v);
+    const x1 = x0 + 1;
+    const y1 = y0 + 1;
+    const fx = u - x0;
+    const fy = v - y0;
+    const cx0 = Math.max(0, Math.min(w - 1, x0));
+    const cx1 = Math.max(0, Math.min(w - 1, x1));
+    const cy0 = Math.max(0, Math.min(h - 1, y0));
+    const cy1 = Math.max(0, Math.min(h - 1, y1));
+    const s00 = data[cy0 * w + cx0] / 65535;
+    const s10 = data[cy0 * w + cx1] / 65535;
+    const s01 = data[cy1 * w + cx0] / 65535;
+    const s11 = data[cy1 * w + cx1] / 65535;
+    const top = s00 + fx * (s10 - s00);
+    const bot = s01 + fx * (s11 - s01);
+    return top + fy * (bot - top);
+}
+
+const _expBuf = new ArrayBuffer(8);
+const _expDV = new DataView(_expBuf);
+const EXP_LN2HI = 6.93147180369123816490e-01; // 0x3fe62e42, 0xfee00000
+const EXP_LN2LO = 1.90821492927058770002e-10; // 0x3dea39ef, 0x35793c76
+const EXP_INVLN2 = 1.44269504088896338700e+00; // 0x3ff71547, 0x652b82fe
+const EXP_P1 = 1.66666666666666019037e-01; // 0x3FC55555, 0x5555553E
+const EXP_P2 = -2.77777777770155933842e-03; // 0xBF66C16C, 0x16BEBD93
+const EXP_P3 = 6.61375632143793436117e-05; // 0x3F11566A, 0xAF25DE2C
+const EXP_P4 = -1.65339022054652515390e-06; // 0xBEBBBD41, 0xC5D26BF1
+const EXP_P5 = 4.13813679705723846039e-08; // 0x3E663769, 0x72BEA4D0
+const EXP_1P1023 = 8.98846567431158e+307; // 0x7fe0000000000000 (2^1023)
+const EXP_SUBNORM_MUL = 2.0041683600089728e-292; // 0x0360000000000000 (2^-969)
+
+/**
+ * Port of `compiler_builtins` / `libm::exp` (`e_exp.c` + `scalbn`, IEEE 754 `f64`) as compiled into `px.wasm` and
+ * `px_scalar.wasm`, so the JS twin and Rust kernel produce identical `f64` bits across all V8 versions (Node and
+ * Electron).
+ */
+export function libmExp(x) {
+    _expDV.setFloat64(0, x, true);
+    let hx = _expDV.getUint32(4, true);
+    const sign = hx >>> 31;
+    hx &= 0x7fffffff;
+
+    if (hx >= 0x4086232b) {
+        if (Number.isNaN(x)) return x;
+        if (x > 709.782712893383973096) return x * EXP_1P1023;
+        if (x < -745.13321910194110842) return 0.0;
+    }
+
+    let hi = 0.0;
+    let lo = 0.0;
+    let k = 0;
+    if (hx > 0x3fd62e42) {
+        if (hx >= 0x3ff0a2b2) {
+            k = (EXP_INVLN2 * x + (sign ? -0.5 : 0.5)) | 0;
+        } else {
+            k = 1 - sign - sign;
+        }
+        hi = x - k * EXP_LN2HI;
+        lo = k * EXP_LN2LO;
+        x = hi - lo;
+    } else if (hx > 0x3e300000) {
+        k = 0;
+        hi = x;
+        lo = 0.0;
+    } else {
+        return 1.0 + x;
+    }
+
+    const xx = x * x;
+    const c = x - xx * (EXP_P1 + xx * (EXP_P2 + xx * (EXP_P3 + xx * (EXP_P4 + xx * EXP_P5))));
+    let y = 1.0 + (x * c / (2.0 - c) - lo + hi);
+    if (k === 0) return y;
+
+    let n = k;
+    if (n > 1023) {
+        y *= EXP_1P1023;
+        n -= 1023;
+        if (n > 1023) {
+            y *= EXP_1P1023;
+            n -= 1023;
+            if (n > 1023) n = 1023;
+        }
+    } else if (n < -1022) {
+        y *= EXP_SUBNORM_MUL;
+        n += 969;
+        if (n < -1022) {
+            y *= EXP_SUBNORM_MUL;
+            n += 969;
+            if (n < -1022) n = -1022;
+        }
+    }
+    _expDV.setUint32(0, 0, true);
+    _expDV.setUint32(4, ((1023 + n) << 20) >>> 0, true);
+    return y * _expDV.getFloat64(0, true);
+}
+
+function rangeSnapField(mdata, w, h, gdata, gw, gh, mx, my, pr, pg, pb, sigmaR, tau) {
+    if (!(sigmaR > 0) || !gdata) {
+        return rangeU16Bilinear(mdata, w, h, mx, my);
+    }
+    const u = mx - 0.5;
+    const v = my - 0.5;
+    const ix = Math.floor(u);
+    const iy = Math.floor(v);
+
+    let lo = 65535;
+    let hi = 0;
+    for (let dy = -1; dy <= 2; dy++) {
+        const y = Math.max(0, Math.min(h - 1, iy + dy));
+        const row = y * w;
+        for (let dx = -1; dx <= 2; dx++) {
+            const x = Math.max(0, Math.min(w - 1, ix + dx));
+            const val = mdata[row + x];
+            if (val < lo) lo = val;
+            if (val > hi) hi = val;
+        }
+    }
+
+    const range = hi / 65535 - lo / 65535;
+    const k = rangeSstep(tau, 2 * tau, range);
+    if (k <= 0) {
+        return rangeU16Bilinear(mdata, w, h, mx, my);
+    }
+
+    const inv2SigmaR2 = 0.5 / (sigmaR * sigmaR);
+    let num = 0;
+    let den = 0;
+    for (let dy = -1; dy <= 2; dy++) {
+        const ty = iy + dy;
+        const distY = v - ty;
+        const distY2 = distY * distY;
+        const cy = Math.max(0, Math.min(h - 1, ty));
+        const gy = Math.max(0, Math.min(gh - 1, ty));
+        const mrow = cy * w;
+        const grow = gy * gw;
+        for (let dx = -1; dx <= 2; dx++) {
+            const tx = ix + dx;
+            const distX = u - tx;
+            const distSpatial2 = distX * distX + distY2;
+            const cx = Math.max(0, Math.min(w - 1, tx));
+            const gx = Math.max(0, Math.min(gw - 1, tx));
+            const gIdx = (grow + gx) * 4;
+            const gr = gdata[gIdx] / 255;
+            const gg = gdata[gIdx + 1] / 255;
+            const gb = gdata[gIdx + 2] / 255;
+            const dr = pr - gr;
+            const dg = pg - gg;
+            const db = pb - gb;
+            const distColor2 = dr * dr + dg * dg + db * db;
+            const wSpatial = libmExp(-0.5 * distSpatial2);
+            const wColor = libmExp(-distColor2 * inv2SigmaR2);
+            const weight = wSpatial * wColor;
+            const mVal = mdata[mrow + cx] / 65535;
+            num += weight * mVal;
+            den += weight;
+        }
+    }
+
+    const bil = rangeU16Bilinear(mdata, w, h, mx, my);
+    if (!(den > 1e-6)) return bil;
+    const snapped = num / den;
+    return bil + k * (snapped - bil);
+}
+
+/**
+ * Evaluates the `"compute"`-class tiles (`classes[tx] === 2` or `"compute"`, or every column when `classes` is null)
+ * of one document tile row `ty` (`[y0, y1)` clipped to `[ty * tile, min((ty + 1) * tile, H))`) over a depth map
+ * (`map`, `mw` x `mh` u16, affine transform `xf`) and optional joint-bilateral snap (`snap = [sigmaR, tau]`, `guide`,
+ * `pic`) (K22, docs/PLAN_WASM_BUILD.md §4.8). Rust twin: crates/px/src/range.rs `range_tiles_depth` (`px.js`
+ * `rangeTilesDepth`).
+ */
+export function rangeTilesDepth(map, mw, mh, xf, W, H, ty, y0, y1, limit, invert = false, snap = null, guide = null, pic = null, classes = null, tile = 256) {
+    if (!map || !limit || !(mw > 0) || !(mh > 0) || !(W > 0) || !(H > 0) || !(tile > 0 && tile <= 4096) || !(ty >= 0) || !(y0 < y1) || !Array.isArray(xf) || xf.length < 6) {
+        throw new Error("rangeTilesDepth: bad arguments");
+    }
+    const [m0, m1, m2, m3, m4, m5] = xf;
+    const lo = +limit.lo || 0, hi = +limit.hi || 0;
+    const fLo = +limit.fLo || 0, fHi = +limit.fHi || 0;
+    const limitInvert = !!limit.invert;
+    const jobInvert = !!invert;
+    const sigmaR = Array.isArray(snap) && snap.length >= 2 ? +snap[0] || 0 : 0;
+    const tau = Array.isArray(snap) && snap.length >= 2 ? +snap[1] || 0 : 0;
+    if (![m0, m1, m2, m3, m4, m5, lo, hi, fLo, fHi, sigmaR, tau].every(Number.isFinite)) {
+        throw new Error("rangeTilesDepth: non-finite parameters");
+    }
+    if (map.length < mw * mh) throw new Error("rangeTilesDepth: short map");
+    const cols = Math.ceil(W / tile);
+    if (classes && classes.length < cols) throw new Error("rangeTilesDepth: short classes");
+
+    let gBytes = null, gw = mw, gh = mh;
+    if (guide) {
+        const gd = guide.data || guide;
+        gw = guide.w != null ? guide.w | 0 : mw;
+        gh = guide.h != null ? guide.h | 0 : mh;
+        if (!gd || gw !== mw || gh !== mh) throw new Error("rangeTilesDepth: bad guide");
+        gBytes = bytesOf(gd);
+        if (gBytes.length < mw * mh * 4) throw new Error("rangeTilesDepth: short guide");
+    }
+    let pBytes = null, picX0 = 0, picY0 = 0, picX1 = 0, picY1 = 0, picW = 0;
+    if (pic && pic.data && (pic.w | 0) > 0 && (pic.h | 0) > 0) {
+        if ((pic.x0 | 0) < 0 || (pic.y0 | 0) < 0) throw new Error("rangeTilesDepth: bad pic origin");
+        pBytes = bytesOf(pic.data);
+        picX0 = pic.x0 | 0;
+        picY0 = pic.y0 | 0;
+        picW = pic.w | 0;
+        const picH = pic.h | 0;
+        if (pBytes.length < picW * picH * 4) throw new Error("rangeTilesDepth: short pic");
+        picX1 = picX0 + picW;
+        picY1 = picY0 + picH;
+    }
+    const snapOn = sigmaR > 0 && gBytes !== null && pBytes !== null;
+
+    const tileY0 = ty * tile;
+    const tileY1 = Math.min(tileY0 + tile, H);
+    const tiles = [];
+    let bX0 = Infinity, bY0 = Infinity, bX1 = -Infinity, bY1 = -Infinity;
+    let alphaSum = 0;
+
+    for (let tx = 0; tx < cols; tx++) {
+        if (classes) {
+            const cls = classes[tx];
+            if (cls !== 2 && cls !== "compute") continue;
+        }
+        const tileX0 = tx * tile;
+        const tileX1 = Math.min(tileX0 + tile, W);
+        const alpha = new Uint8Array(tile * tile);
+        let zeros = 0, fulls = 0;
+        let tMinX = tile, tMinY = tile, tMaxX = -1, tMaxY = -1;
+
+        for (let py = 0; py < tile; py++) {
+            const y = tileY0 + py;
+            if (y < y0 || y >= y1 || y >= H) {
+                zeros += tile;
+                continue;
+            }
+            const pyOffset = py * tile;
+            const pyCentre = y + 0.5;
+            for (let px = 0; px < tile; px++) {
+                const x = tileX0 + px;
+                if (x >= W) {
+                    zeros++;
+                    continue;
+                }
+                const pxCentre = x + 0.5;
+                const mx = m0 * pxCentre + m2 * pyCentre + m4;
+                const my = m1 * pxCentre + m3 * pyCentre + m5;
+                let v;
+                if (snapOn && x >= picX0 && x < picX1 && y >= picY0 && y < picY1) {
+                    const pOffset = ((y - picY0) * picW + (x - picX0)) * 4;
+                    const pr = pBytes[pOffset] / 255;
+                    const pg = pBytes[pOffset + 1] / 255;
+                    const pb = pBytes[pOffset + 2] / 255;
+                    v = rangeSnapField(map, mw, mh, gBytes, gw, gh, mx, my, pr, pg, pb, sigmaR, tau);
+                } else {
+                    v = rangeU16Bilinear(map, mw, mh, mx, my);
+                }
+                const w = rangeWeightScalar(v, lo, hi, fLo, fHi, limitInvert);
+                const a = Math.round(255 * (jobInvert ? 1 - w : w));
+                alpha[pyOffset + px] = a;
+                alphaSum += a;
+                if (a === 0) {
+                    zeros++;
+                } else {
+                    if (a === 255) fulls++;
+                    if (px < tMinX) tMinX = px;
+                    if (px > tMaxX) tMaxX = px;
+                    if (py < tMinY) tMinY = py;
+                    if (py > tMaxY) tMaxY = py;
+                }
+            }
+        }
+
+        if (zeros === tile * tile) continue;
+        if (fulls === tile * tile && (tileX1 - tileX0) === tile && (tileY1 - tileY0) === tile) {
+            tiles.push({ tx, ty, full: true });
+            bX0 = Math.min(bX0, tileX0);
+            bY0 = Math.min(bY0, tileY0);
+            bX1 = Math.max(bX1, tileX0 + tile);
+            bY1 = Math.max(bY1, tileY0 + tile);
+        } else {
+            tiles.push({ tx, ty, alpha: alpha.buffer });
+            bX0 = Math.min(bX0, tileX0 + tMinX);
+            bY0 = Math.min(bY0, tileY0 + tMinY);
+            bX1 = Math.max(bX1, tileX0 + tMaxX + 1);
+            bY1 = Math.max(bY1, tileY0 + tMaxY + 1);
+        }
+    }
+
+    const bounds = Number.isFinite(bX0) ? [bX0, bY0, bX1, bY1] : null;
+    return { tiles, bounds, alphaSum };
+}
+
+const RANGE_LUMA_R = new Float64Array(256);
+const RANGE_LUMA_G = new Float64Array(256);
+const RANGE_LUMA_B = new Float64Array(256);
+const RANGE_INV255 = new Float64Array(256);
+const RANGE_OPP_R = new Float64Array(256);
+const RANGE_OPP_G = new Float64Array(256);
+const RANGE_OPP_B = new Float64Array(256);
+for (let i = 0; i < 256; i++) {
+    RANGE_LUMA_R[i] = 0.299 * i;
+    RANGE_LUMA_G[i] = 0.587 * i;
+    RANGE_LUMA_B[i] = 0.114 * i;
+    const u = i / 255;
+    RANGE_INV255[i] = u;
+    RANGE_OPP_R[i] = 0.299 * u;
+    RANGE_OPP_G[i] = 0.587 * u;
+    RANGE_OPP_B[i] = 0.114 * u;
+}
+
+function rangeHexToRgb01(hex) {
+    if (!hex || typeof hex !== "string") return [1, 1, 1];
+    const clean = hex.replace(/^#/, "");
+    if (clean.length === 6) {
+        return [
+            parseInt(clean.slice(0, 2), 16) / 255,
+            parseInt(clean.slice(2, 4), 16) / 255,
+            parseInt(clean.slice(4, 6), 16) / 255,
+        ];
+    }
+    if (clean.length === 3) {
+        return [
+            parseInt(clean[0] + clean[0], 16) / 255,
+            parseInt(clean[1] + clean[1], 16) / 255,
+            parseInt(clean[2] + clean[2], 16) / 255,
+        ];
+    }
+    return [1, 1, 1];
+}
+
+/**
+ * Evaluates one document tile row `ty` (`[y0, y1)` clipped to `[ty * tile, min((ty + 1) * tile, H))`) over a
+ * `(y1 - y0)`-row RGBA8 band `rgba` (`W * (y1 - y0) * 4` bytes) for `"luma"` (three 256-entry `f64` product tables)
+ * or `"color"` (opponent colour similarity with `libmExp`) range selection (K23, docs/PLAN_WASM_BUILD.md §4.8).
+ * Rust twin: crates/px/src/range.rs `range_tiles_rgba` (`px.js` `rangeTilesRgba`).
+ */
+export function rangeTilesRgba(rgba, W, H, ty, y0, y1, limit, invert = false, tile = 256) {
+    if (!rgba || !limit || !(W > 0) || !(H > 0) || !(tile > 0 && tile <= 4096) || !(ty >= 0) || !(y0 >= 0) || !(y0 < y1) || !(y1 <= H)) {
+        throw new Error("rangeTilesRgba: bad arguments");
+    }
+    const u8 = bytesOf(rgba);
+    if (!u8 || u8.length < (y1 - y0) * W * 4) throw new Error("rangeTilesRgba: short rgba");
+
+    const isColor = limit.source === "color" || (limit.source !== "luma" && limit.color != null);
+    const lo = limit.lo == null ? 0 : +limit.lo;
+    const hi = limit.hi == null ? 0 : +limit.hi;
+    const fLo = limit.fLo == null ? 0 : +limit.fLo;
+    const fHi = limit.fHi == null ? 0 : +limit.fHi;
+    const tol = limit.tol == null ? 30 : +limit.tol;
+    const limitInvert = !!limit.invert;
+    const jobInvert = !!invert;
+    let refL = 0, refA = 0, refB = 0;
+    if (isColor) {
+        const [r, g, b] = rangeHexToRgb01(limit.color || "#ffffff");
+        refL = 0.299 * r + 0.587 * g + 0.114 * b;
+        refA = r - refL;
+        refB = b - refL;
+    }
+    if (![lo, hi, fLo, fHi, refL, refA, refB, tol].every(Number.isFinite)) {
+        throw new Error("rangeTilesRgba: non-finite parameters");
+    }
+
+    const tileY0 = ty * tile;
+    const tileY1 = Math.min(tileY0 + tile, H);
+    const ry0 = Math.max(tileY0, y0);
+    const ry1 = Math.min(tileY1, y1);
+    if (!(ry0 < ry1)) {
+        return { tiles: [], bounds: null, alphaSum: 0 };
+    }
+
+    const s = 0.04 + Math.max(0, Math.min(1, (tol || 0) / 100)) * 0.6;
+    const twoS2 = 2 * s * s;
+
+    const cols = Math.ceil(W / tile);
+    const tiles = [];
+    let bX0 = Infinity, bY0 = Infinity, bX1 = -Infinity, bY1 = -Infinity;
+    let alphaSum = 0;
+
+    for (let tx = 0; tx < cols; tx++) {
+        const tileX0 = tx * tile;
+        const tileX1 = Math.min(tileX0 + tile, W);
+        const alpha = new Uint8Array(tile * tile);
+        let zeros = 0, fulls = 0;
+        let tMinX = tile, tMinY = tile, tMaxX = -1, tMaxY = -1;
+
+        for (let py = 0; py < tile; py++) {
+            const y = tileY0 + py;
+            if (y < y0 || y >= y1 || y >= H) {
+                zeros += tile;
+                continue;
+            }
+            const pyOffset = py * tile;
+            const rowOffset = (y - y0) * W;
+            for (let px = 0; px < tile; px++) {
+                const x = tileX0 + px;
+                if (x >= W) {
+                    zeros++;
+                    continue;
+                }
+                const offset = (rowOffset + x) * 4;
+                const rb = u8[offset];
+                const gb = u8[offset + 1];
+                const bb = u8[offset + 2];
+                let v;
+                if (!isColor) {
+                    v = (RANGE_LUMA_R[rb] + RANGE_LUMA_G[gb] + RANGE_LUMA_B[bb]) / 255;
+                } else {
+                    const L = RANGE_OPP_R[rb] + RANGE_OPP_G[gb] + RANGE_OPP_B[bb];
+                    const d0 = L - refL;
+                    const d1 = (RANGE_INV255[rb] - L) - refA;
+                    const d2 = (RANGE_INV255[bb] - L) - refB;
+                    const dd = d0 * d0 + 4 * (d1 * d1 + d2 * d2);
+                    v = libmExp(-dd / twoS2);
+                }
+                const w = rangeWeightScalar(v, lo, hi, fLo, fHi, limitInvert);
+                const a = Math.round(255 * (jobInvert ? 1 - w : w));
+                alpha[pyOffset + px] = a;
+                alphaSum += a;
+                if (a === 0) {
+                    zeros++;
+                } else {
+                    if (a === 255) fulls++;
+                    if (px < tMinX) tMinX = px;
+                    if (px > tMaxX) tMaxX = px;
+                    if (py < tMinY) tMinY = py;
+                    if (py > tMaxY) tMaxY = py;
+                }
+            }
+        }
+
+        if (zeros === tile * tile) continue;
+        if (fulls === tile * tile && (tileX1 - tileX0) === tile && (tileY1 - tileY0) === tile) {
+            tiles.push({ tx, ty, full: true });
+            bX0 = Math.min(bX0, tileX0);
+            bY0 = Math.min(bY0, tileY0);
+            bX1 = Math.max(bX1, tileX0 + tile);
+            bY1 = Math.max(bY1, tileY0 + tile);
+        } else {
+            tiles.push({ tx, ty, alpha: alpha.buffer });
+            bX0 = Math.min(bX0, tileX0 + tMinX);
+            bY0 = Math.min(bY0, tileY0 + tMinY);
+            bX1 = Math.max(bX1, tileX0 + tMaxX + 1);
+            bY1 = Math.max(bY1, tileY0 + tMaxY + 1);
+        }
+    }
+
+    const bounds = Number.isFinite(bX0) ? [bX0, bY0, bX1, bY1] : null;
+    return { tiles, bounds, alphaSum };
+}
+
+/**
+ * Multiplies the alpha channel of `rgba` (`w * h * 4` RGBA8 bytes, in place) by the depth limit weight over `map`
+ * (`mw` x `mh` u16, affine transform `xf`) and optional joint-bilateral snap (`snap = [sigmaR, tau]`, `guide`,
+ * optional `col` reference RGBA8) in chunks of at most 256 rows (K25, docs/PLAN_WASM_BUILD.md §4.8).
+ * When `col` is null and `guide` is given, the snap reference colour is sampled from `guide` at `(mx, my)`.
+ * Rust twin: crates/px/src/range.rs `limit_alpha_rows` (`px.js` `limitAlphaRows`).
+ */
+export function limitAlphaRows(rgba, map, mw, mh, xf, x0, y0, w, h, limit, snap = null, guide = null, col = null) {
+    if (!rgba || !(map instanceof Uint16Array) || !limit || !(mw > 0) || !(mh > 0) || !Number.isInteger(w) || !Number.isInteger(h) || w < 0 || h < 0 || !Number.isInteger(x0) || !Number.isInteger(y0) || (!Array.isArray(xf) && !ArrayBuffer.isView(xf)) || xf.length < 6) {
+        throw new Error("limitAlphaRows: bad arguments");
+    }
+    if (map.length < mw * mh) throw new Error("limitAlphaRows: short map");
+    const u8 = ArrayBuffer.isView(rgba)
+        ? bytesOf(rgba)
+        : (rgba instanceof ArrayBuffer ? new Uint8Array(rgba) : null);
+    const needBytes = w * h * 4;
+    if (!u8 || u8.length < needBytes) throw new Error("limitAlphaRows: short rgba");
+
+    let cBytes = null;
+    if (col != null) {
+        cBytes = ArrayBuffer.isView(col)
+            ? bytesOf(col)
+            : (col instanceof ArrayBuffer ? new Uint8Array(col) : null);
+        if (!cBytes || cBytes.length < needBytes) throw new Error("limitAlphaRows: short col");
+    }
+
+    const m0 = +xf[0], m1 = +xf[1], m2 = +xf[2], m3 = +xf[3], m4 = +xf[4], m5 = +xf[5];
+    const lo = limit.lo == null ? 0 : +limit.lo;
+    const hi = limit.hi == null ? 1 : +limit.hi;
+    const fLo = limit.fLo == null ? 0 : +limit.fLo;
+    const fHi = limit.fHi == null ? 0 : +limit.fHi;
+    const limitInvert = !!limit.invert;
+    let sigmaR = 0, tau = 0;
+    if (snap != null) {
+        if ((!Array.isArray(snap) && !ArrayBuffer.isView(snap)) || snap.length < 2) {
+            throw new Error("limitAlphaRows: snap must have 2 elements");
+        }
+        sigmaR = snap[0] == null ? 0 : +snap[0];
+        tau = snap[1] == null ? 0 : +snap[1];
+    }
+    if (![m0, m1, m2, m3, m4, m5, lo, hi, fLo, fHi, sigmaR, tau].every(Number.isFinite)) {
+        throw new Error("limitAlphaRows: non-finite parameters");
+    }
+
+    let gBytes = null;
+    if (guide != null) {
+        const gRaw = guide.data || guide;
+        const gw = guide.w != null ? guide.w | 0 : mw;
+        const gh = guide.h != null ? guide.h | 0 : mh;
+        if (!gRaw || gw !== mw || gh !== mh) throw new Error("limitAlphaRows: bad guide");
+        gBytes = ArrayBuffer.isView(gRaw)
+            ? bytesOf(gRaw)
+            : (gRaw instanceof ArrayBuffer ? new Uint8Array(gRaw) : null);
+        if (!gBytes || gBytes.length < mw * mh * 4) throw new Error("limitAlphaRows: short guide");
+    }
+    if (w === 0 || h === 0) return rgba;
+
+    const snapOn = !!(sigmaR > 0 && gBytes);
+    const maxX = mw - 1, maxY = mh - 1;
+
+    for (let cy = 0; cy < h; cy += 256) {
+        const ch = Math.min(256, h - cy);
+        for (let ry = 0; ry < ch; ry++) {
+            const y = cy + ry;
+            const py = y0 + y + 0.5;
+            let off = y * w * 4;
+            for (let x = 0; x < w; x++, off += 4) {
+                const px = x0 + x + 0.5;
+                const mx = m0 * px + m2 * py + m4;
+                const my = m1 * px + m3 * py + m5;
+                let mv;
+                if (snapOn) {
+                    let pr, pg, pb;
+                    if (cBytes) {
+                        pr = cBytes[off] / 255;
+                        pg = cBytes[off + 1] / 255;
+                        pb = cBytes[off + 2] / 255;
+                    } else {
+                        const gx = Math.max(0, Math.min(maxX, Math.floor(mx)));
+                        const gy = Math.max(0, Math.min(maxY, Math.floor(my)));
+                        const gOff = (gy * mw + gx) * 4;
+                        pr = gBytes[gOff] / 255;
+                        pg = gBytes[gOff + 1] / 255;
+                        pb = gBytes[gOff + 2] / 255;
+                    }
+                    mv = rangeSnapField(map, mw, mh, gBytes, mw, mh, mx, my, pr, pg, pb, sigmaR, tau);
+                } else {
+                    mv = rangeU16Bilinear(map, mw, mh, mx, my);
+                }
+                const v = Math.max(0, Math.min(1, mv));
+                const wVal = rangeWeightScalar(v, lo, hi, fLo, fHi, limitInvert);
+                u8[off + 3] = Math.max(0, Math.min(255, Math.round(u8[off + 3] * wVal)));
+            }
+        }
+    }
+    return rgba;
+}
+
+
+

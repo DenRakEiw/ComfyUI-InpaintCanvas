@@ -103,6 +103,111 @@ export function fieldReader(field) {
 }
 
 /**
+ * A dense ow x oh Uint8Array of thaw or freeze bytes from node (i0, j0) over per-tile n x n byte cells (`cellOf(key)`
+ * returns the cell's Uint8Array or null, `sh = 8 - log2(s)`), zero where no cell holds them.
+ */
+export function thawPlane(cellOf, n, sh, i0, j0, ow, oh) {
+    const a = new Uint8Array(ow * oh);
+    const cx0 = Math.max(0, i0 >> sh), cx1 = (i0 + ow - 1) >> sh, cy0 = Math.max(0, j0 >> sh), cy1 = (j0 + oh - 1) >> sh;
+    for (let cy = cy0; cy <= cy1; cy++) {
+        for (let cx = cx0; cx <= cx1; cx++) {
+            const c = cellOf((cy << 16) | cx);
+            if (!c) continue;
+            const a0 = Math.max(i0, cx * n), a1 = Math.min(i0 + ow, cx * n + n);
+            const b0 = Math.max(j0, cy * n), b1 = Math.min(j0 + oh, cy * n + n);
+            for (let j = b0; j < b1; j++) {
+                const so = (j - cy * n) * n + (a0 - cx * n);
+                a.set(c.subarray(so, so + (a1 - a0)), (j - j0) * ow + (a0 - i0));
+            }
+        }
+    }
+    return a;
+}
+
+/**
+ * The dense dab kernel (K30): over the node box i0..(i0 + ow - 1), j0..(j0 + oh - 1) (inclusive), reads the pre-dab
+ * field from `src` (sw x sh dense nodes from (si0, sj0), dx and dy interleaved in 1/256 px; must cover i0..i1, j0..j1
+ * and, for the advected modes, every floor(sample / s) and +1 within 0..ni+1, 0..nj+1), weighs by `sel` (alpha 0..255)
+ * and `freeze` (0..255, weighed by 1 - freeze / 255) when given (ow x oh bytes each), writes the resulting ow x oh
+ * nodes to `out` (Int32Array of ow * oh * 2) and the changed node bounds [bi0, bj0, bi1, bj1] to `box` (Int32Array of
+ * 4), and returns how many nodes changed (0 when none did).
+ */
+export function liquifyDabNodes(mode, src, sw, si0, sj0, s, ni, nj, cx, cy, r, h, amount, dxStep, dyStep, sel, freeze, i0, j0, ow, oh, out, box) {
+    const restore = mode === "restore", push = mode === "push";
+    const grow = mode === "grow" ? -1 : mode === "shrink" ? 1 : 0;
+    const turn = mode === "swirlcw" ? -1 : mode === "swirlccw" ? 1 : 0;
+    if (!restore && !push && !grow && !turn) throw new Error(`Inpaint Canvas: no liquify mode "${mode}"`);
+    if (!(ow > 0) || !(oh > 0) || !(r > 0) || !(amount > 0)) return 0;
+    if (push && !(dxStep || dyStep)) return 0;
+    if (src && typeof src.nodes === "function") {
+        const field = src, sh = field._dabSh | 0, before = out && typeof out.get === "function" ? out : null;
+        if (!(sh > 0 && box && box.length >= 4)) return 0;
+        const sNeed = sw * sh * 2, need = ow * oh * 2;
+        const srcBuf = field._dabSrc && field._dabSrc.length >= sNeed ? field._dabSrc : (field._dabSrc = new Int32Array(sNeed));
+        const sArr = field.nodes(si0, sj0, sw, sh, srcBuf);
+        const oArr = field._dabOut && field._dabOut.length >= need ? field._dabOut.subarray(0, need) : (field._dabOut = new Int32Array(need));
+        const count = liquifyDabNodes(mode, sArr, sw, si0, sj0, s, ni, nj, cx, cy, r, h, amount, dxStep, dyStep, sel, freeze, i0, j0, ow, oh, oArr, box);
+        if (count > 0 && typeof field._writeDense === "function") {
+            field._writeDense(oArr, i0, j0, ow, box[0], box[1], box[2], box[3], before, restore);
+        }
+        return count;
+    }
+    const i1 = i0 + ow - 1, j1 = j0 + oh - 1, xmax = ni * s, ymax = nj * s;
+    if (!src || !out || !box || box.length < 4 || out.length < ow * oh * 2) return 0;
+    if (i0 < si0 || j0 < sj0 || i1 - si0 >= sw || src.length < ((j1 - sj0) * sw + (i1 - si0) + 1) * 2) return 0;
+    if ((sel && sel.length < ow * oh) || (freeze && freeze.length < ow * oh)) return 0;
+    h = Math.min(0.8, Math.max(0, h || 0));
+    let count = 0, bi0 = Infinity, bj0 = Infinity, bi1 = -Infinity, bj1 = -Infinity;
+    for (let j = j0; j <= j1; j++) {
+        const dy = j * s - cy;
+        let so = ((j - sj0) * sw + (i0 - si0)) * 2;
+        let q = (j - j0) * ow;
+        for (let i = i0; i <= i1; i++, so += 2, q++) {
+            const ox = src[so], oy = src[so + 1], o = q * 2;
+            const dx = i * s - cx;
+            const t = Math.sqrt(dx * dx + dy * dy) / r;
+            if (!(t < 1)) { out[o] = ox; out[o + 1] = oy; continue; }
+            let w = amount * liquifyFalloff(t, h);
+            if (w > 0) {
+                if (sel && freeze) w *= (sel[q] / 255) * (1 - freeze[q] / 255);
+                else if (sel) w *= sel[q] / 255;
+                else if (freeze) w *= 1 - freeze[q] / 255;
+            }
+            if (!(w > 0)) { out[o] = ox; out[o + 1] = oy; continue; }
+            let vx, vy;
+            if (restore) {
+                const f = 1 - w * LIQUIFY_RATES.restore;
+                vx = Math.trunc(ox * f); vy = Math.trunc(oy * f);
+            } else {
+                let nx, ny;
+                if (push) { nx = -w * dxStep; ny = -w * dyStep; }
+                else if (grow) { const g = grow * w * LIQUIFY_RATES.grow; nx = g * dx; ny = g * dy; }
+                else {
+                    const a = turn * w * LIQUIFY_RATES.swirl * Math.PI / 180, c = Math.cos(a), sn = Math.sin(a);
+                    nx = dx * c - dy * sn - dx; ny = dx * sn + dy * c - dy;
+                }
+                let x = i * s + nx, y = j * s + ny;
+                x = x < 0 ? 0 : x > xmax ? xmax : x;
+                y = y < 0 ? 0 : y > ymax ? ymax : y;
+                const gx = x / s, gy = y / s, si = Math.floor(gx), sj = Math.floor(gy);
+                const fx = gx - si, fy = gy - sj, ex = 1 - fx, ey = 1 - fy;
+                const o00 = ((sj - sj0) * sw + (si - si0)) * 2, o10 = o00 + 2, o01 = o00 + sw * 2, o11 = o01 + 2;
+                const d0 = ex * ey * src[o00] + fx * ey * src[o10] + ex * fy * src[o01] + fx * fy * src[o11];
+                const d1 = ex * ey * src[o00 + 1] + fx * ey * src[o10 + 1] + ex * fy * src[o01 + 1] + fx * fy * src[o11 + 1];
+                vx = clampD(Math.floor(nx * 256 + d0 + 0.5));
+                vy = clampD(Math.floor(ny * 256 + d1 + 0.5));
+            }
+            out[o] = vx; out[o + 1] = vy;
+            if (vx === ox && vy === oy) continue;
+            count++;
+            if (i < bi0) bi0 = i; if (i > bi1) bi1 = i; if (j < bj0) bj0 = j; if (j > bj1) bj1 = j;
+        }
+    }
+    if (count && box) { box[0] = bi0; box[1] = bj0; box[2] = bi1; box[3] = bj1; }
+    return count;
+}
+
+/**
  * The displacement field of one layer of w x h pixels at grid step s (see the contract at the top). `cells` may be
  * given (an undo step's map); nothing here writes into a cell `before` holds.
  */
@@ -129,8 +234,11 @@ export class LiquifyField {
     }
 
     /** The nodes (i0.., j0..), nw x nh, as one dense Int32Array (dx, dy interleaved), zero where no cell holds them. */
-    nodes(i0, j0, nw, nh) {
-        const a = new Int32Array(nw * nh * 2), n = this.n, sh = 8 - this.ls;
+    nodes(i0, j0, nw, nh, out = null) {
+        const len = nw * nh * 2, n = this.n, sh = 8 - this.ls;
+        let a;
+        if (out && out.length >= len) { a = out.subarray(0, len); a.fill(0); }
+        else a = new Int32Array(len);
         const cx0 = Math.max(0, i0 >> sh), cx1 = (i0 + nw - 1) >> sh, cy0 = Math.max(0, j0 >> sh), cy1 = (j0 + nh - 1) >> sh;
         for (let cy = cy0; cy <= cy1; cy++) {
             for (let cx = cx0; cx <= cx1; cx++) {
@@ -193,6 +301,41 @@ export class LiquifyField {
         }
     }
 
+    /** Write the dense ow x oh nodes `out` (from (i0, j0)) over the changed node box bi0..bi1, bj0..bj1 (inclusive). */
+    _writeDense(out, i0, j0, ow, bi0, bj0, bi1, bj1, before, prune) {
+        const n = this.n, sh = 8 - this.ls;
+        const cx0 = bi0 >> sh, cx1 = bi1 >> sh, cy0 = bj0 >> sh, cy1 = bj1 >> sh;
+        for (let cy = cy0; cy <= cy1; cy++) {
+            for (let cx = cx0; cx <= cx1; cx++) {
+                const key = (cy << 16) | cx;
+                const a0 = Math.max(bi0, cx * n), a1 = Math.min(bi1 + 1, cx * n + n);
+                const b0 = Math.max(bj0, cy * n), b1 = Math.min(bj1 + 1, cy * n + n);
+                const c0 = this.cells.get(key) || null;
+                let changed = false;
+                for (let j = b0; j < b1 && !changed; j++) {
+                    const so = ((j - j0) * ow + (a0 - i0)) * 2, len = (a1 - a0) * 2;
+                    if (!c0) {
+                        for (let k = 0; k < len; k++) if (out[so + k] !== 0) { changed = true; break; }
+                    } else {
+                        const doff = ((j - cy * n) * n + (a0 - cx * n)) * 2;
+                        for (let k = 0; k < len; k++) if (out[so + k] !== c0[doff + k]) { changed = true; break; }
+                    }
+                }
+                if (!changed) continue;
+                const lc = this._writable(key, before);
+                for (let j = b0; j < b1; j++) {
+                    const so = ((j - j0) * ow + (a0 - i0)) * 2;
+                    lc.set(out.subarray(so, so + (a1 - a0) * 2), ((j - cy * n) * n + (a0 - cx * n)) * 2);
+                }
+                if (prune) {
+                    let zero = true;
+                    for (let q = 0; q < lc.length; q++) if (lc[q]) { zero = false; break; }
+                    if (zero) this.cells.delete(key);
+                }
+            }
+        }
+    }
+
     /** The pixels [x0, y0, x1, y1) whose output the nodes i0..i1, j0..j1 (inclusive) reach. */
     _pixelBox(i0, j0, i1, j1) {
         const s = this.s;
@@ -203,7 +346,8 @@ export class LiquifyField {
      * One dab: `mode` one of LIQUIFY_MODES, centre (cx, cy) and radius r in pixel-index positions of the layer, `hard`
      * the falloff's flat core (clamped to 0..0.8), `amount` the strength times the pressure (0..1), `delta` [dx, dy] the
      * push's step (px; push only), `thaw(i, j)` 0..1 per node or null (the selection), `before` the cells at the
-     * stroke's press. Returns the pixels [x0, y0, x1, y1) whose output may have changed, or null when no node did.
+     * stroke's press, `kernel` an optional dense dab kernel (`liquifyDabNodes` or its Rust twin, K30 / K31). Returns the
+     * pixels [x0, y0, x1, y1) whose output may have changed, or null when no node did.
      *
      *   push       n = -w delta                          (the content under the brush follows the pointer)
      *   grow       n = -w 0.04 (q - c)                   (reads nearer the centre: the content swells)
@@ -214,7 +358,7 @@ export class LiquifyField {
      *
      * w = amount * falloff(|q - c| / r) * thaw; the advected modes store floor(256 n + D(q + n) + 0.5).
      */
-    dab(mode, cx, cy, r, hard, amount, delta, thaw, before) {
+    dab(mode, cx, cy, r, hard, amount, delta, thaw, before, kernel = null) {
         const s = this.s, h = Math.min(0.8, Math.max(0, hard || 0));
         if (!(r > 0) || !(amount > 0)) return null;
         const i0 = Math.max(0, Math.ceil((cx - r) / s)), i1 = Math.min(this.ni, Math.floor((cx + r) / s));
@@ -225,6 +369,39 @@ export class LiquifyField {
         const turn = mode === "swirlcw" ? -1 : mode === "swirlccw" ? 1 : 0;
         if (!restore && !push && !grow && !turn) throw new Error(`Inpaint Canvas: no liquify mode "${mode}"`);
         if (push && !(delta && (delta[0] || delta[1]))) return null;
+        if (kernel && (!thaw || typeof thaw.planes === "function" || typeof thaw === "object")) {
+            const ow = i1 - i0 + 1, oh = j1 - j0 + 1;
+            const dxStep = push ? delta[0] : 0, dyStep = push ? delta[1] : 0;
+            let si0 = i0, sj0 = j0, sw = ow, sh = oh;
+            if (!restore) {
+                const am = Math.abs(amount);
+                const padX = push ? Math.abs(amount * dxStep) : grow ? am * LIQUIFY_RATES.grow * r : Math.min(2 * r, am * (LIQUIFY_RATES.swirl * Math.PI / 180) * r + 1);
+                const padY = push ? Math.abs(amount * dyStep) : padX;
+                si0 = Math.max(0, Math.floor((i0 * s - padX) / s));
+                sj0 = Math.max(0, Math.floor((j0 * s - padY) / s));
+                sw = Math.min(this.ni, Math.floor((i1 * s + padX) / s)) + 1 - si0 + 1;
+                sh = Math.min(this.nj, Math.floor((j1 * s + padY) / s)) + 1 - sj0 + 1;
+            } else {
+                if (!this.cells.size) return null;
+                const csh = 8 - this.ls, cx0 = i0 >> csh, cx1 = i1 >> csh, cy0 = j0 >> csh, cy1 = j1 >> csh;
+                let any = false;
+                for (let cy = cy0; cy <= cy1 && !any; cy++) {
+                    for (let cx = cx0; cx <= cx1; cx++) if (this.cells.has((cy << 16) | cx)) { any = true; break; }
+                }
+                if (!any) return null;
+            }
+            let sel = null, freeze = null;
+            if (thaw) {
+                if (typeof thaw.planes === "function") ({ sel, freeze } = thaw.planes(i0, j0, ow, oh));
+                else if (thaw instanceof Uint8Array) sel = thaw;
+                else { sel = thaw.sel || null; freeze = thaw.freeze || null; }
+            }
+            const box = this._dabBox || (this._dabBox = new Int32Array(4));
+            this._dabSh = sh;
+            const count = kernel(mode, this, sw, si0, sj0, s, this.ni, this.nj, cx, cy, r, h, amount, dxStep, dyStep, sel, freeze, i0, j0, ow, oh, before, box);
+            if (!count) return null;
+            return this._pixelBox(box[0], box[1], box[2], box[3]);
+        }
         const rd = this.reader || (this.reader = fieldReader(this));
         rd.reset();
         const list = new Float64Array((i1 - i0 + 1) * (j1 - j0 + 1) * 4);
@@ -521,6 +698,9 @@ export function liquifyStore(src, s, nodesOf, keys, clamp, rt, target, blockMax 
  * 0.5) inv) (continuous: pixel corners at integers). Positions outside the layer are transparent.
  */
 export function previewBlock(win, field, ox, oy, inv, out, bw, bh) {
+    if (win.px && win.ptr && (!win.data || win.data.buffer !== win.px.memory.buffer)) {
+        win.data = new Uint8Array(win.px.memory.buffer, win.ptr, win.w * win.h * 4);
+    }
     const rd = fieldReader(field);
     const D = [0, 0], L2 = 1 << win.L, data = win.data, ww = win.w, wh = win.h;
     const W = field.w, H = field.h;

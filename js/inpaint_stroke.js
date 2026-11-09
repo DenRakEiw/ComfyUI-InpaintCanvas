@@ -178,3 +178,22 @@ export function spongeRGBA(src, amount, saturate = false, vibrance = true) {
     }
     return out;
 }
+
+/**
+ * Frequency separation's split (PLAN_0_1_31 §4 step 8; moved here from `InpaintEditor.frequencySeparation` as the twin of
+ * px's `freq_split`, K27): `I` the picture, `L` its blur (straight RGBA8, changed in place), returns `Hi` (a new
+ * Uint8ClampedArray, or `Hi` given) with H = floor((I - L + 255) / 2) per colour channel and, where I - L is odd, L one
+ * level up (at 255 one down, H one up), so that L + 2H - 255 = I exactly; both keep I's alpha.
+ */
+export function freqSplit(I, L, Hi = new Uint8ClampedArray(I.length)) {
+    for (let i = 0; i < I.length; i += 4) {
+        for (let c = 0; c < 3; c++) {
+            const v = I[i + c], l = L[i + c], t = v - l + 255;
+            let hv = t >> 1;
+            if (t & 1) { if (l < 255) L[i + c] = l + 1; else { L[i + c] = 254; hv += 1; } }
+            Hi[i + c] = hv;
+        }
+        L[i + 3] = I[i + 3]; Hi[i + 3] = I[i + 3];
+    }
+    return Hi;
+}

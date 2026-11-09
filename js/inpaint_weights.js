@@ -56,6 +56,71 @@ export function rangeWeight(v, r) {
 }
 
 /**
+ * Classifies a document tile whose window texels lie in `[vMin, vMax]` (0..1) against a soft range `r`
+ * (`docs/PLAN_WASM_BUILD.md` §4.8, K21). Because bilinear sampling and joint-bilateral snap are convex combinations
+ * of window texels, every sample in the tile lies in `[vMin, vMax]`.
+ *
+ * @param {number} vMin - Minimum normalized value in the tile's window (0..1)
+ * @param {number} vMax - Maximum normalized value in the tile's window (0..1)
+ * @param {{ lo: number, hi: number, fLo?: number, fHi?: number, invert?: boolean }} r - Range descriptor
+ * @param {boolean} [invert=false] - Additional job-level inversion (e.g. intersect mode)
+ * @returns {"full" | "empty" | "compute"}
+ */
+export function rangeTileClass(vMin, vMax, r, invert = false) {
+    if (!(vMin <= vMax) || !r) return "compute";
+    const fLo = r.fLo || 0;
+    const fHi = r.fHi || 0;
+    const wLoMin = fLo > 0 ? sstep(r.lo - fLo, r.lo, vMin) : (vMin >= r.lo - 1e-12 ? 1 : 0);
+    const wLoMax = fLo > 0 ? sstep(r.lo - fLo, r.lo, vMax) : (vMax >= r.lo - 1e-12 ? 1 : 0);
+    const wHiMin = fHi > 0 ? (1 - sstep(r.hi, r.hi + fHi, vMin)) : (vMin <= r.hi + 1e-12 ? 1 : 0);
+    const wHiMax = fHi > 0 ? (1 - sstep(r.hi, r.hi + fHi, vMax)) : (vMax <= r.hi + 1e-12 ? 1 : 0);
+    const inv = Boolean(r.invert) !== Boolean(invert);
+    if (wLoMin === 1 && wHiMax === 1) return inv ? "empty" : "full";
+    if (wLoMax === 0 || wHiMin === 0) return inv ? "full" : "empty";
+    return "compute";
+}
+
+/**
+ * Computes `{ tiles, bounds, alphaSum }` for the `"full"` (or `1`) tiles of one document tile row `ty`
+ * (`docs/PLAN_WASM_BUILD.md` §4.8, K21): 255 per in-image pixel, the exact bounds and `{ tx, ty, full: true }` tiles
+ * as `inpaint_worker.js` `rangeSelectJob` returns them. Shared by the window (for rows that post no job), the worker
+ * (for full tiles in a row that posts a job), and tests.
+ *
+ * @param {number} W - Document width
+ * @param {number} H - Document height
+ * @param {number} ty - Tile row index
+ * @param {ArrayLike<string | number>} rowClasses - Per-column class ("full"|"empty"|"compute" or 1|0|2)
+ * @param {number} [tile=256] - Tile side in pixels
+ * @returns {{ tiles: Array<{ tx: number, ty: number, full: boolean }>, bounds: number[] | null, alphaSum: number }}
+ */
+export function rangeRowBookkeeping(W, H, ty, rowClasses, tile = 256) {
+    const tileY0 = ty * tile;
+    const tileY1 = Math.min(tileY0 + tile, H);
+    const th = Math.max(0, tileY1 - tileY0);
+    const tiles = [];
+    let bX0 = Infinity, bY0 = Infinity, bX1 = -Infinity, bY1 = -Infinity;
+    let alphaSum = 0;
+    if (th > 0 && rowClasses) {
+        for (let tx = 0; tx < rowClasses.length; tx++) {
+            const cls = rowClasses[tx];
+            if (cls !== "full" && cls !== 1) continue;
+            const tileX0 = tx * tile;
+            const tileX1 = Math.min(tileX0 + tile, W);
+            const tw = Math.max(0, tileX1 - tileX0);
+            if (tw <= 0) continue;
+            alphaSum += 255 * tw * th;
+            tiles.push({ tx, ty, full: true });
+            if (tileX0 < bX0) bX0 = tileX0;
+            if (tileY0 < bY0) bY0 = tileY0;
+            if (tileX1 > bX1) bX1 = tileX1;
+            if (tileY1 > bY1) bY1 = tileY1;
+        }
+    }
+    const bounds = Number.isFinite(bX0) ? [bX0, bY0, bX1, bY1] : null;
+    return { tiles, bounds, alphaSum };
+}
+
+/**
  * Converts sRGB (0..1) to film.points opponent colour space [L, r - L, b - L].
  *
  * @param {number} r - Red 0..1
@@ -175,11 +240,14 @@ export function weightTable(r) {
  * Normalises an input limit descriptor into a clean, validated Limit object.
  * Returns null for null/false. Clamps values to [0, 1], swaps lo > hi,
  * and validates source type. Always returns a fresh object.
+ * For new input (a command, the selection): a field that is not a finite number and a colour that is
+ * not #rgb / #rrggbb throw with a readable message. `opts.stored` is `normalizeStoredLimit`.
  *
  * @param {any} v
+ * @param {{ stored?: boolean }} [opts]
  * @returns {Limit | null}
  */
-export function normalizeLimit(v) {
+export function normalizeLimit(v, opts) {
     if (!v || v === false) return null;
     if (typeof v !== "object") throw new Error("limit must be an object");
 
@@ -188,27 +256,57 @@ export function normalizeLimit(v) {
         throw new Error("limit.source must be depth, luma or color");
     }
 
-    let lo = Math.max(0, Math.min(1, Number(v.lo ?? 0)));
-    let hi = Math.max(0, Math.min(1, Number(v.hi ?? 1)));
+    const stored = !!(opts && opts.stored);
+    const numField = (name, val, def) => {
+        if (stored) return Number(val ?? def);
+        if (val == null) return def;
+        const n = typeof val === "number" ? val : (typeof val === "string" && val.trim() !== "" ? Number(val) : NaN);
+        if (!Number.isFinite(n)) throw new Error(`limit.${name} must be a finite number (got ${JSON.stringify(val)})`);
+        return n;
+    };
+
+    let lo = Math.max(0, Math.min(1, numField("lo", v.lo, 0)));
+    let hi = Math.max(0, Math.min(1, numField("hi", v.hi, 1)));
     if (lo > hi) {
         const tmp = lo;
         lo = hi;
         hi = tmp;
     }
 
-    const fLo = Math.max(0, Math.min(1, Number(v.fLo ?? 0)));
-    const fHi = Math.max(0, Math.min(1, Number(v.fHi ?? 0)));
+    const fLo = Math.max(0, Math.min(1, numField("fLo", v.fLo, 0)));
+    const fHi = Math.max(0, Math.min(1, numField("fHi", v.fHi, 0)));
     const invert = !!v.invert;
 
     /** @type {Limit} */
     const res = { source, lo, hi, fLo, fHi, invert };
 
     if (source === "color") {
-        res.color = typeof v.color === "string" ? v.color : "#ffffff";
-        res.tol = Math.max(0, Math.min(100, Number(v.tol ?? 30)));
+        if (stored) {
+            res.color = typeof v.color === "string" ? v.color : "#ffffff";
+        } else if (v.color != null) {
+            if (typeof v.color !== "string" || !/^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(v.color)) {
+                throw new Error(`limit.color must be #rgb or #rrggbb (got ${JSON.stringify(v.color)})`);
+            }
+            res.color = v.color;
+        } else {
+            res.color = "#ffffff";
+        }
+        res.tol = Math.max(0, Math.min(100, numField("tol", v.tol, 30)));
     }
 
     return res;
+}
+
+/**
+ * The limit a layer or a document already holds, on the draw and export paths and in the panel: no field or colour
+ * throws, so a document keeps drawing as it did. Commands wrote any colour string into documents up to 0.1.52 (`ff2d2d`
+ * without the #, which `hexToRgb` reads correctly); the refusal is for new input only.
+ *
+ * @param {any} v
+ * @returns {Limit | null}
+ */
+export function normalizeStoredLimit(v) {
+    return normalizeLimit(v, { stored: true });
 }
 
 /**

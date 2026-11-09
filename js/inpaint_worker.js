@@ -41,6 +41,8 @@
  *                   from bytes (a new worker's cold and warm calls, tools/px_probe.py): a diagnostic only, like
  *                   inflate_bench.
  *   px_stats        this thread's px instances and memory (kernels.js `pxInstances`), answered at once like `arena`.
+ *   area_cells      the separate areas of the selection (inpaint_areas.js, CLAUDE.md item 54): its tiles' selected
+ *                   pixels counted on a coarse grid and the grid's parts labelled, their boxes back.
  *
  * Pixels arrive as ImageBitmaps (transferred, never copied through structured cloning) and
  * are closed as soon as they are drawn. Every reply carries the request's id; a failure
@@ -54,18 +56,19 @@
  */
 import { PsdWriter, OraWriter } from "./inpaint_export.js";
 import { floodMask, maskToColorCanvas, clipMaskToSelection, clipCoverage, growMaskBounds, invertMask, maskBounds, hexToRgb } from "./inpaint_raster.js";
-import { pngChunk, crc32, readPng, PNG_LEVEL, NO_PARTS } from "./inpaint_png.js";
+import { crc32, readPng, PNG_LEVEL, NO_PARTS } from "./inpaint_png.js";
 import { readTiff, tiffPart } from "./inpaint_tiff.js";
-import { readPsdStream } from "./inpaint_layered.js";
+import { readPsdStream, inflateAtMost } from "./inpaint_layered.js";
 import { resampleStore } from "./inpaint_resample.js";
 import { liquifyStore } from "./inpaint_liquify.js";
 import { guidedFar } from "./inpaint_depth.js";
-import { u16Bilinear, rangeWeight, LUMA, opp, colourSimilarity, hexToRgb as hexToRgb01 } from "./inpaint_weights.js";
-import { snapField, fuseTiles } from "./inpaint_edges.js";
-import { mipChain, mipChainBytes, clampExtend, compositeTile, matchPixels, psdPackRows, kernelsReady, setKernels, rustPx, kernelsInUse, releaseIfLarge, deflate, resampleBlock, poissonBlend, boxBlurs, heightNormals, shadowMarch, pxCalls, floodShape, recovered, pxSplit, pxJobStart, pxJobEnd, adoptRoutes, pxTimed, pxInstances, dropPx, pxSettled, pxLapAdd, PxOutOfMemory } from "./px/kernels.js";
+import { rangeRowBookkeeping } from "./inpaint_weights.js";
+import { fuseTiles } from "./inpaint_edges.js";
+import { mipChain, mipChainBytes, clampExtend, compositeTile, matchPixels, psdPackRows, kernelsReady, setKernels, rustPx, kernelsInUse, releaseIfLarge, deflate, resampleBlock, liquifyBlock, poissonBlend, boxBlurs, heightNormals, shadowMarch, pxCalls, floodShape, recovered, pxSplit, pxJobStart, pxJobEnd, adoptRoutes, pxTimed, pxInstances, dropPx, pxSettled, pxLapAdd, PxOutOfMemory, rangeTilesDepth, rangeTilesRgba } from "./px/kernels.js";
 import { Px } from "./px/px.js";
 import { hash32, mul255 } from "./blend_modes.js";
 import { detailRatio } from "./inpaint_relight.js";
+import { countTileCells, labelParts } from "./inpaint_areas.js";
 
 const TILE = 256, LEVELS = 5, TILE_BYTES = TILE * TILE * 4;
 const now = () => performance.now();
@@ -451,13 +454,10 @@ async function pngPart(msg) {
     const tc = now();
     const prev = msg.rgba ? (msg.prev ? new Uint8Array(msg.prev, 0, msg.w * 4) : null) : msg.stack ? rowsOfStack(msg, true) : rowsOfTiles(msg, true);
     const tp = now();
-    const laps = {};   // copyIn, filter, adler, deflate, copyOut (px.js pngPart)
+    const laps = {};   // copyIn, filter, adler, deflate, chunk, copyOut (px.js pngPart)
     const r = p.pngPart(rgba, msg.w, msg.rows, prev, msg.level === undefined ? PNG_LEVEL : msg.level, !!msg.last, laps);
     releaseIfLarge();
-    const tk = now();
-    const chunk = pngChunk("IDAT", r.bytes);
-    const chunkMs = now() - tk;   // the chunk's copy and its JS CRC-32
-    return { chunk: chunk.buffer, adler: r.adler, raw: r.raw, transfer: [chunk.buffer], timing: { op: "png_part", kernels: "rust", pixels: msg.w * msg.rows, kernel: now() - t0, compose: msg.stack ? tc - t0 : 0, rows: tc - t0, prev: tp - tc, ...laps, chunk: chunkMs } };
+    return { chunk: r.chunk.buffer, adler: r.adler, raw: r.raw, crc: r.crc, transfer: [r.chunk.buffer], timing: { op: "png_part", kernels: "rust", pixels: msg.w * msg.rows, kernel: now() - t0, compose: msg.stack ? tc - t0 : 0, rows: tc - t0, prev: tp - tc, ...laps } };
 }
 
 /**
@@ -508,12 +508,6 @@ async function tiffRead(msg) {
     return { info, timing: { op: "tiff_read", kernels: "js", pixels: info.width * info.height, kernel: now() - t0, ...spent } };
 }
 
-/** zlib bytes inflated by the browser (the window's inflateBytes, inpaint_canvas.js: the same inflater, the same bytes). */
-async function inflateZlib(bytes) {
-    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate"));
-    return new Uint8Array(await new Response(stream).arrayBuffer());
-}
-
 /**
  * A PSD read in this worker (inpaint_layered.js `readPsdStream`, docs/PLAN_WASM_BUILD.md §7 D0): the file's bytes read
  * here from the blob, so the window makes no array of them (the window has checked the size from the header's 26 bytes
@@ -531,7 +525,8 @@ async function psdRead(msg) {
     const timing = () => ({ op: "psd_read", kernels: "js", pixels, kernel: now() - t0, read, inflate, inflates, ...spent });
     try {
         const doc = await readPsdStream(bytes, {
-            inflate: async (b) => { const t = now(); try { return await inflateZlib(b); } finally { inflate += now() - t; inflates++; } },
+            // the window's inflater (inpaint_layered.js inflateAtMost): the same bytes, stopped at the bytes kept
+            inflate: async (b, cap) => { const t = now(); try { return await inflateAtMost(b, "deflate", cap); } finally { inflate += now() - t; inflates++; } },
             rowsPerBand: msg.rowsPerBand || TILE,
             onHeader: (h) => { pixels = h.width * h.height; },   // the window checked the size from the header before the job
             onRows: (index, kind, rgba, w, h, y0, rows) => { self.postMessage({ id: msg.id, progress: true, index, mask: kind === "mask", rgba: rgba.buffer, w, h, y0, rows }, [rgba.buffer]); },
@@ -798,9 +793,11 @@ async function selectionOverTiles(msg) {
     let data = new Uint8ClampedArray(W * H * 4);
     storeRows(msg.sel, X0, W, Y0, H, data);
     const ms = { op: "selection", kind: msg.kind, kernels: kernelsInUse(), pixels: W * H, tiles: true, read: now() - t0 };
-    let bounds;
+    const cols = (W + 255) >> 8, rows = (H + 255) >> 8;
+    let bounds, cells = null;
     if (msg.kind === "grow") {
-        bounds = growMaskBounds(data, W, H, msg.n, { ms });
+        cells = rustPx() ? new Uint8Array(cols * rows) : null;
+        bounds = growMaskBounds(data, W, H, msg.n, { ms, cells });
     } else if (msg.kind === "feather") {
         const c = new OffscreenCanvas(W, H);
         c.getContext("2d").putImageData(new ImageData(data, W, H), 0, 0);
@@ -816,26 +813,32 @@ async function selectionOverTiles(msg) {
     } else throw new Error("unknown selection job " + msg.kind);
     const tc = now();
     const tiles = [], transfer = [];
-    const d32 = new Uint32Array(data.buffer, data.byteOffset, W * H);
+    const d32 = cells ? null : new Uint32Array(data.buffer, data.byteOffset, W * H);
     const sx = msg.sel.x | 0, sy = msg.sel.y | 0;
     for (let ty = 0; ty * TILE < H; ty++) for (let tx = 0; tx * TILE < W; tx++) {
         const x0 = tx * TILE, y0 = ty * TILE, bw = Math.min(TILE, W - x0), bh = Math.min(TILE, H - y0);
         const row = msg.sel.tiles[(Y0 + y0 - sy) >> 8];
         const name = row ? row[(X0 + x0 - sx) >> 8] : null;
-        const ob = name ? tileBytes(name).bytes : null;
-        const old = ob ? new Uint32Array(ob.buffer, ob.byteOffset, TILE * TILE) : null;
-        // whole pixels as words (little endian: the alpha is the top byte)
-        let any = false, changed = false;
-        for (let yy = 0; yy < bh && !(any && changed); yy++) {
-            const o = (y0 + yy) * W + x0, so = yy * TILE;
-            for (let i = 0; i < bw; i++) {
-                const v = d32[o + i];
-                if (v >>> 24) any = true;
-                if (v !== (old ? old[so + i] : 0)) changed = true;
+        if (cells) {
+            const c = cells[ty * cols + tx];
+            if (c === 2) continue;
+            if (!c) { if (name) tiles.push({ tx, ty, empty: true }); continue; }
+        } else {
+            const ob = name ? tileBytes(name).bytes : null;
+            const old = ob ? new Uint32Array(ob.buffer, ob.byteOffset, TILE * TILE) : null;
+            // whole pixels as words (little endian: the alpha is the top byte)
+            let any = false, changed = false;
+            for (let yy = 0; yy < bh && !(any && changed); yy++) {
+                const o = (y0 + yy) * W + x0, so = yy * TILE;
+                for (let i = 0; i < bw; i++) {
+                    const v = d32[o + i];
+                    if (v >>> 24) any = true;
+                    if (v !== (old ? old[so + i] : 0)) changed = true;
+                }
             }
+            if (!changed) continue;
+            if (!any) { tiles.push({ tx, ty, empty: true }); continue; }
         }
-        if (!changed) continue;
-        if (!any) { tiles.push({ tx, ty, empty: true }); continue; }
         const out = new Uint8ClampedArray(TILE * TILE * 4);
         for (let yy = 0; yy < bh; yy++) { const o = ((y0 + yy) * W + x0) * 4; out.set(data.subarray(o, o + bw * 4), yy * TILE * 4); }
         tiles.push({ tx, ty, data: out.buffer });
@@ -909,8 +912,8 @@ async function flood(msg) {
  * The flood over a picture the pool composited from tiles (`stack_into`), B item 2: `sab` holds the box's RGBA8, `w` x
  * `h`; `sel` is the selection as a store (the bucket's clip), read here from its tiles. No canvas on the way in. The
  * shape goes back as a bitmap (the bucket draws it into a layer), or with `out: "tiles"` as the tiles of the box that
- * hold any of it, `[{ tx, ty, data }]` of 256 x 256 RGBA8 each (the box starts on the tile grid, so they are the
- * selection's own tiles): the wand writes them into the mask without a canvas on the way out either.
+ * hold any of it, `[{ tx, ty, alpha }]` of 256 x 256 alpha bytes each (the box starts on the tile grid, so they are the
+ * selection's own tiles, K9): the wand writes them into the mask without a canvas on the way out either.
  *
  * The kernel is kernels.js `floodShape`, so the `flood` route chooses Rust or the twin on the users' JS loop over the
  * same read (docs/PLAN_WASM_K1.md §0.1); only a thread without the Rust kernels refuses the stacks, as before.
@@ -927,9 +930,10 @@ async function floodOverTiles(msg) {
     if (msg.sel) { sel = new Uint8Array(W * H * 4); storeRows(msg.sel, msg.x0 | 0, W, msg.y0 | 0, H, sel); }
     lap("clip");
     const [r, g, b] = hexToRgb(msg.color || "#ff0000");
-    const res = floodShape(data, W, H, msg.x, msg.y, msg.tolerance === undefined ? 32 : msg.tolerance, msg.contiguous !== false, sel, (r << 16) | (g << 8) | b, (view, count, bounds) => {
+    const wantTiles = msg.out === "tiles";
+    const res = floodShape(data, W, H, msg.x, msg.y, msg.tolerance === undefined ? 32 : msg.tolerance, msg.contiguous !== false, sel, (r << 16) | (g << 8) | b, (view, count, bounds, cells) => {
         lap("flood");
-        if (msg.out !== "tiles") {
+        if (!wantTiles) {
             const shape = new OffscreenCanvas(W, H);
             shape.getContext("2d").putImageData(new ImageData(view, W, H), 0, 0);
             lap("shape");
@@ -937,23 +941,22 @@ async function floodOverTiles(msg) {
         }
         const tiles = [];
         if (bounds) {
+            const cols = (W + 255) >> 8;
             for (let ty = bounds[1] >> 8; ty * TILE < bounds[3]; ty++) for (let tx = bounds[0] >> 8; tx * TILE < bounds[2]; tx++) {
+                if (!cells[ty * cols + tx]) continue;
                 const x0 = tx * TILE, y0 = ty * TILE, bw = Math.min(TILE, W - x0), bh = Math.min(TILE, H - y0);
-                let any = false;
-                for (let yy = 0; yy < bh && !any; yy++) { const o = ((y0 + yy) * W + x0) * 4 + 3; for (let xx = 0; xx < bw; xx++) if (view[o + xx * 4]) { any = true; break; } }
-                if (!any) continue;
-                const out = new Uint8ClampedArray(TILE * TILE * 4);
-                for (let yy = 0; yy < bh; yy++) { const o = ((y0 + yy) * W + x0) * 4; out.set(view.subarray(o, o + bw * 4), yy * TILE * 4); }
-                tiles.push({ tx, ty, data: out.buffer });
+                const out = new Uint8Array(TILE * TILE);
+                for (let yy = 0; yy < bh; yy++) { const o = (y0 + yy) * W + x0; out.set(view.subarray(o, o + bw), yy * TILE); }
+                tiles.push({ tx, ty, alpha: out.buffer });
             }
         }
         lap("shape");
         return { count, bounds, tiles };
-    });
+    }, wantTiles ? 1 : 4);
     const bb = res.bounds;
     const touches = bb ? { l: bb[0] === 0, t: bb[1] === 0, r: bb[2] === W, b: bb[3] === H } : null;
     ms.total = now() - t0;
-    if (res.tiles) return { tiles: res.tiles, count: res.count, bounds: bb, touches, transfer: res.tiles.map((x) => x.data), timing: ms };
+    if (res.tiles) return { tiles: res.tiles, count: res.count, bounds: bb, touches, transfer: res.tiles.map((x) => x.alpha), timing: ms };
     return { bitmap: res.bitmap, count: res.count, bounds: bb, touches, timing: ms };
 }
 
@@ -1045,8 +1048,8 @@ function liquifyJob(msg) {
         done: (tx, _ty, count) => {
             if (count) { tiles.push({ tx, data: current.buffer }); transfer.push(current.buffer); } else tiles.push({ tx, empty: true });
         },
-    }, msg.blockMax || undefined);
-    return { tiles, stats, transfer, timing: { op: "liquify", tiles: msg.txs.length, total: now() - t0 } };
+    }, msg.blockMax || undefined, liquifyBlock);
+    return { tiles, stats, transfer, timing: { op: "liquify", kernels: kernelsInUse(), tiles: msg.txs.length, total: now() - t0 } };
 }
 
 function depthGuide(msg) {
@@ -1096,8 +1099,6 @@ export function rangeSelectJob(msg) {
         const m = map.m;
 
         const snap = msg.snap;
-        const sigmaR = (Array.isArray(snap) && snap.length >= 2) ? snap[0] : 0;
-        const tau = (Array.isArray(snap) && snap.length >= 2) ? snap[1] : 0;
 
         let guideObj = null;
         if (msg.guide && (msg.guide.sab || msg.guide.data)) {
@@ -1109,184 +1110,72 @@ export function rangeSelectJob(msg) {
             guideObj = { data: gBytes, w: msg.guide.w | 0, h: msg.guide.h | 0 };
         }
 
-        const mapObj = { data: mapData, w: mapW, h: mapH };
-
         const pic = msg.picture;
-        let picData = null, picX0 = 0, picY0 = 0, picX1 = 0, picY1 = 0, picW = 0;
+        let picObj = null;
         if (pic && (pic.sab || pic.data)) {
-            picData = pic.sab
+            const picData = pic.sab
                 ? new Uint8Array(pic.sab)
                 : (pic.data instanceof Uint8Array
                     ? pic.data
                     : new Uint8Array(pic.data.buffer, pic.data.byteOffset, pic.data.byteLength));
-            picX0 = pic.x0 | 0;
-            picY0 = pic.y0 | 0;
-            picW = pic.w | 0;
-            const picH = pic.h | 0;
-            picX1 = picX0 + picW;
-            picY1 = picY0 + picH;
+            picObj = {
+                data: picData,
+                x0: pic.x0 | 0,
+                y0: pic.y0 | 0,
+                w: pic.w | 0,
+                h: pic.h | 0,
+            };
         }
 
-        const tileCols = Math.ceil(W / TILE);
         const startTileY = Math.floor(y0 / TILE);
         const endTileY = Math.ceil(y1 / TILE);
+        const rowClasses = (msg.classes && startTileY === endTileY - 1 && y0 <= startTileY * TILE && y1 >= Math.min((startTileY + 1) * TILE, H))
+            ? msg.classes
+            : null;
+        if (rowClasses) {
+            const bk = rangeRowBookkeeping(W, H, startTileY, rowClasses, TILE);
+            alphaSum += bk.alphaSum;
+            for (const ft of bk.tiles) tiles.push(ft);
+            if (bk.bounds) {
+                bX0 = Math.min(bX0, bk.bounds[0]);
+                bY0 = Math.min(bY0, bk.bounds[1]);
+                bX1 = Math.max(bX1, bk.bounds[2]);
+                bY1 = Math.max(bY1, bk.bounds[3]);
+            }
+        }
 
         for (let ty = startTileY; ty < endTileY; ty++) {
-            const tileY0 = ty * TILE;
-            const tileY1 = Math.min(tileY0 + TILE, H);
-            for (let tx = 0; tx < tileCols; tx++) {
-                const tileX0 = tx * TILE;
-                const tileX1 = Math.min(tileX0 + TILE, W);
-
-                const alpha = new Uint8Array(TILE * TILE);
-                let zeros = 0, fulls = 0;
-                let tMinX = TILE, tMinY = TILE, tMaxX = -1, tMaxY = -1;
-
-                for (let py = 0; py < TILE; py++) {
-                    const y = tileY0 + py;
-                    if (y < y0 || y >= y1 || y >= H) {
-                        zeros += TILE;
-                        continue;
-                    }
-                    const pyOffset = py * TILE;
-                    const pyCentre = y + 0.5;
-
-                    for (let px = 0; px < TILE; px++) {
-                        const x = tileX0 + px;
-                        if (x >= W) {
-                            zeros++;
-                            continue;
-                        }
-                        const pxCentre = x + 0.5;
-                        const mx = m[0] * pxCentre + m[2] * pyCentre + m[4];
-                        const my = m[1] * pxCentre + m[3] * pyCentre + m[5];
-                        let v;
-                        if (sigmaR > 0 && guideObj && picData && x >= picX0 && x < picX1 && y >= picY0 && y < picY1) {
-                            const pOffset = ((y - picY0) * picW + (x - picX0)) * 4;
-                            const pr = picData[pOffset] / 255;
-                            const pg = picData[pOffset + 1] / 255;
-                            const pb = picData[pOffset + 2] / 255;
-                            v = snapField(mapObj, guideObj, mx, my, pr, pg, pb, sigmaR, tau);
-                        } else {
-                            v = u16Bilinear(mapData, mapW, mapH, mx, my);
-                        }
-                        const w = rangeWeight(v, limit);
-                        const a = Math.round(255 * (invert ? 1 - w : w));
-
-                        alpha[pyOffset + px] = a;
-                        alphaSum += a;
-                        if (a === 0) {
-                            zeros++;
-                        } else {
-                            if (a === 255) fulls++;
-                            if (px < tMinX) tMinX = px;
-                            if (px > tMaxX) tMaxX = px;
-                            if (py < tMinY) tMinY = py;
-                            if (py > tMaxY) tMaxY = py;
-                        }
-                    }
-                }
-
-                if (zeros === TILE * TILE) {
-                    continue;
-                }
-                if (fulls === TILE * TILE && (tileX1 - tileX0) === TILE && (tileY1 - tileY0) === TILE) {
-                    tiles.push({ tx, ty, full: true });
-                    bX0 = Math.min(bX0, tileX0);
-                    bY0 = Math.min(bY0, tileY0);
-                    bX1 = Math.max(bX1, tileX0 + TILE);
-                    bY1 = Math.max(bY1, tileY0 + TILE);
-                } else {
-                    tiles.push({ tx, ty, alpha: alpha.buffer });
-                    transfer.push(alpha.buffer);
-                    bX0 = Math.min(bX0, tileX0 + tMinX);
-                    bY0 = Math.min(bY0, tileY0 + tMinY);
-                    bX1 = Math.max(bX1, tileX0 + tMaxX + 1);
-                    bY1 = Math.max(bY1, tileY0 + tMaxY + 1);
-                }
+            const res = rangeTilesDepth(mapData, mapW, mapH, m, W, H, ty, y0, y1, limit, invert, snap, guideObj, picObj, rowClasses, TILE);
+            alphaSum += res.alphaSum;
+            for (const t of res.tiles) {
+                tiles.push(t);
+                if (t.alpha) transfer.push(t.alpha);
+            }
+            if (res.bounds) {
+                bX0 = Math.min(bX0, res.bounds[0]);
+                bY0 = Math.min(bY0, res.bounds[1]);
+                bX1 = Math.max(bX1, res.bounds[2]);
+                bY1 = Math.max(bY1, res.bounds[3]);
             }
         }
     } else if (source === "luma" || source === "color") {
         const buf = new Uint8Array(msg.sab || msg.buffer);
-        const isLuma = source === "luma";
-        let colorRef = null, colorTol = 30;
-        if (!isLuma) {
-            const rgbRef = hexToRgb01(limit.color || "#ffffff");
-            colorRef = opp(rgbRef[0], rgbRef[1], rgbRef[2]);
-            colorTol = limit.tol ?? 30;
-        }
-
-        const tileCols = Math.ceil(W / TILE);
+        const rowLimit = limit && limit.source === source ? limit : { ...limit, source };
         const startTileY = Math.floor(y0 / TILE);
         const endTileY = Math.ceil(y1 / TILE);
 
         for (let ty = startTileY; ty < endTileY; ty++) {
-            const tileY0 = ty * TILE;
-            const tileY1 = Math.min(tileY0 + TILE, H);
-            for (let tx = 0; tx < tileCols; tx++) {
-                const tileX0 = tx * TILE;
-                const tileX1 = Math.min(tileX0 + TILE, W);
-
-                const alpha = new Uint8Array(TILE * TILE);
-                let zeros = 0, fulls = 0;
-                let tMinX = TILE, tMinY = TILE, tMaxX = -1, tMaxY = -1;
-
-                for (let py = 0; py < TILE; py++) {
-                    const y = tileY0 + py;
-                    if (y < y0 || y >= y1 || y >= H) {
-                        zeros += TILE;
-                        continue;
-                    }
-                    const pyOffset = py * TILE;
-                    const rowOffset = (y - y0) * W;
-
-                    for (let px = 0; px < TILE; px++) {
-                        const x = tileX0 + px;
-                        if (x >= W) {
-                            zeros++;
-                            continue;
-                        }
-                        const offset = (rowOffset + x) * 4;
-                        let v;
-                        if (isLuma) {
-                            v = (0.299 * buf[offset] + 0.587 * buf[offset + 1] + 0.114 * buf[offset + 2]) / 255;
-                        } else {
-                            v = colourSimilarity(buf[offset] / 255, buf[offset + 1] / 255, buf[offset + 2] / 255, colorRef, colorTol);
-                        }
-                        const w = rangeWeight(v, limit);
-                        const a = Math.round(255 * (invert ? 1 - w : w));
-
-                        alpha[pyOffset + px] = a;
-                        alphaSum += a;
-                        if (a === 0) {
-                            zeros++;
-                        } else {
-                            if (a === 255) fulls++;
-                            if (px < tMinX) tMinX = px;
-                            if (px > tMaxX) tMaxX = px;
-                            if (py < tMinY) tMinY = py;
-                            if (py > tMaxY) tMaxY = py;
-                        }
-                    }
-                }
-
-                if (zeros === TILE * TILE) {
-                    continue;
-                }
-                if (fulls === TILE * TILE && (tileX1 - tileX0) === TILE && (tileY1 - tileY0) === TILE) {
-                    tiles.push({ tx, ty, full: true });
-                    bX0 = Math.min(bX0, tileX0);
-                    bY0 = Math.min(bY0, tileY0);
-                    bX1 = Math.max(bX1, tileX0 + TILE);
-                    bY1 = Math.max(bY1, tileY0 + TILE);
-                } else {
-                    tiles.push({ tx, ty, alpha: alpha.buffer });
-                    transfer.push(alpha.buffer);
-                    bX0 = Math.min(bX0, tileX0 + tMinX);
-                    bY0 = Math.min(bY0, tileY0 + tMinY);
-                    bX1 = Math.max(bX1, tileX0 + tMaxX + 1);
-                    bY1 = Math.max(bY1, tileY0 + tMaxY + 1);
-                }
+            const res = rangeTilesRgba(buf, W, H, ty, y0, y1, rowLimit, invert, TILE);
+            alphaSum += res.alphaSum;
+            for (const t of res.tiles) {
+                tiles.push(t);
+                if (t.alpha) transfer.push(t.alpha);
+            }
+            if (res.bounds) {
+                bX0 = Math.min(bX0, res.bounds[0]);
+                bY0 = Math.min(bY0, res.bounds[1]);
+                bX1 = Math.max(bX1, res.bounds[2]);
+                bY1 = Math.max(bY1, res.bounds[3]);
             }
         }
     } else if (source === "logit") {
@@ -1425,6 +1314,34 @@ function relightShadowJob(msg) {
     return { vis: vis.buffer, row0, rows, transfer: [vis.buffer], timing: timing() };
 }
 
+/**
+ * The separate areas of the selection (CLAUDE.md item 54): `sel` the selection's tiles (a store as `storeRows` takes it,
+ * at (0, 0)), `W` x `H` the picture, `cell` the coarse grid's cell and `speck` the fewest pixels an area needs
+ * (inpaint_areas.js). Only the tiles the store names are read, each where it lies; the reply is `labelParts`'s.
+ */
+function areaCellsJob(msg) {
+    const t0 = now();
+    const W = msg.W | 0, H = msg.H | 0, cell = Math.max(1, msg.cell | 0);
+    const gw = Math.ceil(W / cell), gh = Math.ceil(H / cell);
+    const counts = new Uint32Array(gw * gh);
+    const store = msg.sel;
+    let tiles = 0;
+    for (const [row, names] of Object.entries(store.tiles || {})) {
+        const oy = (+row) * TILE;
+        if (!names || oy >= H) continue;
+        for (let tx = 0; tx < names.length; tx++) {
+            const t = names[tx];
+            const ox = tx * TILE;
+            if (!t || ox >= W) continue;
+            countTileCells(tileBytes(t).bytes, ox, oy, Math.min(TILE, W - ox), Math.min(TILE, H - oy), cell, gw, counts);
+            tiles++;
+        }
+    }
+    const t1 = now();
+    const out = labelParts(counts, gw, gh, cell, W, H, msg.speck | 0);
+    return { ...out, timing: { op: "area_cells", tiles, cells: gw * gh, count: t1 - t0, label: now() - t1, total: now() - t0 } };
+}
+
 function relightRatioJob(msg) {
     const { fullPx, lowPx, ansPx, W, H, wAns, hAns } = msg;
     const full = fullPx instanceof Uint8Array ? fullPx : new Uint8Array(fullPx);
@@ -1447,6 +1364,7 @@ async function run(msg) {
     if (msg.op === "relight_shadow") return relightShadowJob(msg);
     if (msg.op === "relight_ratio") return relightRatioJob(msg);
     if (msg.op === "range_select") return rangeSelectJob(msg);
+    if (msg.op === "area_cells") return areaCellsJob(msg);
     if (msg.op === "depth_guide") return depthGuide(msg);
     if (msg.op === "depth_fuse") return depthFuse(msg);
     if (msg.op === "resample") return resampleJob(msg);

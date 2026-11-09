@@ -104,11 +104,11 @@ function newChunk() {
 }
 
 /**
- * The bytes of a new tile (zeroed) for `owner`, the object that holds them: a `Uint8ClampedArray` of SLOT_BYTES, with
- * `arenaChunk` / `arenaSlot` set on `owner` when they live in the arena. Throws a PixelMemoryError at the renderer's
- * limit, and then `owner` is untouched.
+ * The bytes of a new tile (zeroed when `zero` is true) for `owner`, the object that holds them: a `Uint8ClampedArray`
+ * of SLOT_BYTES, with `arenaChunk` / `arenaSlot` set on `owner` when they live in the arena. Throws a PixelMemoryError
+ * at the renderer's limit, and then `owner` is untouched.
  */
-export function allocTileBytes(owner) {
+export function allocTileBytes(owner, zero = true) {
     if (!arenaEnabled()) return ownTileBytes();
     if (!registry) registry = new FinalizationRegistry(release);
     let index = -1;
@@ -124,8 +124,9 @@ export function allocTileBytes(owner) {
     STATS.allocated++;
     const bytes = new Uint8ClampedArray(c.sab, slot * SLOT_BYTES, SLOT_BYTES);
     // a slot handed out again still holds its last tile's pixels; one of a new chunk is zero already, and zeroing it
-    // anyway was a memset of the whole document when one is opened (2.4 GB at 30000 x 20000)
-    if (c.used_[slot]) { bytes.fill(0); c.used_[slot] = 0; }
+    // anyway was a memset of the whole document when one is opened (2.4 GB at 30000 x 20000). When `zero` is false the
+    // caller overwrites all SLOT_BYTES in the same synchronous step (e.g. wasm `_out` or a full-tile `w.fill`).
+    if (c.used_[slot]) { if (zero) bytes.fill(0); c.used_[slot] = 0; }
     owner.arenaChunk = index;
     owner.arenaSlot = slot;
     registry.register(owner, { chunk: index, slot });

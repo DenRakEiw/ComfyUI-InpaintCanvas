@@ -26,11 +26,91 @@
  * `readOra(bytes, { inflateRaw })` answers `{ width, height, layers, notes }`, each layer with its PNG as `png`
  * (bytes) instead of `rgba`, for the caller to decode; nested stacks are flattened: their visibility and opacity go
  * into their layers.
+ *
+ * A crafted file is refused with a plain message before it can make the reader grow (H1 S5): a layer or mask larger
+ * than a document can hold, a channel whose data cannot fill its rectangle, a deflate stream that unpacks to more than
+ * what is kept (`inflateAtMost`, the inflater both readers use); both readers take `onHeader` for the caller's size
+ * check before anything is read. `inflate(bytes, cap)` / `inflateRaw(bytes, cap)` get the most they may give.
  */
 
 import { PSD_BLENDS, ORA_BLENDS } from "./blend_modes.js";
 
 export const LAYERED_EXT = /\.(psd|ora)$/i;
+
+// What a crafted file can make the reader allocate (H1 S5, docs/research/review_external_2026-11-07/verified.json): a
+// layer or mask rectangle at most what a document can hold (inpaint_canvas.js HUGE_MAX_SIDE, HUGE_MAX_PIXELS), and no
+// channel larger than its data can fill (PackBits gives at most 128 bytes for 2, deflate at most 1032 for 1), so what
+// a file asks for grows with its own size; an inflate stops at the bytes it may give (`inflateAtMost`).
+export const LAYER_MAX_SIDE = 65535;
+export const LAYER_MAX_PIXELS = 1024 * 1024 * 1024;
+const DEFLATE_MAX_RATIO = 1032;
+// OpenRaster: stack.xml unpacked at most this large, and every deflated entry together at most ORA_INFLATE_BASE plus
+// ORA_INFLATE_RATIO times the file (a layer's PNG is compressed already: a zip deflates it by a few per cent)
+const ORA_XML_MAX = 16 * 1024 * 1024;
+const ORA_INFLATE_BASE = 256 * 1024 * 1024;
+const ORA_INFLATE_RATIO = 64;
+const INFLATE_SLICE = 64 * 1024;
+// OpenRaster layers are PNGs the browser decodes: one below 2^29 px (what Blink decodes at all, so the refusal is
+// plain), and all of a file's together at most what a layered file opens at (268 MP, inpaint_canvas.js
+// checkLayeredSize) or 64 times the picture, whichever is more, counted from the PNGs' headers before any decode
+const ORA_LAYER_MAX_PIXELS = 2 ** 29 - 1;
+const ORA_PIXELS_BASE = 268435456;
+const ORA_PIXELS_PER_PICTURE = 64;
+
+const mbText = (n) => (n >= 1048576 ? `${Math.round(n / 1048576).toLocaleString("en-US")} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
+const sizeText = (w, h) => `${w.toLocaleString("en-US")} × ${h.toLocaleString("en-US")} px`;
+
+/**
+ * `bytes` (zlib "deflate" or "deflate-raw") inflated by the browser's DecompressionStream, but never to more than `cap`
+ * bytes: the input goes in in slices of 64 KB while the output is read, and once the output passes `cap` the inflate
+ * stops and throws (`.tooLarge` set), so a deflate bomb costs at most `cap` plus one slice's output (64 KB at 1032:1)
+ * instead of all it unpacks to. Within the cap it is the whole inflate it was (the same bytes, the stream's end and
+ * checksum checked): the window's reader and the pool's (inpaint_worker.js) both use this one, so their bytes agree.
+ */
+export async function inflateAtMost(bytes, format = "deflate", cap = Infinity) {
+    const ds = new DecompressionStream(format);
+    const writer = ds.writable.getWriter(), reader = ds.readable.getReader();
+    let fedErr = null, stop = false;
+    const feed = (async () => {   // fed while the output is read, or the inflater's back-pressure would stall it
+        try {
+            for (let i = 0; i < bytes.length && !stop; i += INFLATE_SLICE) await writer.write(bytes.subarray(i, i + INFLATE_SLICE));
+            if (!stop) await writer.close();
+        } catch (err) { if (!stop) fedErr = err; }
+    })();
+    const parts = [];
+    let n = 0;
+    try {
+        for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            n += value.length;
+            if (n > cap) {
+                stop = true;
+                reader.cancel().catch(() => {});   // the feeding side stops with it
+                const err = new Error(`the compressed data unpacks to more than ${cap.toLocaleString("en-US")} bytes`);
+                err.tooLarge = true;
+                throw err;
+            }
+            parts.push(value);
+        }
+    } catch (err) {
+        if (!stop) { stop = true; reader.cancel().catch(() => {}); }
+        throw err;
+    }
+    await feed;
+    if (fedErr) throw fedErr;
+    if (parts.length === 1) return parts[0];
+    const out = new Uint8Array(n);
+    for (let i = 0, o = 0; i < parts.length; o += parts[i].length, i++) out.set(parts[i], o);
+    return out;
+}
+
+/** A layer or mask rectangle against what a document can hold; `what` names it in the refusal. */
+function checkRect(what, w, h, maxPixels = LAYER_MAX_PIXELS) {
+    if (w > LAYER_MAX_SIDE || h > LAYER_MAX_SIDE || w * h > maxPixels) {
+        throw new Error(`${what} is ${sizeText(w, h)}, more than a layer can be (${LAYER_MAX_SIDE.toLocaleString("en-US")} px a side, ${Math.round(maxPixels / 1e6).toLocaleString("en-US")} MP): the file is damaged or not one this reader takes`);
+    }
+}
 
 // additional layer info keys that make a layer an adjustment or a fill (no pixels of its own)
 const ADJUSTMENTS = new Set(["SoCo", "GdFl", "PtFl", "brit", "levl", "curv", "expA", "vibA", "hue ", "hue2", "blnc", "blwh",
@@ -106,24 +186,51 @@ function unpredict(buf, w, h, depth) {
     }
 }
 
-/** One channel's samples as 8-bit bytes (w * h), from `compression` at r.p; the reader ends after `len` bytes. */
-async function readChannel(r, compression, w, h, depth, dataLen, inflate) {
-    const bpc = depth / 8, rowBytes = w * bpc;
-    const out = new Uint8Array(w * h * bpc);
+/** The fewest PackBits bytes that unpack to `rows` rows of `rowBytes` bytes (2 bytes give at most 128). */
+const packedAtLeast = (rows, rowBytes) => rows * 2 * Math.ceil(rowBytes / 128);
+
+/** The refusal of a channel whose data cannot fill its rectangle (`what` names the layer). */
+function tooShort(what, w, h) {
+    return new Error(`${what} holds less data than its ${sizeText(w, h)} need: the file is damaged`);
+}
+
+/**
+ * One channel's samples as 8-bit bytes (w * h), from `compression` at r.p; the reader ends after `len` bytes. Its data
+ * is checked against the rectangle before anything is made (H1 S5): raw data must hold every sample, PackBits rows at
+ * least what the rows can unpack from, deflate at least 1 byte per 1032; a ZIP channel unpacking to more than its
+ * samples is refused at that point. `what` names the layer in a refusal.
+ */
+async function readChannel(r, compression, w, h, depth, dataLen, inflate, what = "a PSD layer") {
+    const bpc = depth / 8, rowBytes = w * bpc, size = w * h * bpc;
     const start = r.p;
+    let out;
     if (compression === 0) {
-        out.set(r.bytes(Math.min(out.length, dataLen)));
+        if (dataLen < size) throw tooShort(what, w, h);
+        out = new Uint8Array(size);
+        out.set(r.bytes(size));
     } else if (compression === 1) {
+        // the row table and the rows lie inside the channel's own length: rows read past it would be the next
+        // channels' bytes, so a few MB of records could each claim the same data for planes of gigabytes
+        if (2 * h > dataLen) throw tooShort(what, w, h);
         const lens = new Array(h);
         for (let y = 0; y < h; y++) lens[y] = r.u16();
         const total = lens.reduce((a, b) => a + b, 0);
         r.need(total);
+        if (total < packedAtLeast(h, rowBytes) || 2 * h + total > dataLen) throw tooShort(what, w, h);
+        out = new Uint8Array(size);
         unpackRows(r.b, r.p, lens, rowBytes, out);
         r.p += total;
     } else if (compression === 2 || compression === 3) {
         if (!inflate) throw new Error("a ZIP-compressed PSD channel needs an inflater");
-        const raw = await inflate(r.bytes(dataLen));
-        out.set(raw.subarray(0, Math.min(raw.length, out.length)));
+        r.need(dataLen);
+        if (size > dataLen * DEFLATE_MAX_RATIO) throw tooShort(what, w, h);
+        // an inflater that does not stop at the cap (a test's) is held to it all the same
+        const bomb = () => new Error(`a ZIP channel of ${what} unpacks to more than its ${sizeText(w, h)}: the file is damaged`);
+        let raw;
+        try { raw = await inflate(r.bytes(dataLen), size); } catch (err) { throw err && err.tooLarge ? bomb() : err; }
+        if (raw.length > size) throw bomb();
+        out = new Uint8Array(size);
+        out.set(raw.subarray(0, Math.min(raw.length, size)));
         if (compression === 3) unpredict(out, w, h, depth);
     } else {
         throw new Error(`unknown PSD compression ${compression}`);
@@ -245,8 +352,13 @@ function listNames(names, max = 6) {
     return names.length > max ? `${shown} and ${names.length - max} more` : shown;
 }
 
-export async function readPsd(input, { inflate = null } = {}) {
-    return decodePsd(input, inflate, null);
+/**
+ * The window's reader. `onHeader({ width, height, depth, mode, channels })` (optional) once the header is accepted and
+ * before anything else is read or made: the caller's size check (H1 S5: the window checks the document's size there,
+ * as the pool route does from the header's bytes before its job).
+ */
+export async function readPsd(input, { inflate = null, onHeader = null } = {}) {
+    return decodePsd(input, inflate, null, onHeader);
 }
 
 /**
@@ -319,12 +431,25 @@ function mergedPlanes(r, bytes, width, height, channels, depth, gray) {
     const planes = {};
     const n = Math.min(channels, gray ? 2 : 4);
     if (comp === 1) {
-        const lens = [];
-        for (let i = 0; i < height * channels; i++) lens.push(r.u16());
+        // the row lengths of every channel are there; only the first n channels' are read (their rows come first), and
+        // a channel whose rows cannot unpack to the picture is not made (H1 S5)
+        const rowBytes = width * depth / 8;
+        r.need(2 * height * channels);
+        const lens = new Uint16Array(height * n);
+        for (let i = 0; i < lens.length; i++) lens[i] = r.u16();
+        r.skip(2 * height * (channels - n));
         for (let c = 0; c < n; c++) {
-            const rowLens = lens.slice(c * height, (c + 1) * height);
+            const rowLens = lens.subarray(c * height, (c + 1) * height);
+            let total = 0;
+            for (let y = 0; y < rowLens.length; y++) total += rowLens[y];
+            if (total < packedAtLeast(height, rowBytes)) {
+                // refused, not dropped quietly: a file without layers then has nothing to open (decodePsd throws it)
+                const err = new Error(`the PSD's merged picture holds less data than its ${sizeText(width, height)} need: the file is damaged`);
+                err.refused = true;
+                throw err;
+            }
             const out = new Uint8Array(width * height * depth / 8);
-            r.p = unpackRows(bytes, r.p, rowLens, width * depth / 8, out);
+            r.p = unpackRows(bytes, r.p, rowLens, rowBytes, out);
             planes[c] = out;
         }
     } else if (comp === 0) {
@@ -336,7 +461,7 @@ function mergedPlanes(r, bytes, width, height, channels, depth, gray) {
 }
 
 /** readPsd (`stream` null) and readPsdStream (`stream` its state) on one parse. */
-async function decodePsd(input, inflate, stream) {
+async function decodePsd(input, inflate, stream, onHeader = null) {
     const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
     const r = new Reader(bytes);
     if (r.ascii(4) !== "8BPS") throw new Error("not a PSD file");
@@ -348,6 +473,7 @@ async function decodePsd(input, inflate, stream) {
     if (mode !== 3 && mode !== 1) throw new Error(`this PSD is in ${PSD_MODES[mode] || "mode " + mode} colour; only RGB and grayscale are read (convert it in Photoshop: Image > Mode > RGB)`);
     if (depth !== 8 && depth !== 16) throw new Error(`this PSD has ${depth} bits per channel; only 8 and 16 are read`);
     if (stream && stream.onHeader) stream.onHeader({ width, height, depth, mode, channels });
+    if (onHeader) onHeader({ width, height, depth, mode, channels });
     const gray = mode === 1;
     r.skip(r.u32());   // colour mode data
     r.skip(r.u32());   // image resources
@@ -399,7 +525,11 @@ async function decodePsd(input, inflate, stream) {
                     if (m && !(cw > 0 && chh > 0)) { L.ch[c.id] = EMPTY; r.p = end; continue; }   // an empty rectangle: the default colour everywhere
                     if (c.len < 2) { r.p = end; continue; }
                     const comp = r.u16();
-                    if (cw > 0 && chh > 0) L.ch[c.id] = await readChannel(r, comp, cw, chh, depth, c.len - 2, inflate);
+                    if (cw > 0 && chh > 0) {
+                        const what = `the PSD layer "${String(L.name).slice(0, 60)}"${isMask ? "'s mask" : ""}`;
+                        checkRect(what, cw, chh);
+                        L.ch[c.id] = await readChannel(r, comp, cw, chh, depth, c.len - 2, inflate, what);
+                    }
                     r.p = end;
                 }
                 if (stream) {
@@ -417,12 +547,12 @@ async function decodePsd(input, inflate, stream) {
     }
     r.p = lmEnd;
     // the merged picture (the stream reads it after the layers, and only when none has pixels)
-    let composite = null;
+    let composite = null, mergedRefused = null;
     if (!stream) {
         try {
             const ch = mergedPlanes(r, bytes, width, height, channels, depth, gray);
             if (ch) composite = interleave(ch, width, height, gray);
-        } catch (_) { composite = null; }
+        } catch (err) { composite = null; if (err && err.refused) mergedRefused = err; }
     }
     // records are bottom first; groups are a bounding divider (3) below their layers and a folder record (1 / 2) above.
     // A group comes back as a folder (PLAN_0_1_31 §6.5): `groups` [{ id, name, visible, collapsed, parent }], a layer's
@@ -474,9 +604,11 @@ async function decodePsd(input, inflate, stream) {
     if (stream && !layers.length && width > 0 && height > 0) {   // a header of no area has no merged picture to send
         r.p = lmEnd;
         let ch = null;
-        try { ch = mergedPlanes(r, bytes, width, height, channels, depth, gray); } catch (_) { ch = null; }
+        try { ch = mergedPlanes(r, bytes, width, height, channels, depth, gray); } catch (err) { ch = null; if (err && err.refused) mergedRefused = err; }
         if (ch) composite = streamPixels(stream, ch, width, height, gray, null);
     }
+    // a file whose only picture is a merged picture too short for its size is refused (both readers alike)
+    if (!layers.length && mergedRefused) throw mergedRefused;
     const hasComposite = composite != null;
     if (adjust.length) notes.push(`${adjust.length} adjustment or fill layer${adjust.length > 1 ? "s" : ""} left out (${listNames(adjust)}): the picture can look different`);
     if (clips) notes.push(`${clips} clipped layer${clips > 1 ? "s" : ""} kept clipped`);
@@ -497,7 +629,11 @@ async function decodePsd(input, inflate, stream) {
 
 // ---- OpenRaster -------------------------------------------------------------------------
 
-/** The entries of a zip: { name: { method, data } } from the central directory. */
+/**
+ * The entries of a zip: { name: { method, data, size } } from the central directory, `size` the entry's uncompressed
+ * size as the directory gives it (what a deflated entry may unpack to). A map without a prototype, so an entry named
+ * "__proto__" or "constructor" is an entry like any other.
+ */
 function unzip(bytes) {
     const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     let eocd = -1;
@@ -505,19 +641,27 @@ function unzip(bytes) {
     if (eocd < 0) throw new Error("the ORA file is not a complete zip");
     const count = v.getUint16(eocd + 10, true);
     let p = v.getUint32(eocd + 16, true);
-    const out = {};
+    const out = Object.create(null);
     for (let i = 0; i < count; i++) {
         if (v.getUint32(p, true) !== 0x02014b50) throw new Error("the ORA file's zip directory is damaged");
-        const method = v.getUint16(p + 10, true), csize = v.getUint32(p + 20, true);
+        const method = v.getUint16(p + 10, true), csize = v.getUint32(p + 20, true), size = v.getUint32(p + 24, true);
         const nameLen = v.getUint16(p + 28, true), extra = v.getUint16(p + 30, true), comment = v.getUint16(p + 32, true);
         const local = v.getUint32(p + 42, true);
         const name = new TextDecoder().decode(bytes.subarray(p + 46, p + 46 + nameLen));
         const lNameLen = v.getUint16(local + 26, true), lExtra = v.getUint16(local + 28, true);
         const at = local + 30 + lNameLen + lExtra;
-        out[name] = { method, data: bytes.subarray(at, at + csize) };
+        out[name] = { method, data: bytes.subarray(at, at + csize), size };
         p += 46 + nameLen + extra + comment;
     }
     return out;
+}
+
+/** A PNG's size from its IHDR (`{ w, h }`), or null when the bytes are no PNG (the decoder says why later). */
+function pngSize(png) {
+    if (!png || png.length < 24 || png[0] !== 0x89 || png[1] !== 0x50 || png[2] !== 0x4e || png[3] !== 0x47) return null;
+    const v = new DataView(png.buffer, png.byteOffset, png.byteLength);
+    if (v.getUint32(12) !== 0x49484452) return null;   // "IHDR"
+    return { w: v.getUint32(16), h: v.getUint32(20) };
 }
 
 const attr = (tag, name) => {
@@ -526,16 +670,32 @@ const attr = (tag, name) => {
     return (m[2] != null ? m[2] : m[3]).replace(/&quot;/g, "\"").replace(/&apos;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
 };
 
-export async function readOra(input, { inflateRaw = null } = {}) {
+/**
+ * `onHeader({ width, height })` (optional) once stack.xml gave the size and before any layer's picture is read: the
+ * caller's size check (H1 S5). A deflated entry unpacks to at most the size the zip's directory gives it (more is
+ * refused), stack.xml to 16 MB, and all deflated entries together to 256 MB plus 64 times the file; a layer whose PNG
+ * says it is larger than a layer can be is refused before it is decoded.
+ */
+export async function readOra(input, { inflateRaw = null, onHeader = null } = {}) {
     const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
     const zip = unzip(bytes);
+    const budget = ORA_INFLATE_BASE + ORA_INFLATE_RATIO * bytes.length;
+    let unpacked = 0;
     const get = async (name) => {
         const e = zip[name];
         if (!e) return null;
         if (e.method === 0) return e.data;
         if (e.method === 8) {
             if (!inflateRaw) throw new Error("a deflated ORA entry needs an inflater");
-            return inflateRaw(e.data);
+            const label = String(name).slice(0, 80);
+            if (name === "stack.xml" && e.size > ORA_XML_MAX) throw new Error(`the ORA file's stack.xml unpacks to ${mbText(e.size)}, more than a stack.xml can be (${mbText(ORA_XML_MAX)}): the file is damaged`);
+            if (unpacked + e.size > budget) throw new Error(`the ORA file's entries unpack to more than ${mbText(budget)} (at ${label}), far more than its ${mbText(bytes.length)} can hold: the file is damaged or not an image`);
+            unpacked += e.size;
+            const bomb = () => new Error(`the ORA entry ${label} unpacks to more than the ${e.size.toLocaleString("en-US")} bytes its zip directory gives: the file is damaged`);
+            let raw;
+            try { raw = await inflateRaw(e.data, e.size); } catch (err) { throw err && err.tooLarge ? bomb() : err; }
+            if (raw.length > e.size) throw bomb();
+            return raw;
         }
         throw new Error(`unknown zip method ${e.method} for ${name}`);
     };
@@ -546,6 +706,9 @@ export async function readOra(input, { inflateRaw = null } = {}) {
     if (!img) throw new Error("the ORA stack.xml has no <image>");
     const width = Math.round(+attr(img[0], "w")), height = Math.round(+attr(img[0], "h"));
     if (!(width > 0 && height > 0)) throw new Error("the ORA image has no size");
+    if (onHeader) onHeader({ width, height });
+    const pixelBudget = Math.max(ORA_PIXELS_BASE, ORA_PIXELS_PER_PICTURE * width * height);
+    let pixels = 0;
     const notes = [];
     const found = [];   // top first
     const blends = [], missing = [];
@@ -576,6 +739,13 @@ export async function readOra(input, { inflateRaw = null } = {}) {
         if (!blend) { blends.push(`${name} (${op})`); blend = "normal"; }
         const png = src ? await get(src) : null;
         if (!png) { missing.push(name); continue; }
+        const size = pngSize(png);
+        if (size) {
+            const label = `the ORA layer "${String(name).slice(0, 60)}"`;
+            checkRect(label, size.w, size.h, ORA_LAYER_MAX_PIXELS);
+            pixels += size.w * size.h;
+            if (pixels > pixelBudget) throw new Error(`the ORA file's layers add up to more than ${Math.round(pixelBudget / 1e6).toLocaleString("en-US")} MP at ${label}, more than the layers of a ${sizeText(width, height)} picture can be: the file is damaged`);
+        }
         found.push({ name, x: Math.round(x), y: Math.round(y), opacity: Math.max(0, Math.min(1, opacity)), visible, blend, png });
     }
     if (blends.length) notes.push(`blend modes the editor lacks became normal: ${listNames(blends)}`);

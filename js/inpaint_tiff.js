@@ -33,7 +33,8 @@ const MAX_IFDS = 256;              // IFDs walked to count the pages (and to fin
 const MAX_VALUES = 1 << 24;        // entries of one tag's array (a strip table of a gigapixel picture is far below)
 
 const TRUNCATED = "the file ends early (it is truncated, or not a TIFF)";
-const truncated = (what = "") => new Error(TRUNCATED + (what ? ": " + what : ""));
+const tiffError = (msg, code) => { const e = new Error(msg); e.code = code; return e; };
+const truncated = (what = "") => tiffError(TRUNCATED + (what ? ": " + what : ""), -2);
 
 const CODEC = { 1: "none", 5: "lzw", 8: "deflate", 32773: "packbits", 32946: "deflate" };   // `readTiff`'s `spent.codec`
 const clock = () => (typeof performance !== "undefined" ? performance.now() : Date.now());
@@ -273,20 +274,21 @@ class Sink {
     take() { const out = this.buf.slice(0, this.len); this.len = 0; return out; }
 }
 
-/** PackBits (Apple, TIFF 6.0 section 9), streamed: a run may be cut anywhere between two pieces. */
-function packBitsDecoder() {
-    const out = new Sink();
-    let lit = 0, rep = -1;   // literal bytes still to copy; a repeat count waiting for its byte
+/** PackBits (Apple, TIFF 6.0 section 9), streamed: a run may be cut anywhere between two pieces; stops once `need` bytes are emitted. */
+function packBitsDecoder(need = Infinity) {
+    const out = new Sink(Number.isFinite(need) ? Math.min(Math.max(need, 64), 65536) : 65536);
+    let lit = 0, rep = -1, left = need;   // literal bytes still to copy; a repeat count waiting for its byte; bytes still wanted
     return {
         push(chunk) {
-            for (let i = 0; i < chunk.length;) {
+            for (let i = 0; i < chunk.length && left > 0;) {
                 if (lit > 0) {
-                    const n = Math.min(lit, chunk.length - i);
+                    const n = Math.min(lit, chunk.length - i, left);
                     out.room(n); out.buf.set(chunk.subarray(i, i + n), out.len); out.len += n;
-                    lit -= n; i += n;
+                    lit -= n; left -= n; i += n;
                 } else if (rep > 0) {
-                    out.room(rep); out.buf.fill(chunk[i], out.len, out.len + rep); out.len += rep;
-                    rep = -1; i++;
+                    const n = Math.min(rep, left);
+                    out.room(n); out.buf.fill(chunk[i], out.len, out.len + n); out.len += n;
+                    left -= n; rep = -1; i++;
                 } else {
                     const h = chunk[i++];
                     if (h < 128) lit = h + 1;
@@ -301,20 +303,25 @@ function packBitsDecoder() {
 
 /**
  * TIFF's LZW (TIFF 6.0 section 13), streamed: codes of 9 to 12 bits, most significant bit first, the width growing one
- * code early; 256 clears the table, 257 ends the strip. The LZW of before TIFF 6 (bits the other way round) is refused.
+ * code early; 256 clears the table, 257 ends the strip, and decoding stops once `need` bytes are emitted. The LZW of
+ * before TIFF 6 (bits the other way round) is refused.
  */
-function lzwDecoder() {
+function lzwDecoder(need = Infinity) {
     const prefix = new Int32Array(4096), suffix = new Uint8Array(4096), first = new Uint8Array(4096), len = new Uint16Array(4096);
     for (let i = 0; i < 256; i++) { prefix[i] = -1; suffix[i] = i; first[i] = i; len[i] = 1; }
-    const out = new Sink();
-    let next = 258, width = 9, old = -1, acc = 0, nbits = 0, ended = false, checked = false, head = -1;
+    const out = new Sink(Number.isFinite(need) ? Math.min(Math.max(need, 64), 65536) : 65536);
+    let left = need, next = 258, width = 9, old = -1, acc = 0, nbits = 0, ended = left <= 0, checked = false, head = -1;
     const emit = (code) => {
-        const l = len[code];
-        out.room(l);
+        const l = len[code], keep = Math.min(l, left);
+        out.room(keep);
         const b = out.buf;
-        let p = out.len + l - 1;
-        for (let c = code; c >= 0; c = prefix[c]) b[p--] = suffix[c];
-        out.len += l;
+        let c = code;
+        for (let skip = l - keep; skip > 0; skip--) c = prefix[c];
+        let p = out.len + keep - 1;
+        for (; c >= 0; c = prefix[c]) b[p--] = suffix[c];
+        out.len += keep;
+        left -= keep;
+        if (left <= 0) ended = true;
     };
     const add = (pre, ch) => {
         if (next >= 4096) return;
@@ -326,26 +333,30 @@ function lzwDecoder() {
         if (c === 256) { next = 258; width = 9; old = -1; return; }
         if (c === 257) { ended = true; return; }
         if (old < 0) {
-            if (c > 255) throw new Error("damaged LZW data in the TIFF (a code before any literal)");
+            if (c > 255) throw tiffError("damaged LZW data in the TIFF (a code before any literal)", -4);
             emit(c); old = c; return;
         }
         if (c < next) { emit(c); add(old, first[c]); }
         else if (c === next) { add(old, first[old]); emit(c); }
-        else throw new Error("damaged LZW data in the TIFF (a code beyond the table)");
+        else throw tiffError("damaged LZW data in the TIFF (a code beyond the table)", -5);
         old = c;
     };
     return {
         push(chunk) {
+            if (ended || !chunk.length) return new Uint8Array(0);
             let i = 0;
-            if (!checked && chunk.length) {
+            if (!checked) {
                 // an old-style stream starts with its clear code least significant bit first: 0x00, then a byte with bit 0 set
-                if (head < 0) { head = chunk[0]; if (chunk.length < 2) return new Uint8Array(0); }
-                const second = head === chunk[0] && chunk.length >= 2 ? chunk[1] : chunk[0];
-                if (head === 0 && (second & 1)) throw new Error("this TIFF uses the old-style LZW of before TIFF 6, which is not read; save it again with LZW or ZIP compression");
-                checked = true;
-                if (chunk[0] !== head || chunk.length < 2) {   // the first byte came alone: feed it now
+                let firstByte, secondByte;
+                if (head < 0) {
+                    if (chunk.length < 2) { head = chunk[0]; return new Uint8Array(0); }
+                    firstByte = chunk[0]; secondByte = chunk[1];
+                } else {
+                    firstByte = head; secondByte = chunk[0];
                     acc = head; nbits = 8;
                 }
+                if (firstByte === 0 && (secondByte & 1)) throw tiffError("this TIFF uses the old-style LZW of before TIFF 6, which is not read; save it again with LZW or ZIP compression", -3);
+                checked = true;
             }
             for (; i < chunk.length && !ended; i++) {
                 acc = ((acc << 8) | chunk[i]) & 0xFFFFFF;
@@ -361,6 +372,41 @@ function lzwDecoder() {
         end() { return out.take(); },
     };
 }
+
+/**
+ * Whole-strip or whole-tile unpacker for uncompressed (`1`), LZW (`5`) and PackBits (`32773`) bytes `src` into `out`
+ * (`need` bytes, allocated when absent), stopping as soon as `need` bytes are written (`crates/px/src/tiff.rs`
+ * `tiff_unpack`, K16). Throws the reader's refusal on truncated or damaged streams.
+ */
+export function unpackStrip(compression, src, need, out = null, name = "strip") {
+    if (need instanceof Uint8Array) { out = need; need = out.byteLength; }
+    if (!(compression === 1 || compression === 5 || compression === 32773) || !ArrayBuffer.isView(src) || !Number.isInteger(need) || need < 0) {
+        throw tiffError(`unsupported TIFF strip unpack (compression ${compression}, need ${need})`, -1);
+    }
+    const bytes = src instanceof Uint8Array ? src : new Uint8Array(src.buffer, src.byteOffset, src.byteLength);
+    let dst;
+    if (out == null) {
+        dst = new Uint8Array(need);
+    } else {
+        if (!ArrayBuffer.isView(out) || out.byteLength < need) {
+            throw tiffError(`output buffer (${out && typeof out.byteLength === "number" ? out.byteLength : 0} bytes) is smaller than need (${need})`, -1);
+        }
+        dst = out instanceof Uint8Array ? out : new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
+    }
+    if (need === 0) return out || dst;
+    if (compression === 1) {
+        if (bytes.length < need) throw truncated(`${name} holds fewer bytes than its rows`);
+        dst.set(bytes.subarray(0, need));
+        return out || dst;
+    }
+    const dec = compression === 5 ? lzwDecoder(need) : packBitsDecoder(need);
+    const decoded = dec.push(bytes);
+    if (decoded.length < need) throw truncated(`${name} holds fewer bytes than its rows`);
+    dst.subarray(0, need).set(decoded);
+    return out || dst;
+}
+
+export const TIFF_JS = Object.freeze({ unpackStrip });
 
 /**
  * The pieces of a ReadableStream, and the stream cancelled when the caller stops early. Each await of the next piece
@@ -383,22 +429,41 @@ async function* piecesOf(stream, spent) {
     }
 }
 
-/** The uncompressed bytes of one strip or tile, piece by piece. */
-async function* unpacked(src, off, count, compression, name) {
+/** The uncompressed bytes of one strip or tile, piece by piece, stopping once `need` bytes have been yielded. */
+async function* unpacked(src, off, count, compression, name, need = Infinity) {
     if (!(off >= 0) || !(count >= 0) || off + count > src.size) throw truncated(`${name} lies past the end of the file`);
     const sp = src.spent;
     const raw = src.blob.slice(off, off + count).stream();
-    if (compression === 1) { yield* piecesOf(raw, sp); return; }
-    if (compression === 8 || compression === 32946) {
-        try { yield* piecesOf(raw.pipeThrough(new DecompressionStream("deflate")), sp); } catch (err) { throw new Error(`${name} of the TIFF is damaged or cut off (${(err && err.message) || err})`); }
+    if (compression === 1) {
+        let got = 0;
+        for await (const piece of piecesOf(raw, sp)) {
+            const take = Math.min(piece.length, need - got);
+            if (take > 0) yield take === piece.length ? piece : piece.subarray(0, take);
+            got += take;
+            if (got >= need) return;
+        }
         return;
     }
-    const dec = compression === 5 ? lzwDecoder() : packBitsDecoder();
+    if (compression === 8 || compression === 32946) {
+        let got = 0;
+        try {
+            for await (const piece of piecesOf(raw.pipeThrough(new DecompressionStream("deflate")), sp)) {
+                const take = Math.min(piece.length, need - got);
+                if (take > 0) yield take === piece.length ? piece : piece.subarray(0, take);
+                got += take;
+                if (got >= need) return;
+            }
+        } catch (err) { throw new Error(`${name} of the TIFF is damaged or cut off (${(err && err.message) || err})`); }
+        return;
+    }
+    const dec = compression === 5 ? lzwDecoder(need) : packBitsDecoder(need);
+    let got = 0;
     for await (const piece of piecesOf(raw, sp)) {
         const t0 = clock();
         const o = dec.push(piece);
         sp.decode += clock() - t0;
-        if (o.length) yield o;
+        if (o.length) { yield o; got += o.length; }
+        if (got >= need) return;
     }
     const t1 = clock();
     const tail = dec.end();
@@ -437,7 +502,7 @@ class StripRows {
         const k = this.plane * L.per + s;
         const rows = Math.min(L.rps, this.info.height - s * L.rps);
         this.need = rows * L.rowBytes;
-        this.it = unpacked(this.src, L.offsets[k], L.counts[k], this.info.compression, `strip ${k + 1}`);
+        this.it = unpacked(this.src, L.offsets[k], L.counts[k], this.info.compression, `strip ${k + 1}`, this.need);
         this.piece = null; this.at = 0;
     }
     async read(n) {
@@ -481,7 +546,7 @@ class TileRows {
         const L = this.L, sp = this.src.spent, tileRow = Math.ceil((L.tw * L.perPixel * this.info.bits) / 8), want = tileRow * L.tl;
         const buf = new Uint8Array(want);
         let got = 0;
-        const it = unpacked(this.src, L.offsets[k], L.counts[k], this.info.compression, `tile ${k + 1}`);
+        const it = unpacked(this.src, L.offsets[k], L.counts[k], this.info.compression, `tile ${k + 1}`, want);
         try {
             for await (const piece of it) {
                 const take = Math.min(piece.length, want - got);

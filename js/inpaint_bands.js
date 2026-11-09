@@ -16,7 +16,7 @@
  * channel, the row length tables joined), `OraBandWriter` (a stored zip of PNGs made by `writePng`). `run(op, args,
  * transfer)` is the pool. Nothing here touches a canvas; the editor makes the sources.
  */
-import { PngStreamWriter, partRows } from "./inpaint_png.js";
+import { PngStreamWriter, partRows, crc32 } from "./inpaint_png.js";
 import { TiffStreamWriter, tiffStripRows } from "./inpaint_tiff.js";
 import { PSD_BLEND, ORA_BLEND } from "./blend_modes.js";
 
@@ -415,19 +415,23 @@ export class OraBandWriter {
         this.entries = [];   // { name, blob, crc, size }
         this.stackLines = [];
         this.count = 0;
-        this._add("mimetype", new Blob([new TextEncoder().encode("image/openraster")]));
+        const mime = new TextEncoder().encode("image/openraster");
+        this._add("mimetype", new Blob([mime]), crc32(mime));
     }
 
-    _add(name, blob) {
-        const e = { name, blob, crc: 0, size: blob.size };
-        e.ready = Promise.resolve(this.run("crc", { blob }, [])).then((r) => { e.crc = r.crc >>> 0; });
+    _add(name, blob, crc) {
+        const e = { name, blob, crc: crc !== undefined ? crc >>> 0 : 0, size: blob.size };
+        e.ready = crc !== undefined
+            ? Promise.resolve()
+            : Promise.resolve(this.run("crc", { blob }, [])).then((r) => { e.crc = r.crc >>> 0; });
         e.ready.catch(() => {});
         this.entries.push(e);
     }
 
     async layer(L, source, progress = null) {
         const file = `data/layer${this.count}.png`;
-        this._add(file, await writePng(source, this.run, { flights: this.flights, progress, pause: this.pause }));
+        const blob = await writePng(source, this.run, { flights: this.flights, progress, pause: this.pause });
+        this._add(file, blob, blob.crc);
         // ORA lists layers top first, they arrive bottom first
         this.stackLines.unshift(`    <layer name="${xmlEsc(L.name || "Layer")}" src="${file}" x="${L.x}" y="${L.y}" opacity="${(L.opacity ?? 1).toFixed(3)}" visibility="${L.visible === false ? "hidden" : "visible"}" composite-op="${ORA_BLEND[L.blend] || "svg:src-over"}" />`);
         this.count++;
@@ -435,9 +439,10 @@ export class OraBandWriter {
 
     /** `composite`: the merged picture's row source; `thumbnail`: a PNG Blob of at most 256 px. */
     async finish(composite, thumbnail, progress = null) {
-        const stack = `<?xml version="1.0" encoding="UTF-8"?>\n<image version="0.0.3" w="${this.width}" h="${this.height}" xres="72" yres="72">\n  <stack>\n${this.stackLines.join("\n")}\n  </stack>\n</image>\n`;
-        this._add("stack.xml", new Blob([new TextEncoder().encode(stack)]));
-        this._add("mergedimage.png", await writePng(composite, this.run, { flights: this.flights, progress, pause: this.pause }));
+        const stack = new TextEncoder().encode(`<?xml version="1.0" encoding="UTF-8"?>\n<image version="0.0.3" w="${this.width}" h="${this.height}" xres="72" yres="72">\n  <stack>\n${this.stackLines.join("\n")}\n  </stack>\n</image>\n`);
+        this._add("stack.xml", new Blob([stack]), crc32(stack));
+        const merged = await writePng(composite, this.run, { flights: this.flights, progress, pause: this.pause });
+        this._add("mergedimage.png", merged, merged.crc);
         if (thumbnail) this._add("Thumbnails/thumbnail.png", thumbnail);
         await Promise.all(this.entries.map((e) => e.ready));
         const pieces = [], central = [];

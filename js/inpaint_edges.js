@@ -3,9 +3,10 @@
 // Pure edge mathematics module for snap sampling, detail tile fusion and edge tile detection (R2-S2 / PLAN_NIK9_BUILD sec 3.3)
 // Holds JS functions and SNAP_GLSL with identical maths. No DOM at import.
 
-import { u16Bilinear, sstep } from "./inpaint_weights.js";
-import { boxBlurs, rangeMax as rangeMaxKernel } from "./px/kernels.js";
-import { xfBox } from "./inpaint_resample.js";
+import { u16Bilinear, sstep, rangeTileClass, rangeRowBookkeeping } from "./inpaint_weights.js";
+import { boxBlurs, rangeMax as rangeMaxKernel, mapTileStats as mapTileStatsKernel } from "./px/kernels.js";
+
+export { rangeTileClass, rangeRowBookkeeping };
 
 /** Default edge snap depth threshold (R2-S3) */
 export const SNAP_TAU = 0.02;
@@ -540,6 +541,29 @@ export function rangeMax(map) {
 }
 
 /**
+ * Per-tile minimum, maximum, and edge flag over a depth map (`map` and optional `rmax`) for a `W` x `H` document
+ * in `tile`² tiles (`docs/PLAN_WASM_BUILD.md` §4.8, K21).
+ *
+ * @param {{ data: Uint16Array, w: number, h: number }} map - Depth map
+ * @param {Uint16Array | { data: Uint16Array } | null} rmax - Precomputed rangeMax buffer (or null when snap is off)
+ * @param {number[] | null} xfInvToMap - Doc px -> map px affine transform (or null)
+ * @param {number} W - Document width
+ * @param {number} H - Document height
+ * @param {number} [tau=SNAP_TAU] - Threshold fraction (e.g. 0.02)
+ * @param {number} [tile=256] - Tile size in document pixels
+ * @returns {{ min: Uint16Array, max: Uint16Array, edge: Uint8Array, cols: number, rows: number }}
+ */
+export function mapTileStats(map, rmax, xfInvToMap, W, H, tau = SNAP_TAU, tile = 256) {
+    const mw = map.w, mh = map.h;
+    // @ts-ignore
+    const rData = rmax ? (rmax.data || rmax) : null;
+    const mData = map.data || rData;
+    const thresh = rData ? Math.round(tau * 65535) : 0;
+    const xf = xfInvToMap || [mw / W, 0, 0, mh / H, 0, 0];
+    return mapTileStatsKernel(mData, rData, mw, mh, xf, W, H, thresh, tile);
+}
+
+/**
  * Flags 256x256 document tiles that cross significant depth edges.
  *
  * @param {{ data: Uint16Array, w: number, h: number }} map - Depth map
@@ -552,44 +576,6 @@ export function rangeMax(map) {
  * @returns {Uint8Array}
  */
 export function edgeTiles(map, rmax, xfInvToMap, W, H, tau, tile = 256) {
-    const cols = Math.ceil(W / tile);
-    const rows = Math.ceil(H / tile);
-    const out = new Uint8Array(cols * rows);
-    const thresh = Math.round(tau * 65535);
-    const mw = map.w, mh = map.h;
-    // @ts-ignore
-    const rData = rmax.data || rmax;
-
-    const xf = xfInvToMap || [mw / W, 0, 0, mh / H, 0, 0];
-
-    for (let ty = 0; ty < rows; ty++) {
-        const y0 = ty * tile;
-        const y1 = Math.min(H, (ty + 1) * tile);
-        for (let tx = 0; tx < cols; tx++) {
-            const x0 = tx * tile;
-            const x1 = Math.min(W, (tx + 1) * tile);
-
-            const [mx0, my0, mx1, my1] = xfBox(xf, x0, y0, x1, y1);
-            // plus 2 texels
-            const ix0 = Math.max(0, Math.floor(mx0 - 2));
-            const iy0 = Math.max(0, Math.floor(my0 - 2));
-            const ix1 = Math.min(mw - 1, Math.ceil(mx1 + 2));
-            const iy1 = Math.min(mh - 1, Math.ceil(my1 + 2));
-
-            let hasEdge = false;
-            for (let my = iy0; my <= iy1 && !hasEdge; my++) {
-                const row = my * mw;
-                for (let mx = ix0; mx <= ix1; mx++) {
-                    if (rData[row + mx] > thresh) {
-                        hasEdge = true;
-                        break;
-                    }
-                }
-            }
-            if (hasEdge) {
-                out[ty * cols + tx] = 1;
-            }
-        }
-    }
-    return out;
+    return mapTileStats(map, rmax, xfInvToMap, W, H, tau, tile).edge;
 }
+

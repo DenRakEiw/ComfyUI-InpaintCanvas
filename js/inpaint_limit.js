@@ -6,11 +6,12 @@
 // the guide is the picture without filters.
 // No DOM at import.
 
-import { WEIGHTS_GLSL, normalizeLimit, limitWeight, u16Bilinear, opp, hexToRgb } from "./inpaint_weights.js";
+import { WEIGHTS_GLSL, normalizeStoredLimit, limitWeight, u16Bilinear, opp, hexToRgb } from "./inpaint_weights.js";
 import { SAMPLE_GLSL, runShader, glToCanvas } from "./inpaint_filters_gl.js";
 import { passToMap, rg8View, guideView } from "./inpaint_maps.js";
 import { setLimitStage } from "./inpaint_filters.js";
-import { SNAP_GLSL, snapParams, snapField } from "./inpaint_edges.js";
+import { SNAP_GLSL, snapParams, snapRgb, snapField } from "./inpaint_edges.js";
+import { limitAlphaRows as limitAlphaRowsKernel } from "./px/kernels.js";
 
 export const LIMIT_SHADER = {
     label: "limit",
@@ -54,7 +55,7 @@ vec4 shade(vec4 c, vec2 uv) {
  */
 export function limitStage(src, out, limitIn, info = {}, def = null) {
     if (!limitIn) return out;
-    const limit = normalizeLimit(limitIn);
+    const limit = normalizeStoredLimit(limitIn);
     if (!limit) return out;
     if (out === src) return src;
     if (limit.lo <= 0 && limit.hi >= 1 && !limit.invert) return out;
@@ -202,10 +203,11 @@ export function limitStageCPU(srcCanvas, outCanvas, limit, info = {}, over = fal
  * @param {number} h
  * @param {any} limit
  * @param {any} map
+ * @param {Uint8Array|Uint8ClampedArray|null} [col=null]
  */
-export function limitAlphaRows(rgba, x0, y0, w, h, limit, map) {
+export function limitAlphaRows(rgba, x0, y0, w, h, limit, map, col = null) {
     if (!rgba || !limit || w <= 0 || h <= 0) return;
-    const lim = normalizeLimit(limit);
+    const lim = normalizeStoredLimit(limit);
     if (!lim) return;
 
     // Shortcut: full range and not inverted leaves alpha untouched
@@ -221,6 +223,42 @@ export function limitAlphaRows(rgba, x0, y0, w, h, limit, map) {
     const snap = (map && map.guide) ? snapParams(map.meta?.snap?.strength) : null;
     const sigmaR = snap ? snap[0] : 0;
     const tau = snap ? snap[1] : 0;
+    const gRaw = (map && map.guide) ? (map.guide.data || map.guide) : null;
+    const gw = (map && map.guide && map.guide.w != null) ? (map.guide.w | 0) : (map ? map.w : 0);
+    const gh = (map && map.guide && map.guide.h != null) ? (map.guide.h | 0) : (map ? map.h : 0);
+
+    const x1 = x0 + w, y1 = y0 + h;
+    if (
+        lim.source === "depth" &&
+        map &&
+        map.data instanceof Uint16Array &&
+        map.w > 0 &&
+        map.h > 0 &&
+        map.data.length >= map.w * map.h &&
+        rgba.length >= w * h * 4 &&
+        (!col || col.length >= w * h * 4) &&
+        (!gRaw || (gw === map.w && gh === map.h && gRaw.length >= map.w * map.h * 4)) &&
+        Number.isInteger(x0) &&
+        Number.isInteger(y0) &&
+        Array.isArray(m) &&
+        m.length >= 6 &&
+        m.every(Number.isFinite) &&
+        [
+            m[0] * x0 + m[2] * y0 + m[4],
+            m[0] * x1 + m[2] * y0 + m[4],
+            m[0] * x0 + m[2] * y1 + m[4],
+            m[0] * x1 + m[2] * y1 + m[4],
+            m[1] * x0 + m[3] * y0 + m[5],
+            m[1] * x1 + m[3] * y0 + m[5],
+            m[1] * x0 + m[3] * y1 + m[5],
+            m[1] * x1 + m[3] * y1 + m[5],
+        ].every(Number.isFinite) &&
+        [lim.lo, lim.hi, lim.fLo, lim.fHi, sigmaR, tau].every(Number.isFinite)
+    ) {
+        limitAlphaRowsKernel(rgba, map.data, map.w, map.h, m, x0, y0, w, h, lim, snap, gRaw, col);
+        return;
+    }
+
     let ptr = 0;
     for (let y = 0; y < h; y++) {
         const py = y0 + y + 0.5;
@@ -230,9 +268,23 @@ export function limitAlphaRows(rgba, x0, y0, w, h, limit, map) {
                 const px = x0 + x + 0.5;
                 const mx = m[0] * px + m[2] * py + m[4];
                 const my = m[1] * px + m[3] * py + m[5];
-                mapVal = (sigmaR > 0)
-                    ? snapField(map, map.guide, mx, my, rgba[ptr] / 255, rgba[ptr + 1] / 255, rgba[ptr + 2] / 255, sigmaR, tau)
-                    : u16Bilinear(map.data, map.w, map.h, mx, my);
+                if (sigmaR > 0) {
+                    let sr, sg, sb;
+                    if (col) {
+                        sr = col[ptr] / 255;
+                        sg = col[ptr + 1] / 255;
+                        sb = col[ptr + 2] / 255;
+                    } else if (gRaw && gw > 0 && gh > 0) {
+                        [sr, sg, sb] = snapRgb(gRaw, gw, gh, Math.floor(mx), Math.floor(my));
+                    } else {
+                        sr = rgba[ptr] / 255;
+                        sg = rgba[ptr + 1] / 255;
+                        sb = rgba[ptr + 2] / 255;
+                    }
+                    mapVal = snapField(map, map.guide, mx, my, sr, sg, sb, sigmaR, tau);
+                } else {
+                    mapVal = u16Bilinear(map.data, map.w, map.h, mx, my);
+                }
             }
             const wVal = (lim.source === "depth" && (!map || !map.data))
                 ? 0
