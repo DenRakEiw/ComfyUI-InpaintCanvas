@@ -9,8 +9,8 @@
  * worker made it (length, type, data, CRC), an IDAT with the Adler-32 of all the filtered bytes (the parts' own sums
  * joined by `adlerCombine`), IEND. The file is a Blob of those pieces.
  *
- * A part's rows come either as bytes (`{ rgba, prev }`, a band the editor composited) or as the tiles that hold them
- * (`{ tiles, prevTiles }`, named by arena slot or as copies), which a worker reads where they lie.
+ * A part's rows come either as bytes (`{ rgba, prev }`, a band with an optional row above) or as the tiles that hold
+ * them (`{ tiles }`, named by arena slot or as copies; `png_part` starts each tile or stack part independent, P5).
  *
  * Without the Rust kernels in the workers a part fails with `NO_PARTS`, and the caller keeps its canvas path.
  */
@@ -177,9 +177,9 @@ export class PngStreamWriter {
     }
 
     /**
-     * The next `rows` rows. `source`: `{ rgba: ArrayBuffer, prev: ArrayBuffer | null }` (both transferred; `prev` the row
-     * above, which the writer does not keep) or `{ tiles, prevTiles, x0, r0 }` (see `png_part`). Parts must be added in
-     * the order of their rows; they finish in any.
+     * The next `rows` rows. `source`: `{ rgba: ArrayBuffer, prev: ArrayBuffer | null }` (both transferred; `prev` an
+     * explicit row above, which the writer does not keep) or `{ tiles, x0, r0 }` (see `png_part`; `prevTiles` is
+     * ignored since parts start with None or Sub, P5). Parts must be added in the order of their rows; they finish in any.
      */
     add(rows, source, transfer = []) {
         if (this.failed) throw this.failed;
@@ -436,4 +436,219 @@ export async function readPng(blob, { onHeader = null, onRows, rowsPerBand = 256
     await Promise.all([feed, drain]);
     if (y !== height) throw new Error(`the PNG ended after ${y} of ${height} rows`);
     return { width, height, bitDepth, colorType, texts, spent };
+}
+
+/**
+ * Inspect `blob` with 8-byte chunk header reads for Scumble's parted PNG layout (K8, docs/PLAN_WASM_BUILD.md §4.2):
+ * 8-bit RGBA, not interlaced, no colour profile or gamma chunk (`iCCP`, `gAMA`, `cHRM`, `cICP`, `PLTE`, `tRNS`),
+ * a 2-byte zlib header `IDAT`, one or more part `IDAT` chunks, a 4-byte tail `IDAT` holding the expected Adler-32,
+ * and `IEND`. Any other file returns `null` after 33–49 bytes (or at the first chunk that deviates).
+ */
+export async function pngPartsOf(blob) {
+    if (!blob || typeof blob.slice !== "function" || !(blob.size >= 33)) return null;
+    const head = new Uint8Array(await blob.slice(0, 33).arrayBuffer());
+    const h = pngHeader(head);
+    if (!h || !(h.width > 0) || !(h.height > 0) || h.bitDepth !== 8 || h.colorType !== 6 || h.interlace !== 0) return null;
+    if (head[8] !== 0 || head[9] !== 0 || head[10] !== 0 || head[11] !== 13 ||
+        head[12] !== 0x49 || head[13] !== 0x48 || head[14] !== 0x44 || head[15] !== 0x52) return null;
+    const texts = {};
+    let latin1 = null;
+    let at = 33, seenHeaderIdat = false;
+    for (let n = 0; n < 64; n++) {
+        if (at + 12 > blob.size) return null;
+        const ch = new Uint8Array(await blob.slice(at, at + 8).arrayBuffer());
+        if (ch.length < 8) return null;
+        const len = new DataView(ch.buffer, ch.byteOffset, 8).getUint32(0);
+        const type = String.fromCharCode(ch[4], ch[5], ch[6], ch[7]);
+        if (at + 12 + len > blob.size) return null;
+        if (type === "IDAT") {
+            if (len !== 2) return null;
+            const z = new Uint8Array(await blob.slice(at + 8, at + 10).arrayBuffer());
+            if (z.length !== 2) return null;
+            const cmf = z[0], flg = z[1];
+            if ((cmf & 0x0f) !== 8 || (cmf >> 4) > 7 || (flg & 0x20) !== 0 || (((cmf << 8) | flg) % 31) !== 0) return null;
+            at += 14;
+            seenHeaderIdat = true;
+            break;
+        }
+        if (type === "iCCP" || type === "gAMA" || type === "cHRM" || type === "cICP" ||
+            type === "PLTE" || type === "tRNS" || type === "IEND") return null;
+        if (type === "tEXt" && len > 0 && len < 4 * 1048576) {
+            const small = new Uint8Array(await blob.slice(at + 8, at + 8 + len).arrayBuffer());
+            const z = small.indexOf(0);
+            if (z > 0) {
+                if (!latin1) latin1 = new TextDecoder("latin1");
+                texts[latin1.decode(small.subarray(0, z))] = latin1.decode(small.subarray(z + 1));
+            }
+        }
+        at += 12 + len;
+    }
+    if (!seenHeaderIdat) return null;
+    const idats = [];
+    for (let n = 0; n < 65536; n++) {
+        if (at + 12 > blob.size) return null;
+        const ch = new Uint8Array(await blob.slice(at, at + 8).arrayBuffer());
+        if (ch.length < 8) return null;
+        const len = new DataView(ch.buffer, ch.byteOffset, 8).getUint32(0);
+        const type = String.fromCharCode(ch[4], ch[5], ch[6], ch[7]);
+        if (at + 12 + len > blob.size) return null;
+        if (type === "IDAT") {
+            if (len === 0) return null;
+            idats.push({ off: at + 8, len });
+            at += 12 + len;
+            continue;
+        }
+        if (type === "IEND") {
+            if (len !== 0 || at + 12 !== blob.size || idats.length < 2) return null;
+            const tail = idats[idats.length - 1];
+            if (tail.len !== 4) return null;
+            const tb = new Uint8Array(await blob.slice(tail.off, tail.off + 4).arrayBuffer());
+            if (tb.length !== 4) return null;
+            const adler = new DataView(tb.buffer, tb.byteOffset, 4).getUint32(0) >>> 0;
+            return { width: h.width, height: h.height, bitDepth: 8, colorType: 6, parts: idats.slice(0, -1), adler, texts };
+        }
+        return null;
+    }
+    return null;
+}
+
+/**
+ * Decode a Scumble parted PNG in parallel across `pool` (`png_part_read` and `png_part_finish`, K8,
+ * docs/PLAN_WASM_BUILD.md §4.2). Parts launch in order, at most `pool.size + 2` ahead of the unfilter chain's head;
+ * `png_part_finish` jobs run at `INTERACTIVE` (`priority: 0`) so the serial chain never waits behind queued decodes;
+ * the part Adlers join with `adlerCombine` against the 4-byte tail IDAT. Any failure cancels the group and throws so
+ * the caller can release partial pixels and fall back to `png_read`.
+ */
+export async function readPngParts(blob, { pool, rt = null, onHeader = null, onRows, layout = null } = {}) {
+    if (!pool || typeof pool.run !== "function") throw new Error("no worker pool");
+    const info = layout || await pngPartsOf(blob);
+    if (!info) throw new Error("not a parted PNG");
+    const { width, height, bitDepth, colorType, parts, adler: wantAdler, texts } = info;
+    const n = parts.length;
+    if (!(n > 0)) throw new Error("no PNG parts");
+    if (onHeader) await onHeader({ width, height, bitDepth, colorType });
+
+    const stride = 1 + width * 4;
+    const windowSize = Math.max(1, (pool.size | 0) || 8) + 2;
+    const group = Symbol("png_parts");
+
+    const readDone = new Array(n).fill(null);
+    const finishLaunched = new Uint8Array(n);
+    const prevReady = new Array(n).fill(null);
+    const rgbaReady = new Array(n).fill(null);
+
+    let nextLaunch = 0;
+    let deliverHead = 0;
+    let failed = null;
+    let notify = null;
+
+    const wake = () => {
+        if (notify) {
+            const fn = notify;
+            notify = null;
+            fn();
+        }
+    };
+    const waitNext = () => new Promise((r) => { notify = r; });
+
+    const onFail = (err) => {
+        if (failed) return;
+        failed = err instanceof Error ? err : new Error(String(err || "PNG part decode failed"));
+        if (typeof pool.cancel === "function") pool.cancel(group);
+        wake();
+    };
+
+    const pumpFinish = () => {
+        if (failed) return;
+        for (let i = Math.max(1, deliverHead); i < nextLaunch; i++) {
+            const r = readDone[i];
+            if (!r) continue;
+            if (!r.needsPrev) {
+                prevReady[i - 1] = null;
+                continue;
+            }
+            if (finishLaunched[i]) continue;
+            const prev = prevReady[i - 1];
+            if (!prev) continue;
+            finishLaunched[i] = 1;
+            prevReady[i - 1] = null;
+            const lines = r.lines;
+            r.lines = null;
+            pool.run(
+                "png_part_finish",
+                { lines, rows: r.rows, w: width, prev, rt },
+                [lines, prev],
+                { priority: 0, group, timeout: 600000 }
+            ).then((fin) => {
+                if (failed) return;
+                if (i + 1 < n) prevReady[i] = fin.prev;
+                rgbaReady[i] = { rows: r.rows, adler: r.adler, rgba: fin.rgba };
+                pumpFinish();
+                wake();
+            }, onFail);
+        }
+    };
+
+    const launchReads = () => {
+        while (!failed && nextLaunch < n && nextLaunch < deliverHead + windowSize) {
+            const i = nextLaunch++;
+            const p = parts[i];
+            const slice = blob.slice(p.off, p.off + p.len);
+            let prev = null;
+            if (i > 0 && prevReady[i - 1]) {
+                prev = prevReady[i - 1];
+                prevReady[i - 1] = null;
+            }
+            const transfer = prev ? [prev] : [];
+            pool.run(
+                "png_part_read",
+                { blob: slice, w: width, h: height, first: i === 0, last: i === n - 1, prev, rt },
+                transfer,
+                { group, timeout: 600000 }
+            ).then((r) => {
+                if (failed) return;
+                readDone[i] = r;
+                if (!r.needsPrev) {
+                    if (i > 0) prevReady[i - 1] = null;
+                    if (i + 1 < n) prevReady[i] = r.prev;
+                    rgbaReady[i] = { rows: r.rows, adler: r.adler, rgba: r.rgba };
+                }
+                pumpFinish();
+                wake();
+            }, onFail);
+        }
+    };
+
+    let y0 = 0;
+    let adler = 1;
+    try {
+        launchReads();
+        while (!failed && deliverHead < n) {
+            if (!rgbaReady[deliverHead]) {
+                await waitNext();
+                continue;
+            }
+            const cur = rgbaReady[deliverHead];
+            rgbaReady[deliverHead] = null;
+            readDone[deliverHead] = null;
+            if (deliverHead > 0) prevReady[deliverHead - 1] = null;
+            deliverHead++;
+            launchReads();
+            pumpFinish();
+            if (!(cur.rows > 0) || y0 + cur.rows > height) {
+                throw new Error(`PNG part at row ${y0} has ${cur.rows} rows (height ${height})`);
+            }
+            adler = adlerCombine(adler, cur.adler, cur.rows * stride);
+            const partY0 = y0;
+            y0 += cur.rows;
+            if (onRows) await onRows(new Uint8ClampedArray(cur.rgba), partY0, cur.rows);
+        }
+        if (failed) throw failed;
+        if (y0 !== height) throw new Error(`the PNG ended after ${y0} of ${height} rows`);
+        if ((adler >>> 0) !== (wantAdler >>> 0)) throw new Error("the PNG Adler-32 checksum does not match");
+    } catch (err) {
+        if (typeof pool.cancel === "function") pool.cancel(group);
+        throw err;
+    }
+    return { width, height, bitDepth, colorType, texts, parts: n, adler };
 }

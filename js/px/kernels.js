@@ -31,7 +31,7 @@ import { liquifyBlock as liquifyBlockJS, previewBlock as previewBlockJS, liquify
 // the retouch brushes' twins live with the brushes (K26, K27; inpaint_stroke.js imports nothing, so no cycle)
 import { blurRGBA as blurRGBATwin, sharpenRGBA as sharpenRGBATwin, toneRGBA as toneRGBATwin, spongeRGBA as spongeRGBATwin, freqSplit as freqSplitTwin } from "../inpaint_stroke.js";
 
-export { OPS, mipChainBytes, deflate, SMUDGE_ALPHA_LOCK, SMUDGE_PICKUP, POISSON_TOL, POISSON_MAX_CYCLES, floodScan, SEL_NONE, SEL_ALPHA, SEL_FULL, SEL_RGBA, unpackStrip, TIFF_JS } from "./kernels_js.js";
+export { OPS, mipChainBytes, deflate, SMUDGE_ALPHA_LOCK, SMUDGE_PICKUP, POISSON_TOL, POISSON_MAX_CYCLES, floodScan, SEL_NONE, SEL_ALPHA, SEL_FULL, SEL_RGBA, unpackStrip, unpredict, predictRgba, toRgba, paletteLut, tiffPlan, readTiffBand, readTiffBands, TIFF_BAND_BYTES, TIFF_JS, PSD_JS } from "./kernels_js.js";
 // this thread's Rust kernel calls by export name (px.js, docs/PLAN_WASM_BUILD.md §3.4), their clocks and the copies
 // around them (docs/PLAN_WASM_K1.md §1.1); they survive a new instance
 export { pxCalls, pxTimed, pxLaps, pxLapAdd, PxOutOfMemory } from "./px.js";
@@ -57,10 +57,20 @@ export { pxCalls, pxTimed, pxLaps, pxLapAdd, PxOutOfMemory } from "./px.js";
  * (K21), `rangeDepth` and `rangeDepthSnap` (K22): `mapTileStats` and `rangeTilesDepth` (plain bilinear tiles and
  * joint-bilateral snapped tiles). `rangeLuma` and `rangeColor` (K23): `rangeTilesRgba` (luminance and colour-similarity
  * range selection over an RGBA8 band). `limitAlphaRows` (K25): `limitAlphaRows` (fill layer depth limit alpha on PSD/ORA
- * export).
+ * export). `guidedFar` (K24): `guidedFar` of `inpaint_depth.js` (the depth map's guided filter).
  * `compositeMaskedTile` (K36): `compositeMaskedTile` of inpaint_tiles.js `compositeStroke`.
+ * `matchPixels` (K38): `matchPixels` of inpaint_filters.js `matchCanvas`, inpaint_boxstack.js and inpaint_worker.js.
+ * `growMask` (K39): `growMaskBounds` of inpaint_raster.js (the selection grow / shrink job and window fallback).
+ * `composeTiles` and `composeStack` (K10b): pointer gather into wasm memory for tile-store and stack `png_part` / `tiff_part` jobs.
+ * `tiffUnpack`, `tiffUnpredict`, `tiffPredict`, `tiffToRgba`, and `tiffStripWasm` (K15, K17): `tiffUnpack`, `tiffUnpredict`, `tiffPredictRgba`, `tiffToRgba`, and `tiffPartJob` / `tiffStrip` of `inpaint_tiff.js`.
+ * `clipCoverage`, `dissolveRows`, `psdPartWasm` and `stackIntoWasm` (K10c): clipping-group coverage and dissolve in
+ * wasm memory, and pointer gather for `psd_part` and `stack_into` jobs.
+ * `psdRead` (K20b): the PSD reader's band kernels (`packbitsRows`, `psdMaskRgba`, `psdBandRgba`, `psdBandMask`) in `psd_read`.
+ * `psdWindow` (K20b review), read on the window: how many bands a `psd_read` job may have posted and not yet had
+ * acknowledged after the window's `writeRect` (inpaint_canvas.js `readPsdOnPool`); absent, `PSD_WINDOW` (8); 0 posts every
+ * band at once (K20b as first built).
  */
-export const ROUTE_KINDS = Object.freeze({ flood: "kernelSize", mips: "kernel", selCombine: "kernel", maskInvert: "kernel", crc32: "kernelSize", compositeMaskedTile: "kernel", releaseMB: "mb", keepMB: "mb", relightStripes: "count", relightFeed: "count", dabBlur: "kernel", dabTone: "kernel", dabSponge: "kernel", freqSplit: "kernel", liquifyBlock: "kernel", liquifyPreview: "kernel", liquifyDab: "kernel", stitchMask: "kernel", colorMatch: "kernel", blendAlpha: "kernel", mapTileStats: "kernel", rangeDepth: "kernel", rangeDepthSnap: "kernel", rangeLuma: "kernel", rangeColor: "kernel", limitAlphaRows: "kernel", edgefit: "kernel", edgefitShrink: "kernel", warpRgba: "kernel", warpCoverage: "kernel" });
+export const ROUTE_KINDS = Object.freeze({ flood: "kernelSize", mips: "kernel", selCombine: "kernel", maskInvert: "kernel", crc32: "kernelSize", compositeMaskedTile: "kernel", matchPixels: "kernel", growMask: "kernel", releaseMB: "mb", keepMB: "mb", relightStripes: "count", relightFeed: "count", dabBlur: "kernel", dabTone: "kernel", dabSponge: "kernel", freqSplit: "kernel", liquifyBlock: "kernel", liquifyPreview: "kernel", liquifyDab: "kernel", stitchMask: "kernel", colorMatch: "kernel", blendAlpha: "kernel", mapTileStats: "kernel", rangeDepth: "kernel", rangeDepthSnap: "kernel", rangeLuma: "kernel", rangeColor: "kernel", limitAlphaRows: "kernel", guidedFar: "kernel", edgefit: "kernel", edgefitShrink: "kernel", warpRgba: "kernel", warpCoverage: "kernel", composeTiles: "kernel", composeStack: "kernel", shadowMarch: "kernelSize", tiffUnpack: "kernel", tiffUnpredict: "kernel", tiffPredict: "kernel", tiffToRgba: "kernel", tiffStripWasm: "kernel", clipCoverage: "kernel", dissolveRows: "kernel", psdPartWasm: "kernel", stackIntoWasm: "kernel", psdRead: "kernel", psdWindow: "count" });
 
 // Today's behaviour. An absent kernel route means Rust; a measured default goes here with a comment that cites its row
 // (docs/PLAN_WASM_BUILD.md §1.1 rule 4). keepMB equal to releaseMB makes the idle trim almost a no-op.
@@ -81,9 +91,36 @@ export const ROUTE_KINDS = Object.freeze({ flood: "kernelSize", mips: "kernel", 
 // kernel row 6092.4 vs 10728.2 ms; before/after on Rust 11829.1 -> 6036.1 ms wall, 1.96x; export_test fill_limit_rows
 // 11178 -> 6209 ms, 1.80x, psd_fill_limit fillRowsMs 12141 -> 6496 ms, 1.87x; plain bilinear path measured at the
 // kernel row only, PX_BENCH 15000x256: twin 100.16 vs simd 85.98 / scalar 88.06 ms, 1.16x).
+// No shadowMarch entry (K14, docs/measurements/k14_2026-11-09/summary.txt): at 15000x10000 (map 4096x2731) lane-free
+// shadow_march_f64 with row y-march precompute (after_scalar) beat 2-lane f64x2 SIMD (after_lanes, removed) across the
+// whole-operation rows (relight_one 493 [490-501] vs 599 [570-608] ms; one-job 3245 [3197-3257] vs 3530 [3511-3733] ms;
+// relight_one_rep 516 [507-531] vs 576 [540-617] ms; relight_one_nofeed 468 [460-487] vs 548 [547-571] ms), won outside
+// spreads over the hoisted f64 twin (after_js, shadowMarch: "js") and before (K13 scalar f64 on point/spot, f32
+// shadow_march on sun) on relight_one landed (493 [490-501] vs 681 [650-709] vs 748 [748-753] ms; kernel 3648 [3626-3670]
+// vs 5037 [4641-5293] vs 5616 [5606-5661] ms; one-job 3245 [3197-3257] vs 3595 [3456-3684] vs 4894 [4785-4982] ms;
+// relight_one_nofeed 468 [460-487] vs 545 [510-579] vs 701 [698-788] ms) and the sun rows (relight_sun landed 170
+// [166-172] vs 286 [250-309] vs 527 [506-575] ms; one-job 762 [748-850] vs 1075 [1008-1097] vs 1586 [1581-1647] ms;
+// unfed 175 [174-176] vs 209 [187-213] ms; fed2 171 [169-186] vs 207 [206-272] ms), and tied after_js within spread
+// (decided by the kernel row, with after_scalar ahead on every landed median) on relight_one_rep (516 [507-531] vs 539
+// [490-547] ms, kernel 3860 vs 4054 ms; after_js had lower blocked 47 [40-52] vs 59.8 [58.1-63.5] ms), relight_sun_rep
+// (180 [164-185] vs 193 [182-209] ms, kernel 903 [872-943] vs 1106 [1056-1108] ms outside spreads), relight_three (1009
+// [965-1070] vs 1144 [1015-1212] ms, kernel 7883 vs 8990 ms, one-job 3284 [3282-3572] vs 3863 [3570-5187] ms; after_js
+// had lower blocked 58 [53-59] vs 84.4 [75.3-89.3] ms), relight_nodraw (465 [463-564] vs 561 [500-602] ms, kernel 3456 vs
+// 4243 ms), and relight_draw (518 [485-565] vs 546 [504-552] ms, one-job 3194 [3024-3354] vs 3608 [3392-3667] ms outside
+// spreads). On after_lanes vs after_js, after_js had the lower median on relight_one_rep (539 vs 576 ms) and
+// relight_one_nofeed (545 vs 548 ms); removing the f64x2 lanes flipped both to after_scalar (516 and 468 ms).
 // crc32 64 (K3, docs/measurements/k3_2026-11-08/summary.txt): 64 B is about a tie decided by the kernel row (Electron V8
 // size sweep: 0.075-0.100 vs 0.028-0.074 us at 16-48 B, 0.093-0.138 vs 0.156-0.235 us at 64-128 B, 1.50-2.53x; 4.97x at
 // 64 KB; 4.26x on w0_bench crc32_64mb); smaller headers (PNG signature, IHDR, 4-byte chunk lengths) stay in JS.
+// No tiffUnpack entry (K17, docs/measurements/k17_2026-11-09/summary.txt): at 15000x10000 Rust won tiffUnpack=js:rust
+// non-overlapping on readTiffBand for LZW (openMs 5684.0 [5619.0-5775.0] vs 10541.0 [10493.0-10595.0] ms, 1.85x;
+// tiff_read kernel 3028.8 vs 7857.4 ms, 2.59x; decode 2514.2 vs 7396.3 ms, 2.94x; before/after 0740aeab -> K17 openMs
+// 11826.0 -> 5696.0 ms, 2.08x) and PackBits (openMs 3416.0 [3327.0-3635.0] vs 3684.0 [3638.0-3686.0] ms, 1.08x;
+// tiff_read kernel 608.4 vs 796.8 ms, 1.31x; decode 110.3 vs 297.0 ms, 2.69x; before/after openMs 5967.0 -> 3622.0 ms,
+// 1.65x). Uncompressed (compression === 1) is guarded in tiffUnpack to stay on J.tiffUnpack (one dst.set vs 3 copies
+// across wasm: raw_strips 625-strip decode 66.6 [66.4-72.3] vs 91.9 [89.2-98.5] ms non-overlapping, 1.38x; PX_BENCH 1 MB
+// strip 0.02 vs 0.05 ms; before/after raw_strips openMs 3622.0 -> 3523.0 ms, 1.03x, openSteps pixels 858.0 -> 613.0 ms,
+// 1.40x).
 const DEFAULT_ROUTES = Object.freeze({ releaseMB: 256, keepMB: 16, crc32: 64 });
 
 const TAKES = { kernel: '"js" or "rust"', kernelSize: '"js", "rust" or a number of pixels >= 0', mb: "a number of MB >= 0 or Infinity", count: "a whole number >= 0" };
@@ -777,7 +814,7 @@ export function poissonBlend(dst, src, mask, w, h, out = null, info = null) {
 }
 
 export function matchPixels(rgba, params) {
-    const p = rustPx();
+    const p = rustPx("matchPixels");
     if (p) {
         try { return p.matchPixels(rgba, params); }
         catch (err) { if (!recovered(p, err, "match_pixels")) throw err; }
@@ -846,7 +883,10 @@ export function pngPartDecode(lines, w, prev = null, rt = null, out = null, laps
         catch (err) { if (!recovered(p, err, "png_part_decode")) throw err; }
         finally { releaseIfLarge(); }
     }
-    return J.pngPartDecode(lines, w, prev, rt, out);
+    const t0 = laps && typeof performance !== "undefined" ? performance.now() : 0;
+    const r = J.pngPartDecode(lines, w, prev, rt, out);
+    if (laps && typeof performance !== "undefined") laps.decode = performance.now() - t0;
+    return r;
 }
 
 /** Finish a part whose `pngPartDecode` answered `needsPrev: true` once `prev` arrives (K7, docs/PLAN_WASM_BUILD.md §4.2). */
@@ -857,7 +897,10 @@ export function pngPartFinish(lines, rows, w, prev, rt = null, out = null, laps 
         catch (err) { if (!recovered(p, err, "png_part_finish")) throw err; }
         finally { releaseIfLarge(); }
     }
-    return J.pngPartFinish(lines, rows, w, prev, rt, out);
+    const t0 = laps && typeof performance !== "undefined" ? performance.now() : 0;
+    const r = J.pngPartFinish(lines, rows, w, prev, rt, out);
+    if (laps && typeof performance !== "undefined") laps.finish = performance.now() - t0;
+    return r;
 }
 
 /** Computes max - min over each texel's 4x4 block of a w x h Uint16Array. */
@@ -882,19 +925,36 @@ export function heightNormals(depth, w, h, scale, sigma, out = null) {
     return J.heightNormals(depth, w, h, scale, sigma, out);
 }
 
+const MARCH_MAX = 0x40000000;
+
+function marchGuardOk(w, h, scale, light, radius, bias) {
+    if (!Number.isInteger(w) || !Number.isInteger(h) || !(w > 0 && h > 0 && w < MARCH_MAX && h < MARCH_MAX)) return false;
+    if (!light || light.length < 4) return false;
+    for (const v of [scale, light[0], light[1], light[2], light[3], radius ?? 0, bias ?? 0]) {
+        const n = Number(v);
+        if (!Number.isFinite(n) || !(Math.abs(n) < MARCH_MAX)) return false;
+    }
+    if (Number(bias ?? 0) < 0) return false;
+    return true;
+}
+
 /**
  * Marches shadow rays through u16 depth height field. A full-size `out` takes rows row0.. at row0 * w (both kernels), so
- * the stripes of one march write into one buffer (K12). `key` names the depth map's data for the Rust sun's resident copy
- * (px.js `_slot`): the stripes of one march on one worker copy it once; the twin reads `depth` where it lies.
+ * the stripes of one march write into one buffer (K12). `key` names the depth map's data for the Rust march's resident copy
+ * (px.js `_slot`): the stripes of one march on one worker copy it once; the twin reads `depth` where it lies. Non-finite
+ * lights or coordinates `>= 2^30` fall back to the twin (K13).
  */
 export function shadowMarch(depth, w, h, scale, light, radius, taps, steps, bias, row0, rows, out = null, key = null) {
-    if (light && light[3] !== 1) {
+    if (!marchGuardOk(w, h, scale, light, radius, bias)) {
         return J.shadowMarch(depth, w, h, scale, light, radius, taps, steps, bias, row0, rows, out);
     }
-    const p = rustPx();
+    const p = rustPx("shadowMarch", w * h);
     if (p) {
-        try { return p.shadowMarch(depth, w, h, scale, light, radius, taps, steps, bias, row0, rows, out, key); }
-        catch (err) { if (!recovered(p, err, "shadow_march")) throw err; }
+        try {
+            const res = p.shadowMarchF64(depth, w, h, scale, light, radius, taps, steps, bias, row0, rows, out, key);
+            if (res) return res;
+        }
+        catch (err) { if (!recovered(p, err, "shadow_march_f64")) throw err; }
         finally { releaseIfLarge(); }
     }
     return J.shadowMarch(depth, w, h, scale, light, radius, taps, steps, bias, row0, rows, out);
@@ -1083,16 +1143,101 @@ export function rangeTilesRgba(rgba, W, H, ty, y0, y1, limit, invert = false, ti
 /**
  * Unpacks one TIFF strip or tile of uncompressed (`1`), LZW (`5`) or PackBits (`32773`) bytes `src` into `out`
  * (`need` bytes, allocated when absent), stopping as soon as `need` bytes are written (`inpaint_tiff.js`
- * `unpackStrip`, K16, docs/PLAN_WASM_BUILD.md §4.6).
+ * `unpackStrip`, K16, K17, `docs/PLAN_WASM_BUILD.md` §4.6). LZW and PackBits are routed by `tiffUnpack`;
+ * uncompressed (`1`) stays on the JS copy (`dst.set`) to avoid copying `src` in and `out` back across wasm.
  */
 export function tiffUnpack(compression, src, need, out = null, name = "strip") {
-    const p = rustPx();
-    if (p) {
-        try { return p.tiffUnpack(compression, src, need, out, name); }
-        catch (err) { if (!recovered(p, err, "tiff_unpack")) throw err; }
-        finally { releaseIfLarge(); }
+    if (compression !== 1) {
+        const p = rustPx("tiffUnpack");
+        if (p) {
+            try { return p.tiffUnpack(compression, src, need, out, name); }
+            catch (err) { if (!recovered(p, err, "tiff_unpack")) throw err; }
+            finally { releaseIfLarge(); }
+        }
     }
     return J.tiffUnpack(compression, src, need, out, name);
+}
+
+/**
+ * Undo horizontal differencing (Predictor 2) in place on `rows` rows of `rowBytes` stride, each `pixels` wide with
+ * `per` samples per pixel at `bits` (`8` or `16`) bits per sample (`inpaint_tiff.js` `unpredict`, K15,
+ * `docs/PLAN_WASM_BUILD.md` §4.6), routed by `tiffUnpredict`.
+ */
+export function tiffUnpredict(buf, rows, rowBytes, pixels, per, bits, le = true) {
+    const p = rustPx("tiffUnpredict");
+    if (p) {
+        try { return p.tiffUnpredict(buf, rows, rowBytes, pixels, per, bits, le); }
+        catch (err) { if (!recovered(p, err, "tiff_unpredict")) throw err; }
+        finally { releaseIfLarge(); }
+    }
+    return J.tiffUnpredict(buf, rows, rowBytes, pixels, per, bits, le);
+}
+
+/**
+ * Horizontal differencing (Predictor 2) in place on `rows` rows of `w`-wide RGBA8 (`inpaint_tiff.js` `predictRgba`, K15),
+ * routed by `tiffPredict`.
+ */
+export function tiffPredictRgba(rgba, w, rows) {
+    const p = rustPx("tiffPredict");
+    if (p) {
+        try { return p.tiffPredictRgba(rgba, w, rows); }
+        catch (err) { if (!recovered(p, err, "tiff_predict_rgba")) throw err; }
+        finally { releaseIfLarge(); }
+    }
+    return J.tiffPredictRgba(rgba, w, rows);
+}
+
+/**
+ * Convert `rows` rows (`bufs`: one buffer for chunky, or `samples` buffers for planar) to straight-alpha RGBA8 in `out`
+ * (or a fresh `Uint8Array(rows * width * 4)`; `inpaint_tiff.js` `toRgba`, K15), routed by `tiffToRgba`.
+ */
+export function tiffToRgba(bufs, rows, out = null, spec = {}) {
+    const p = rustPx("tiffToRgba");
+    if (p) {
+        try { return p.tiffToRgba(bufs, rows, out, spec); }
+        catch (err) { if (!recovered(p, err, "tiff_to_rgba")) throw err; }
+        finally { releaseIfLarge(); }
+    }
+    return J.tiffToRgba(bufs, rows, out, spec);
+}
+
+/**
+ * One strip of a TIFF from `{ rgba, w, rows, predictor = 2 }` (or positional `(rgba, w, rows, level, predictor, laps)`),
+ * byte-identical to `tiffPart(args, (b) => p.zlib(b, level))` (`inpaint_tiff.js` `tiffPart`, K15), routed by
+ * `tiffStripWasm` and `tiffPredict`.
+ */
+export async function tiffStrip(rgbaOrArgs, wOrLevel = 2, rowsOrLaps = null, level = 2, predictor = 2, laps = null) {
+    const p = rustPx("tiffStripWasm") && rustPx("tiffPredict");
+    if (p) {
+        try { return p.tiffStrip(rgbaOrArgs, wOrLevel, rowsOrLaps, level, predictor, laps); }
+        catch (err) { if (!recovered(p, err, "tiff_part")) throw err; }
+        finally { releaseIfLarge(); }
+    }
+    let args = rgbaOrArgs, lvl = wOrLevel, lp = rowsOrLaps;
+    if (!rgbaOrArgs || typeof rgbaOrArgs !== "object" || ArrayBuffer.isView(rgbaOrArgs) || rgbaOrArgs instanceof ArrayBuffer) {
+        args = { rgba: rgbaOrArgs, w: wOrLevel, rows: rowsOrLaps, predictor };
+        lvl = level;
+        lp = laps;
+    }
+    const pz = rustPx();
+    return J.tiffPart(args, (bytes) => (pz ? pz.zlib(bytes, lvl) : J.deflate(bytes)), lp);
+}
+
+const TIFF_RUST = Object.freeze({
+    unpackStrip: tiffUnpack,
+    unpredict: tiffUnpredict,
+    predictRgba: tiffPredictRgba,
+    toRgba: tiffToRgba,
+    paletteLut: J.paletteLut,
+});
+
+/**
+ * The TIFF kernel set for `readTiff(..., { kernels: tiffKernels() })` (K15, `docs/PLAN_WASM_BUILD.md` §4.6).
+ * Each method looks up `rustPx(...)` per call so an instance swap (`releaseIfLarge` or trap recovery) mid-stream uses
+ * the new instance (or falls back to `TIFF_JS` when `setKernels("js")` or a route override is active).
+ */
+export function tiffKernels() {
+    return TIFF_RUST;
 }
 
 
@@ -1121,6 +1266,84 @@ export function limitAlphaRows(rgba, map, mw, mh, xf, x0, y0, w, h, limit, snap 
         return rgba;
     }
     return J.limitAlphaRows(rgba, map, mw, mh, xf, x0, y0, w, h, limit, snap, guide, col);
+}
+
+/**
+ * The depth map's guided filter (`inpaint_depth.js` `guidedFar`, K24), routed by `guidedFar`. Accepts either an options
+ * object `{ raw, rw, rh, grey, gw, gh, r, eps, lo, hi }` (with optional `out` as the second argument) or positional
+ * `(raw, rw, rh, grey, gw, gh, r, eps, lo, hi, out = null)`.
+ */
+export function guidedFar(raw, rw, rh, grey, gw, gh, r, eps, lo, hi, out = null) {
+    const p = rustPx("guidedFar");
+    if (p) {
+        try {
+            const res = p.guidedFar(raw, rw, rh, grey, gw, gh, r, eps, lo, hi, out);
+            if (res) return res;
+        } catch (err) {
+            if (!recovered(p, err, "guided_far")) throw err;
+        } finally { releaseIfLarge(); }
+    }
+    return J.guidedFar(raw, rw, rh, grey, gw, gh, r, eps, lo, hi, out);
+}
+
+/**
+ * Unpack `rows` PSD PackBits rows (`rowBytes` unpacked bytes per row) from `src`, advancing by each row's big-endian
+ * `u16` byte count in `lensBytes` (`inpaint_layered.js` `packbitsRows`, K20b), routed by `psdRead`.
+ */
+export function packbitsRows(lensBytes, src, rows, rowBytes, out = null) {
+    const p = rustPx("psdRead");
+    if (p) {
+        try { return p.packbitsRows(lensBytes, src, rows, rowBytes, out); }
+        catch (err) { if (!recovered(p, err, "packbits_rows")) throw err; }
+        finally { releaseIfLarge(); }
+    }
+    return J.packbitsRows(lensBytes, src, rows, rowBytes, out);
+}
+
+/**
+ * Place a band's mask overlap into `out` as `[255, 255, 255, alpha]` over `[ry0, ry1) × [x0, x1)` and
+ * `[255, 255, 255, def]` elsewhere (`inpaint_layered.js` `psdMaskRgba`, K20b), routed by `psdRead`.
+ */
+export function psdMaskRgba(src, mw, sx0, w, rows, x0, x1, ry0, ry1, bits, def, out = null) {
+    const p = rustPx("psdRead");
+    if (p) {
+        try { return p.psdMaskRgba(src, mw, sx0, w, rows, x0, x1, ry0, ry1, bits, def, out); }
+        catch (err) { if (!recovered(p, err, "psd_mask_rgba")) throw err; }
+        finally { releaseIfLarge(); }
+    }
+    return J.psdMaskRgba(src, mw, sx0, w, rows, x0, x1, ry0, ry1, bits, def, out);
+}
+
+const PSD_RUST = Object.freeze({
+    packbitsRows,
+    maskRgba: psdMaskRgba,
+    bandRgba(descs, w, y0, rows, depth, gray, spent = null) {
+        const p = rustPx("psdRead") && rustPx("tiffUnpredict") && rustPx("tiffToRgba");
+        if (p) {
+            try { return p.psdBandRgba(descs, w, y0, rows, depth, gray, spent); }
+            catch (err) { if (!recovered(p, err, "packbits_rows")) throw err; }
+            finally { releaseIfLarge(); }
+        }
+        return J.psdBandRgba(descs, w, y0, rows, depth, gray, spent);
+    },
+    bandMask(desc, L, m, w, h, y0, rows, depth, spent = null) {
+        const p = rustPx("psdRead") && rustPx("tiffUnpredict");
+        if (p) {
+            try { return p.psdBandMask(desc, L, m, w, h, y0, rows, depth, spent); }
+            catch (err) { if (!recovered(p, err, "psd_mask_rgba")) throw err; }
+            finally { releaseIfLarge(); }
+        }
+        return J.psdBandMask(desc, L, m, w, h, y0, rows, depth, spent);
+    },
+});
+
+/**
+ * The PSD band kernel set for `readPsdStream(..., { kernels: psdKernels() })` (K20b, `docs/PLAN_WASM_K20.md` §2.3).
+ * Each band looks up `rustPx("psdRead")` dynamically so an instance replacement or trap recovery mid-file falls back
+ * seamlessly without dropping or duplicating bands.
+ */
+export function psdKernels() {
+    return PSD_RUST;
 }
 
 

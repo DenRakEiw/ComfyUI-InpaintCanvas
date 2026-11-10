@@ -12,7 +12,11 @@
  * anything that could have allocated, never keep one across `alloc` / `take`.
  */
 
-export const PX_ABI = 39;
+import { relightVogel } from "./kernels_js.js";
+import { disparityRange } from "../inpaint_depth.js";
+import { paletteLut } from "../inpaint_tiff.js";
+
+export const PX_ABI = 46;
 
 // arithmetic, not `& -n`: sizes above 2 GB do not survive a 32-bit bitwise operator
 const roundUp = (n, to) => Math.ceil(n / to) * to;
@@ -365,13 +369,15 @@ export class Px {
 
     /** The colour match of `params` (meanS[3], meanT[3], scale[3], k) over straight RGBA8, in place (B item 7 part 3). */
     matchPixels(rgba, params) {
-        const a = this.job, px = rgba.byteLength >> 2;
+        const a = this.job, px = rgba.byteLength >>> 2;
+        if (!(px > 0)) return rgba;
         try {
             const pd = this._in(a, rgba, px * 4), pp = a.take(40);
             const f = this.view(Float32Array, pp, 10);
             for (let i = 0; i < 10; i++) f[i] = params[i];
             this.exports.match_pixels(pd, px, pp);
-            return this._out(Uint8Array, pd, px * 4, rgba);
+            this._out(Uint8Array, pd, px * 4, rgba instanceof Uint8Array ? rgba : new Uint8Array(rgba.buffer, rgba.byteOffset, px * 4));
+            return rgba;
         } finally { this._reset(a); }
     }
 
@@ -635,21 +641,81 @@ export class Px {
     }
 
     /**
-     * Marches shadow rays through u16 depth height field.
+     * Marches shadow rays through u16 depth height field in exact `f64` arithmetic (`shadowMarchF64`, K13-K14).
      * Visibility map into `out` (0=shadow, 255=lit): a full-size `out` takes the rows at row0 * w. With a `key` the depth
      * map stays resident in this instance (`_slot`, kind "relight_depth"): the stripes of one march copy it once (K12).
      */
-    shadowMarch(depth, w, h, scale, light, radius, taps, steps, bias, row0, rows, out = null, key = null) {
+    shadowMarch(depth, w, h, scale, light, radius, taps, steps, bias, row0 = 0, rows = h - row0, out = null, key = null) {
+        return this.shadowMarchF64(depth, w, h, scale, light, radius, taps, steps, bias, row0, rows, out, key);
+    }
+
+    /**
+     * Marches shadow rays through u16 depth height field in exact `f64` arithmetic (K13-K14, docs/PLAN_WASM_BUILD.md §4.4-4.5).
+     * Precomputes the per-tap constants `[tapX, tapY, tapZ]` in `f64` from `relightVogel` and passes them to
+     * `shadow_march_f64`. Returns `null` when the arguments lie outside the kernel's contract.
+     */
+    shadowMarchF64(depth, w, h, scale, light, radius, taps, steps, bias, row0 = 0, rows = h - row0, out = null, key = null) {
+        if (!(depth instanceof Uint16Array) || !Number.isInteger(w) || !Number.isInteger(h) || !(w > 0 && h > 0 && w < 0x40000000 && h < 0x40000000)) return null;
+        const n = w * h;
+        if (depth.length < n) return null;
+        if (!Number.isInteger(row0) || !Number.isInteger(rows) || row0 < 0 || rows <= 0 || row0 >= h) return null;
+        if (!light || light.length < 4) return null;
+        const s = Number(scale) || 0;
+        const lx = Number(light[0]) || 0;
+        const ly = Number(light[1]) || 0;
+        const lz = Number(light[2]) || 0;
+        const kind = Number(light[3]) || 0;
+        const rad = Number(radius ?? 0);
+        const b = Number(bias ?? 0);
+        if (![Number(scale), Number(light[0]), Number(light[1]), Number(light[2]), Number(light[3]), rad, b].every((v) => Number.isFinite(v) && Math.abs(v) < 0x40000000) || b < 0) return null;
         const bandRows = Math.min(rows, h - row0);
-        const a = this.job, n = w * h, nOut = w * bandRows;
+        const nOut = w * bandRows;
+        if (out !== null && (!(out instanceof Uint8Array) || out.length < (out.length >= n && row0 > 0 ? (row0 + bandRows) * w : nOut))) return null;
+
+        const nTaps = Math.max(1, Math.min(16, Number.isFinite(Number(taps)) ? Math.round(Number(taps)) : 4));
+        const nSteps = Math.max(1, Math.min(64, Number.isFinite(Number(steps)) ? Math.round(Number(steps)) : 32));
+        const r = Math.max(0, rad || 0);
+        const zBias = Math.max(0, b);
+        const disc = relightVogel(nTaps);
+        const longSide = Math.max(w, h);
+        const sunDist = longSide * 1.5;
+        const isSun = kind === 1 ? 1 : 0;
+
+        const a = this.job;
         try {
             const pd = key !== null && key !== undefined ? this._slot("relight_depth", String(key), depth, n * 2) : this._in(a, depth, n * 2);
-            const pl = this._in(a, new Float32Array(light), 16);
+            const pt = a.take(nTaps * 24);
             const po = a.take(nOut);
-            this.exports.shadow_march(pd, w, h, scale, pl, radius, taps, steps, bias, row0, bandRows, po);
-            if (out && out.length >= w * h && row0 > 0) {
-                const target = out.subarray(row0 * w, (row0 + bandRows) * w);
-                return this._out(Uint8Array, po, nOut, target);
+            const tv = this.view(Float64Array, pt, nTaps * 3);
+            if (isSun) {
+                const lLen = Math.hypot(lx, ly, lz) || 1.0;
+                const normLx = lx / lLen;
+                const normLy = ly / lLen;
+                const normLz = lz / lLen;
+                for (let t = 0; t < nTaps; t++) {
+                    const jx = disc[t][0] * (r / longSide);
+                    const jy = disc[t][1] * (r / longSide);
+                    const dirX = normLx + jx;
+                    const dirY = normLy + jy;
+                    const dirZ = normLz;
+                    const dLen = Math.hypot(dirX, dirY, dirZ) || 1.0;
+                    const t3 = t * 3;
+                    tv[t3] = (dirX / dLen) * sunDist;
+                    tv[t3 + 1] = (dirY / dLen) * sunDist;
+                    tv[t3 + 2] = (dirZ / dLen) * sunDist;
+                }
+            } else {
+                for (let t = 0; t < nTaps; t++) {
+                    const t3 = t * 3;
+                    tv[t3] = lx + disc[t][0] * r;
+                    tv[t3 + 1] = ly + disc[t][1] * r;
+                    tv[t3 + 2] = lz;
+                }
+            }
+            this.exports.shadow_march_f64(pd, w, h, s, isSun, pt, nTaps, nSteps, zBias, row0, bandRows, po);
+            if (out && out.length >= n && row0 > 0) {
+                this._out(Uint8Array, po, nOut, out.subarray(row0 * w, (row0 + bandRows) * w));
+                return out;
             }
             return this._out(Uint8Array, po, nOut, out);
         } finally { this._reset(a); }
@@ -1076,15 +1142,229 @@ export class Px {
         const a = this.job;
         try {
             const pr = this._in(a, rgba, rows * 4 * w);
-            const cap = this.exports.psd_pack_rows_cap(w, rows), po = a.take(cap), pl = a.take(rows * 2);
-            const out = [];
-            for (let ch = 0; ch < 4; ch++) {
-                const n = this.exports.psd_pack_rows(pr, w, rows, ch, po, cap, pl);
-                if (n < 0) throw new Error("px: psd_pack_rows ran out of room");
-                const t = TIMED ? clock() : 0;
-                out.push({ lens: this.u8().slice(pl, pl + rows * 2), data: this.u8().slice(po, po + n) });
-                if (TIMED) lapOut(t, rows * 2 + n);
+            return this.psdPackRowsFromPtr(a, pr, w, rows);
+        } finally { this._reset(a); }
+    }
+
+    /**
+     * `psdPackRows` when `pr` (`rows * 4 * w` bytes of RGBA8) is already in `a` (`this.job`). The caller resets `a`
+     * in its `finally` block (K10c, docs/PLAN_WASM_K10.md §2.2).
+     */
+    psdPackRowsFromPtr(a, pr, w, rows) {
+        const cap = this.exports.psd_pack_rows_cap(w, rows), po = a.take(cap), pl = a.take(rows * 2);
+        const out = [];
+        for (let ch = 0; ch < 4; ch++) {
+            const n = this.exports.psd_pack_rows(pr, w, rows, ch, po, cap, pl);
+            if (n < 0) throw new Error("px: psd_pack_rows ran out of room");
+            const t = TIMED ? clock() : 0;
+            out.push({ lens: this.u8().slice(pl, pl + rows * 2), data: this.u8().slice(po, po + n) });
+            if (TIMED) lapOut(t, rows * 2 + n);
+        }
+        return out;
+    }
+
+    /**
+     * Unpack `rows` PSD PackBits rows (`rowBytes` unpacked bytes per row) from `src`, advancing by each row's
+     * big-endian `u16` byte count in `lensBytes` (`2 * rows` bytes), into `out` (or a fresh `Uint8Array(rows * rowBytes)`;
+     * `inpaint_layered.js` `packbitsRows`, K20b).
+     */
+    packbitsRows(lensBytes, src, rows, rowBytes, out = null) {
+        if (!Number.isInteger(rows) || !Number.isInteger(rowBytes) || rows < 0 || rowBytes < 0) {
+            throw new Error(`packbits_rows: invalid dimensions (rows=${rows}, rowBytes=${rowBytes})`);
+        }
+        if (rows === 0 || rowBytes === 0) {
+            if (out != null && !ArrayBuffer.isView(out)) throw new Error("packbits_rows: out must be an ArrayBufferView");
+            return out || new Uint8Array(0);
+        }
+        if (!ArrayBuffer.isView(lensBytes) || lensBytes.byteLength < rows * 2 || !ArrayBuffer.isView(src)) {
+            throw new Error("packbits_rows: invalid lensBytes or src");
+        }
+        const need = rows * rowBytes, sLen = src.byteLength;
+        if (need > 0x7fffffff || sLen > 0x7fffffff || rows * 2 > 0x7fffffff) {
+            throw new Error("packbits_rows: buffer exceeds 2 GB");
+        }
+        let dst = null;
+        if (out != null) {
+            if (!ArrayBuffer.isView(out) || out.byteLength < need) {
+                throw new Error(`packbits_rows: out too short (${out && out.byteLength} < ${need})`);
             }
+            dst = out instanceof Uint8Array ? out : new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
+        }
+        const a = this.job;
+        try {
+            const pl = a.take(rows * 2), ps = sLen > 0 ? a.take(sLen) : 0, po = a.take(need);
+            this.put(pl, new Uint8Array(lensBytes.buffer, lensBytes.byteOffset, rows * 2));
+            if (sLen > 0) this.put(ps, src);
+            const rc = this.exports.packbits_rows(pl, ps, sLen, rows, rowBytes, po, need) | 0;
+            if (rc < 0) throw new Error(`packbits_rows: refused (${rc})`);
+            this._out(Uint8Array, po, need, dst ? (dst.length === need ? dst : dst.subarray(0, need)) : (dst = new Uint8Array(need)));
+            return out || dst;
+        } finally { this._reset(a); }
+    }
+
+    /**
+     * Place a band's mask overlap (`ry1 - ry0` rows of width `mw` starting at mask column `sx0`, `8`-bit or big-endian
+     * `16`-bit) into `out` (or a fresh `Uint8ClampedArray(rows * w * 4)`) as `[255, 255, 255, alpha]` over
+     * `[ry0, ry1) × [x0, x1)` and `[255, 255, 255, def]` elsewhere (`inpaint_layered.js` `psdMaskRgba`, K20b).
+     */
+    psdMaskRgba(src, mw, sx0, w, rows, x0, x1, ry0, ry1, bits, def, out = null) {
+        if (!Number.isInteger(w) || !Number.isInteger(rows) || w <= 0 || rows <= 0 || (bits !== 8 && bits !== 16)) {
+            throw new Error(`psd_mask_rgba: invalid size or bits (w=${w}, rows=${rows}, bits=${bits})`);
+        }
+        if (!Number.isInteger(x0) || !Number.isInteger(x1) || !Number.isInteger(ry0) || !Number.isInteger(ry1)
+            || x0 < 0 || x0 > x1 || x1 > w || ry0 < 0 || ry0 > ry1 || ry1 > rows) {
+            throw new Error(`psd_mask_rgba: invalid overlap (${x0}..${x1} in ${w}, ${ry0}..${ry1} in ${rows})`);
+        }
+        const needOut = w * rows * 4;
+        if (needOut > 0x7fffffff) throw new Error("psd_mask_rgba: out exceeds 2 GB");
+        let dst = null;
+        if (out != null) {
+            if (!ArrayBuffer.isView(out) || out.byteLength < needOut) {
+                throw new Error(`psd_mask_rgba: out too short (${out && out.byteLength} < ${needOut})`);
+            }
+            dst = out instanceof Uint8Array || out instanceof Uint8ClampedArray
+                ? out
+                : new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
+        }
+        const mRows = ry1 - ry0, span = x1 - x0;
+        let needSrc = 0;
+        if (mRows > 0 && span > 0) {
+            if (!Number.isInteger(mw) || !Number.isInteger(sx0) || mw <= 0 || sx0 < 0 || sx0 + span > mw) {
+                throw new Error(`psd_mask_rgba: invalid mask columns (sx0=${sx0}, span=${span}, mw=${mw})`);
+            }
+            const bps = bits >>> 3;
+            needSrc = (mRows - 1) * mw * bps + (sx0 + span) * bps;
+            if (needSrc > 0x7fffffff || !ArrayBuffer.isView(src) || src.byteLength < needSrc) {
+                throw new Error(`psd_mask_rgba: src too short (${src && src.byteLength} < ${needSrc})`);
+            }
+        }
+        const a = this.job;
+        try {
+            const ps = needSrc > 0 ? a.take(needSrc) : 0, po = a.take(needOut);
+            if (needSrc > 0) this.put(ps, new Uint8Array(src.buffer, src.byteOffset, needSrc));
+            const rc = this.exports.psd_mask_rgba(ps, needSrc, mw | 0, sx0 | 0, w, rows, x0, x1, ry0, ry1, bits, def & 255, po, needOut) | 0;
+            if (rc !== 0) throw new Error(`psd_mask_rgba: refused (${rc})`);
+            if (dst) {
+                this._out(Uint8Array, po, needOut, dst.length === needOut ? dst : dst.subarray(0, needOut));
+                return out;
+            }
+            return this._out(Uint8ClampedArray, po, needOut, null);
+        } finally { this._reset(a); }
+    }
+
+    /**
+     * Unpack, optionally unpredict (`comp === 3`), and interleave one `rows`-row PSD colour/alpha band `[y0, y0 + rows)`
+     * inside one `PxArena` scope without copying unpacked planes out to JS (`docs/PLAN_WASM_K20.md` §2.1–2.3, K20b).
+     */
+    psdBandRgba(descs, w, y0, rows, depth, gray, spent = null) {
+        const bpc = depth >>> 3, rowBytes = w * bpc, planeBytes = rows * rowBytes;
+        const hasA = !!descs["-1"];
+        const list = gray
+            ? (hasA ? [descs[0], descs["-1"]] : [descs[0]])
+            : (hasA ? [descs[0], descs[1], descs[2], descs["-1"]] : [descs[0], descs[1], descs[2]]);
+        const spp = list.length, totalPlanes = spp * planeBytes, needOut = rows * w * 4;
+        let anyRle = false, maxPacked = 0;
+        for (let i = 0; i < spp; i++) {
+            const d = list[i];
+            if (d && d.comp === 1) {
+                anyRle = true;
+                const s0 = d.dataAt + d.rowOff[y0], s1 = Math.min(d.bytes.length, d.dataAt + d.rowOff[y0 + rows]);
+                const pLen = s0 < s1 ? s1 - s0 : 0;
+                if (pLen > maxPacked) maxPacked = pLen;
+            }
+        }
+        const a = this.job;
+        try {
+            const t0 = spent ? clock() : 0;
+            const pPlanes = a.take(totalPlanes), pOut = a.take(needOut);
+            const pLens = anyRle ? a.take(rows * 2) : 0;
+            const pPacked = maxPacked > 0 ? a.take(maxPacked) : 0;
+            for (let i = 0; i < spp; i++) {
+                const d = list[i], dstPtr = pPlanes + i * planeBytes;
+                if (!d) {
+                    this.u8().fill(0, dstPtr, dstPtr + planeBytes);
+                } else if (d.comp === 1) {
+                    this.put(pLens, d.lensBytes.subarray(2 * y0, 2 * (y0 + rows)));
+                    const s0 = d.dataAt + d.rowOff[y0], s1 = Math.min(d.bytes.length, d.dataAt + d.rowOff[y0 + rows]);
+                    const pLen = s0 < s1 ? s1 - s0 : 0;
+                    if (pLen > 0) this.put(pPacked, d.bytes.subarray(s0, s1));
+                    const rc = this.exports.packbits_rows(pLens, pLen > 0 ? pPacked : 0, pLen, rows, rowBytes, dstPtr, planeBytes) | 0;
+                    if (rc < 0) throw new Error(`packbits_rows: refused (${rc})`);
+                } else {
+                    const off = d.at + y0 * rowBytes;
+                    this.put(dstPtr, d.bytes.subarray(off, off + planeBytes));
+                    if (d.comp === 3) {
+                        const rc = this.exports.tiff_unpredict(dstPtr, planeBytes, rows, rowBytes, w, 1, depth, 0) | 0;
+                        if (rc !== 0) throw new Error(`tiff_unpredict: refused (${rc})`);
+                    }
+                }
+            }
+            const t1 = spent ? clock() : 0;
+            if (spent) spent.channels += t1 - t0;
+            const rc = this.exports.tiff_to_rgba(
+                pPlanes, totalPlanes, spp, rowBytes, w, rows, spp, depth, 0,
+                gray ? 1 : 2, hasA ? 2 : 0, 0, 0, pOut, needOut
+            ) | 0;
+            if (rc !== 0) throw new Error(`tiff_to_rgba: refused (${rc})`);
+            const out = this._out(Uint8ClampedArray, pOut, needOut, null);
+            if (spent) spent.interleave += clock() - t1;
+            return out;
+        } finally { this._reset(a); }
+    }
+
+    /**
+     * Unpack, optionally unpredict (`comp === 3`), and place one `rows`-row PSD mask band `[y0, y0 + rows)` inside one
+     * `PxArena` scope (`docs/PLAN_WASM_K20.md` §2.2–2.3, K20b).
+     */
+    psdBandMask(desc, L, m, w, h, y0, rows, depth, spent = null) {
+        const t0 = spent ? clock() : 0;
+        const x0 = Math.min(w, Math.max(0, m.left - L.left));
+        const x1 = Math.max(x0, Math.min(w, m.right - L.left));
+        const gy0 = Math.min(h, Math.max(0, m.top - L.top));
+        const gy1 = Math.max(gy0, Math.min(h, m.bottom - L.top));
+        const ry0 = Math.min(rows, Math.max(0, gy0 - y0));
+        const ry1 = Math.max(ry0, Math.min(rows, gy1 - y0));
+        const needOut = rows * w * 4;
+        const a = this.job;
+        try {
+            if (!desc || desc.kind === "empty" || !(x1 > x0 && ry1 > ry0)) {
+                const pOut = a.take(needOut);
+                const rc = this.exports.psd_mask_rgba(0, 0, 0, 0, w, rows, 0, 0, 0, 0, 8, m.def & 255, pOut, needOut) | 0;
+                if (rc !== 0) throw new Error(`psd_mask_rgba: refused (${rc})`);
+                const out = this._out(Uint8ClampedArray, pOut, needOut, null);
+                if (spent) spent.mask += clock() - t0;
+                return out;
+            }
+            const mRows = ry1 - ry0;
+            const my0 = L.top + y0 + ry0 - m.top;
+            const sx0 = L.left + x0 - m.left;
+            const planeBytes = mRows * desc.rowBytes;
+            let s0 = 0, s1 = 0, pLen = 0;
+            if (desc.comp === 1) {
+                s0 = desc.dataAt + desc.rowOff[my0];
+                s1 = Math.min(desc.bytes.length, desc.dataAt + desc.rowOff[my0 + mRows]);
+                pLen = s0 < s1 ? s1 - s0 : 0;
+            }
+            const pPlane = a.take(planeBytes), pOut = a.take(needOut);
+            const pLens = desc.comp === 1 ? a.take(mRows * 2) : 0;
+            const pPacked = pLen > 0 ? a.take(pLen) : 0;
+            if (desc.comp === 1) {
+                this.put(pLens, desc.lensBytes.subarray(2 * my0, 2 * (my0 + mRows)));
+                if (pLen > 0) this.put(pPacked, desc.bytes.subarray(s0, s1));
+                const rcU = this.exports.packbits_rows(pLens, pLen > 0 ? pPacked : 0, pLen, mRows, desc.rowBytes, pPlane, planeBytes) | 0;
+                if (rcU < 0) throw new Error(`packbits_rows: refused (${rcU})`);
+            } else {
+                const off = desc.at + my0 * desc.rowBytes;
+                this.put(pPlane, desc.bytes.subarray(off, off + planeBytes));
+                if (desc.comp === 3) {
+                    const rcP = this.exports.tiff_unpredict(pPlane, planeBytes, mRows, desc.rowBytes, desc.cw, 1, depth, 0) | 0;
+                    if (rcP !== 0) throw new Error(`tiff_unpredict: refused (${rcP})`);
+                }
+            }
+            const rc = this.exports.psd_mask_rgba(pPlane, planeBytes, desc.cw, sx0, w, rows, x0, x1, ry0, ry1, depth, m.def & 255, pOut, needOut) | 0;
+            if (rc !== 0) throw new Error(`psd_mask_rgba: refused (${rc})`);
+            const out = this._out(Uint8ClampedArray, pOut, needOut, null);
+            if (spent) spent.mask += clock() - t0;
             return out;
         } finally { this._reset(a); }
     }
@@ -1171,9 +1451,36 @@ export class Px {
         } finally { this._reset(a); }
     }
 
+    pngPartFromPtr(a, pr, w, rows, pp, level, last, laps = null) {
+        const n = rows * (1 + 4 * w);
+        const lap = laps ? lapper(laps) : null;
+        const pf = a.take(n);
+        this.exports.png_filter_rows(pr, w, rows, pp, pf);
+        if (lap) lap("filter");
+        const adler = this.exports.adler32(pf, n, 1) >>> 0;
+        if (lap) lap("adler");
+        let cap = storedCap(n);
+        for (;;) {
+            const po = a.take(cap + 12);
+            const written = this.exports.deflate_part(pf, n, level, last ? 1 : 0, po + 8, cap);
+            if (lap) lap("deflate");
+            if (written >= 0) {
+                const crc = this.exports.png_chunk_frame(po, written, 0x49444154) >>> 0;
+                if (lap) lap("chunk");
+                const t = TIMED ? clock() : 0;
+                const chunk = this.u8().slice(po, po + written + 12);
+                const bytes = chunk.subarray(8, 8 + written);
+                if (TIMED) lapOut(t, written + 12);
+                if (lap) lap("copyOut");
+                return { bytes, adler, raw: n, chunk, crc };
+            }
+            cap *= 2;
+        }
+    }
+
     /**
      * Byte capacity of `lines` for a standard `PART_BYTES` (`8 MB`) part of a `w`-wide 8-bit RGBA PNG
-     * (`partRows(w) * (1 + 4 * w)`), or 0 when `w <= 0` (K7, docs/PLAN_WASM_BUILD.md §4.2).
+     * (`partRows(w, 2048) * (1 + 4 * w)`), or 0 when `w <= 0` (K7, docs/PLAN_WASM_BUILD.md §4.2).
      */
     pngPartLinesCap(w) {
         if (!Number.isInteger(w) || w <= 0 || w > 0x3fffffff) return 0;
@@ -1557,6 +1864,190 @@ export class Px {
     }
 
     /**
+     * Undo horizontal differencing (Predictor 2) in place on `rows` rows of `rowBytes` stride, each `pixels` wide with
+     * `per` samples per pixel at `bits` (`8` or `16`) bits per sample (`inpaint_tiff.js` `unpredict`, K15).
+     */
+    tiffUnpredict(buf, rows, rowBytes, pixels, per, bits, le = true) {
+        if (!ArrayBuffer.isView(buf)) throw new Error("tiff_unpredict: buf must be an ArrayBufferView");
+        if (!Number.isInteger(rows) || !Number.isInteger(rowBytes) || !Number.isInteger(pixels) || !Number.isInteger(per)
+            || rows < 0 || rowBytes < 0 || pixels < 0 || per < 1 || (bits !== 8 && bits !== 16)) {
+            throw new Error(`tiff_unpredict: invalid parameters (rows=${rows}, rowBytes=${rowBytes}, pixels=${pixels}, per=${per}, bits=${bits})`);
+        }
+        if (rows === 0 || pixels === 0) return buf;
+        const bps = bits >>> 3;
+        const active = pixels * per * bps;
+        const need = (rows - 1) * rowBytes + active;
+        if (rowBytes < active || buf.byteLength < need) {
+            throw new Error(`tiff_unpredict: buffer (${buf.byteLength}) too short for ${rows} x ${rowBytes} (active ${active})`);
+        }
+        const u8 = new Uint8Array(buf.buffer, buf.byteOffset, need);
+        const a = this.job;
+        try {
+            const pb = this._in(a, u8, need);
+            const rc = this.exports.tiff_unpredict(pb, need, rows, rowBytes, pixels, per, bits, le ? 1 : 0) | 0;
+            if (rc !== 0) throw new Error(`tiff_unpredict: refused (${rc})`);
+            this._out(Uint8Array, pb, need, u8);
+            return buf;
+        } finally { this._reset(a); }
+    }
+
+    /**
+     * Horizontal differencing (Predictor 2) in place on `rows` rows of `w`-wide RGBA8 (`inpaint_tiff.js` `predictRgba`, K15).
+     */
+    tiffPredictRgba(rgba, w, rows) {
+        if (!ArrayBuffer.isView(rgba)) throw new Error("tiff_predict_rgba: rgba must be an ArrayBufferView");
+        if (!Number.isInteger(w) || !Number.isInteger(rows) || w <= 0 || rows <= 0 || rgba.byteLength < w * rows * 4) {
+            throw new Error(`tiff_predict_rgba: invalid size (${w} x ${rows}, byteLength ${rgba && rgba.byteLength})`);
+        }
+        const n = w * rows * 4;
+        const u8 = new Uint8Array(rgba.buffer, rgba.byteOffset, n);
+        const a = this.job;
+        try {
+            const pr = this._in(a, u8, n);
+            const rc = this.exports.tiff_predict_rgba(pr, w, rows) | 0;
+            if (rc !== 0) throw new Error(`tiff_predict_rgba: refused (${rc})`);
+            this._out(Uint8Array, pr, n, u8);
+            return rgba;
+        } finally { this._reset(a); }
+    }
+
+    /**
+     * Convert `rows` rows (`bufs`: one buffer for chunky, or `samples` buffers for planar) to straight-alpha RGBA8 in `out`
+     * (or a fresh `Uint8Array(rows * width * 4)`; `inpaint_tiff.js` `toRgba`, K15).
+     */
+    tiffToRgba(bufs, rows, out = null, spec = {}) {
+        if (!spec || typeof spec !== "object") throw new Error("tiff_to_rgba: spec is required");
+        const W = (spec.width ?? spec.w) | 0, spp = (spec.samples ?? spec.spp) | 0, bits = spec.bits | 0, ph = spec.photometric | 0;
+        const nRows = rows | 0;
+        const le = spec.le !== false && spec.le !== 0;
+        const alphaMode = spec.alpha === "premultiplied" || spec.alpha === 1 ? 1
+            : spec.alpha === "straight" || spec.alpha === 2 ? 2
+            : spec.alpha === "none" || spec.alpha === 0 || spec.alpha === undefined ? 0 : -1;
+        if (W <= 0 || nRows <= 0 || (bits !== 1 && bits !== 2 && bits !== 4 && bits !== 8 && bits !== 16)
+            || (ph !== 0 && ph !== 1 && ph !== 2 && ph !== 3) || (ph === 2 && bits < 8) || alphaMode < 0) {
+            throw new Error(`tiff_to_rgba: invalid spec (W=${W}, rows=${nRows}, bits=${bits}, ph=${ph}, alpha=${spec.alpha})`);
+        }
+        const base = ph === 2 ? 3 : 1;
+        const ai = alphaMode === 0 ? -1 : base;
+        if (spp < base + (ai >= 0 ? 1 : 0)) throw new Error(`tiff_to_rgba: samples=${spp} too small for ph=${ph} alpha=${spec.alpha}`);
+        const planeList = Array.isArray(bufs) ? bufs : [bufs];
+        const planes = planeList.length;
+        if (planes !== 1 && planes !== spp) throw new Error(`tiff_to_rgba: planes=${planes} must be 1 or samples=${spp}`);
+        const perPlane = planes === 1 ? W * spp : W;
+        const minRowBytes = Math.ceil((perPlane * bits) / 8);
+        const rowBytes = spec.rowBytes ? (spec.rowBytes | 0) : minRowBytes;
+        if (rowBytes < minRowBytes) throw new Error(`tiff_to_rgba: rowBytes=${rowBytes} < ${minRowBytes}`);
+        const planeBytes = nRows * rowBytes;
+        const minPlaneBytes = (nRows - 1) * rowBytes + minRowBytes;
+        for (let p = 0; p < planes; p++) {
+            const b = planeList[p];
+            if (!ArrayBuffer.isView(b) || b.byteLength < minPlaneBytes) {
+                throw new Error(`tiff_to_rgba: plane ${p} too short (${b && b.byteLength} < ${minPlaneBytes})`);
+            }
+        }
+        let pal = null;
+        if (ph === 3) {
+            pal = spec.pal || (spec.colormap ? paletteLut(spec.colormap, bits) : null);
+            const needPal = (1 << bits) * 3;
+            if (!ArrayBuffer.isView(pal) || pal.byteLength < needPal) {
+                throw new Error(`tiff_to_rgba: pal too short for ${bits}-bit palette`);
+            }
+        }
+        const needOut = nRows * W * 4;
+        let dst = null;
+        if (out != null) {
+            if (!ArrayBuffer.isView(out) || out.byteLength < needOut) throw new Error(`tiff_to_rgba: out too short (${out && out.byteLength} < ${needOut})`);
+            dst = out instanceof Uint8Array ? out : new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
+        }
+        const a = this.job;
+        try {
+            const totalSrc = planes === 1 ? minPlaneBytes : (planes - 1) * planeBytes + minPlaneBytes;
+            const ps = a.take(totalSrc);
+            const pp = pal ? this._in(a, pal, (1 << bits) * 3) : 0;
+            const po = a.take(needOut);
+            for (let p = 0; p < planes; p++) {
+                const b = planeList[p];
+                const takeLen = p === planes - 1 ? minPlaneBytes : Math.min(b.byteLength, planeBytes);
+                this.put(ps + p * planeBytes, new Uint8Array(b.buffer, b.byteOffset, takeLen));
+            }
+            const rc = this.exports.tiff_to_rgba(
+                ps, totalSrc, planes, rowBytes, W, nRows, spp, bits, le ? 1 : 0, ph, alphaMode,
+                pp, pal ? (1 << bits) * 3 : 0, po, needOut
+            ) | 0;
+            if (rc !== 0) throw new Error(`tiff_to_rgba: refused (${rc})`);
+            this._out(Uint8Array, po, needOut, dst ? (dst.length === needOut ? dst : dst.subarray(0, needOut)) : (dst = new Uint8Array(needOut)));
+            return out || dst;
+        } finally { this._reset(a); }
+    }
+
+    /**
+     * One strip of a TIFF from a pointer `pr` (`w * rows * 4` RGBA8 bytes) already in `a` (`docs/PLAN_WASM_K10.md` §6, K15):
+     * differences in place when `predictor === 2` (`tiff_predict_rgba`), computes `adler32`, deflates at `level`
+     * (`deflate_part` with `last = 1`), and frames with `78 9C` and the big-endian Adler-32. Byte-identical to
+     * `tiffPart(args, (b) => p.zlib(b, level))`.
+     */
+    tiffStripFromPtr(a, pr, w, rows, level = 2, predictor = 2, laps = null) {
+        const rawLen = w * rows * 4;
+        const pred = predictor === undefined ? 2 : predictor;
+        const lap = laps ? lapper(laps) : null;
+        if (pred === 2) {
+            const rc = this.exports.tiff_predict_rgba(pr, w, rows) | 0;
+            if (rc !== 0) throw new Error(`px: tiff_predict_rgba refused (${w}x${rows})`);
+        }
+        if (lap) lap("predict");
+        const adler = this.exports.adler32(pr, rawLen, 1) >>> 0;
+        let cap = storedCap(rawLen);
+        for (;;) {
+            const po = a.take(cap + 6);
+            const written = this.exports.deflate_part(pr, rawLen, level, 1, po + 2, cap);
+            if (lap) lap("deflate");
+            if (written >= 0) {
+                const t = TIMED ? clock() : 0;
+                const out = this.u8();
+                out[po] = 0x78;
+                out[po + 1] = 0x9C;
+                const end = po + 2 + written;
+                out[end] = adler >>> 24; out[end + 1] = (adler >>> 16) & 255;
+                out[end + 2] = (adler >>> 8) & 255; out[end + 3] = adler & 255;
+                const strip = out.slice(po, end + 4);
+                if (TIMED) lapOut(t, written + 6);
+                return { chunk: strip.buffer, raw: rawLen };
+            }
+            cap *= 2;
+        }
+    }
+
+    /**
+     * One strip of a TIFF from `{ rgba, w, rows, predictor = 2 }` (or positional `(rgba, w, rows, level, predictor, laps)`):
+     * copies `rgba` into `this.job` and delegates to `tiffStripFromPtr` (K15, `docs/PLAN_WASM_BUILD.md` §4.6).
+     */
+    tiffStrip(rgbaOrArgs, wOrLevel = 2, rowsOrLaps = null, level = 2, predictor = 2, laps = null) {
+        let rgba, w, rows, lvl, pred, lp;
+        if (rgbaOrArgs && typeof rgbaOrArgs === "object" && !ArrayBuffer.isView(rgbaOrArgs) && !(rgbaOrArgs instanceof ArrayBuffer)) {
+            rgba = rgbaOrArgs.rgba;
+            w = rgbaOrArgs.w;
+            rows = rgbaOrArgs.rows;
+            pred = rgbaOrArgs.predictor === undefined ? 2 : rgbaOrArgs.predictor;
+            lvl = typeof wOrLevel === "number" ? wOrLevel : 2;
+            lp = rowsOrLaps;
+        } else {
+            rgba = rgbaOrArgs;
+            w = wOrLevel;
+            rows = rowsOrLaps;
+            lvl = level;
+            pred = predictor === undefined ? 2 : predictor;
+            lp = laps;
+        }
+        const n = w * rows * 4;
+        const src = rgba instanceof Uint8Array ? rgba.subarray(0, n) : ArrayBuffer.isView(rgba) ? new Uint8Array(rgba.buffer, rgba.byteOffset, n) : new Uint8Array(rgba, 0, n);
+        const a = this.job;
+        try {
+            const pr = this._in(a, src, n);
+            return this.tiffStripFromPtr(a, pr, w, rows, lvl, pred, lp);
+        } finally { this._reset(a); }
+    }
+
+    /**
      * Multiplies the alpha channel of `rgba` (`w * h * 4` RGBA8 bytes, in place) by the depth limit weight over `map`
      * (`mw` x `mh` u16, affine transform `xf`) and optional joint-bilateral snap (`snap = [sigmaR, tau]`, `guide`,
      * optional `col` reference RGBA8) in chunks of at most 256 rows (K25, docs/PLAN_WASM_BUILD.md §4.8).
@@ -1674,6 +2165,47 @@ export class Px {
             } finally { this._reset(a); }
         }
         return rgba;
+    }
+
+    /**
+     * The depth map's guided filter (`inpaint_depth.js` `guidedFar`, K24): accepts either an options object
+     * `{ raw, rw, rh, grey, gw, gh, r, eps, lo, hi }` (with optional `out` as the second argument) or positional
+     * `(raw, rw, rh, grey, gw, gh, r, eps, lo, hi, out = null)`. Returns `out` (or a new `Uint16Array` of `gw * gh`),
+     * or `null` when the arguments lie outside the kernel's contract (the wrapper then runs the JS twin).
+     */
+    guidedFar(raw, rw, rh, grey, gw, gh, r, eps, lo, hi, out = null) {
+        if (raw && typeof raw === "object" && !ArrayBuffer.isView(raw) && !(raw instanceof ArrayBuffer)) {
+            const msg = raw;
+            out = rw instanceof Uint16Array ? rw : null;
+            ({ raw, rw, rh, grey, gw, gh, r, eps, lo, hi } = msg);
+        }
+        if (!(raw instanceof Float32Array) || !isBytes(grey)) return null;
+        if (!(Number.isInteger(rw) && Number.isInteger(rh) && rw > 0 && rh > 0 && Number.isInteger(gw) && Number.isInteger(gh) && gw > 0 && gh > 0)) {
+            return null;
+        }
+        const nRaw = rw * rh, nWork = gw * gh;
+        if (raw.length < nRaw || grey.length < nWork) return null;
+        if (out !== null && (!(out instanceof Uint16Array) || out.length < nWork)) return null;
+        if (lo == null || hi == null) {
+            const bounds = disparityRange(raw);
+            if (lo == null) lo = bounds.lo;
+            if (hi == null) hi = bounds.hi;
+        }
+        const rf = +r, epsf = +eps, lof = +lo, hif = +hi;
+        if (!Number.isFinite(rf) || !Number.isFinite(epsf) || !(epsf > 0) || !Number.isFinite(lof) || !Number.isFinite(hif)) {
+            return null;
+        }
+        const bytes = this.exports.guided_far_scratch_bytes(rw, rh, gw, gh) >>> 0;
+        if (!bytes) return null;
+        const a = this.job;
+        try {
+            const pRaw = this._in(a, raw, nRaw * 4);
+            const pGrey = this._in(a, grey, nWork);
+            const pOut = a.take(nWork * 2);
+            const pScratch = a.take(bytes);
+            const ok = this.exports.guided_far(pRaw, rw, rh, pGrey, gw, gh, rf, epsf, lof, hif, pOut, pScratch);
+            return ok === 1 ? this._out(Uint16Array, pOut, nWork, out) : null;
+        } finally { this._reset(a); }
     }
 }
 

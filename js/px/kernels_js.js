@@ -15,9 +15,12 @@
 
 import { BLEND_OPS } from "../blend_modes.js";
 import { gaussRadii } from "../inpaint_edges.js";
-import { unpackStrip, TIFF_JS } from "../inpaint_tiff.js";
+import { guidedFar as guidedFarDepth } from "../inpaint_depth.js";
+import { unpackStrip, unpredict, predictRgba, toRgba, paletteLut, tiffPlan, readTiffBand, readTiffBands, TIFF_BAND_BYTES, tiffPart, TIFF_JS } from "../inpaint_tiff.js";
+import { packbitsRows, psdMaskRgba, psdBandRgba, psdBandMask, PSD_JS } from "../inpaint_layered.js";
 
-export { unpackStrip, unpackStrip as tiffUnpack, TIFF_JS };
+export { unpackStrip, unpackStrip as tiffUnpack, unpredict, unpredict as tiffUnpredict, predictRgba, predictRgba as tiffPredictRgba, toRgba, toRgba as tiffToRgba, paletteLut, tiffPlan, readTiffBand, readTiffBands, TIFF_BAND_BYTES, tiffPart, TIFF_JS };
+export { packbitsRows, psdMaskRgba, psdBandRgba, psdBandMask, PSD_JS };
 
 export const OPS = Object.freeze({
     "source-over": 0,
@@ -1014,7 +1017,7 @@ export function matchPixels(rgba, params) {
  * `rows` rows of RGBA8 (`w` wide) filtered into `out` (rows × (1 + 4w) bytes): per row the
  * filter byte of None / Sub / Up / Average / Paeth with the smallest sum of absolute signed
  * values (libpng's heuristic, ties to the lower type), then the filtered row. `prev` is the
- * row above the first one, or null for zeros.
+ * row above the first one; when `prev` is null the first row picks only None or Sub (P5).
  */
 export function pngFilterRows(rgba, w, rows, prev = null, out = new Uint8Array(rows * (1 + 4 * w))) {
     rgba = bytesOf(rgba);
@@ -1039,9 +1042,11 @@ export function pngFilterRows(rgba, w, rows, prev = null, out = new Uint8Array(r
         }
         let best = 0, min = s0;
         if (s1 < min) { best = 1; min = s1; }
-        if (s2 < min) { best = 2; min = s2; }
-        if (s3 < min) { best = 3; min = s3; }
-        if (s4 < min) { best = 4; min = s4; }
+        if (y > 0 || prev) {
+            if (s2 < min) { best = 2; min = s2; }
+            if (s3 < min) { best = 3; min = s3; }
+            if (s4 < min) { best = 4; min = s4; }
+        }
         const o = y * (n + 1);
         out[o] = best;
         for (let i = 0; i < n; i++) {
@@ -1485,7 +1490,7 @@ export function pngChunkFrame(buf, dataLen = buf.byteLength - 12, kind = 0x49444
 
 const ADLER_MOD = 65521;
 const PNG_PART_BYTES = 8 * 1048576;
-const PNG_PART_MAX_ROWS = 2048; // programRows / bandPlan.rows cap (inpaint_program.js / inpaint_bands.js)
+const PNG_PART_MAX_ROWS = 2048; // programRows / bandPlan.rows / bandSource (inpaint_canvas.js) -> forParts (inpaint_bands.js)
 export const PART_NOT_LINES = -4, PART_BAD_FILTER = -5;
 
 /** Adler-32 of `bytes`, continued from `start` (1 for a new checksum). */
@@ -1506,7 +1511,7 @@ export function adler32(bytes, start = 1) {
 
 /**
  * Byte capacity of `lines` for a standard `PART_BYTES` (`8 MB`) part of a `w`-wide 8-bit RGBA PNG
- * (`partRows(w) * (1 + 4 * w)`), or 0 when `w <= 0` (K7, docs/PLAN_WASM_BUILD.md §4.2).
+ * (`partRows(w, 2048) * (1 + 4 * w)`), or 0 when `w <= 0` (K7, docs/PLAN_WASM_BUILD.md §4.2).
  */
 export function pngPartLinesCap(w) {
     if (!Number.isInteger(w) || w <= 0 || w > 0x3fffffff) return 0;
@@ -2107,7 +2112,7 @@ export function heightNormals(depth, w, h, scale, sigma, out = null) {
  * @param {number} n
  * @returns {Array<[number, number]>}
  */
-function relightVogel(n) {
+export function relightVogel(n) {
     const N = 16;
     const ga = 2.39996323;
     const taps = [];
@@ -2153,13 +2158,33 @@ export function shadowMarch(depth, w, h, scale, light, radius, taps, steps, bias
     const longSide = Math.max(w, h);
     const sunDist = longSide * 1.5;
     const inv65535 = scale / 65535.0;
+    const invSteps = 1.0 / nSteps;
 
-    let normLx = 0, normLy = 0, normLz = 0;
+    const tapX = new Float64Array(nTaps);
+    const tapY = new Float64Array(nTaps);
+    const tapZ = new Float64Array(nTaps);
     if (kind === 1) {
         const lLen = Math.hypot(lx, ly, lz) || 1.0;
-        normLx = lx / lLen;
-        normLy = ly / lLen;
-        normLz = lz / lLen;
+        const normLx = lx / lLen;
+        const normLy = ly / lLen;
+        const normLz = lz / lLen;
+        for (let t = 0; t < nTaps; t++) {
+            const jx = disc[t][0] * (r / longSide);
+            const jy = disc[t][1] * (r / longSide);
+            const dirX = normLx + jx;
+            const dirY = normLy + jy;
+            const dirZ = normLz;
+            const dLen = Math.hypot(dirX, dirY, dirZ) || 1.0;
+            tapX[t] = (dirX / dLen) * sunDist;
+            tapY[t] = (dirY / dLen) * sunDist;
+            tapZ[t] = (dirZ / dLen) * sunDist;
+        }
+    } else {
+        for (let t = 0; t < nTaps; t++) {
+            tapX[t] = lx + disc[t][0] * r;
+            tapY[t] = ly + disc[t][1] * r;
+            tapZ[t] = lz;
+        }
     }
 
     for (let rIdx = 0; rIdx < bandRows; rIdx++) {
@@ -2177,19 +2202,13 @@ export function shadowMarch(depth, w, h, scale, light, radius, taps, steps, bias
             for (let t = 0; t < nTaps; t++) {
                 let tx, ty, tz;
                 if (kind === 1) {
-                    const jx = disc[t][0] * (r / longSide);
-                    const jy = disc[t][1] * (r / longSide);
-                    const dirX = normLx + jx;
-                    const dirY = normLy + jy;
-                    const dirZ = normLz;
-                    const dLen = Math.hypot(dirX, dirY, dirZ) || 1.0;
-                    tx = px + (dirX / dLen) * sunDist;
-                    ty = py + (dirY / dLen) * sunDist;
-                    tz = pz + (dirZ / dLen) * sunDist;
+                    tx = px + tapX[t];
+                    ty = py + tapY[t];
+                    tz = pz + tapZ[t];
                 } else {
-                    tx = lx + disc[t][0] * r;
-                    ty = ly + disc[t][1] * r;
-                    tz = lz;
+                    tx = tapX[t];
+                    ty = tapY[t];
+                    tz = tapZ[t];
                 }
 
                 const rdx = tx - px;
@@ -2197,7 +2216,6 @@ export function shadowMarch(depth, w, h, scale, light, radius, taps, steps, bias
                 const rdz = tz - pz;
                 let blocked = false;
 
-                const invSteps = 1.0 / nSteps;
                 const stepX = rdx * invSteps;
                 const stepY = rdy * invSteps;
                 const stepZ = rdz * invSteps;
@@ -3089,5 +3107,28 @@ export function limitAlphaRows(rgba, map, mw, mh, xf, x0, y0, w, h, limit, snap 
     return rgba;
 }
 
+// ---- depth map guided filter (K24) --------------------------------------------------------------
+
+/**
+ * The depth map's guided filter (`inpaint_depth.js` `guidedFar`, K24): accepts either an options object
+ * `{ raw, rw, rh, grey, gw, gh, r, eps, lo, hi }` (with optional `out` as the second argument) or positional
+ * `(raw, rw, rh, grey, gw, gh, r, eps, lo, hi, out = null)`. Writes `gw * gh` `u16` values into `out` (or a new
+ * `Uint16Array`) and returns it.
+ */
+export function guidedFar(raw, rw, rh, grey, gw, gh, r, eps, lo, hi, out = null) {
+    let msg;
+    if (raw && typeof raw === "object" && !ArrayBuffer.isView(raw) && !(raw instanceof ArrayBuffer)) {
+        msg = raw;
+        if (rw instanceof Uint16Array) out = rw;
+    } else {
+        msg = { raw, rw, rh, grey, gw, gh, r, eps, lo, hi };
+    }
+    const res = guidedFarDepth(msg, boxBlurs);
+    if (out) {
+        out.set(res);
+        return out;
+    }
+    return res;
+}
 
 

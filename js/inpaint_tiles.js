@@ -41,7 +41,7 @@ import { mipChain, mipChainBytes, clampExtend, compositeMaskedTile, resampleBloc
 import { allocTileBytes, isShared } from "./inpaint_arena.js";
 import { canvasRoundTrip, resampleOptions, resampleStore, toFixed, preimage } from "./inpaint_resample.js";
 import { liquifyStore, liquifyBox } from "./inpaint_liquify.js";
-import { SEL_MODES } from "./inpaint_raster.js";
+import { SEL_MODES, hexToRgb, tilesSource } from "./inpaint_raster.js";
 
 export const TILE_SIZE = 256;
 const TILE_BYTES = TILE_SIZE * TILE_SIZE * 4;
@@ -565,6 +565,23 @@ function probeColor(color) {
     if (COLORS.size > 64) COLORS.clear();
     COLORS.set(color, rgba);
     return rgba;
+}
+
+let FILL_TILE = null, FILL_WORD = -1;
+
+/** A 256 x 256 tile of opaque RGBA8 pixels in `color` (a `#rrggbb` string as `flood` takes it, or `[r, g, b]`). */
+function fillTile(color) {
+    const [r, g, b] = Array.isArray(color) ? [color[0] | 0, color[1] | 0, color[2] | 0] : hexToRgb(color || "#ff0000");
+    if (!FILL_TILE || FILL_TILE.length !== TILE_BYTES) { FILL_TILE = new Uint8Array(TILE_BYTES); FILL_WORD = -1; }
+    if (LITTLE) {
+        const w = ((255 << 24) | (b << 16) | (g << 8) | r) >>> 0;
+        if (w !== FILL_WORD) { new Uint32Array(FILL_TILE.buffer).fill(w); FILL_WORD = w; }
+    } else {
+        for (let i = 0; i < TILE_BYTES; i += 4) {
+            FILL_TILE[i] = r; FILL_TILE[i + 1] = g; FILL_TILE[i + 2] = b; FILL_TILE[i + 3] = 255;
+        }
+    }
+    return FILL_TILE;
 }
 
 // ---- block helpers -------------------------------------------------------------------------------
@@ -1434,6 +1451,67 @@ const tiled = (Base) => class extends Base {
             if (!r) continue;
             if (r === 2) this._dropTile(key);
             written++;
+        }
+        return written;
+    }
+
+    /**
+     * A flood's 256 x 256 alpha tiles (`tiles`: `[{ tx, ty, alpha }]` at `at = [ox, oy]` in these pixels' coordinates,
+     * K9) composited in `color` into these pixels in place through `compositeMaskedTile` (K37): `op` an OPS number
+     * (source-over, source-atop), `alpha` the opacity 0..255. No scratch canvas or `getImageData` (1.2 s of blocked
+     * window at 15000 x 10000). Returns the number of tiles written.
+     */
+    compositeFill(tiles, color, op, alpha, at = [0, 0]) {
+        this._guard();
+        if (!tiles || !tiles.length || !(alpha > 0)) return 0;
+        const ox = at[0] | 0, oy = at[1] | 0;
+        const src = fillTile(color);
+        const px = TILE_SIZE * TILE_SIZE;
+        let written = 0;
+        const applyTile = (tx, ty, cov) => {
+            const x0 = tx * TILE_SIZE, y0 = ty * TILE_SIZE;
+            if (tx < 0 || ty < 0 || x0 >= this._w || y0 >= this._h) return;
+            const key = (ty << 16) | tx;
+            const old = this._tiles.get(key) || null;
+            if (!old && op !== 0) return;
+            const bw = Math.min(TILE_SIZE, this._w - x0), bh = Math.min(TILE_SIZE, this._h - y0);
+            if (bw < TILE_SIZE || bh < TILE_SIZE) {
+                cov = cov.slice();
+                if (bw < TILE_SIZE) for (let y = 0; y < bh; y++) cov.fill(0, y * TILE_SIZE + bw, (y + 1) * TILE_SIZE);
+                if (bh < TILE_SIZE) cov.fill(0, bh * TILE_SIZE);
+            }
+            const r = compositeMaskedTile(old ? old.data : null, (whole) => this.writable(tx, ty, true, whole && TILE_SIZE === 256).data,
+                src, op, alpha, cov, px);
+            if (!r) return;
+            if (r === 2) this._dropTile(key);
+            written++;
+        };
+        if ((ox & (TILE_SIZE - 1)) === 0 && (oy & (TILE_SIZE - 1)) === 0) {
+            const dtx = ox >> 8, dty = oy >> 8;
+            for (const ft of tiles) {
+                if (!ft || ft.empty || !ft.alpha) continue;
+                const cov = ft.alpha instanceof Uint8Array ? ft.alpha : new Uint8Array(ft.alpha);
+                if (cov.length < px) continue;
+                applyTile(ft.tx + dtx, ft.ty + dty, cov);
+            }
+            return written;
+        }
+        const maskSrc = tilesSource(tiles, [ox, oy]);
+        const seen = new Set();
+        const maxTx = (this._w - 1) >> 8, maxTy = (this._h - 1) >> 8;
+        for (const ft of tiles) {
+            if (!ft || ft.empty || !ft.alpha) continue;
+            const x0 = ox + ft.tx * TILE_SIZE, y0 = oy + ft.ty * TILE_SIZE;
+            const tx0 = Math.max(0, x0 >> 8), ty0 = Math.max(0, y0 >> 8);
+            const tx1 = Math.min(maxTx, (x0 + TILE_SIZE - 1) >> 8), ty1 = Math.min(maxTy, (y0 + TILE_SIZE - 1) >> 8);
+            for (let ty = ty0; ty <= ty1; ty++) {
+                for (let tx = tx0; tx <= tx1; tx++) {
+                    const key = (ty << 16) | tx;
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+                    applyTile(tx, ty, maskSrc.read(tx * TILE_SIZE, ty * TILE_SIZE, TILE_SIZE, TILE_SIZE));
+                }
+            }
         }
         return written;
     }

@@ -179,7 +179,7 @@ export function growMask(d, W, H, n, { dist = distTransform, ms = null, cells = 
  * is replaced and the JS path below makes it: the kernel writes `d` only after its call, so it starts from the same bytes.
  */
 export function growMaskBounds(d, W, H, n, { ms = null, cells = null } = {}) {
-    const p = rustPx();
+    const p = rustPx("growMask");
     if (p) {
         const t = ms ? performance.now() : 0;
         try { return p.growMask(d, W, H, n, cells); }

@@ -236,7 +236,7 @@ async function parse(blob) {
     layout.planes = planes;
     layout.perPixel = perPixel;
     layout.colormap = photometric === 3 ? await get(320, null) : null;
-    if (photometric === 3 && (!layout.colormap || layout.colormap.length < 3 * (1 << bits))) throw new Error("a palette TIFF without its colour map");
+    if (photometric === 3 && (!layout.colormap || typeof layout.colormap === "string" || layout.colormap.length < 3 * (1 << bits))) throw new Error("a palette TIFF without its colour map");
 
     if (pages > 1) notes.push(`page 1 of ${pages === MAX_IFDS ? pages + " or more" : pages} opened; the other pages are left out`);
     if (reducedFirst) notes.push("a reduced-resolution preview in front of the picture was skipped");
@@ -406,8 +406,6 @@ export function unpackStrip(compression, src, need, out = null, name = "strip") 
     return out || dst;
 }
 
-export const TIFF_JS = Object.freeze({ unpackStrip });
-
 /**
  * The pieces of a ReadableStream, and the stream cancelled when the caller stops early. Each await of the next piece
  * adds to `spent.wait` (the blob read, and for deflate the inflater too), each piece to `spent.pieces`.
@@ -472,19 +470,33 @@ async function* unpacked(src, off, count, compression, name, need = Infinity) {
 }
 
 /** Undo horizontal prediction (Predictor 2) on `rows` rows of `rowBytes`, `pixels` wide with `per` samples a pixel. */
-function unpredict(buf, rows, rowBytes, pixels, per, bits, le) {
+export function unpredict(buf, rows, rowBytes, pixels, per, bits, le = true) {
+    if (!ArrayBuffer.isView(buf)) throw new Error("tiff unpredict: buf must be an ArrayBufferView");
+    if (!Number.isInteger(rows) || !Number.isInteger(rowBytes) || !Number.isInteger(pixels) || !Number.isInteger(per)
+        || rows < 0 || rowBytes < 0 || pixels < 0 || per < 1 || (bits !== 8 && bits !== 16)) {
+        throw new Error(`tiff unpredict: invalid parameters (rows=${rows}, rowBytes=${rowBytes}, pixels=${pixels}, per=${per}, bits=${bits})`);
+    }
+    if (rows === 0 || pixels === 0) return buf;
+    const bps = bits >>> 3;
+    const active = pixels * per * bps;
+    if (rowBytes < active || buf.byteLength < (rows - 1) * rowBytes + active) {
+        throw new Error(`tiff unpredict: buffer (${buf.byteLength}) too short for ${rows} x ${rowBytes} (active ${active})`);
+    }
+    const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
     if (bits === 8) {
         for (let r = 0; r < rows; r++) {
             const o = r * rowBytes, end = o + pixels * per;
-            for (let i = o + per; i < end; i++) buf[i] = (buf[i] + buf[i - per]) & 255;
+            for (let i = o + per; i < end; i++) u8[i] = (u8[i] + u8[i - per]) & 255;
         }
     } else {
-        const v = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+        const v = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+        const little = !!le;
         for (let r = 0; r < rows; r++) {
             const o = r * rowBytes;
-            for (let s = per; s < pixels * per; s++) v.setUint16(o + s * 2, (v.getUint16(o + s * 2, le) + v.getUint16(o + (s - per) * 2, le)) & 0xFFFF, le);
+            for (let s = per; s < pixels * per; s++) v.setUint16(o + s * 2, (v.getUint16(o + s * 2, little) + v.getUint16(o + (s - per) * 2, little)) & 0xFFFF, little);
         }
     }
+    return buf;
 }
 
 /**
@@ -525,7 +537,7 @@ class StripRows {
         }
         if (this.info.predictor === 2) {
             const t1 = clock();
-            unpredict(out, n, L.rowBytes, this.info.width, L.perPixel, this.info.bits, this.src.le);
+            (this.src.kernels || TIFF_JS).unpredict(out, n, L.rowBytes, this.info.width, L.perPixel, this.info.bits, this.src.le);
             sp.unpredict += clock() - t1;
         }
         return out;
@@ -560,7 +572,7 @@ class TileRows {
         if (got < want) throw truncated(`tile ${k + 1} holds ${got} of ${want} bytes`);
         if (this.info.predictor === 2) {
             const t1 = clock();
-            unpredict(buf, L.tl, tileRow, L.tw, L.perPixel, this.info.bits, this.src.le);
+            (this.src.kernels || TIFF_JS).unpredict(buf, L.tl, tileRow, L.tw, L.perPixel, this.info.bits, this.src.le);
             sp.unpredict += clock() - t1;
         }
         return { buf, tileRow };
@@ -600,71 +612,698 @@ class TileRows {
 const to8 = (v) => ((v * 2 + 257) / 514) | 0;
 
 /**
- * A band of rows (one buffer per plane) as RGBA8. Every sample first becomes 8 bits in pixel order (`s8`, palette
- * indices stay indices), then the colour kind turns it into RGBA.
+ * The 8-bit RGB colour map (`(1 << bits) * 3` bytes) from a TIFF `ColorMap` tag (`3 * (1 << bits)` u16 entries):
+ * by high byte as libtiff reads it, or low byte when every entry is below 256.
  */
-function converter(info, layout, le) {
-    const W = info.width, spp = info.samples, bits = info.bits, ph = info.photometric;
-    const base = ph === 2 ? 3 : 1;
-    const ai = info.alpha === "none" ? -1 : base;
-    const pre = info.alpha === "premultiplied";
-    const palette = ph === 3;
-    const cm = layout.colormap;
-    const levels = palette ? 1 << bits : 0;
-    const pal = palette ? new Uint8Array(levels * 3) : null;
-    // the colour map by its high byte, as libtiff reads it: exact for the v * 256 some writers store and the v * 257 of
-    // others; a map with every entry below 256 is taken as 8 bits already (libtiff's test for such writers)
-    const map8 = palette && cm.slice(0, 3 * levels).every((v) => v < 256) ? (v) => v : (v) => v >> 8;
-    if (palette) for (let i = 0; i < levels; i++) { pal[i * 3] = map8(cm[i]); pal[i * 3 + 1] = map8(cm[levels + i]); pal[i * 3 + 2] = map8(cm[2 * levels + i]); }
-    const scale = bits < 8 && !palette ? 255 / ((1 << bits) - 1) : 1;
-    const s8 = new Uint8Array(W * spp);
-    const planes = layout.planes, rowBytes = layout.rowBytes;
-    const view = (b) => new DataView(b.buffer, b.byteOffset, b.byteLength);
+export function paletteLut(cm, bits) {
+    const levels = 1 << bits;
+    if (!cm || typeof cm === "string" || cm.length < 3 * levels) throw new Error(`tiff paletteLut: colormap too short for ${bits} bits`);
+    const pal = new Uint8Array(levels * 3);
+    let all8 = true;
+    for (let i = 0; i < 3 * levels; i++) {
+        if (!(cm[i] < 256)) { all8 = false; break; }
+    }
+    for (let i = 0; i < levels; i++) {
+        pal[i * 3] = all8 ? cm[i] : cm[i] >> 8;
+        pal[i * 3 + 1] = all8 ? cm[levels + i] : cm[levels + i] >> 8;
+        pal[i * 3 + 2] = all8 ? cm[2 * levels + i] : cm[2 * levels + i] >> 8;
+    }
+    return pal;
+}
 
-    /** Row `r` of the band as 8-bit samples in pixel order. */
-    const samples = (bufs, r) => {
-        if (planes === 1 && bits === 8) return bufs[0].subarray(r * rowBytes, r * rowBytes + W * spp);
+/**
+ * Convert `n` rows (`bufs`: one buffer for chunky, or `samples` buffers for planar) to straight-alpha RGBA8 in `out`
+ * (or a fresh `Uint8Array(n * width * 4)`). Question 6.4 (K15): on sub-byte (`1, 2, 4`-bit) palette files with alpha,
+ * the palette index sample (`0`) stays raw (`0 .. 2^bits - 1`) while the alpha sample (`1`) is scaled by
+ * `255 / (2^bits - 1)` for both chunky and planar, straight and premultiplied.
+ */
+export function toRgba(bufs, n, out = null, spec = {}) {
+    if (!spec || typeof spec !== "object") throw new Error("tiff toRgba: spec is required");
+    const W = (spec.width ?? spec.w) | 0, spp = (spec.samples ?? spec.spp) | 0, bits = spec.bits | 0, ph = spec.photometric | 0;
+    const rows = n | 0;
+    const le = spec.le !== false && spec.le !== 0;
+    const alphaMode = spec.alpha === "premultiplied" || spec.alpha === 1 ? 1
+        : spec.alpha === "straight" || spec.alpha === 2 ? 2
+        : spec.alpha === "none" || spec.alpha === 0 || spec.alpha === undefined ? 0 : -1;
+    if (W <= 0 || rows <= 0 || (bits !== 1 && bits !== 2 && bits !== 4 && bits !== 8 && bits !== 16)
+        || (ph !== 0 && ph !== 1 && ph !== 2 && ph !== 3) || (ph === 2 && bits < 8) || alphaMode < 0) {
+        throw new Error(`tiff toRgba: invalid spec (W=${W}, rows=${rows}, bits=${bits}, ph=${ph}, alpha=${spec.alpha})`);
+    }
+    const base = ph === 2 ? 3 : 1;
+    const ai = alphaMode === 0 ? -1 : base;
+    const pre = alphaMode === 1;
+    const palette = ph === 3;
+    if (spp < base + (ai >= 0 ? 1 : 0)) throw new Error(`tiff toRgba: samples=${spp} too small for ph=${ph} alpha=${spec.alpha}`);
+    const planeList = Array.isArray(bufs) ? bufs : [bufs];
+    const planes = planeList.length;
+    if (planes !== 1 && planes !== spp) throw new Error(`tiff toRgba: planes=${planes} must be 1 or samples=${spp}`);
+    const perPlane = planes === 1 ? W * spp : W;
+    const minRowBytes = Math.ceil((perPlane * bits) / 8);
+    const rowBytes = spec.rowBytes ? (spec.rowBytes | 0) : minRowBytes;
+    if (rowBytes < minRowBytes) throw new Error(`tiff toRgba: rowBytes=${rowBytes} < ${minRowBytes}`);
+    const minPlaneBytes = (rows - 1) * rowBytes + minRowBytes;
+    const u8Planes = new Array(planes);
+    for (let p = 0; p < planes; p++) {
+        const b = planeList[p];
+        if (!ArrayBuffer.isView(b) || b.byteLength < minPlaneBytes) {
+            throw new Error(`tiff toRgba: plane ${p} too short (${b && b.byteLength} < ${minPlaneBytes})`);
+        }
+        u8Planes[p] = b instanceof Uint8Array ? b : new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+    }
+    let pal = null;
+    if (palette) {
+        const rawPal = spec.pal || (spec.colormap ? paletteLut(spec.colormap, bits) : null);
+        const needPal = (1 << bits) * 3;
+        if (!ArrayBuffer.isView(rawPal) || rawPal.byteLength < needPal) {
+            throw new Error(`tiff toRgba: pal too short for ${bits}-bit palette`);
+        }
+        pal = rawPal instanceof Uint8Array ? rawPal : new Uint8Array(rawPal.buffer, rawPal.byteOffset, rawPal.byteLength);
+    }
+    const needOut = rows * W * 4;
+    let dst;
+    if (out != null) {
+        if (!ArrayBuffer.isView(out) || out.byteLength < needOut) throw new Error(`tiff toRgba: out too short (${out && out.byteLength} < ${needOut})`);
+        dst = out instanceof Uint8Array ? out : new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
+    } else {
+        dst = new Uint8Array(needOut);
+    }
+
+    // Fast path: chunky RGBA8 straight is a direct copy
+    if (planes === 1 && bits === 8 && ph === 2 && spp === 4 && alphaMode === 2) {
+        const b0 = u8Planes[0];
+        if (rowBytes === W * 4) dst.subarray(0, needOut).set(b0.subarray(0, needOut));
+        else for (let r = 0; r < rows; r++) dst.set(b0.subarray(r * rowBytes, r * rowBytes + W * 4), r * W * 4);
+        return out || dst;
+    }
+
+    const scale = bits < 8 ? 255 / ((1 << bits) - 1) : 1;
+    const s8 = planes === 1 && bits === 8 ? null : new Uint8Array(W * spp);
+    const views = bits === 16 ? u8Planes.map((b) => new DataView(b.buffer, b.byteOffset, b.byteLength)) : null;
+
+    const samples = (r) => {
+        if (planes === 1 && bits === 8) return u8Planes[0].subarray(r * rowBytes, r * rowBytes + W * spp);
         for (let p = 0; p < planes; p++) {
-            const b = bufs[p], o = r * rowBytes;
+            const b = u8Planes[p], o = r * rowBytes;
             const per = planes === 1 ? spp : 1, step = planes === 1 ? 1 : spp, off = planes === 1 ? 0 : p;
-            const n = W * per;
-            if (bits === 8) { for (let i = 0; i < n; i++) s8[off + i * step] = b[o + i]; }
-            else if (bits === 16) { const v = view(b); for (let i = 0; i < n; i++) s8[off + i * step] = to8(v.getUint16(o + i * 2, le)); }
+            const cnt = W * per;
+            if (bits === 8) { for (let i = 0; i < cnt; i++) s8[off + i * step] = b[o + i]; }
+            else if (bits === 16) { const v = views[p]; for (let i = 0; i < cnt; i++) s8[off + i * step] = to8(v.getUint16(o + i * 2, le)); }
             else {
                 const mask = (1 << bits) - 1, perByte = 8 / bits;
-                for (let i = 0; i < n; i++) {
+                for (let i = 0; i < cnt; i++) {
                     const byte = b[o + Math.floor(i / perByte)];
                     const raw = (byte >> (8 - bits - (i % perByte) * bits)) & mask;
-                    s8[off + i * step] = palette ? raw : Math.round(raw * scale);
+                    const isIdx = palette && (planes === 1 ? i % spp === 0 : p === 0);
+                    s8[off + i * step] = isIdx ? raw : Math.round(raw * scale);
                 }
             }
         }
         return s8;
     };
-    return (bufs, n, out) => {
-        for (let r = 0; r < n; r++) {
-            const s = samples(bufs, r);
-            let o = r * W * 4;
-            for (let x = 0, i = 0; x < W; x++, i += spp, o += 4) {
-                let R, G, B;
-                if (ph === 2) { R = s[i]; G = s[i + 1]; B = s[i + 2]; }
-                else if (palette) { const k = s[i] * 3; R = pal[k]; G = pal[k + 1]; B = pal[k + 2]; }
-                else { R = G = B = ph === 0 ? 255 - s[i] : s[i]; }
-                let A = 255;
-                if (ai >= 0) {
-                    A = s[i + ai];
-                    if (pre) {
-                        if (A === 0) { R = G = B = 0; }
-                        else if (A < 255) {
-                            const h = A >> 1;
-                            R = Math.min(255, Math.floor((R * 255 + h) / A)); G = Math.min(255, Math.floor((G * 255 + h) / A)); B = Math.min(255, Math.floor((B * 255 + h) / A));
+
+    for (let r = 0; r < rows; r++) {
+        const s = samples(r);
+        let o = r * W * 4;
+        for (let x = 0, i = 0; x < W; x++, i += spp, o += 4) {
+            let R, G, B;
+            if (ph === 2) { R = s[i]; G = s[i + 1]; B = s[i + 2]; }
+            else if (palette) { const k = s[i] * 3; R = pal[k]; G = pal[k + 1]; B = pal[k + 2]; }
+            else { R = G = B = ph === 0 ? 255 - s[i] : s[i]; }
+            let A = 255;
+            if (ai >= 0) {
+                A = s[i + ai];
+                if (pre) {
+                    if (A === 0) { R = G = B = 0; }
+                    else if (A < 255) {
+                        const h = A >> 1;
+                        R = Math.min(255, Math.floor((R * 255 + h) / A)); G = Math.min(255, Math.floor((G * 255 + h) / A)); B = Math.min(255, Math.floor((B * 255 + h) / A));
+                    }
+                }
+            }
+            dst[o] = R; dst[o + 1] = G; dst[o + 2] = B; dst[o + 3] = A;
+        }
+    }
+    return out || dst;
+}
+
+/**
+ * A band of rows (one buffer per plane) as RGBA8. Every sample first becomes 8 bits in pixel order (`s8`, palette
+ * indices stay indices), then the colour kind turns it into RGBA.
+ */
+function converter(info, layout, le, K = TIFF_JS) {
+    const pal = info.photometric === 3 ? paletteLut(layout.colormap, info.bits) : null;
+    const spec = { width: info.width, samples: info.samples, bits: info.bits, photometric: info.photometric, alpha: info.alpha, le, rowBytes: layout.rowBytes, pal };
+    return (bufs, n, out) => K.toRgba(bufs, n, out, spec);
+}
+
+export const TIFF_BAND_BYTES = 64 * 1048576;   // RGBA bytes of a band at most: a 1-strip 1-bit 15k file is 19 MB raw and 600 MB RGBA
+
+/**
+ * Plans how a TIFF will be read (`docs/PLAN_WASM_BUILD.md` §4.6, K17): parses the header and directories, decides
+ * `streamed` and the band height from the band's RGBA bytes (`rows * width * 4 <= TIFF_BAND_BYTES`, ~64 MB) rather than
+ * the raw strip size, and cuts `offsets` and `counts` into per-band slices (`plan.bands[i]`) so a band job carries only
+ * its own strip or tile entries alongside the per-file constants (`plan.spec`).
+ */
+export async function tiffPlan(blob, opts = {}) {
+    if (typeof opts === "number") opts = { rowsPerBand: opts };
+    const { rowsPerBand = 256, spent = null, streamed: forceStreamed = false } = opts || {};
+    const t0 = clock();
+    const { src, info, layout } = await parse(blob);
+    if (spent) {
+        spent.parse = (spent.parse || 0) + (clock() - t0);
+        spent.codec = CODEC[info.compression];
+    }
+    const W = info.width, H = info.height;
+    const unit = layout.tiled ? layout.tl : layout.rps;
+    const unitRows = Math.min(unit, H);
+    const maxRgbaRows = Math.floor(TIFF_BAND_BYTES / (W * 4));
+    const rawRowBytes = layout.rowBytes * layout.planes;
+    const maxPlaneRows = rawRowBytes > 0 ? Math.floor((2 * TIFF_BAND_BYTES) / rawRowBytes) : maxRgbaRows;
+    const maxRows = Math.min(maxRgbaRows, maxPlaneRows);
+    const singleTileBytes = layout.tiled ? Math.ceil((layout.tw * layout.perPixel * info.bits) / 8) * layout.tl : 0;
+    let streamed = !!forceStreamed || unitRows > maxRows || singleTileBytes > 2 * TIFF_BAND_BYTES;
+    const pal = info.photometric === 3 ? paletteLut(layout.colormap, info.bits) : null;
+    const spec = {
+        info,
+        le: src.le,
+        rowBytes: layout.rowBytes,
+        planes: layout.planes,
+        perPixel: layout.perPixel,
+        rps: layout.tiled ? 0 : layout.rps,
+        per: layout.tiled ? 0 : layout.per,
+        tw: layout.tiled ? layout.tw : 0,
+        tl: layout.tiled ? layout.tl : 0,
+        across: layout.tiled ? layout.across : 0,
+        down: layout.tiled ? layout.down : 0,
+        pal,
+    };
+    const bands = [];
+    let bandRows = 0;
+    if (!streamed) {
+        const wantRows = Math.min(Math.max(1, rowsPerBand | 0), maxRows);
+        const unitsPerBand = Math.max(1, Math.floor(wantRows / unit));
+        bandRows = unitsPerBand * unit;
+        const totalUnits = layout.tiled ? layout.down : layout.per;
+        const segsPerUnit = layout.tiled ? layout.across : 1;
+        const planeSegs = totalUnits * segsPerUnit;
+        for (let u0 = 0, idx = 0; u0 < totalUnits; u0 += unitsPerBand, idx++) {
+            const uCount = Math.min(unitsPerBand, totalUnits - u0);
+            const y0 = u0 * unit;
+            const rows = Math.min(uCount * unit, H - y0);
+            const seg0 = u0 * segsPerUnit;
+            const segCount = uCount * segsPerUnit;
+            let offsets, counts;
+            if (layout.planes === 1) {
+                offsets = layout.offsets.slice(seg0, seg0 + segCount);
+                counts = layout.counts.slice(seg0, seg0 + segCount);
+            } else {
+                offsets = new Array(layout.planes * segCount);
+                counts = new Array(layout.planes * segCount);
+                for (let p = 0; p < layout.planes; p++) {
+                    const base = p * planeSegs + seg0, dst = p * segCount;
+                    for (let s = 0; s < segCount; s++) {
+                        offsets[dst + s] = layout.offsets[base + s];
+                        counts[dst + s] = layout.counts[base + s];
+                    }
+                }
+            }
+            const bandUnpacked = layout.tiled ? uCount * layout.across * singleTileBytes * layout.planes : rows * rawRowBytes;
+            let effSum = 0, minOff = Infinity, maxEnd = 0, allInFile = true;
+            const effCounts = new Array(counts.length);
+            for (let k = 0; k < counts.length; k++) {
+                const off = offsets[k], count = counts[k];
+                if (!(off >= 0) || !(count >= 0) || off + count > blob.size) { allInFile = false; break; }
+                const need = layout.tiled ? singleTileBytes : Math.min(layout.rps, rows - (k % segCount) * layout.rps) * layout.rowBytes;
+                const eff = info.compression === 1 ? Math.min(count, need) : count;
+                effCounts[k] = eff;
+                effSum += eff;
+                if (off < minOff) minOff = off;
+                if (off + eff > maxEnd) maxEnd = off + eff;
+            }
+            if (allInFile) {
+                let sliceBytes = 0;
+                if (maxEnd > minOff) {
+                    if (maxEnd - minOff <= effSum + 65536) {
+                        sliceBytes = maxEnd - minOff;
+                    } else {
+                        for (let i = 0; i < counts.length;) {
+                            const runStart = offsets[i];
+                            let runEnd = runStart + effCounts[i], j = i + 1;
+                            while (j < counts.length && offsets[j] >= runEnd && offsets[j] - runEnd <= 65536) {
+                                runEnd = Math.max(runEnd, offsets[j] + effCounts[j]);
+                                j++;
+                            }
+                            sliceBytes += runEnd - runStart;
+                            i = j;
                         }
                     }
                 }
-                out[o] = R; out[o + 1] = G; out[o + 2] = B; out[o + 3] = A;
+                if (Math.max(effSum, sliceBytes) > 4 * bandUnpacked + 1048576) {
+                    streamed = true;
+                    bands.length = 0;
+                    bandRows = 0;
+                    break;
+                }
+            }
+            const b = { index: idx, y0, rows, first: u0, offsets, counts };
+            Object.defineProperty(b, "plan", { value: spec, enumerable: false });
+            bands.push(b);
+        }
+    }
+    const plan = { ...spec, colormap: layout.colormap, spec, streamed, rowsPerBand: bandRows, bandRows, bands };
+    Object.defineProperty(plan, "_src", { value: src, enumerable: false });
+    Object.defineProperty(plan, "_layout", { value: layout, enumerable: false });
+    return plan;
+}
+
+const INFLATE_FEED_SLICE = 1048576;
+
+async function inflateInto(rawSlice, dst, need, name, tiled, sp) {
+    const ds = new DecompressionStream("deflate");
+    const writer = ds.writable.getWriter(), reader = ds.readable.getReader();
+    let got = 0, stop = false, fedErr = null, wakeFeed = null;
+    const stopFeed = () => {
+        stop = true;
+        if (wakeFeed) { const w = wakeFeed; wakeFeed = null; w(); }
+    };
+    const feed = (async () => {
+        try {
+            for (let i = 0; i < rawSlice.length && !stop; i += INFLATE_FEED_SLICE) {
+                await writer.write(rawSlice.subarray(i, i + INFLATE_FEED_SLICE));
+            }
+            if (!stop) {
+                await new Promise((r) => {
+                    const tid = setTimeout(() => { wakeFeed = null; r(); }, 0);
+                    wakeFeed = () => { clearTimeout(tid); r(); };
+                });
+            }
+            if (!stop) await writer.close();
+        } catch (err) {
+            if (!stop) fedErr = err;
+        }
+    })();
+    try {
+        for (;;) {
+            const tw = clock();
+            const { value, done } = await reader.read();
+            sp.wait += clock() - tw;
+            if (done) break;
+            sp.pieces++;
+            const take = Math.min(value.length, need - got);
+            if (take > 0) {
+                const tc = clock();
+                dst.set(value.subarray(0, take), got);
+                sp.copy += clock() - tc;
+            }
+            got += take;
+            if (got >= need) {
+                stopFeed();
+                await reader.cancel().catch(() => {});
+                break;
             }
         }
+    } catch (err) {
+        if (!stop) {
+            stopFeed();
+            await reader.cancel().catch(() => {});
+        }
+        await feed;
+        throw new Error(`${name} of the TIFF is damaged or cut off (${(err && err.message) || err})`);
+    }
+    await feed;
+    if (!stop && fedErr) {
+        throw new Error(`${name} of the TIFF is damaged or cut off (${(fedErr && fedErr.message) || fedErr})`);
+    }
+    if (got < need) throw truncated(tiled ? `${name} holds ${got} of ${need} bytes` : `${name} holds fewer bytes than its rows`);
+}
+
+/**
+ * Reads and decodes one planned band (`plan.bands[i]`) of `blob` into straight-alpha RGBA8 (`Uint8Array` of
+ * `band.rows * width * 4` bytes; `docs/PLAN_WASM_BUILD.md` §4.6, K17): one `blob.slice(...).arrayBuffer()` per
+ * contiguous band (or per contiguous plane run), `K.unpackStrip` for uncompressed / LZW / PackBits and one
+ * `DecompressionStream("deflate")` per strip or tile (cancelled once `need` bytes are read) for Deflate, per-tile
+ * `K.unpredict` before scattering into band rows on tiled files, and `K.toRgba` to convert the band to RGBA8.
+ */
+export async function readTiffBand(blob, planOrBand, bandOrOpts = null, maybeOpts = null) {
+    let P = null, band = null, opts = {};
+    if (planOrBand && planOrBand.info) {
+        P = planOrBand;
+        band = typeof bandOrOpts === "number" ? (P.bands && P.bands[bandOrOpts])
+            : (bandOrOpts && Array.isArray(bandOrOpts.offsets)) ? bandOrOpts
+            : Array.isArray(planOrBand.offsets) ? planOrBand : null;
+        opts = (band === planOrBand ? bandOrOpts : maybeOpts) || {};
+    } else if (planOrBand && Array.isArray(planOrBand.offsets)) {
+        band = planOrBand;
+        if (bandOrOpts && bandOrOpts.info) {
+            P = bandOrOpts;
+            opts = maybeOpts || (bandOrOpts.kernels || bandOrOpts.spent || bandOrOpts.out ? bandOrOpts : {});
+        } else if (bandOrOpts && bandOrOpts.plan && bandOrOpts.plan.info) {
+            P = bandOrOpts.plan;
+            opts = bandOrOpts;
+        } else {
+            P = band.plan || null;
+            opts = bandOrOpts || {};
+        }
+    } else if (planOrBand && planOrBand.plan && planOrBand.band !== undefined) {
+        P = planOrBand.plan;
+        band = typeof planOrBand.band === "number" ? (P.bands && P.bands[planOrBand.band]) : planOrBand.band;
+        opts = planOrBand;
+    }
+    if (!blob || typeof blob.slice !== "function" || !(blob.size >= 0)) throw new Error("tiff readTiffBand: invalid blob");
+    if (!P || !P.info || !band || !Array.isArray(band.offsets) || !Array.isArray(band.counts)) {
+        throw new Error("tiff readTiffBand: invalid plan or band");
+    }
+    const { out = null, spent = null, kernels = null } = opts;
+    const K = kernels || TIFF_JS;
+    const info = P.info;
+    const sp = spent || { wait: 0, decode: 0, copy: 0, unpredict: 0, convert: 0, pieces: 0 };
+    if (spent) {
+        for (const k of ["wait", "decode", "copy", "unpredict", "convert", "pieces"]) {
+            if (typeof sp[k] !== "number") sp[k] = 0;
+        }
+        if (!sp.codec) sp.codec = CODEC[info.compression];
+    }
+    const rows = band.rows | 0;
+    if (!(rows > 0) || !(band.y0 >= 0) || band.y0 + rows > info.height) {
+        throw new Error(`tiff readTiffBand: invalid band rows (${band.y0} + ${rows} of ${info.height})`);
+    }
+    const planes = P.planes || 1;
+    const offsets = band.offsets, counts = band.counts;
+    const totalSegs = offsets.length;
+    if (counts.length !== totalSegs || totalSegs === 0 || totalSegs % planes !== 0) {
+        throw new Error(`tiff readTiffBand: invalid segment table (${totalSegs} offsets, ${counts.length} counts, ${planes} planes)`);
+    }
+    const needRgba = rows * info.width * 4;
+    let rgba;
+    if (out != null) {
+        if (!ArrayBuffer.isView(out) || out.byteLength < needRgba) {
+            throw new Error(`tiff readTiffBand: out buffer (${out && out.byteLength}) too short for ${needRgba} bytes`);
+        }
+        rgba = out instanceof Uint8Array ? out : new Uint8Array(out.buffer, out.byteOffset, needRgba);
+    } else {
+        rgba = new Uint8Array(needRgba);
+    }
+
+    const segsPerPlane = totalSegs / planes;
+    const firstUnit = band.first !== undefined ? band.first : Math.floor(band.y0 / (info.tiled ? P.tl : P.rps));
+    const planeTotalSegs = info.tiled
+        ? (P.down || Math.ceil(info.height / P.tl)) * P.across
+        : (P.per || Math.ceil(info.height / P.rps));
+    const firstSegInPlane = info.tiled ? firstUnit * P.across : firstUnit;
+    const segName = (i) => {
+        const p = Math.floor(i / segsPerPlane), s = i - p * segsPerPlane;
+        const k = p * planeTotalSegs + firstSegInPlane + s;
+        return info.tiled ? `tile ${k + 1}` : `strip ${k + 1}`;
     };
+
+    const rowBytes = P.rowBytes, perPixel = P.perPixel;
+    const tileWant = info.tiled ? Math.ceil((P.tw * perPixel * info.bits) / 8) * P.tl : 0;
+    const segNeed = (i) => {
+        if (info.tiled) return tileWant;
+        const s = i % segsPerPlane;
+        return Math.min(P.rps, rows - s * P.rps) * rowBytes;
+    };
+    const effCounts = new Array(totalSegs);
+    let minOff = Infinity, maxEnd = 0, sumCounts = 0;
+    for (let i = 0; i < totalSegs; i++) {
+        const off = offsets[i], count = counts[i];
+        if (!(off >= 0) || !(count >= 0) || off + count > blob.size) throw truncated(`${segName(i)} lies past the end of the file`);
+        const eff = info.compression === 1 ? Math.min(count, segNeed(i)) : count;
+        effCounts[i] = eff;
+        if (off < minOff) minOff = off;
+        if (off + eff > maxEnd) maxEnd = off + eff;
+        sumCounts += eff;
+    }
+    const rawSlices = new Array(totalSegs);
+    const rawBuffers = [];
+    if (maxEnd <= minOff) {
+        rawSlices.fill(new Uint8Array(0));
+    } else if (maxEnd - minOff <= sumCounts + 65536) {
+        const tw = clock();
+        const ab = await blob.slice(minOff, maxEnd).arrayBuffer();
+        sp.wait += clock() - tw;
+        sp.pieces++;
+        rawBuffers.push(ab);
+        const raw = new Uint8Array(ab);
+        for (let i = 0; i < totalSegs; i++) {
+            const start = offsets[i] - minOff, end = start + effCounts[i];
+            if (raw.length < end) throw truncated(`${segName(i)} lies past the end of the file`);
+            rawSlices[i] = raw.subarray(start, end);
+        }
+    } else {
+        for (let i = 0; i < totalSegs;) {
+            const runStart = offsets[i];
+            let runEnd = runStart + effCounts[i], j = i + 1;
+            while (j < totalSegs && offsets[j] >= runEnd && offsets[j] - runEnd <= 65536) {
+                runEnd = Math.max(runEnd, offsets[j] + effCounts[j]);
+                j++;
+            }
+            const tw = clock();
+            const ab = await blob.slice(runStart, runEnd).arrayBuffer();
+            sp.wait += clock() - tw;
+            sp.pieces++;
+            rawBuffers.push(ab);
+            const raw = new Uint8Array(ab);
+            for (let k = i; k < j; k++) {
+                const start = offsets[k] - runStart, end = start + effCounts[k];
+                if (raw.length < end) throw truncated(`${segName(k)} lies past the end of the file`);
+                rawSlices[k] = raw.subarray(start, end);
+            }
+            i = j;
+        }
+    }
+
+    const isDeflate = info.compression === 8 || info.compression === 32946;
+    const bufs = new Array(planes);
+    try {
+        if (info.tiled) {
+            const tw = P.tw, tl = P.tl, across = P.across;
+            const tileRow = Math.ceil((tw * perPixel * info.bits) / 8), want = tileRow * tl;
+            const tyCount = Math.ceil(rows / tl);
+            const per = (perPixel * info.bits) / 8;
+            const tileBuf = new Uint8Array(want);
+            for (let p = 0; p < planes; p++) {
+                const planeBuf = new Uint8Array(rows * rowBytes);
+                for (let tyLocal = 0; tyLocal < tyCount; tyLocal++) {
+                    const r0 = tyLocal * tl;
+                    const tRows = Math.min(tl, rows - r0);
+                    for (let tx = 0; tx < across; tx++) {
+                        const segIdx = p * segsPerPlane + tyLocal * across + tx;
+                        const name = segName(segIdx);
+                        const rawSlice = rawSlices[segIdx];
+                        if (isDeflate) {
+                            await inflateInto(rawSlice, tileBuf, want, name, true, sp);
+                        } else {
+                            const td = clock();
+                            K.unpackStrip(info.compression, rawSlice, want, tileBuf, name);
+                            sp.decode += clock() - td;
+                        }
+                        if (info.predictor === 2) {
+                            const tu = clock();
+                            K.unpredict(tileBuf, tl, tileRow, tw, perPixel, info.bits, P.le);
+                            sp.unpredict += clock() - tu;
+                        }
+                        const px = Math.min(tw, info.width - tx * tw);
+                        const bytes = Math.ceil(px * per), at = Math.floor(tx * tw * per);
+                        const tc = clock();
+                        for (let r = 0; r < tRows; r++) {
+                            planeBuf.set(tileBuf.subarray(r * tileRow, r * tileRow + bytes), (r0 + r) * rowBytes + at);
+                        }
+                        sp.copy += clock() - tc;
+                    }
+                }
+                bufs[p] = planeBuf;
+            }
+        } else {
+            const rps = P.rps;
+            const stripCount = Math.ceil(rows / rps);
+            for (let p = 0; p < planes; p++) {
+                const planeBuf = new Uint8Array(rows * rowBytes);
+                for (let s = 0; s < stripCount; s++) {
+                    const r0 = s * rps;
+                    const sRows = Math.min(rps, rows - r0);
+                    const need = sRows * rowBytes;
+                    const segIdx = p * segsPerPlane + s;
+                    const name = segName(segIdx);
+                    const rawSlice = rawSlices[segIdx];
+                    const dst = planeBuf.subarray(r0 * rowBytes, r0 * rowBytes + need);
+                    if (isDeflate) {
+                        await inflateInto(rawSlice, dst, need, name, false, sp);
+                    } else {
+                        const td = clock();
+                        K.unpackStrip(info.compression, rawSlice, need, dst, name);
+                        sp.decode += clock() - td;
+                    }
+                }
+                if (info.predictor === 2) {
+                    const tu = clock();
+                    K.unpredict(planeBuf, rows, rowBytes, info.width, perPixel, info.bits, P.le);
+                    sp.unpredict += clock() - tu;
+                }
+                bufs[p] = planeBuf;
+            }
+        }
+    } finally {
+        for (const ab of rawBuffers) {
+            try { if (typeof ab.transfer === "function") ab.transfer(0); } catch (_) { /* ignore */ }
+        }
+    }
+
+    const tc = clock();
+    const pal = info.photometric === 3 ? (P.pal || (P.colormap ? K.paletteLut(P.colormap, info.bits) : null)) : null;
+    K.toRgba(bufs, rows, rgba, {
+        width: info.width,
+        samples: info.samples,
+        bits: info.bits,
+        photometric: info.photometric,
+        alpha: info.alpha,
+        le: P.le,
+        rowBytes,
+        pal,
+        colormap: P.colormap,
+    });
+    sp.convert += clock() - tc;
+    return out || rgba;
+}
+
+function tiffCancelError() {
+    const err = new Error("tiff open cancelled");
+    err.name = "CancelledError";
+    err.cancelled = true;
+    return err;
+}
+
+function detachBuffer(buf) {
+    if (!buf) return;
+    const ab = ArrayBuffer.isView(buf) ? buf.buffer : buf;
+    try { if (ab && typeof ab.transfer === "function") ab.transfer(0); } catch (_) { /* ignore */ }
+}
+
+/**
+ * Decode a non-streamed TIFF (`!plan.streamed`) in parallel across `pool` (`tiff_band` jobs at `NORMAL` priority,
+ * `docs/PLAN_WASM_BUILD.md` §4.6, K18). Each job carries only `plan.spec` and its own `plan.bands[i]` (never the full
+ * strip / tile offset table); bands go to `onRows(rgba, y0, rows)` as each job answers. Returns `null` when
+ * `plan.streamed` is true so the caller can fall back to `tiff_read`. On any band failure or `later()`, cancels the
+ * pool group before rejecting.
+ */
+export async function readTiffBands(blob, {
+    pool,
+    plan: givenPlan = null,
+    rowsPerBand = 256,
+    priority = 1,
+    later = null,
+    onHeader = null,
+    onRows = null,
+    spent = null,
+} = {}) {
+    if (!pool || typeof pool.run !== "function") throw new Error("no worker pool");
+    const isLater = typeof later === "function" ? later : null;
+    if (isLater && isLater()) throw tiffCancelError();
+    const plan = givenPlan || await tiffPlan(blob, { rowsPerBand, spent });
+    if (isLater && isLater()) throw tiffCancelError();
+    if (plan.streamed || !plan.bands || !plan.bands.length) return null;
+    const { info, spec, bands } = plan;
+    if (onHeader) await onHeader(info);
+    if (isLater && isLater()) throw tiffCancelError();
+
+    const n = bands.length;
+    const maxInFlight = Math.max(1, (pool.size | 0) || 8) * 2;
+    const group = Symbol("tiff_bands");
+    let next = 0, inFlight = 0, done = 0;
+    let failed = null, cancelled = false;
+    let wake = null;
+
+    const notify = () => {
+        if (wake) { const fn = wake; wake = null; fn(); }
+    };
+    const cancelGroup = () => {
+        if (typeof pool.cancel === "function") pool.cancel(group);
+    };
+    const stopCancel = () => {
+        if (cancelled || failed) return;
+        cancelled = true;
+        cancelGroup();
+        notify();
+    };
+    const onFail = (err) => {
+        if (cancelled || failed) return;
+        if (isLater && isLater()) { stopCancel(); return; }
+        failed = err instanceof Error ? err : new Error(String(err || "tiff_band failed"));
+        cancelGroup();
+        notify();
+    };
+    const launch = () => {
+        while (!failed && !cancelled && next < n && inFlight < maxInFlight) {
+            if (isLater && isLater()) { stopCancel(); return; }
+            const band = bands[next++];
+            inFlight++;
+            pool.run(
+                "tiff_band",
+                { blob, spec, band },
+                [],
+                { priority, group, timeout: 600000 },
+            ).then((r) => {
+                if (failed || cancelled) {
+                    inFlight--;
+                    if (r && r.rgba) detachBuffer(r.rgba);
+                    return;
+                }
+                if (isLater && isLater()) {
+                    inFlight--;
+                    if (r && r.rgba) detachBuffer(r.rgba);
+                    stopCancel();
+                    return;
+                }
+                try {
+                    const y0 = band.y0, rows = band.rows;
+                    const needBytes = rows * info.width * 4;
+                    const buf = r && r.rgba;
+                    const rgba = buf instanceof Uint8Array
+                        ? buf
+                        : (buf instanceof ArrayBuffer ? new Uint8Array(buf) : null);
+                    if (!rgba || rgba.byteLength < needBytes) {
+                        inFlight--;
+                        if (buf) detachBuffer(buf);
+                        throw new Error(`tiff_band ${band.index}: expected ${needBytes} RGBA bytes, got ${rgba ? rgba.byteLength : 0}`);
+                    }
+                    const view = rgba.byteLength === needBytes ? rgba : rgba.subarray(0, needBytes);
+                    const finishBand = () => {
+                        inFlight--;
+                        if (failed || cancelled) return;
+                        if (isLater && isLater()) { stopCancel(); return; }
+                        done++;
+                        launch();
+                        if (done === n) notify();
+                    };
+                    const p = onRows ? onRows(view, y0, rows) : null;
+                    if (p && typeof p.then === "function") {
+                        p.then(finishBand, (err) => { inFlight--; onFail(err); });
+                    } else {
+                        finishBand();
+                    }
+                } catch (err) {
+                    onFail(err);
+                }
+            }, (err) => {
+                inFlight--;
+                onFail(err);
+            });
+        }
+    };
+
+    launch();
+    while (!failed && !cancelled && done < n) {
+        await new Promise((r) => { wake = r; });
+    }
+    if (cancelled || (isLater && isLater())) {
+        cancelGroup();
+        throw tiffCancelError();
+    }
+    if (failed) {
+        cancelGroup();
+        throw failed;
+    }
+    return info;
 }
 
 /**
@@ -679,18 +1318,41 @@ function converter(info, layout, le) {
  * included), `unpredict`, `convert` the rows made RGBA8, `deliver` inside `onRows`; the counts `bands` and `pieces`; and
  * `codec` ("none", "lzw", "packbits" or "deflate"). A planar file reads its planes concurrently, so their laps overlap.
  */
-export async function readTiff(blob, { onHeader = null, onRows, rowsPerBand = 256, spent = null } = {}) {
+export async function readTiff(blob, { onHeader = null, onRows, rowsPerBand = 256, spent = null, kernels = null, streamed = false } = {}) {
+    const K = kernels || TIFF_JS;
     const sp = Object.assign(spent || {}, { parse: 0, wait: 0, decode: 0, copy: 0, unpredict: 0, convert: 0, deliver: 0, bands: 0, pieces: 0 });
-    const t0 = clock();
-    const { src, info, layout } = await parse(blob);
-    sp.parse = clock() - t0;
-    sp.codec = CODEC[info.compression];
-    src.spent = sp;
+    const plan = await tiffPlan(blob, { rowsPerBand, spent: sp, streamed });
+    const { info } = plan;
     if (onHeader) await onHeader(info);
+    const band = Math.max(1, rowsPerBand | 0);
+    if (!plan.streamed) {
+        for (const b of plan.bands) {
+            const out = await readTiffBand(blob, plan, b, { spent: sp, kernels: K });
+            if (b.rows <= band) {
+                const td = clock();
+                if (onRows) await onRows(out, b.y0, b.rows);
+                sp.deliver += clock() - td;
+                sp.bands++;
+            } else {
+                const stride = info.width * 4;
+                for (let r = 0; r < b.rows; r += band) {
+                    const n = Math.min(band, b.rows - r);
+                    const slice = out.slice(r * stride, (r + n) * stride);
+                    const td = clock();
+                    if (onRows) await onRows(slice, b.y0 + r, n);
+                    sp.deliver += clock() - td;
+                    sp.bands++;
+                }
+            }
+        }
+        return info;
+    }
+    const src = plan._src, layout = plan._layout;
+    src.spent = sp;
+    src.kernels = K;
     const Rows = layout.tiled ? TileRows : StripRows;
     const planes = Array.from({ length: layout.planes }, (_, p) => new Rows(src, info, layout, p));
-    const convert = converter(info, layout, src.le);
-    const band = Math.max(1, rowsPerBand | 0);
+    const convert = converter(info, layout, src.le, K);
     try {
         for (let y = 0; y < info.height; y += band) {
             const n = Math.min(band, info.height - y);
@@ -721,6 +1383,23 @@ export function tiffStripRows(width) {
     return r;
 }
 
+/** Horizontal differencing (Predictor 2) in place on `rows` rows of `w`-wide RGBA8. */
+export function predictRgba(rgba, w, rows) {
+    if (!ArrayBuffer.isView(rgba)) throw new Error("tiff predictRgba: rgba must be an ArrayBufferView");
+    if (!Number.isInteger(w) || !Number.isInteger(rows) || w <= 0 || rows <= 0 || rgba.byteLength < w * rows * 4) {
+        throw new Error(`tiff predictRgba: invalid size (${w} x ${rows}, byteLength ${rgba && rgba.byteLength})`);
+    }
+    const row = w * 4;
+    const bytes = rgba instanceof Uint8Array ? rgba : new Uint8Array(rgba.buffer, rgba.byteOffset, w * rows * 4);
+    for (let r = 0; r < rows; r++) {
+        const o = r * row;
+        for (let i = o + row - 1; i >= o + 4; i--) bytes[i] = (bytes[i] - bytes[i - 4]) & 255;
+    }
+    return rgba;
+}
+
+export const TIFF_JS = Object.freeze({ unpackStrip, unpredict, predictRgba, toRgba, paletteLut });
+
 /**
  * One strip: `rows` rows of RGBA8 `w` wide, differenced horizontally (Predictor 2, on a copy) and compressed by
  * `deflate` (bytes -> a zlib stream). `{ chunk, raw }`. `laps` (optional): `predict` (the copy and the differencing)
@@ -728,16 +1407,12 @@ export function tiffStripRows(width) {
  */
 export async function tiffPart({ rgba, w, rows, predictor = 2 }, deflate, laps = null) {
     const n = w * rows * 4;
-    const src = rgba instanceof Uint8Array ? rgba.subarray(0, n) : new Uint8Array(rgba, 0, n);
+    const src = rgba instanceof Uint8Array ? rgba.subarray(0, n) : ArrayBuffer.isView(rgba) ? new Uint8Array(rgba.buffer, rgba.byteOffset, n) : new Uint8Array(rgba, 0, n);
     let bytes = src;
     const t0 = clock();
     if (predictor === 2) {
         bytes = new Uint8Array(src);
-        const row = w * 4;
-        for (let r = 0; r < rows; r++) {
-            const o = r * row;
-            for (let i = o + row - 1; i >= o + 4; i--) bytes[i] = (bytes[i] - bytes[i - 4]) & 255;
-        }
+        predictRgba(bytes, w, rows);
     }
     const t1 = clock();
     const z = await deflate(bytes);

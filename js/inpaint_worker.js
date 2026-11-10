@@ -29,6 +29,9 @@
  *                   (`progress` messages), the window never runs the reader's loops (docs/PLAN_WASM_BUILD.md §7 D0).
  *   inflate_bench   byte ranges of a blob through the browser's inflater, counted and dropped: a benchmark only.
  *   png_read        a PNG file decoded as a stream, its rows back band by band (`progress` messages).
+ *   tiff_band       one planned band of a TIFF (`readTiffBand`, K18): per-file `spec` and that band's slices only,
+ *                   its RGBA8 transferred back.
+ *   tiff_read       a TIFF file decoded as a stream (`readTiff`), for single-strip / huge bands and the fallback.
  *   image_read      any image file the browser decodes (JPEG, WebP, a PNG with a colour profile), decoded here and
  *                   read back band by band like png_read: the window never decodes or reads it.
  *   resample        one row of destination tiles of an affine resample (inpaint_resample.js): the straighten of 23b.
@@ -57,14 +60,14 @@
 import { PsdWriter, OraWriter } from "./inpaint_export.js";
 import { floodMask, maskToColorCanvas, clipMaskToSelection, clipCoverage, growMaskBounds, invertMask, maskBounds, hexToRgb } from "./inpaint_raster.js";
 import { crc32, readPng, PNG_LEVEL, NO_PARTS } from "./inpaint_png.js";
-import { readTiff, tiffPart } from "./inpaint_tiff.js";
+import { readTiff, readTiffBand, tiffPart } from "./inpaint_tiff.js";
 import { readPsdStream, inflateAtMost } from "./inpaint_layered.js";
 import { resampleStore } from "./inpaint_resample.js";
 import { liquifyStore } from "./inpaint_liquify.js";
-import { guidedFar } from "./inpaint_depth.js";
+import { disparityRange } from "./inpaint_depth.js";
 import { rangeRowBookkeeping } from "./inpaint_weights.js";
 import { fuseTiles } from "./inpaint_edges.js";
-import { mipChain, mipChainBytes, clampExtend, compositeTile, matchPixels, psdPackRows, kernelsReady, setKernels, rustPx, kernelsInUse, releaseIfLarge, deflate, resampleBlock, liquifyBlock, poissonBlend, boxBlurs, heightNormals, shadowMarch, pxCalls, floodShape, recovered, pxSplit, pxJobStart, pxJobEnd, adoptRoutes, pxTimed, pxInstances, dropPx, pxSettled, pxLapAdd, PxOutOfMemory, rangeTilesDepth, rangeTilesRgba } from "./px/kernels.js";
+import { mipChain, mipChainBytes, clampExtend, compositeTile, matchPixels, psdPackRows, kernelsReady, setKernels, rustPx, kernelsInUse, releaseIfLarge, deflate, resampleBlock, liquifyBlock, poissonBlend, boxBlurs, heightNormals, shadowMarch, pxCalls, floodShape, recovered, pxSplit, pxJobStart, pxJobEnd, adoptRoutes, pxTimed, pxInstances, dropPx, pxSettled, pxLapAdd, PxOutOfMemory, rangeTilesDepth, rangeTilesRgba, guidedFar, route, pngPartLinesCap, pngPartDecode, pngPartFinish, tiffKernels, psdKernels } from "./px/kernels.js";
 import { Px } from "./px/px.js";
 import { hash32, mul255 } from "./blend_modes.js";
 import { detailRatio } from "./inpaint_relight.js";
@@ -203,7 +206,7 @@ function poissonJob(msg) {
  * for one that does not exist: transparent). With `above`, the single row above them instead (the PNG filter's `prev`):
  * row `r0 - 1` of the same tiles, or the last row of `prevTiles`, or null for the picture's first row.
  */
-function rowsOfTiles(msg, above = false) {
+export function rowsOfTiles(msg, above = false) {
     let tiles = msg.tiles, r0 = msg.r0 | 0, rows = msg.rows;
     if (above) {
         if (r0 > 0) { r0--; rows = 1; } else if (msg.prevTiles) { tiles = msg.prevTiles; r0 = TILE - 1; rows = 1; } else return null;
@@ -223,12 +226,41 @@ function rowsOfTiles(msg, above = false) {
 }
 
 /**
+ * The same tile rows gathered directly into wasm memory at `ptr` (K10b, docs/PLAN_WASM_K10.md §5.1).
+ * Returns false only when `above` is true at the picture's top row (`r0 === 0 && !msg.prevTiles`).
+ */
+export function tilesRowsToWasm(p, msg, above, ptr) {
+    let tiles = msg.tiles, r0 = msg.r0 | 0, rows = msg.rows;
+    if (above) {
+        if (r0 > 0) { r0--; rows = 1; }
+        else if (msg.prevTiles) { tiles = msg.prevTiles; r0 = TILE - 1; rows = 1; }
+        else return false;
+    }
+    const w = msg.w, timed = pxTimed();
+    const mem = p.u8();
+    mem.fill(0, ptr, ptr + w * rows * 4);
+    for (let tx = 0; tx * TILE < w; tx++) {
+        const t = tiles[tx];
+        if (!t) continue;
+        const { bytes, shared } = tileBytes(t);
+        const n = Math.min(TILE, w - tx * TILE) * 4;
+        const c0 = timed ? now() : 0;
+        for (let y = 0; y < rows; y++) {
+            const so = (r0 + y) * TILE * 4;
+            mem.set(bytes.subarray(so, so + n), ptr + (y * w + tx * TILE) * 4);
+        }
+        if (timed) pxLapAdd("copyIn", now() - c0, n * rows, shared);
+    }
+    return true;
+}
+
+/**
  * The rows `Y0` to `Y0 + n` of the image out of one store of a stack: `{ x, y, w, h, tiles }`, its pixels at (x, y) of
  * the image, `tiles[lty]` the names of its tile row `lty` from the left (as `rowsOfTiles` takes them). Into `out`, `W`
  * pixels wide from the image's column `X0`: RGBA8, or with `alphaOnly` one byte a pixel, the alpha. False when no tile
  * of the store lies there.
  */
-function storeRows(store, X0, W, Y0, n, out, alphaOnly = false) {
+export function storeRows(store, X0, W, Y0, n, out, alphaOnly = false) {
     const sx = store.x | 0, sy = store.y | 0;
     const y0 = Math.max(Y0, sy), y1 = Math.min(Y0 + n, sy + store.h);
     const x0 = Math.max(X0, sx), x1 = Math.min(X0 + W, sx + store.w);
@@ -255,6 +287,42 @@ function storeRows(store, X0, W, Y0, n, out, alphaOnly = false) {
 }
 
 /**
+ * The same store rows gathered directly into wasm memory at `ptr` (K10b, docs/PLAN_WASM_K10.md §5.2).
+ * Returns false when no tile of the store lies in the requested row/column window.
+ */
+export function storeRowsToWasm(p, store, X0, W, Y0, n, ptr, alphaOnly = false) {
+    const sx = store.x | 0, sy = store.y | 0;
+    const y0 = Math.max(Y0, sy), y1 = Math.min(Y0 + n, sy + store.h);
+    const x0 = Math.max(X0, sx), x1 = Math.min(X0 + W, sx + store.w);
+    if (y1 <= y0 || x1 <= x0) return false;
+    const mem = p.u8(), timed = pxTimed();
+    let any = false;
+    for (let lty = (y0 - sy) >> 8; lty * TILE < y1 - sy; lty++) {
+        const names = store.tiles[lty];
+        if (!names) continue;
+        const ry0 = Math.max(y0, sy + lty * TILE), ry1 = Math.min(y1, sy + (lty + 1) * TILE);
+        for (let ltx = (x0 - sx) >> 8; ltx * TILE < x1 - sx; ltx++) {
+            const t = names[ltx];
+            if (!t) continue;
+            const { bytes, shared } = tileBytes(t);
+            const cx0 = Math.max(x0, sx + ltx * TILE), cx1 = Math.min(x1, sx + (ltx + 1) * TILE), k = cx1 - cx0;
+            any = true;
+            const c0 = timed ? now() : 0;
+            for (let Y = ry0; Y < ry1; Y++) {
+                const so = ((Y - sy - lty * TILE) * TILE + (cx0 - sx - ltx * TILE)) * 4, o = (Y - Y0) * W + cx0 - X0;
+                if (alphaOnly) {
+                    for (let i = 0; i < k; i++) mem[ptr + o + i] = bytes[so + i * 4 + 3];
+                } else {
+                    mem.set(bytes.subarray(so, so + k * 4), ptr + o * 4);
+                }
+            }
+            if (timed) pxLapAdd("copyIn", now() - c0, (ry1 - ry0) * k * (alphaOnly ? 1 : 4), shared);
+        }
+    }
+    return any;
+}
+
+/**
  * Rows of a plain stack composited here, from the tiles where they lie (docs/PLAN_BCE.md §3b, B item 1): `stack` is
  * `{ base, layers: [{ x, y, w, h, tiles, alpha, op, mask }] }`, every store as `storeRows` takes it, a layer drawn
  * source-over or in its blend mode (`op`, the kernel's number; B item 7) at `alpha` (0..255) through its mask's alpha (a store on the layer's own grid; where the mask has no
@@ -267,7 +335,7 @@ function storeRows(store, X0, W, Y0, n, out, alphaOnly = false) {
  * `match` (the ten floats of a colour match, B item 7 part 3) is matched here, on its copy of the rows, before it
  * is composited.
  */
-function rowsOfStack(msg, above = false, into = null) {
+export function rowsOfStack(msg, above = false, into = null) {
     let Y0 = msg.y | 0, n = msg.rows;
     if (above) { if (Y0 <= 0) return null; Y0--; n = 1; }
     const W = msg.w, X0 = msg.x0 | 0, st = msg.stack;
@@ -324,17 +392,179 @@ function rowsOfStack(msg, above = false, into = null) {
 }
 
 /**
+ * The same stack band gathered and composited directly in wasm memory `a` (`p.job`) (K10b, docs/PLAN_WASM_K10.md §5.2).
+ * Returns the destination pointer `pd` in linear memory, or `0` when `above` is true at `y <= 0`.
+ */
+export function stackRowsToWasm(p, a, msg, above = false, into = null) {
+    let Y0 = msg.y | 0, n = msg.rows;
+    if (above) {
+        if (Y0 <= 0) return 0;
+        Y0--;
+        n = 1;
+    }
+    const W = msg.w, X0 = msg.x0 | 0, st = msg.stack;
+    const px = W * n, byteLen = px * 4, timed = pxTimed();
+    const pd = a.take(byteLen);
+    if (st.base) {
+        p.u8().fill(0, pd, pd + byteLen);
+        storeRowsToWasm(p, st.base, X0, W, Y0, n, pd, false);
+    } else if (into && !msg.clear) {
+        const c0 = timed ? now() : 0;
+        p.u8().set(into, pd);
+        if (timed) pxLapAdd("copyIn", now() - c0, byteLen, true);
+    } else {
+        p.u8().fill(0, pd, pd + byteLen);
+    }
+    const maxL = st.layers.length;
+    const srcPtrs = new Uint32Array(maxL);
+    const maskPtrs = new Uint32Array(maxL);
+    const opsArr = new Uint8Array(maxL);
+    const alphasArr = new Uint8Array(maxL);
+    let count = 0, scratchSrc = 0;
+    for (const l of st.layers) {
+        const psrc = scratchSrc || a.take(byteLen);
+        if (l.sab) {
+            scratchSrc = 0;
+            const sabView = new Uint8Array(l.sab, (Y0 - (msg.y0 | 0)) * W * 4, byteLen);
+            const c0 = timed ? now() : 0;
+            p.u8().set(sabView, psrc);
+            if (timed) pxLapAdd("copyIn", now() - c0, byteLen, true);
+        } else {
+            p.u8().fill(0, psrc, psrc + byteLen);
+            if (!storeRowsToWasm(p, l, X0, W, Y0, n, psrc, false)) {
+                scratchSrc = psrc;
+                continue;
+            }
+            scratchSrc = 0;
+            if (l.match) {
+                const pp = a.take(40, 4);
+                const f = p.view(Float32Array, pp, 10);
+                for (let i = 0; i < 10; i++) f[i] = l.match[i];
+                p.exports.match_pixels(psrc, px, pp);
+            }
+        }
+        let pm = 0;
+        if (l.mask) {
+            pm = a.take(px);
+            p.u8().fill(0, pm, pm + px);
+            storeRowsToWasm(p, { x: l.x, y: l.y, w: l.w, h: l.h, tiles: l.mask }, X0, W, Y0, n, pm, true);
+        }
+        if (l.clip) {
+            const c = l.clip;
+            const pcov = a.take(px);
+            p.u8().fill(0, pcov, pcov + px);
+            storeRowsToWasm(p, c, X0, W, Y0, n, pcov, true);
+            let pbm = 0;
+            if (c.mask) {
+                pbm = a.take(px);
+                p.u8().fill(0, pbm, pbm + px);
+                storeRowsToWasm(p, { x: c.x, y: c.y, w: c.w, h: c.h, tiles: c.mask }, X0, W, Y0, n, pbm, true);
+            }
+            if (p.exports.clip_coverage && route("clipCoverage") !== "js") {
+                p.exports.clip_coverage(pcov, px, pbm, c.alpha, pm);
+            } else {
+                const covView = p.view(Uint8Array, pcov, px);
+                const bmView = pbm ? p.view(Uint8Array, pbm, px) : null;
+                const ownView = pm ? p.view(Uint8Array, pm, px) : null;
+                clipCoverage(covView, bmView, c.alpha, ownView);
+            }
+            pm = pcov;
+        }
+        if (l.dissolve != null) {
+            if (p.exports.dissolve_rows && route("dissolveRows") !== "js") {
+                p.exports.dissolve_rows(psrc, W, n, X0, Y0, l.alpha, pm, l.dissolve >>> 0);
+            } else {
+                const srcView = p.view(Uint8Array, psrc, byteLen);
+                const mView = pm ? p.view(Uint8Array, pm, px) : null;
+                for (let r = 0; r < n; r++) {
+                    const imgY = Y0 + r;
+                    for (let c = 0; c < W; c++) {
+                        const imgX = X0 + c;
+                        const o = r * W + c, idx = o * 4;
+                        const srcA = srcView[idx + 3];
+                        if (srcA === 0) continue;
+                        const m = mView ? mView[o] : 255;
+                        const cVal = mul255(mul255(srcA, l.alpha), m);
+                        const keep = (cVal === 255) || ((hash32(imgX, imgY, l.dissolve) >>> 24) < cVal);
+                        if (keep) {
+                            srcView[idx + 3] = 255;
+                        } else {
+                            srcView[idx] = 0;
+                            srcView[idx + 1] = 0;
+                            srcView[idx + 2] = 0;
+                            srcView[idx + 3] = 0;
+                        }
+                    }
+                }
+            }
+            srcPtrs[count] = psrc;
+            alphasArr[count] = 255;
+            maskPtrs[count] = 0;
+            opsArr[count] = 0;
+            count++;
+        } else {
+            srcPtrs[count] = psrc;
+            alphasArr[count] = l.alpha;
+            maskPtrs[count] = pm;
+            opsArr[count] = l.op | 0;
+            count++;
+        }
+    }
+    if (count > 0) {
+        const psrcs = a.take(count * 4, 4);
+        const pmasks = a.take(count * 4, 4);
+        const pops = a.take(count, 4);
+        const palphas = a.take(count, 4);
+        p.view(Uint32Array, psrcs, count).set(srcPtrs.subarray(0, count));
+        p.view(Uint32Array, pmasks, count).set(maskPtrs.subarray(0, count));
+        p.view(Uint8Array, pops, count).set(opsArr.subarray(0, count));
+        p.view(Uint8Array, palphas, count).set(alphasArr.subarray(0, count));
+        p.exports.composite_tile(pd, px, count, psrcs, pops, palphas, pmasks);
+    }
+    return pd;
+}
+
+/**
  * Rows of a stack composited into a shared buffer (B item 2: the picture a flood reads, put together by the pool):
  * `sab` holds `w` x `h` RGBA8 of the box at (`x0`, `y0`) of the image, zeroed (or `clear` asks this job to zero its
  * rows first); this job fills the rows `y` to `y + rows`.
  */
-async function stackInto(msg) {
+export async function stackInto(msg) {
     const t0 = now();
+    const byteLen = msg.w * msg.rows * 4;
     const at = ((msg.y | 0) - (msg.y0 | 0)) * msg.w * 4;
-    const into = new Uint8Array(msg.sab, at, msg.w * msg.rows * 4);
+    const into = new Uint8Array(msg.sab, at, byteLen);
+    let p = rustPx();
+    if (p && msg.stack.layers.length > 0 && route("stackIntoWasm") !== "js") {
+        const a = p.job;
+        let ok = false;
+        try {
+            const pd = stackRowsToWasm(p, a, msg, false, into);
+            p.get(Uint8Array, pd, byteLen, into);
+            ok = true;
+        } catch (err) {
+            if (!recovered(p, err, "stack_into")) throw err;
+        } finally {
+            p._reset(a);
+        }
+        if (ok) {
+            return {
+                timing: {
+                    op: "stack_into", kernels: "rust", composeWasm: 1,
+                    pixels: msg.w * msg.rows, kernel: now() - t0,
+                },
+            };
+        }
+        await pxSettled();
+    }
     if (msg.clear) into.fill(0);   // a buffer that is used band after band (B item 7 part 2): cleared here, not on the main thread
     rowsOfStack(msg, false, into);
-    return { timing: { op: "stack_into", kernels: kernelsInUse(), pixels: msg.w * msg.rows, kernel: now() - t0 } };
+    return {
+        timing: {
+            op: "stack_into", kernels: kernelsInUse(), composeWasm: 0,
+            pixels: msg.w * msg.rows, kernel: now() - t0,
+        },
+    };
 }
 
 /**
@@ -378,7 +608,7 @@ function gatherStore(store, xs, ys, out, alphaOnly = false, clip = null) {
  * samples, and the layer's own samples with its mask folded into the alpha. A sample outside a store is transparent.
  * The composite is pointwise, so the composite of the samples is the samples of the composite.
  */
-async function stackPoints(msg) {
+export async function stackPoints(msg) {
     const t0 = now();
     const xs = new Int32Array(msg.xs), ys = new Int32Array(msg.ys), nx = xs.length, ny = ys.length, n = nx * ny;
     const clip = msg.image ? { w: msg.image[0], h: msg.image[1] } : null;
@@ -443,52 +673,257 @@ function partRowsOf(msg) {
 }
 
 /**
- * One part of a PNG's pixels (inpaint_png.js, docs/PLAN_BCE.md §E2): rows as bytes (`rgba`, `prev`) or as tiles
- * (`tiles`, `prevTiles`, `r0`), filtered and deflated by the Rust kernel, as a finished IDAT chunk.
+ * The rows of a part job in wasm memory `a` (`p.job`), plus the optional `above` row for `png_part` (K10b,
+ * docs/PLAN_WASM_K10.md §5.2).
  */
-async function pngPart(msg) {
-    const p = rustPx();
+export function partPtrOf(p, a, msg, needPrev = false) {
+    const byteLen = msg.w * msg.rows * 4;
+    let pr = 0, pp = 0;
+    if (msg.rgba) {
+        pr = p._in(a, new Uint8Array(msg.rgba, 0, byteLen), byteLen);
+        const tc = now();
+        if (needPrev && msg.prev) {
+            const prevBytes = new Uint8Array(msg.prev, 0, msg.w * 4);
+            pp = p._in(a, prevBytes, prevBytes.byteLength);
+        }
+        return { pr, pp, tc, tp: now() };
+    }
+    if (msg.stack) {
+        pr = stackRowsToWasm(p, a, msg, false, null);
+        const tc = now();
+        if (needPrev && (msg.y | 0) > 0) {
+            pp = stackRowsToWasm(p, a, msg, true, null);
+        }
+        return { pr, pp, tc, tp: now() };
+    }
+    pr = a.take(byteLen);
+    tilesRowsToWasm(p, msg, false, pr);
+    const tc = now();
+    if (needPrev && ((msg.r0 | 0) > 0 || msg.prevTiles)) {
+        const cand = a.take(msg.w * 4);
+        if (tilesRowsToWasm(p, msg, true, cand)) pp = cand;
+    }
+    return { pr, pp, tc, tp: now() };
+}
+
+/**
+ * One part of a PNG's pixels (inpaint_png.js, docs/PLAN_BCE.md §E2): rows as bytes (`rgba`, optional `prev`) or as
+ * tiles/stack (`tiles`, `r0`, or `stack`; `prevTiles` is ignored so parts start with None or Sub, P5), as an IDAT chunk.
+ */
+export async function pngPart(msg) {
+    let p = rustPx();
     if (!p) throw new Error(NO_PARTS);
     const t0 = now();
+    const level = msg.level === undefined ? PNG_LEVEL : msg.level;
+    const laps = {};   // copyIn, filter, adler, deflate, chunk, copyOut (px.js pngPart / pngPartFromPtr)
+    const routeName = msg.stack ? "composeStack" : "composeTiles";
+    if (!msg.rgba && route(routeName) !== "js") {
+        const a = p.job;
+        let r = null, tc = 0, tp = 0;
+        try {
+            const ptrs = partPtrOf(p, a, msg, false);
+            tc = ptrs.tc;
+            tp = ptrs.tp;
+            r = p.pngPartFromPtr(a, ptrs.pr, msg.w, msg.rows, ptrs.pp, level, !!msg.last, laps);
+        } catch (err) {
+            if (!recovered(p, err, "png_part")) throw err;
+        } finally {
+            p._reset(a);
+            releaseIfLarge();
+        }
+        if (r) {
+            return {
+                chunk: r.chunk.buffer, adler: r.adler, raw: r.raw, crc: r.crc,
+                transfer: [r.chunk.buffer],
+                timing: {
+                    op: "png_part", kernels: "rust", composeWasm: 1,
+                    pixels: msg.w * msg.rows, kernel: now() - t0,
+                    compose: msg.stack ? tc - t0 : 0, rows: tc - t0, prev: tp - tc, ...laps,
+                },
+            };
+        }
+        p = rustPx();
+        if (!p) {
+            await pxSettled();
+            p = rustPx();
+        }
+        if (!p) throw new Error(NO_PARTS);
+    }
     const rgba = partRowsOf(msg);
     const tc = now();
-    const prev = msg.rgba ? (msg.prev ? new Uint8Array(msg.prev, 0, msg.w * 4) : null) : msg.stack ? rowsOfStack(msg, true) : rowsOfTiles(msg, true);
+    const prev = msg.rgba && msg.prev ? new Uint8Array(msg.prev, 0, msg.w * 4) : null;
     const tp = now();
-    const laps = {};   // copyIn, filter, adler, deflate, chunk, copyOut (px.js pngPart)
-    const r = p.pngPart(rgba, msg.w, msg.rows, prev, msg.level === undefined ? PNG_LEVEL : msg.level, !!msg.last, laps);
+    const r = p.pngPart(rgba, msg.w, msg.rows, prev, level, !!msg.last, laps);
     releaseIfLarge();
-    return { chunk: r.chunk.buffer, adler: r.adler, raw: r.raw, crc: r.crc, transfer: [r.chunk.buffer], timing: { op: "png_part", kernels: "rust", pixels: msg.w * msg.rows, kernel: now() - t0, compose: msg.stack ? tc - t0 : 0, rows: tc - t0, prev: tp - tc, ...laps } };
+    return {
+        chunk: r.chunk.buffer, adler: r.adler, raw: r.raw, crc: r.crc,
+        transfer: [r.chunk.buffer],
+        timing: {
+            op: "png_part", kernels: "rust", composeWasm: 0,
+            pixels: msg.w * msg.rows, kernel: now() - t0,
+            compose: msg.stack ? tc - t0 : 0, rows: tc - t0, prev: tp - tc, ...laps,
+        },
+    };
 }
 
 /**
  * One part of a PSD's channel data (docs/PLAN_BCE.md §E4): rows as bytes or as tiles (as `png_part` takes them),
  * PackBits per channel. `channels`: [{ lens, data }] for R, G, B, A, transferred.
  */
-async function psdPart(msg) {
+export async function psdPart(msg) {
     const t0 = now();
+    let p = rustPx();
+    if (p && !msg.rgba && route("psdPartWasm") !== "js") {
+        const a = p.job;
+        let packed = null, t1 = 0, t2 = 0;
+        try {
+            const ptrs = partPtrOf(p, a, msg, false);
+            t1 = ptrs.tc;
+            packed = p.psdPackRowsFromPtr(a, ptrs.pr, msg.w, msg.rows);
+            t2 = now();
+        } catch (err) {
+            if (!recovered(p, err, "psd_part")) throw err;
+        } finally {
+            p._reset(a);
+            releaseIfLarge();
+        }
+        if (packed) {
+            const channels = packed.map((c) => ({ lens: c.lens.buffer, data: c.data.buffer }));
+            return {
+                channels,
+                transfer: channels.flatMap((c) => [c.lens, c.data]),
+                timing: {
+                    op: "psd_part", kernels: "rust", composeWasm: 1,
+                    pixels: msg.w * msg.rows, kernel: now() - t0,
+                    compose: msg.stack ? t1 - t0 : 0, rows: t1 - t0, pack: t2 - t1,
+                },
+            };
+        }
+        await pxSettled();
+    }
     const rgba = partRowsOf(msg);
     const t1 = now();
     const packed = psdPackRows(rgba, msg.w, msg.rows);
     const t2 = now();
     releaseIfLarge();
     const channels = packed.map((c) => ({ lens: c.lens.buffer, data: c.data.buffer }));
-    return { channels, transfer: channels.flatMap((c) => [c.lens, c.data]), timing: { op: "psd_part", kernels: kernelsInUse(), pixels: msg.w * msg.rows, kernel: now() - t0, rows: t1 - t0, pack: t2 - t1 } };
+    return {
+        channels,
+        transfer: channels.flatMap((c) => [c.lens, c.data]),
+        timing: {
+            op: "psd_part", kernels: kernelsInUse(), composeWasm: 0,
+            pixels: msg.w * msg.rows, kernel: now() - t0,
+            compose: msg.stack ? t1 - t0 : 0, rows: t1 - t0, pack: t2 - t1,
+        },
+    };
 }
 
 /**
  * One strip of a TIFF (inpaint_tiff.js `tiffPart`, docs/PLAN_0_1_29.md 3d): rows as bytes, a stack or tiles (as
  * `png_part` takes them), differenced and deflated into a zlib stream by the Rust kernels (the JS twin without them).
  */
-async function tiffPartJob(msg) {
+export async function tiffPartJob(msg) {
     const t0 = now();
+    const level = msg.level === undefined ? PNG_LEVEL : msg.level;
+    const laps = {};   // predict, deflate (px.js tiffStrip / tiffStripFromPtr, inpaint_tiff.js tiffPart)
+    let p = rustPx("tiffStripWasm") && rustPx("tiffPredict");
+    const composeRoute = msg.stack ? "composeStack" : "composeTiles";
+    if (p && !msg.rgba && route(composeRoute) !== "js") {
+        const a = p.job;
+        let r = null, tc = 0;
+        try {
+            const ptrs = partPtrOf(p, a, msg, false);
+            tc = ptrs.tc;
+            r = p.tiffStripFromPtr(a, ptrs.pr, msg.w, msg.rows, level, msg.predictor, laps);
+        } catch (err) {
+            delete laps.predict;
+            delete laps.deflate;
+            if (!recovered(p, err, "tiff_part")) throw err;
+        } finally {
+            p._reset(a);
+            releaseIfLarge();
+        }
+        if (r) {
+            return {
+                chunk: r.chunk, raw: r.raw, transfer: [r.chunk],
+                timing: {
+                    op: "tiff_part", kernels: kernelsInUse(), composeWasm: 1,
+                    pixels: msg.w * msg.rows, kernel: now() - t0,
+                    compose: msg.stack ? tc - t0 : 0, rows: tc - t0, ...laps,
+                },
+            };
+        }
+        p = rustPx("tiffStripWasm") && rustPx("tiffPredict");
+        if (!p) {
+            await pxSettled();
+            p = rustPx("tiffStripWasm") && rustPx("tiffPredict");
+        }
+    }
     const rgba = partRowsOf(msg);
     const t1 = now();
-    const p = rustPx();
-    const level = msg.level === undefined ? PNG_LEVEL : msg.level;
-    const laps = {};   // predict, deflate (inpaint_tiff.js tiffPart)
-    const r = await tiffPart({ rgba, w: msg.w, rows: msg.rows, predictor: msg.predictor }, (bytes) => (p ? p.zlib(bytes, level) : deflate(bytes)), laps);
+    if (p) {
+        let r = null;
+        try {
+            r = p.tiffStrip({ rgba, w: msg.w, rows: msg.rows, predictor: msg.predictor }, level, laps);
+        } catch (err) {
+            delete laps.predict;
+            delete laps.deflate;
+            if (!recovered(p, err, "tiff_part")) throw err;
+        } finally {
+            releaseIfLarge();
+        }
+        if (r) {
+            return {
+                chunk: r.chunk, raw: r.raw, transfer: [r.chunk],
+                timing: {
+                    op: "tiff_part", kernels: kernelsInUse(), composeWasm: 0,
+                    pixels: msg.w * msg.rows, kernel: now() - t0,
+                    compose: msg.stack ? t1 - t0 : 0, rows: t1 - t0, ...laps,
+                },
+            };
+        }
+        await pxSettled();
+    }
+    const pz = rustPx();
+    const r = await tiffPart({ rgba, w: msg.w, rows: msg.rows, predictor: msg.predictor }, (bytes) => (pz ? pz.zlib(bytes, level) : deflate(bytes)), laps);
     releaseIfLarge();
-    return { chunk: r.chunk, raw: r.raw, transfer: [r.chunk], timing: { op: "tiff_part", kernels: kernelsInUse(), pixels: msg.w * msg.rows, kernel: now() - t0, rows: t1 - t0, ...laps } };
+    return {
+        chunk: r.chunk, raw: r.raw, transfer: [r.chunk],
+        timing: {
+            op: "tiff_part", kernels: kernelsInUse(), composeWasm: 0,
+            pixels: msg.w * msg.rows, kernel: now() - t0,
+            compose: msg.stack ? t1 - t0 : 0, rows: t1 - t0, ...laps,
+        },
+    };
+}
+
+/**
+ * Decode one planned band of a TIFF (inpaint_tiff.js `readTiffBand`, docs/PLAN_WASM_BUILD.md §4.6, K18): carries only
+ * `msg.spec` (per-file constants) and `msg.band` (that band's strip or tile slices), returning straight-alpha RGBA8
+ * transferred back to the window.
+ */
+export async function tiffBandJob(msg) {
+    const t0 = now();
+    const spec = msg.spec, band = msg.band;
+    if (!spec || !spec.info || !band) throw new Error("tiff_band: invalid spec or band");
+    const spent = {};
+    const rgba = await readTiffBand(msg.blob, spec, band, { spent, kernels: tiffKernels() });
+    const rows = band.rows | 0, y0 = band.y0 | 0;
+    const buf = rgba.byteOffset === 0 && rgba.byteLength === rgba.buffer.byteLength ? rgba.buffer : rgba.slice().buffer;
+    return {
+        rgba: buf,
+        y0,
+        rows,
+        transfer: [buf],
+        timing: {
+            op: "tiff_band",
+            kernels: kernelsInUse(),
+            pixels: spec.info.width * rows,
+            rows,
+            kernel: now() - t0,
+            ...spent,
+        },
+    };
 }
 
 /**
@@ -504,8 +939,10 @@ async function tiffRead(msg) {
         onHeader: (h) => { self.postMessage({ id: msg.id, progress: true, header: { width: h.width, height: h.height } }); },
         onRows: (rgba, y0, rows) => { self.postMessage({ id: msg.id, progress: true, rgba: rgba.buffer, y0, rows }, [rgba.buffer]); },
         spent,
+        kernels: tiffKernels(),
     });
-    return { info, timing: { op: "tiff_read", kernels: "js", pixels: info.width * info.height, kernel: now() - t0, ...spent } };
+    releaseIfLarge();
+    return { info, timing: { op: "tiff_read", kernels: kernelsInUse(), pixels: info.width * info.height, kernel: now() - t0, ...spent } };
 }
 
 /**
@@ -514,31 +951,60 @@ async function tiffRead(msg) {
  * before it queued the job); `progress` messages `{ index, mask, rgba, w, h, y0, rows }` (the band's buffer
  * transferred), a layer at a time, its pixels before its mask; the reply `{ doc }` (readPsdStream's answer), or `{ failed }` with the reader's message for a file it refuses,
  * which the window shows as its own reader would, without reading the file again. Plain JS: K20b puts the Rust reader
- * into this job. Its timing: read (the blob), channels, inflate, interleave, mask, deliver (the posts), bands.
+ * into this job. Its timing: read (the blob), channels, inflate, interleave, mask, deliver (the posts), wait (paced, below), bands.
+ *
+ * `msg.window` > 0 (the window's route `psdWindow`, inpaint_canvas.js `readPsdOnPool`; K20b review K20b-T1): at most that
+ * many bands are posted and not yet acknowledged; the window acknowledges each band after its `writeRect` with
+ * `{ op: "ack", id, n }` (`psdAck`, `n` the bands it has written), and the reader waits for that before it makes the next
+ * band, so a reader faster than the window's writes cannot queue a layer's bands ahead of the window's other tasks.
+ * 0 or absent: every band posted at once, as before.
  */
-async function psdRead(msg) {
+export async function psdRead(msg) {
     const t0 = now();
     const bytes = new Uint8Array(await msg.blob.arrayBuffer());
     const read = now() - t0;
     const spent = {};
-    let inflate = 0, inflates = 0, pixels = 0;
-    const timing = () => ({ op: "psd_read", kernels: "js", pixels, kernel: now() - t0, read, inflate, inflates, ...spent });
+    let inflate = 0, inflates = 0, pixels = 0, sent = 0;
+    const win = Math.max(0, msg.window | 0), pace = win > 0 ? { done: 0, wake: null } : null;
+    if (pace) PSD_ACKS.set(msg.id, pace);
+    const caughtUp = async () => { while (sent - pace.done >= win) await new Promise((res) => { pace.wake = res; }); };
+    const timing = () => ({ op: "psd_read", kernels: rustPx("psdRead") ? "rust" : "js", pixels, kernel: now() - t0, read, inflate, inflates, window: win, ...spent });
     try {
         const doc = await readPsdStream(bytes, {
             // the window's inflater (inpaint_layered.js inflateAtMost): the same bytes, stopped at the bytes kept
             inflate: async (b, cap) => { const t = now(); try { return await inflateAtMost(b, "deflate", cap); } finally { inflate += now() - t; inflates++; } },
             rowsPerBand: msg.rowsPerBand || TILE,
             onHeader: (h) => { pixels = h.width * h.height; },   // the window checked the size from the header before the job
-            onRows: (index, kind, rgba, w, h, y0, rows) => { self.postMessage({ id: msg.id, progress: true, index, mask: kind === "mask", rgba: rgba.buffer, w, h, y0, rows }, [rgba.buffer]); },
+            onRows: (index, kind, rgba, w, h, y0, rows) => {
+                self.postMessage({ id: msg.id, progress: true, index, mask: kind === "mask", rgba: rgba.buffer, w, h, y0, rows }, [rgba.buffer]);
+                sent++;
+                return pace && sent - pace.done >= win ? caughtUp() : undefined;
+            },
             spent,
+            kernels: psdKernels(),
         });
         return { doc, timing: timing() };
     } catch (err) {
         return { failed: String((err && err.message) || err), timing: timing() };
     } finally {
+        if (pace) PSD_ACKS.delete(msg.id);
+        releaseIfLarge();
         // the file's array goes now, not at this idle worker's next collection (the answer holds no view of it)
         try { if (typeof bytes.buffer.transfer === "function") bytes.buffer.transfer(0); } catch (_) { /* detached already */ }
     }
+}
+
+/** The paced `psd_read` jobs of this thread: job id -> { done (bands the window acknowledged), wake (the waiting reader's resolve) }. */
+const PSD_ACKS = new Map();
+
+/** The window's acknowledgement of a paced `psd_read` (`{ op: "ack", id, n }`, not a job): wakes the reader when it waits. */
+export function psdAck(msg) {
+    const pace = PSD_ACKS.get(msg && msg.id);
+    if (!pace) return;
+    pace.done = Math.max(pace.done, msg.n | 0);
+    const wake = pace.wake;
+    pace.wake = null;
+    if (wake) wake();
 }
 
 /** CRC-32 and size of a blob (a zip entry of an ORA file). */
@@ -682,6 +1148,118 @@ async function pngRead(msg) {
         onRows: (rgba, y0, rows) => { self.postMessage({ id: msg.id, progress: true, rgba: rgba.buffer, y0, rows }, [rgba.buffer]); },
     });
     return { width: info.width, height: info.height, texts: info.texts, header, timing: { op: "png_read", kernels: kernelsInUse(), pixels: info.width * info.height, kernel: now() - t0, ...info.spent } };   // readPng's split: parse, read, write, wait, copy, unfilter, deliver
+}
+
+const PART_INFLATE_SLICE = 65536;
+const PART_TAIL_0300 = new Uint8Array([0x03, 0x00]);
+
+/**
+ * Inflate one PNG part's `blob` slice through `DecompressionStream("deflate-raw")`, appending `03 00` to non-last
+ * parts only (K8, docs/PLAN_WASM_BUILD.md §4.2), capped at `cap` output bytes so a crafted part cannot inflate without
+ * limit.
+ */
+async function inflatePartAtMost(blob, last, cap) {
+    const t0 = now();
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    const inBytes = bytes.byteLength;
+    const t1 = now();
+    const ds = new DecompressionStream("deflate-raw");
+    const writer = ds.writable.getWriter(), reader = ds.readable.getReader();
+    let fedErr = null, stop = false;
+    const feed = (async () => {
+        try {
+            for (let i = 0; i < bytes.length && !stop; i += PART_INFLATE_SLICE) {
+                await writer.write(bytes.subarray(i, i + PART_INFLATE_SLICE));
+            }
+            if (!last && !stop) await writer.write(PART_TAIL_0300);
+            if (!stop) await writer.close();
+        } catch (err) { if (!stop) fedErr = err; }
+    })();
+    const parts = [];
+    let n = 0;
+    try {
+        for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            n += value.byteLength;
+            if (n > cap) {
+                stop = true;
+                reader.cancel().catch(() => {});
+                const err = new Error(`the PNG part unpacks to more than ${cap} bytes`);
+                err.tooLarge = true;
+                throw err;
+            }
+            parts.push(value);
+        }
+    } catch (err) {
+        if (!stop) { stop = true; reader.cancel().catch(() => {}); }
+        throw err;
+    } finally {
+        try { if (typeof bytes.buffer.transfer === "function") bytes.buffer.transfer(0); } catch (_) { /* ignore */ }
+    }
+    await feed;
+    if (fedErr) throw fedErr;
+    let lines;
+    if (parts.length === 1 && parts[0].byteOffset === 0 && parts[0].byteLength === parts[0].buffer.byteLength) {
+        lines = parts[0];
+    } else {
+        lines = new Uint8Array(n);
+        for (let i = 0, o = 0; i < parts.length; o += parts[i].byteLength, i++) lines.set(parts[i], o);
+    }
+    const t2 = now();
+    return { lines, inBytes, readMs: t1 - t0, inflateMs: t2 - t1 };
+}
+
+/**
+ * Inflate and decode one part of a Scumble parted PNG (K8, docs/PLAN_WASM_BUILD.md §4.2). Bounded by both IHDR (`h`)
+ * and `pngPartLinesCap(w)`. When row 0 needs the previous part's last row and `prev` is not yet known, returns
+ * `needsPrev: true` with `lines` transferred back so `png_part_finish` can finish it at `INTERACTIVE` priority once
+ * `prev` arrives.
+ */
+async function pngPartRead(msg) {
+    const t0 = now();
+    const w = msg.w | 0, h = msg.h | 0, last = !!msg.last;
+    if (!(w > 0)) throw new Error("png_part_read: invalid width");
+    const stride = 1 + w * 4;
+    const pCap = pngPartLinesCap(w);
+    const hCap = msg.h !== undefined ? (h > 0 ? h * stride : 0) : pCap;
+    const cap = Math.min(pCap, hCap);
+    if (!(cap >= stride)) throw new Error("png_part_read: zero line cap");
+    const { lines, inBytes, readMs, inflateMs } = await inflatePartAtMost(msg.blob, last, cap);
+    const prev = msg.prev
+        ? (msg.prev instanceof Uint8Array ? msg.prev : new Uint8Array(msg.prev, 0, w * 4))
+        : msg.first ? new Uint8Array(w * 4) : null;
+    const rt = residentRt(msg.rt ? (msg.rt instanceof Uint8Array ? msg.rt : new Uint8Array(msg.rt)) : null);
+    const laps = {};
+    const r = pngPartDecode(lines, w, prev, rt, null, laps);
+    if (!r || r.code < 0) {
+        try { if (typeof lines.buffer.transfer === "function") lines.buffer.transfer(0); } catch (_) { /* ignore */ }
+        throw new Error("png_part_read: corrupt part (" + (r ? r.code : "null") + ")");
+    }
+    const timing = { op: "png_part_read", kernels: kernelsInUse(), pixels: w * r.rows, bytes: inBytes, rows: r.rows, kernel: now() - t0, read: readMs, inflate: inflateMs, ...laps };
+    if (r.needsPrev) {
+        return { rows: r.rows, adler: r.adler, firstFilter: r.firstFilter, opaque: false, needsPrev: true, lines: lines.buffer, transfer: [lines.buffer], timing };
+    }
+    try { if (typeof lines.buffer.transfer === "function") lines.buffer.transfer(0); } catch (_) { /* ignore */ }
+    return { rows: r.rows, adler: r.adler, firstFilter: r.firstFilter, opaque: r.opaque, needsPrev: false, rgba: r.out.buffer, prev: r.prev.buffer, transfer: [r.out.buffer, r.prev.buffer], timing };
+}
+
+/**
+ * Finish a PNG part whose `png_part_read` answered `needsPrev: true`, once the previous part's last unfiltered row
+ * (`prev`) is ready (K8, docs/PLAN_WASM_BUILD.md §4.2).
+ */
+function pngPartFinishJob(msg) {
+    const t0 = now();
+    const w = msg.w | 0, rows = msg.rows | 0;
+    const lines = msg.lines instanceof Uint8Array ? msg.lines : new Uint8Array(msg.lines);
+    const prev = msg.prev instanceof Uint8Array ? msg.prev : new Uint8Array(msg.prev, 0, w * 4);
+    const rt = residentRt(msg.rt ? (msg.rt instanceof Uint8Array ? msg.rt : new Uint8Array(msg.rt)) : null);
+    const laps = {};
+    const r = pngPartFinish(lines, rows, w, prev, rt, null, laps);
+    try { if (typeof lines.buffer.transfer === "function") lines.buffer.transfer(0); } catch (_) { /* ignore */ }
+    if (!r || r.code < 0) throw new Error("png_part_finish: corrupt part (" + (r ? r.code : "null") + ")");
+    const timing = { op: "png_part_finish", kernels: kernelsInUse(), pixels: w * r.rows, rows: r.rows, kernel: now() - t0, ...laps };
+    return { rows: r.rows, firstFilter: r.firstFilter, opaque: r.opaque, rgba: r.out.buffer, prev: r.prev.buffer, transfer: [r.out.buffer, r.prev.buffer], timing };
 }
 
 /**
@@ -970,12 +1548,17 @@ async function floodOverTiles(msg) {
 // its identity, so one copy is kept for as long as the bytes are the same
 let RESAMPLE_RT = null;
 
+function residentRt(rt) {
+    if (!rt) return null;
+    if (RESAMPLE_RT && RESAMPLE_RT.length === rt.length && RESAMPLE_RT.every((v, i) => v === rt[i])) return RESAMPLE_RT;
+    RESAMPLE_RT = rt;
+    return rt;
+}
+
 function resampleJob(msg) {
     const t0 = now();
     const { src, outW, outH, o, ty } = msg;
-    let rt = msg.rt;
-    if (rt && RESAMPLE_RT && RESAMPLE_RT.length === rt.length && RESAMPLE_RT.every((v, i) => v === rt[i])) rt = RESAMPLE_RT;
-    else RESAMPLE_RT = rt;
+    const rt = residentRt(msg.rt);
     const views = new Map();
     const view = (t) => {
         const k = t.data ? t : t.chunk * 65536 + t.slot;
@@ -1054,8 +1637,27 @@ function liquifyJob(msg) {
 
 function depthGuide(msg) {
     const t0 = now();
-    const u16 = guidedFar(msg, boxBlurs);
-    return { u16: u16.buffer, transfer: [u16.buffer], timing: { op: "depth_guide", total: now() - t0 } };
+    const raw = msg.raw instanceof Float32Array ? msg.raw : new Float32Array(msg.raw);
+    const { rw, rh, gw, gh, r, eps } = msg;
+    let { grey, gd, lo, hi } = msg;
+    let gdBuf = null;
+    if (!grey && gd) {
+        const bytes = gd instanceof Uint8Array || gd instanceof Uint8ClampedArray ? gd : new Uint8Array(gd);
+        gdBuf = bytes.buffer;
+        const n = gw * gh;
+        grey = new Uint8Array(n);
+        for (let i = 0, j = 0; j < n; i += 4, j++) {
+            grey[j] = Math.round(bytes[i] * 0.299 + bytes[i + 1] * 0.587 + bytes[i + 2] * 0.114);
+        }
+    }
+    if (lo == null || hi == null) {
+        const bounds = disparityRange(raw, 0.005, 0.995);
+        if (lo == null) lo = bounds.lo;
+        if (hi == null) hi = bounds.hi;
+    }
+    const u16 = guidedFar(raw, rw, rh, grey, gw, gh, r, eps, lo, hi);
+    const transfer = gdBuf ? [u16.buffer, gdBuf] : [u16.buffer];
+    return { u16: u16.buffer, ...(gdBuf ? { gd: gdBuf } : {}), lo, hi, transfer, timing: { op: "depth_guide", total: now() - t0 } };
 }
 
 function depthFuse(msg) {
@@ -1304,7 +1906,12 @@ function relightShadowJob(msg) {
     const { depth, w, h, scale, light, radius, taps, steps, bias, row0, rows, out, key } = msg;
     const depthArr = depth instanceof Uint16Array ? depth : new Uint16Array(depth);
     const t0 = now(), n = Math.min(rows, h - row0);
-    const timing = () => ({ op: "relight_shadow", kernels: light && light[3] === 1 ? kernelsInUse() : "js", w, h, row0, rows: n, kernel: now() - t0 });
+    const c0 = pxCalls();
+    const timing = () => {
+        const c1 = pxCalls();
+        const ranRust = (c1.shadow_march_f64 || 0) > (c0.shadow_march_f64 || 0);
+        return { op: "relight_shadow", kernels: ranRust ? "rust" : "js", w, h, row0, rows: n, kernel: now() - t0 };
+    };
     if (out) {
         if (!(out instanceof Uint8Array) || out.length < w * h) throw new Error(`relight_shadow: out holds ${out && out.length} bytes, not ${w * h}`);
         shadowMarch(depthArr, w, h, scale, light, radius, taps, steps, bias, row0, rows, out, key ?? null);
@@ -1376,12 +1983,15 @@ async function run(msg) {
     if (msg.op === "band") return band(msg);
     if (msg.op === "poisson") return poissonJob(msg);
     if (msg.op === "png_part") return pngPart(msg);
+    if (msg.op === "png_part_read") return pngPartRead(msg);
+    if (msg.op === "png_part_finish") return pngPartFinishJob(msg);
     if (msg.op === "stack_into") return stackInto(msg);
     if (msg.op === "stack_points") return stackPoints(msg);
     if (msg.op === "hash") return hashJob(msg);
     if (msg.op === "psd_part") return psdPart(msg);
     if (msg.op === "png_read") return pngRead(msg);
     if (msg.op === "image_read") return imageRead(msg);
+    if (msg.op === "tiff_band") return tiffBandJob(msg);
     if (msg.op === "tiff_read") return tiffRead(msg);
     if (msg.op === "psd_read") return psdRead(msg);
     if (msg.op === "tiff_part") return tiffPartJob(msg);
@@ -1430,6 +2040,8 @@ let jobsInFlight = 0;
 if (inWorker) self.onmessage = async (e) => {
     const msg = e.data || {};
     if (msg.op === "arena") { arenaMessage(msg); return; }
+    // not a job: the window's acknowledgement of a paced psd_read's bands (psdRead), handled while that job waits
+    if (msg.op === "ack") { psdAck(msg); return; }
     // not a job: the memory this thread keeps between jobs (tools/px_probe.py --retention), before the counters
     if (msg.op === "px_stats") { self.postMessage({ id: msg.id, ok: true, op: "px_stats", ...pxInstances() }); return; }
     if (!jobsInFlight++) pxCalls(true);

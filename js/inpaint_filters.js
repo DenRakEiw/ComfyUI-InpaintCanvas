@@ -20,6 +20,7 @@ import { buildWheelsControl, buildHslControl } from "./inpaint_wheels.js";
 import { applyVibrance, applyGradientMap, applyThreshold, applyPosterize } from "./inpaint_adjustments.js";
 import { applyLensBlur, lensBlurReach } from "./inpaint_lensblur.js";
 import { applyRelight, relightStats, relightSkip } from "./inpaint_relight.js";
+import { matchPixels } from "./px/kernels.js";
 
 
 function makeCanvas(w, h) {
@@ -264,6 +265,8 @@ function applyGrain(src, p, info) {
 }
 
 /** Mean and high-pass standard deviation of a grain plate, from a 512 px sample (for centring and gain). */
+export const MATCH_CHUNK_BYTES = 4 * 1024 * 1024 * 4;
+
 /**
  * A layer's pixels with their colour statistics shifted towards what is below them:
  * per channel (value - meanT) * scale + meanS, mixed in by `strength` (0..1). `stats`
@@ -281,12 +284,14 @@ export function matchCanvas(src, stats, strength) {
     const d = img.data;
     const { meanS, meanT, scale } = stats;
     const k = Math.max(0, Math.min(1, strength));
-    for (let i = 0; i < d.length; i += 4) {
-        if (!d[i + 3]) continue;
-        for (let ch = 0; ch < 3; ch++) {
-            const v = (d[i + ch] - meanT[ch]) * scale[ch] + meanS[ch];
-            d[i + ch] = Math.max(0, Math.min(255, d[i + ch] + (v - d[i + ch]) * k));
-        }
+    const params = new Float32Array([
+        meanS[0], meanS[1], meanS[2],
+        meanT[0], meanT[1], meanT[2],
+        scale[0], scale[1], scale[2],
+        k,
+    ]);
+    for (let off = 0; off < d.length; off += MATCH_CHUNK_BYTES) {
+        matchPixels(d.subarray(off, off + MATCH_CHUNK_BYTES), params);
     }
     ctx.putImageData(img, 0, 0);
     return out;

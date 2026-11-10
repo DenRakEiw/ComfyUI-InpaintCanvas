@@ -153,24 +153,135 @@ class Reader {
 function unpackRows(src, at, lens, rowBytes, out) {
     let p = at;
     for (let y = 0; y < lens.length; y++) {
-        const end = p + lens[y];
+        const end = p + lens[y], lim = Math.min(end, src.length);
         let o = y * rowBytes;
         const stop = o + rowBytes;
-        while (p < end && o < stop) {
+        while (p < lim && o < stop) {
             const n = src[p++];
             if (n < 128) {
-                const c = Math.min(n + 1, stop - o, end - p);
+                const c = Math.min(n + 1, stop - o, lim - p);
                 out.set(src.subarray(p, p + c), o);
                 p += n + 1; o += c;
             } else if (n > 128) {
                 const c = Math.min(257 - n, stop - o);
-                out.fill(src[p++], o, o + c);
+                out.fill(p < lim ? src[p++] : 0, o, o + c);
                 o += c;
             }   // 128 is a no-op
         }
+        if (o < stop) out.fill(0, o, stop);
         p = end;
     }
     return p;
+}
+
+/**
+ * Unpack `rows` PSD PackBits rows (`rowBytes` unpacked bytes per row) from `src`, advancing by each row's big-endian
+ * `u16` byte count in `lensBytes` (`2 * rows` bytes), into `out` (or a fresh `Uint8Array(rows * rowBytes)`; JS twin of
+ * `crates/px` `packbits_rows`, K20b).
+ */
+export function packbitsRows(lensBytes, src, rows, rowBytes, out = null) {
+    if (!Number.isInteger(rows) || !Number.isInteger(rowBytes) || rows < 0 || rowBytes < 0) {
+        throw new Error(`packbits_rows: invalid dimensions (rows=${rows}, rowBytes=${rowBytes})`);
+    }
+    if (rows === 0 || rowBytes === 0) {
+        if (out != null && !ArrayBuffer.isView(out)) throw new Error("packbits_rows: out must be an ArrayBufferView");
+        return out || new Uint8Array(0);
+    }
+    if (!ArrayBuffer.isView(lensBytes) || lensBytes.byteLength < rows * 2 || !ArrayBuffer.isView(src)) {
+        throw new Error("packbits_rows: invalid lensBytes or src");
+    }
+    const need = rows * rowBytes;
+    let dst = null;
+    if (out != null) {
+        if (!ArrayBuffer.isView(out) || out.byteLength < need) {
+            throw new Error(`packbits_rows: out too short (${out && out.byteLength} < ${need})`);
+        }
+        dst = out instanceof Uint8Array ? out : new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
+    } else {
+        dst = new Uint8Array(need);
+    }
+    const lb = lensBytes instanceof Uint8Array ? lensBytes : new Uint8Array(lensBytes.buffer, lensBytes.byteOffset, lensBytes.byteLength);
+    const sb = src instanceof Uint8Array ? src : new Uint8Array(src.buffer, src.byteOffset, src.byteLength);
+    let p = 0;
+    for (let y = 0; y < rows; y++) {
+        const rowLen = (lb[2 * y] << 8) | lb[2 * y + 1];
+        const end = p + rowLen, lim = Math.min(end, sb.length);
+        let o = y * rowBytes;
+        const stop = o + rowBytes;
+        while (p < lim && o < stop) {
+            const n = sb[p++];
+            if (n < 128) {
+                const c = Math.min(n + 1, stop - o, lim - p);
+                dst.set(sb.subarray(p, p + c), o);
+                p += n + 1; o += c;
+            } else if (n > 128) {
+                const c = Math.min(257 - n, stop - o);
+                dst.fill(p < lim ? sb[p++] : 0, o, o + c);
+                o += c;
+            }
+        }
+        if (o < stop) dst.fill(0, o, stop);
+        p = end;
+    }
+    return out || dst;
+}
+
+/**
+ * Place a band's mask overlap (`ry1 - ry0` rows of width `mw` starting at mask column `sx0`, `8`-bit or big-endian
+ * `16`-bit) into `out` (or a fresh `Uint8ClampedArray(rows * w * 4)`) as `[255, 255, 255, alpha]` over
+ * `[ry0, ry1) × [x0, x1)` and `[255, 255, 255, def]` elsewhere (JS twin of `crates/px` `psd_mask_rgba`, K20b).
+ */
+export function psdMaskRgba(src, mw, sx0, w, rows, x0, x1, ry0, ry1, bits, def, out = null) {
+    if (!Number.isInteger(w) || !Number.isInteger(rows) || w <= 0 || rows <= 0 || (bits !== 8 && bits !== 16)) {
+        throw new Error(`psd_mask_rgba: invalid size or bits (w=${w}, rows=${rows}, bits=${bits})`);
+    }
+    if (!Number.isInteger(x0) || !Number.isInteger(x1) || !Number.isInteger(ry0) || !Number.isInteger(ry1)
+        || x0 < 0 || x0 > x1 || x1 > w || ry0 < 0 || ry0 > ry1 || ry1 > rows) {
+        throw new Error(`psd_mask_rgba: invalid overlap (${x0}..${x1} in ${w}, ${ry0}..${ry1} in ${rows})`);
+    }
+    const needOut = w * rows * 4;
+    let dst = null;
+    if (out != null) {
+        if (!ArrayBuffer.isView(out) || out.byteLength < needOut) {
+            throw new Error(`psd_mask_rgba: out too short (${out && out.byteLength} < ${needOut})`);
+        }
+        dst = out instanceof Uint8Array || out instanceof Uint8ClampedArray
+            ? out
+            : new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
+    } else {
+        dst = new Uint8ClampedArray(needOut);
+    }
+    const mRows = ry1 - ry0, span = x1 - x0, d8 = def & 255;
+    let sb = null, mStride = 0, bps = bits >>> 3;
+    if (mRows > 0 && span > 0) {
+        if (!Number.isInteger(mw) || !Number.isInteger(sx0) || mw <= 0 || sx0 < 0 || sx0 + span > mw) {
+            throw new Error(`psd_mask_rgba: invalid mask columns (sx0=${sx0}, span=${span}, mw=${mw})`);
+        }
+        mStride = mw * bps;
+        const needSrc = (mRows - 1) * mStride + (sx0 + span) * bps;
+        if (!ArrayBuffer.isView(src) || src.byteLength < needSrc) {
+            throw new Error(`psd_mask_rgba: src too short (${src && src.byteLength} < ${needSrc})`);
+        }
+        sb = src instanceof Uint8Array ? src : new Uint8Array(src.buffer, src.byteOffset, src.byteLength);
+    }
+    for (let i = 0; i < needOut; i += 4) {
+        dst[i] = 255; dst[i + 1] = 255; dst[i + 2] = 255; dst[i + 3] = d8;
+    }
+    if (mRows > 0 && span > 0) {
+        for (let mr = 0; mr < mRows; mr++) {
+            const rowBase = (ry0 + mr) * w * 4 + x0 * 4;
+            const sBase = mr * mStride + sx0 * bps;
+            if (bits === 8) {
+                for (let i = 0; i < span; i++) dst[rowBase + i * 4 + 3] = sb[sBase + i];
+            } else {
+                for (let i = 0; i < span; i++) {
+                    const v = (sb[sBase + i * 2] << 8) | sb[sBase + i * 2 + 1];
+                    dst[rowBase + i * 4 + 3] = (v * 255 + 32895) >>> 16;
+                }
+            }
+        }
+    }
+    return out || dst;
 }
 
 /** Undo the ZIP-with-prediction delta per row (8 bit: byte deltas, 16 bit: big-endian word deltas). */
@@ -370,55 +481,236 @@ export async function readPsd(input, { inflate = null, onHeader = null } = {}) {
  * the stream. The answer is readPsd's with `index` in place of a layer's `rgba` and its `mask` without `data`; the
  * merged picture is read only when no layer has pixels (the one case the editor shows it), `composite` then its index,
  * else null. `spent` (optional) gets the milliseconds of channels (the reads and unpacks), interleave, mask, deliver
- * (inside `onRows`) and the count of bands.
+ * (inside `onRows`), wait (awaiting the promises `onRows` returned) and the count of bands. An `onRows` that returns a
+ * promise holds the next band back until it settles (the pool job's acknowledgement window, K20b review).
  */
-export async function readPsdStream(input, { inflate = null, rowsPerBand = 256, onHeader = null, onRows = null, spent = null } = {}) {
+export async function readPsdStream(input, { inflate = null, rowsPerBand = 256, onHeader = null, onRows = null, spent = null, kernels = null } = {}) {
     if (typeof onRows !== "function") throw new Error("readPsdStream needs onRows");
-    const sp = Object.assign(spent || {}, { channels: 0, interleave: 0, mask: 0, deliver: 0, bands: 0 });
-    return decodePsd(input, inflate, { rows: Math.max(1, rowsPerBand | 0), onHeader, onRows, sp, next: 0 });
+    const sp = Object.assign(spent || {}, { channels: 0, interleave: 0, mask: 0, deliver: 0, wait: 0, bands: 0 });
+    return decodePsd(input, inflate, { rows: Math.max(1, rowsPerBand | 0), onHeader, onRows, sp, next: 0, kernels: kernels || PSD_JS });
 }
 
 const clock = () => (typeof performance !== "undefined" ? performance.now() : Date.now());
 
-/** Does readPsd's layer loop make a layer with pixels of this record? Its own tests, in its order. */
-function pixelRecord(L, w, h) {
-    if (L.section === 3 || L.section === 1 || L.section === 2) return false;
-    if (Object.keys(L.info).some((k) => ADJUSTMENTS.has(k))) return false;
-    return w > 0 && h > 0 && !!L.ch[0];
+/**
+ * Validate one channel record upfront for `readPsdStream` (`docs/PLAN_WASM_K20.md` §2.1) with the exact checks and
+ * refusal messages of `readChannel`. When `keep` is true, returns a lightweight descriptor over the channel's bytes
+ * without allocating an unpacked plane (`comp === 0 || 1`) or mutating inflated bytes (`comp === 2 || 3`).
+ */
+async function prepareChannel(r, compression, w, h, depth, dataLen, inflate, what, keep) {
+    const bpc = depth / 8, rowBytes = w * bpc, size = w * h * bpc;
+    if (compression === 0) {
+        if (dataLen < size) throw tooShort(what, w, h);
+        r.need(size);
+        return keep ? { comp: 0, bytes: r.b, at: r.p, cw: w, chh: h, rowBytes } : null;
+    }
+    if (compression === 1) {
+        if (2 * h > dataLen) throw tooShort(what, w, h);
+        r.need(2 * h);
+        const lensAt = r.p, b = r.b;
+        const rowOff = keep ? new Uint32Array(h + 1) : null;
+        let total = 0;
+        for (let y = 0; y < h; y++) {
+            total += (b[lensAt + 2 * y] << 8) | b[lensAt + 2 * y + 1];
+            if (rowOff) rowOff[y + 1] = total;
+        }
+        r.p = lensAt + 2 * h;
+        r.need(total);
+        if (total < packedAtLeast(h, rowBytes) || 2 * h + total > dataLen) throw tooShort(what, w, h);
+        if (!keep) return null;
+        return {
+            comp: 1,
+            lensBytes: b.subarray(lensAt, lensAt + 2 * h),
+            bytes: b,
+            dataAt: lensAt + 2 * h,
+            rowOff,
+            cw: w,
+            chh: h,
+            rowBytes,
+        };
+    }
+    if (compression === 2 || compression === 3) {
+        if (!inflate) throw new Error("a ZIP-compressed PSD channel needs an inflater");
+        r.need(dataLen);
+        if (size > dataLen * DEFLATE_MAX_RATIO) throw tooShort(what, w, h);
+        const bomb = () => new Error(`a ZIP channel of ${what} unpacks to more than its ${sizeText(w, h)}: the file is damaged`);
+        let raw;
+        try { raw = await inflate(r.bytes(dataLen), size); } catch (err) { throw err && err.tooLarge ? bomb() : err; }
+        if (raw.length > size) throw bomb();
+        if (!keep) return null;
+        let buf;
+        if (raw.length === size) buf = raw;
+        else { buf = new Uint8Array(size); buf.set(raw); }
+        return { comp: compression, bytes: buf, at: 0, cw: w, chh: h, rowBytes };
+    }
+    throw new Error(`unknown PSD compression ${compression}`);
+}
+
+/** Unpack rows `[y0, y0 + bandRows)` of a validated channel descriptor without mutating `d.bytes`. */
+function unpackBandDesc(d, y0, bandRows, depth) {
+    if (!d) return null;
+    const planeBytes = bandRows * d.rowBytes;
+    if (d.comp === 1) {
+        const out = new Uint8Array(planeBytes);
+        const s0 = d.dataAt + d.rowOff[y0], s1 = Math.min(d.bytes.length, d.dataAt + d.rowOff[y0 + bandRows]);
+        const packed = s0 < s1 ? d.bytes.subarray(s0, s1) : EMPTY;
+        packbitsRows(d.lensBytes.subarray(2 * y0, 2 * (y0 + bandRows)), packed, bandRows, d.rowBytes, out);
+        return out;
+    }
+    const off = d.at + y0 * d.rowBytes;
+    if (d.comp === 3) {
+        const out = d.bytes.slice(off, off + planeBytes);
+        unpredict(out, d.cw, bandRows, depth);
+        return out;
+    }
+    return d.bytes.subarray(off, off + planeBytes);
 }
 
 /**
- * Planes (readPsd's `ch`: 0, 1, 2, -1; gray 0 and -1) out through the stream as straight RGBA bands, gray replicated, a
- * missing alpha opaque; then `maskData` (w * h bytes, or null) as bands of white with that alpha. Its stream index.
+ * Materialise and interleave one `rows`-row colour/alpha band `[y0, y0 + rows)` into `Uint8ClampedArray(rows * w * 4)`
+ * (`PSD_JS.bandRgba`, JS twin of `Px.prototype.psdBandRgba`, K20b).
  */
-function streamPixels(stream, ch, w, h, gray, maskData) {
-    const index = stream.next++, per = stream.rows, sp = stream.sp;
-    const R = ch[0], G = gray ? ch[0] : ch[1], B = gray ? ch[0] : ch[2], A = ch[-1];
-    const send = (kind, out, y0, n) => {
+export function psdBandRgba(descs, w, y0, rows, depth, gray, spent = null) {
+    const t0 = spent ? clock() : 0;
+    const R = unpackBandDesc(descs[0], y0, rows, depth);
+    const G = gray ? R : unpackBandDesc(descs[1], y0, rows, depth);
+    const B = gray ? R : unpackBandDesc(descs[2], y0, rows, depth);
+    const A = unpackBandDesc(descs["-1"], y0, rows, depth);
+    const t1 = spent ? clock() : 0;
+    if (spent) spent.channels += t1 - t0;
+    const n = rows * w, out = new Uint8ClampedArray(n * 4);
+    if (depth === 8) {
+        for (let i = 0, o = 0; i < n; i++, o += 4) {
+            out[o] = R ? R[i] : 0;
+            out[o + 1] = G ? G[i] : 0;
+            out[o + 2] = B ? B[i] : 0;
+            out[o + 3] = A ? A[i] : 255;
+        }
+    } else {
+        for (let i = 0, s = 0, o = 0; i < n; i++, s += 2, o += 4) {
+            out[o] = R ? (((R[s] << 8) | R[s + 1]) * 255 + 32895) >>> 16 : 0;
+            out[o + 1] = G ? (((G[s] << 8) | G[s + 1]) * 255 + 32895) >>> 16 : 0;
+            out[o + 2] = B ? (((B[s] << 8) | B[s + 1]) * 255 + 32895) >>> 16 : 0;
+            out[o + 3] = A ? (((A[s] << 8) | A[s + 1]) * 255 + 32895) >>> 16 : 255;
+        }
+    }
+    if (spent) spent.interleave += clock() - t1;
+    return out;
+}
+
+/**
+ * Materialise and place one `rows`-row mask band `[y0, y0 + rows)` into `Uint8ClampedArray(rows * w * 4)` as
+ * `[255, 255, 255, alpha]` (`PSD_JS.bandMask`, JS twin of `Px.prototype.psdBandMask`, K20b).
+ */
+export function psdBandMask(desc, L, m, w, h, y0, rows, depth, spent = null) {
+    const t0 = spent ? clock() : 0;
+    const x0 = Math.min(w, Math.max(0, m.left - L.left));
+    const x1 = Math.max(x0, Math.min(w, m.right - L.left));
+    const gy0 = Math.min(h, Math.max(0, m.top - L.top));
+    const gy1 = Math.max(gy0, Math.min(h, m.bottom - L.top));
+    const ry0 = Math.min(rows, Math.max(0, gy0 - y0));
+    const ry1 = Math.max(ry0, Math.min(rows, gy1 - y0));
+    let out;
+    if (!desc || desc.kind === "empty" || !(x1 > x0 && ry1 > ry0)) {
+        out = psdMaskRgba(null, 0, 0, w, rows, 0, 0, 0, 0, 8, m.def & 255);
+    } else {
+        const mRows = ry1 - ry0;
+        const my0 = L.top + y0 + ry0 - m.top;
+        const sx0 = L.left + x0 - m.left;
+        const plane = unpackBandDesc(desc, my0, mRows, depth);
+        out = psdMaskRgba(plane, desc.cw, sx0, w, rows, x0, x1, ry0, ry1, depth, m.def & 255);
+    }
+    if (spent) spent.mask += clock() - t0;
+    return out;
+}
+
+export const PSD_JS = Object.freeze({
+    packbitsRows,
+    maskRgba: psdMaskRgba,
+    bandRgba: psdBandRgba,
+    bandMask: psdBandMask,
+});
+
+/**
+ * Stream one layer's (or merged picture's) validated channel descriptors band-by-band through `stream.kernels`. An
+ * `onRows` that returns a promise (the worker's acknowledgement window, inpaint_worker.js `psdRead`) is awaited before
+ * the next band is made; its wait goes into `spent.wait`, not `deliver`.
+ */
+async function streamChannelDescs(stream, descs, w, h, depth, gray, maskDesc = null, L = null, m = null) {
+    const index = stream.next++, per = stream.rows, sp = stream.sp, K = stream.kernels;
+    const send = async (kind, out, y0, n) => {
         const t = clock();
-        stream.onRows(index, kind, out, w, h, y0, n);
-        sp.deliver += clock() - t;
+        const paced = stream.onRows(index, kind, out, w, h, y0, n);
+        const t1 = clock();
+        sp.deliver += t1 - t;
         sp.bands++;
+        if (paced && typeof paced.then === "function") { await paced; sp.wait += clock() - t1; }
     };
     for (let y0 = 0; y0 < h; y0 += per) {
-        const n = Math.min(per, h - y0), t = clock();
-        const out = new Uint8ClampedArray(n * w * 4);
-        for (let i = y0 * w, end = (y0 + n) * w, o = 0; i < end; i++, o += 4) {
-            out[o] = R ? R[i] : 0; out[o + 1] = G ? G[i] : 0; out[o + 2] = B ? B[i] : 0; out[o + 3] = A ? A[i] : 255;
-        }
-        sp.interleave += clock() - t;
-        send("rgba", out, y0, n);
+        const n = Math.min(per, h - y0);
+        await send("rgba", K.bandRgba(descs, w, y0, n, depth, gray, sp), y0, n);
     }
-    if (maskData) {
+    if (m) {
         for (let y0 = 0; y0 < h; y0 += per) {
-            const n = Math.min(per, h - y0), t = clock();
-            const out = new Uint8ClampedArray(n * w * 4);
-            for (let i = y0 * w, end = (y0 + n) * w, o = 0; i < end; i++, o += 4) { out[o] = 255; out[o + 1] = 255; out[o + 2] = 255; out[o + 3] = maskData[i]; }
-            sp.mask += clock() - t;
-            send("mask", out, y0, n);
+            const n = Math.min(per, h - y0);
+            await send("mask", K.bandMask(maskDesc, L, m, w, h, y0, n, depth, sp), y0, n);
         }
     }
     return index;
+}
+
+/** Validate the merged picture's channels upfront for `readPsdStream`, matching `mergedPlanes` (`docs/PLAN_WASM_K20.md` §2.1). */
+function mergedChannelDescs(r, bytes, width, height, channels, depth, gray) {
+    if (r.p + 2 > bytes.length) return null;
+    const comp = r.u16();
+    const n = Math.min(channels, gray ? 2 : 4);
+    if (n <= 0) return null;
+    const bpc = depth / 8, rowBytes = width * bpc;
+    const descs = [];
+    if (comp === 1) {
+        r.need(2 * height * channels);
+        const tableAt = r.p;
+        r.skip(2 * height * channels);
+        let curAt = r.p;
+        for (let c = 0; c < n; c++) {
+            const lensAt = tableAt + c * 2 * height;
+            const rowOff = new Uint32Array(height + 1);
+            let total = 0;
+            for (let y = 0; y < height; y++) {
+                total += (bytes[lensAt + 2 * y] << 8) | bytes[lensAt + 2 * y + 1];
+                rowOff[y + 1] = total;
+            }
+            if (total < packedAtLeast(height, rowBytes)) {
+                const err = new Error(`the PSD's merged picture holds less data than its ${sizeText(width, height)} need: the file is damaged`);
+                err.refused = true;
+                throw err;
+            }
+            descs.push({
+                comp: 1,
+                lensBytes: bytes.subarray(lensAt, lensAt + 2 * height),
+                bytes,
+                dataAt: curAt,
+                rowOff,
+                cw: width,
+                chh: height,
+                rowBytes,
+            });
+            curAt += total;
+        }
+        r.p = curAt;
+    } else if (comp === 0) {
+        const size = width * height * bpc;
+        for (let c = 0; c < n; c++) {
+            const at = r.p;
+            r.skip(size);
+            descs.push({ comp: 0, bytes, at, cw: width, chh: height, rowBytes });
+        }
+    } else {
+        return null;
+    }
+    return gray
+        ? { 0: descs[0], "-1": descs[1] || null }
+        : { 0: descs[0], 1: descs[1] || null, 2: descs[2] || null, "-1": descs[3] || null };
 }
 
 /**
@@ -515,31 +807,68 @@ async function decodePsd(input, inflate, stream, onHeader = null) {
             for (const L of records) {
                 const w = L.right - L.left, h = L.bottom - L.top;
                 L.ch = {};
-                const t0 = stream ? clock() : 0;
-                for (const c of L.channels) {
-                    const end = r.p + c.len;
-                    const isMask = c.id === -2 || c.id === -3;
-                    const m = isMask ? maskFor(L, c.id) : null;
-                    if (isMask && !m) { r.p = end; continue; }   // a mask channel without its record
-                    const cw = m ? m.right - m.left : w, chh = m ? m.bottom - m.top : h;
-                    if (m && !(cw > 0 && chh > 0)) { L.ch[c.id] = EMPTY; r.p = end; continue; }   // an empty rectangle: the default colour everywhere
-                    if (c.len < 2) { r.p = end; continue; }
-                    const comp = r.u16();
-                    if (cw > 0 && chh > 0) {
-                        const what = `the PSD layer "${String(L.name).slice(0, 60)}"${isMask ? "'s mask" : ""}`;
-                        checkRect(what, cw, chh);
-                        L.ch[c.id] = await readChannel(r, comp, cw, chh, depth, c.len - 2, inflate, what);
+                if (!stream) {
+                    for (const c of L.channels) {
+                        const end = r.p + c.len;
+                        const isMask = c.id === -2 || c.id === -3;
+                        const m = isMask ? maskFor(L, c.id) : null;
+                        if (isMask && !m) { r.p = end; continue; }   // a mask channel without its record
+                        const cw = m ? m.right - m.left : w, chh = m ? m.bottom - m.top : h;
+                        if (m && !(cw > 0 && chh > 0)) { L.ch[c.id] = EMPTY; r.p = end; continue; }   // an empty rectangle: the default colour everywhere
+                        if (c.len < 2) { r.p = end; continue; }
+                        const comp = r.u16();
+                        if (cw > 0 && chh > 0) {
+                            const what = `the PSD layer "${String(L.name).slice(0, 60)}"${isMask ? "'s mask" : ""}`;
+                            checkRect(what, cw, chh);
+                            L.ch[c.id] = await readChannel(r, comp, cw, chh, depth, c.len - 2, inflate, what);
+                        }
+                        r.p = end;
                     }
-                    r.p = end;
-                }
-                if (stream) {
+                } else {
+                    const wantPixels = L.section !== 1 && L.section !== 2 && L.section !== 3
+                        && !Object.keys(L.info).some((k) => ADJUSTMENTS.has(k))
+                        && w > 0 && h > 0
+                        && L.channels.some((c) => c.id === 0 && c.len >= 2);
+                    const hasMaskCh = (mid) => {
+                        const m = maskFor(L, mid);
+                        if (!m) return false;
+                        const mw = m.right - m.left, mh = m.bottom - m.top;
+                        return L.channels.some((c) => c.id === mid && (!(mw > 0 && mh > 0) || c.len >= 2));
+                    };
+                    const activeMaskId = wantPixels ? (hasMaskCh(-2) ? -2 : hasMaskCh(-3) ? -3 : 0) : 0;
+                    const descs = {};
+                    const t0 = clock();
+                    for (const c of L.channels) {
+                        const end = r.p + c.len;
+                        const isMask = c.id === -2 || c.id === -3;
+                        const m = isMask ? maskFor(L, c.id) : null;
+                        if (isMask && !m) { r.p = end; continue; }
+                        const cw = m ? m.right - m.left : w, chh = m ? m.bottom - m.top : h;
+                        if (m && !(cw > 0 && chh > 0)) {
+                            if (c.id === activeMaskId) descs[c.id] = { kind: "empty" };
+                            r.p = end;
+                            continue;
+                        }
+                        if (c.len < 2) { r.p = end; continue; }
+                        const comp = r.u16();
+                        if (cw > 0 && chh > 0) {
+                            const what = `the PSD layer "${String(L.name).slice(0, 60)}"${isMask ? "'s mask" : ""}`;
+                            checkRect(what, cw, chh);
+                            const keep = wantPixels && (c.id === 0 || c.id === -1 || (!gray && (c.id === 1 || c.id === 2)) || c.id === activeMaskId);
+                            const d = await prepareChannel(r, comp, cw, chh, depth, c.len - 2, inflate, what, keep);
+                            if (d) descs[c.id] = d;
+                        }
+                        r.p = end;
+                    }
                     stream.sp.channels += clock() - t0;
-                    // D0: a layer's pixels and mask go out now and its planes are dropped (`L.ch[0]` stays set for the loop below)
-                    if (pixelRecord(L, w, h)) {
-                        const mask = layerMask(L, w, h);
-                        L.streamed = { index: streamPixels(stream, L.ch, w, h, gray, mask ? mask.data : null), mask: mask ? { defaultColor: mask.defaultColor, disabled: mask.disabled } : null };
+                    if (wantPixels && descs[0]) {
+                        const m = activeMaskId ? maskFor(L, activeMaskId) : null;
+                        const index = await streamChannelDescs(stream, descs, w, h, depth, gray, activeMaskId ? descs[activeMaskId] : null, L, m);
+                        L.streamed = { index, mask: m ? { defaultColor: m.def, disabled: !!(m.flags & 2) } : null };
                         L.ch = { 0: EMPTY };
-                    } else L.ch = {};   // not read below: a section or an adjustment is skipped first, the empty test answers alike
+                    } else {
+                        L.ch = {};
+                    }
                 }
             }
         }
@@ -603,9 +932,11 @@ async function decodePsd(input, inflate, stream, onHeader = null) {
     }
     if (stream && !layers.length && width > 0 && height > 0) {   // a header of no area has no merged picture to send
         r.p = lmEnd;
-        let ch = null;
-        try { ch = mergedPlanes(r, bytes, width, height, channels, depth, gray); } catch (err) { ch = null; if (err && err.refused) mergedRefused = err; }
-        if (ch) composite = streamPixels(stream, ch, width, height, gray, null);
+        let descs = null;
+        const t0 = clock();
+        try { descs = mergedChannelDescs(r, bytes, width, height, channels, depth, gray); } catch (err) { descs = null; if (err && err.refused) mergedRefused = err; }
+        stream.sp.channels += clock() - t0;
+        if (descs) composite = await streamChannelDescs(stream, descs, width, height, depth, gray);
     }
     // a file whose only picture is a merged picture too short for its size is refused (both readers alike)
     if (!layers.length && mergedRefused) throw mergedRefused;

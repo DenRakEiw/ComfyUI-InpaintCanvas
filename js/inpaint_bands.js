@@ -56,7 +56,7 @@ export function bandRows(width, height, read, rows = TILE) {
         width, height, align: rows,
         async part(y, n, needPrev) {
             if (y >= by1) {
-                if (band) above = band.slice(band.length - stride);
+                if (band) above = needPrev ? band.slice(band.length - stride) : null;
                 by0 = by1; by1 = Math.min(height, by0 + rows);
                 if (y !== by0) throw new Error(`rows asked for out of order: ${y}, the next band starts at ${by0}`);
                 band = await read(by0, by1);
@@ -170,7 +170,7 @@ export async function writePng(source, run, { texts = null, chunks = null, fligh
     const writer = new PngStreamWriter(source.width, source.height, { texts, chunks, flights, run: (args, transfer) => run("png_part", args, transfer) });
     await forParts(source, async (y, n) => {
         await writer.room();
-        const { args, transfer } = await source.part(y, n, true);
+        const { args, transfer } = await source.part(y, n, false);
         writer.add(n, args, transfer);
         if (progress) progress((y + n) / source.height);
         if (pause && args.rgba) await pause();

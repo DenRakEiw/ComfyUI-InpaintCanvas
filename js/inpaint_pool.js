@@ -73,6 +73,16 @@ export class WorkerPool {
         return Promise.all(jobs.map((j) => this.run(j.op, j.args, j.transfer || [], opts)));
     }
 
+    /**
+     * Tell the worker that runs job `id` that `n` of its progress messages are handled (`{ op: "ack", id, n }`: the paced
+     * `psd_read`, inpaint_worker.js `psdAck`). False when no worker runs that job (it ended, or was stopped).
+     */
+    ack(id, n) {
+        const s = this.workers.find((x) => x.job && x.job.id === id);
+        if (!s) return false;
+        try { s.w.postMessage({ op: "ack", id, n }); return true; } catch (_) { return false; }
+    }
+
     /** Reject the queued jobs of `group`, and the running ones as soon as their worker answers. */
     cancel(group) {
         if (group === null || group === undefined) return 0;
