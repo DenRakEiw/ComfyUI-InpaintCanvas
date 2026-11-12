@@ -629,6 +629,26 @@ function tileEmpty(t) {
     return true;
 }
 
+/**
+ * Would a combine that keeps every alpha (add or subtract of SEL_NONE, intersect with SEL_FULL: the combined alpha is
+ * the tile's own) leave tile `t` byte for byte as it is (tiles/T4)? Yes when each of its `bw` x `bh` pixels is what
+ * selCombine writes for its own alpha, the colour `rgb24` (a word's low 24 bits) where alpha is above 0 and 0 everywhere
+ * else, and one of them at least has alpha (an empty one may be dropped by the combine). Little-endian words only.
+ */
+function selUnchanged(t, bw, bh, rgb24) {
+    const a = u32Of(t);
+    let any = false;
+    for (let y = 0; y < bh; y++) {
+        for (let i = y * TILE_SIZE, e = i + bw; i < e; i++) {
+            const w = a[i];
+            if (w === 0) continue;
+            if (w < ALPHA || ((w ^ rgb24) & 0xFFFFFF) !== 0) return false;
+            any = true;
+        }
+    }
+    return any;
+}
+
 /** The exact non-transparent extent of a tile in its own pixels, cached by its version. */
 function tileExtent(t) {
     if (t.extVersion === t.version) return t.ext;
@@ -2737,6 +2757,10 @@ export class TileMaskPixels extends tiled(MaskPixels) {
                 let v = view ? src.view(ox, oy, bw, bh) : null;
                 if (!v) v = { kind: SEL_ALPHA, data: src.read(ox, oy, bw, bh), off: 0, stride: bw };
                 if (!had && v.kind === SEL_NONE) continue;   // nothing over nothing
+                // add or subtract of nothing, intersect with everything: a tile already as the combine writes it stays
+                // as it is, not made writable (a copy of a tile the undo step shares) nor its version moved (tiles/T4)
+                if (had && LITTLE && ((v.kind === SEL_NONE && (m === 1 || m === 2)) || (v.kind === SEL_FULL && m === 3))
+                    && selUnchanged(had, bw, bh, SEL & 0xFFFFFF)) continue;
 
                 if (v.kind === SEL_FULL && m <= 1 && LITTLE) {
                     // replace or add under full coverage: the colour at 255 wherever the image is, one fill

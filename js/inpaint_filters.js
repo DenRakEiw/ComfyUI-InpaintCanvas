@@ -396,13 +396,57 @@ export function lutFromCube(text) {
         }
     }
     if (!size || values.length < size * size * size * 3) throw new Error("not a valid 3D .cube file");
-    const data = new Float32Array(size * size * size * 3);
-    for (let i = 0; i < data.length; i++) {
-        const c = i % 3;
-        const v = (values[i] - domainMin[c]) / ((domainMax[c] - domainMin[c]) || 1);
+    // DOMAIN_MIN / DOMAIN_MAX are the input range the lattice spans, not a scale of its outputs
+    // (filters/cube-domain-applied-to-outputs): the outputs stay as written, clamped to 0..1
+    const n = size * size * size * 3;
+    const lo = [0, 1, 2].map((c) => (Number.isFinite(domainMin[c]) ? domainMin[c] : 0));
+    const hi = [0, 1, 2].map((c) => (Number.isFinite(domainMax[c]) && domainMax[c] !== lo[c] ? domainMax[c] : lo[c] + 1));
+    const unit = lo.every((v) => v === 0) && hi.every((v) => v === 1);
+    const out = unit ? values : lutOnUnitDomain(values, size, lo, hi);
+    const data = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+        const v = out[i];
         data[i] = v < 0 ? 0 : v > 1 ? 1 : v;
     }
     return { size, data, title };
+}
+
+/**
+ * applyLut and the 3D texture index a lattice over input 0..1. A lattice spanning lo..hi per input channel is
+ * resampled once onto a 0..1 input grid of the same size: trilinear in the original lattice, an input outside
+ * lo..hi clamped to it. `src` holds the outputs as written (red fastest); the caller clamps the result.
+ */
+function lutOnUnitDomain(src, N, lo, hi) {
+    const out = new Float64Array(N * N * N * 3);
+    // per input axis and grid index: the lower lattice index and the weight of the next one
+    const axes = [0, 1, 2].map((c) => {
+        const i0 = new Int32Array(N), w = new Float64Array(N);
+        for (let i = 0; i < N; i++) {
+            const x = N > 1 ? i / (N - 1) : 0;
+            const t = (x - lo[c]) / (hi[c] - lo[c]);
+            const u = (t < 0 ? 0 : t > 1 ? 1 : t) * (N - 1);
+            const f = Math.max(0, Math.min(Math.floor(u), N - 2));
+            i0[i] = f;
+            w[i] = u - f;
+        }
+        return { i0, w };
+    });
+    const [R, G, B] = axes;
+    const at = (r, g, b, k) => src[((b * N + g) * N + r) * 3 + k];
+    for (let b = 0; b < N; b++) for (let g = 0; g < N; g++) for (let r = 0; r < N; r++) {
+        const r0 = R.i0[r], r1 = Math.min(r0 + 1, N - 1), tr = R.w[r];
+        const g0 = G.i0[g], g1 = Math.min(g0 + 1, N - 1), tg = G.w[g];
+        const b0 = B.i0[b], b1 = Math.min(b0 + 1, N - 1), tb = B.w[b];
+        for (let k = 0; k < 3; k++) {
+            const c00 = at(r0, g0, b0, k) + (at(r1, g0, b0, k) - at(r0, g0, b0, k)) * tr;
+            const c10 = at(r0, g1, b0, k) + (at(r1, g1, b0, k) - at(r0, g1, b0, k)) * tr;
+            const c01 = at(r0, g0, b1, k) + (at(r1, g0, b1, k) - at(r0, g0, b1, k)) * tr;
+            const c11 = at(r0, g1, b1, k) + (at(r1, g1, b1, k) - at(r0, g1, b1, k)) * tr;
+            const c0 = c00 + (c10 - c00) * tg, c1 = c01 + (c11 - c01) * tg;
+            out[((b * N + g) * N + r) * 3 + k] = c0 + (c1 - c0) * tb;
+        }
+    }
+    return out;
 }
 
 /** Bake a LUT into an RGB canvas (width size*size, height size): x = r + b * size, y = g. Lossless as PNG. */

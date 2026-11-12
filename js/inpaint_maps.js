@@ -206,13 +206,25 @@ export function deriveMap(map, patch = {}) {
 }
 
 /**
+ * One byte view per map.data (filters/depth-map-texture-reuploaded-every-pass): uploadSampler caches a static sampler
+ * by its `data` object, so a new view per call missed the cache and uploaded the whole map on every filter pass. A
+ * rebuilt map has a new map.data (and dataVersion in the key), so it gets a view, and an upload, of its own.
+ */
+const RG8_VIEWS = new WeakMap();
+
+/**
  * Returns a sampler value compatible with F7 WebGL upload:
- * Uint8Array viewing map.data's bytes (little-endian: R low byte, G high byte).
+ * Uint8Array viewing map.data's bytes (little-endian: R low byte, G high byte), the same view object on every call.
  * @param {DocMap} map
  */
 export function rg8View(map) {
+    let bytes = RG8_VIEWS.get(map.data);
+    if (!bytes) {
+        bytes = new Uint8Array(map.data.buffer, map.data.byteOffset, map.data.byteLength);
+        RG8_VIEWS.set(map.data, bytes);
+    }
     return {
-        data: new Uint8Array(map.data.buffer, map.data.byteOffset, map.data.byteLength),
+        data: bytes,
         width: map.w,
         height: map.h,
         channels: 2,

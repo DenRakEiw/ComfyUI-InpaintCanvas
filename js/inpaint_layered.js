@@ -23,7 +23,7 @@
  * (docs/PLAN_WASM_BUILD.md §7 D0): each layer's pixels and mask go out as RGBA bands once its channels are read, the
  * answer names them by index; readPsd stays the window's reader and its twin (tools/layered_test.js).
  *
- * `readOra(bytes, { inflateRaw })` answers `{ width, height, layers, notes }`, each layer with its PNG as `png`
+ * `readOra(bytes, { inflateRaw })` (`readOraBlob(blob, ...)` for a file left a Blob) answers `{ width, height, layers, notes }`, each layer with its PNG as `png`
  * (bytes) instead of `rgba`, for the caller to decode; nested stacks are flattened: their visibility and opacity go
  * into their layers.
  *
@@ -966,12 +966,34 @@ async function decodePsd(input, inflate, stream, onHeader = null) {
  * "__proto__" or "constructor" is an entry like any other.
  */
 function unzip(bytes) {
+    const { count, p } = zipEnd(bytes);
+    const zip = zipDirectory(bytes, p, count, bytes.length);
     const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    let eocd = -1;
-    for (let i = bytes.length - 22; i >= Math.max(0, bytes.length - 65557); i--) if (v.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
-    if (eocd < 0) throw new Error("the ORA file is not a complete zip");
-    const count = v.getUint16(eocd + 10, true);
-    let p = v.getUint32(eocd + 16, true);
+    for (const name in zip) {
+        const e = zip[name];
+        const at = e.local + 30 + v.getUint16(e.local + 26, true) + v.getUint16(e.local + 28, true);
+        e.data = bytes.subarray(at, at + e.csize);
+    }
+    return zip;
+}
+
+/** Where a zip's directory is (`{ count, p }`, `p` its offset in the file), from the file's last 65,557 bytes or more. */
+function zipEnd(bytes) {
+    const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    for (let i = bytes.length - 22; i >= Math.max(0, bytes.length - 65557); i--) {
+        if (v.getUint32(i, true) === 0x06054b50) return { count: v.getUint16(i + 10, true), p: v.getUint32(i + 16, true) };
+    }
+    throw new Error("the ORA file is not a complete zip");
+}
+
+/**
+ * The directory's `count` records from offset `p` of `bytes`: { name: { method, csize, size, local } }. `bytes` holds
+ * at least the directory and may be a slice of the file (`fileSize` is the whole file's); the record count decides
+ * where it ends, the end record's byte count is not used. Every record's local header has to lie inside the file, an
+ * entry that is never read too.
+ */
+function zipDirectory(bytes, p, count, fileSize) {
+    const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     const out = Object.create(null);
     for (let i = 0; i < count; i++) {
         if (v.getUint32(p, true) !== 0x02014b50) throw new Error("the ORA file's zip directory is damaged");
@@ -979,9 +1001,8 @@ function unzip(bytes) {
         const nameLen = v.getUint16(p + 28, true), extra = v.getUint16(p + 30, true), comment = v.getUint16(p + 32, true);
         const local = v.getUint32(p + 42, true);
         const name = new TextDecoder().decode(bytes.subarray(p + 46, p + 46 + nameLen));
-        const lNameLen = v.getUint16(local + 26, true), lExtra = v.getUint16(local + 28, true);
-        const at = local + 30 + lNameLen + lExtra;
-        out[name] = { method, data: bytes.subarray(at, at + csize), size };
+        if (local + 30 > fileSize) throw new Error("the ORA file's zip directory is damaged");
+        out[name] = { method, csize, size, local };
         p += 46 + nameLen + extra + comment;
     }
     return out;
@@ -1009,28 +1030,73 @@ const attr = (tag, name) => {
  */
 export async function readOra(input, { inflateRaw = null, onHeader = null } = {}) {
     const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
-    const zip = unzip(bytes);
-    const budget = ORA_INFLATE_BASE + ORA_INFLATE_RATIO * bytes.length;
+    return oraFromEntries(bytes.length, unzip(bytes), {
+        whole: (e) => e.data,
+        picture: (e) => e.data,
+        head: (png) => png,
+        keep: (png) => ({ png }),
+    }, inflateRaw, onHeader);
+}
+
+/**
+ * K20c: `readOra` for a file that stays a Blob: what it answers, but each layer with `pngBlob` in place of `png` (a
+ * slice of the file for a stored entry, no copy of it; a Blob of the unpacked bytes for a deflated one). The last
+ * 65,557 bytes, the directory, stack.xml and 24 bytes of each layer are all that is read here: not the merged
+ * picture, the thumbnail or a stored layer's pixels. Every input gives what `readOra` gives, its refusals word for word:
+ * `Blob.slice` clamps as `subarray` does, so an entry the directory says runs past the file ends at the file here too.
+ */
+export async function readOraBlob(blob, { inflateRaw = null, onHeader = null } = {}) {
+    const read = async (part) => new Uint8Array(await part.arrayBuffer());
+    const tail = await read(blob.slice(Math.max(0, blob.size - 65557)));
+    const { count, p } = zipEnd(tail);
+    const zip = zipDirectory(await read(blob.slice(p)), 0, count, blob.size);   // from `p` on: the directory and the end record
+    const place = async (e) => {
+        if (e.blob) return e.blob;
+        const local = new DataView(await blob.slice(e.local, e.local + 30).arrayBuffer());
+        const at = e.local + 30 + local.getUint16(26, true) + local.getUint16(28, true);
+        e.blob = blob.slice(at, at + e.csize, "image/png");
+        return e.blob;
+    };
+    const heads = new Map();   // a stack.xml may name one entry many times
+    return oraFromEntries(blob.size, zip, {
+        whole: async (e) => read(await place(e)),
+        picture: place,
+        head: async (png) => {
+            if (png instanceof Uint8Array) return png;   // unpacked here
+            if (!heads.has(png)) heads.set(png, await read(png.slice(0, 24)));
+            return heads.get(png);
+        },
+        keep: (png) => ({ pngBlob: png instanceof Uint8Array ? new Blob([png], { type: "image/png" }) : png }),
+    }, inflateRaw, onHeader);
+}
+
+/**
+ * The reader behind `readOra` and `readOraBlob`: stack.xml and the layers, every limit and refusal once. `from` says how
+ * an entry is had: `whole(e)` its stored bytes, `picture(e)` a stored layer's PNG as the reader keeps it, `head(png)` at
+ * least the first 24 bytes of that or of an unpacked one, `keep(png)` the layer's field for it.
+ */
+async function oraFromEntries(fileSize, zip, from, inflateRaw, onHeader) {
+    const budget = ORA_INFLATE_BASE + ORA_INFLATE_RATIO * fileSize;
     let unpacked = 0;
-    const get = async (name) => {
+    const get = async (name, stored) => {
         const e = zip[name];
         if (!e) return null;
-        if (e.method === 0) return e.data;
+        if (e.method === 0) return stored(e);
         if (e.method === 8) {
             if (!inflateRaw) throw new Error("a deflated ORA entry needs an inflater");
             const label = String(name).slice(0, 80);
             if (name === "stack.xml" && e.size > ORA_XML_MAX) throw new Error(`the ORA file's stack.xml unpacks to ${mbText(e.size)}, more than a stack.xml can be (${mbText(ORA_XML_MAX)}): the file is damaged`);
-            if (unpacked + e.size > budget) throw new Error(`the ORA file's entries unpack to more than ${mbText(budget)} (at ${label}), far more than its ${mbText(bytes.length)} can hold: the file is damaged or not an image`);
+            if (unpacked + e.size > budget) throw new Error(`the ORA file's entries unpack to more than ${mbText(budget)} (at ${label}), far more than its ${mbText(fileSize)} can hold: the file is damaged or not an image`);
             unpacked += e.size;
             const bomb = () => new Error(`the ORA entry ${label} unpacks to more than the ${e.size.toLocaleString("en-US")} bytes its zip directory gives: the file is damaged`);
             let raw;
-            try { raw = await inflateRaw(e.data, e.size); } catch (err) { throw err && err.tooLarge ? bomb() : err; }
+            try { raw = await inflateRaw(await from.whole(e), e.size); } catch (err) { throw err && err.tooLarge ? bomb() : err; }
             if (raw.length > e.size) throw bomb();
             return raw;
         }
         throw new Error(`unknown zip method ${e.method} for ${name}`);
     };
-    const xmlBytes = await get("stack.xml");
+    const xmlBytes = await get("stack.xml", from.whole);
     if (!xmlBytes) throw new Error("the ORA file has no stack.xml");
     const xml = new TextDecoder().decode(xmlBytes);
     const img = /<image\b[^>]*>/.exec(xml);
@@ -1068,16 +1134,16 @@ export async function readOra(input, { inflateRaw = null, onHeader = null } = {}
         const op = attr(tag, "composite-op") || "svg:src-over";
         let blend = ORA_BLENDS[op];
         if (!blend) { blends.push(`${name} (${op})`); blend = "normal"; }
-        const png = src ? await get(src) : null;
+        const png = src ? await get(src, from.picture) : null;
         if (!png) { missing.push(name); continue; }
-        const size = pngSize(png);
+        const size = pngSize(await from.head(png));
         if (size) {
             const label = `the ORA layer "${String(name).slice(0, 60)}"`;
             checkRect(label, size.w, size.h, ORA_LAYER_MAX_PIXELS);
             pixels += size.w * size.h;
             if (pixels > pixelBudget) throw new Error(`the ORA file's layers add up to more than ${Math.round(pixelBudget / 1e6).toLocaleString("en-US")} MP at ${label}, more than the layers of a ${sizeText(width, height)} picture can be: the file is damaged`);
         }
-        found.push({ name, x: Math.round(x), y: Math.round(y), opacity: Math.max(0, Math.min(1, opacity)), visible, blend, png });
+        found.push({ name, x: Math.round(x), y: Math.round(y), opacity: Math.max(0, Math.min(1, opacity)), visible, blend, ...from.keep(png) });
     }
     if (blends.length) notes.push(`blend modes the editor lacks became normal: ${listNames(blends)}`);
     if (missing.length) notes.push(`${missing.length} layer${missing.length > 1 ? "s" : ""} without a picture left out (${listNames(missing)})`);

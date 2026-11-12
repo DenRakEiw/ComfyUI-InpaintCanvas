@@ -97,7 +97,10 @@ function buildTopBar(ed, root) {
         ed.fileInput.value = "";
     });
     top.appendChild(ed.fileInput);
-    top.appendChild(iconButton("newfile", "New: an empty white canvas. Everything in this editor (layers, results, selection, history) is discarded; you are asked first.", () => ed.newCanvas(), "New"));
+    // the app opens a new canvas in a tab of its own when this one holds work (editor.newCanvasTab, set by the app's shell,
+    // issue #12); the node has no tabs and replaces after asking
+    top.appendChild(iconButton("newfile", "New: an empty white canvas. In the app it opens in a new tab while this one holds work; otherwise this editor's layers, results, selection and history are discarded (you are asked first).",
+        () => (typeof ed.newCanvasTab === "function" ? ed.newCanvasTab() : ed.newCanvas()), "New"));
     if (host.generateNewAvailable && host.generateNewAvailable()) {
         top.appendChild(iconButton("sparkle", "Generate new: make the base image from the prompt alone, no image needed. Model, size and seed are in the dialog.", () => host.openGenerateNew(ed), "Generate new"));
     }

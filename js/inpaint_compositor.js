@@ -214,6 +214,8 @@ const INSTANCE_BYTES = INSTANCE_FLOATS * 4;
 // Pages are an LRU by bytes. The default is the `settings.memory.atlasMB` row in Settings ›
 // Rendering; the memory watch lowers it under pressure.
 const ATLAS_BUDGET_DEFAULT = 512 * 1024 * 1024;
+const ATLAS_BUDGET_MIN = 16 * 1024 * 1024;
+const ATLAS_BUDGET_MAX = 16384 * 1024 * 1024;
 // and an age, like the source textures: a page no composite asked for in this many composites is
 // dropped whatever the budget says (the pixels of a layer that a flip or a transform replaced).
 const ATLAS_STALE = 300;
@@ -581,7 +583,7 @@ export class GLCompositor {
 
     /** The atlas's byte budget (settings.memory.atlasMB); pages above it are dropped LRU. */
     setAtlasBudget(bytes) {
-        this.atlasBudget = Math.max(16 * 1024 * 1024, bytes | 0);
+        this.atlasBudget = Math.min(ATLAS_BUDGET_MAX, Math.max(ATLAS_BUDGET_MIN, Math.floor(Number(bytes)) || 0));
     }
 
     /** Drop the texture of a source the editor threw away (its atlas pages too, when it is pixels). */
@@ -659,6 +661,7 @@ export class GLCompositor {
             page.used = this.frame;
             return { page, slot };
         }
+        if (this.atlasBytes >= this.atlasBudget) this._evictOther(entry);
         if (this.atlasBytes < this.atlasBudget) {
             const page = this._newPage(entry, S, want - this._entrySlots(entry));
             const slot = { i: page.free.pop(), version: -1, used: this.frame };
@@ -980,6 +983,30 @@ export class GLCompositor {
         try { this.gl.deleteTexture(page.tex); } catch (_) { /* context gone */ }
     }
 
+    /**
+     * Drop pages of other entries not touched this frame, oldest first, until `_slot` has room
+     * below the budget for `keep`. Never removes `rec.levels` entries mid-frame.
+     */
+    _evictOther(keep) {
+        const all = [];
+        for (const rec of Array.from(this.atlas.values())) {
+            if (!rec.ref.deref()) { this._dropRecord(rec); continue; }
+            for (const entry of rec.levels.values()) {
+                if (entry === keep) continue;
+                for (const page of entry.pages) {
+                    if (page.used !== this.frame) all.push({ entry, page });
+                }
+            }
+        }
+        if (this.atlasBytes < this.atlasBudget) return;
+        all.sort((a, b) => a.page.used - b.page.used);
+        for (const it of all) {
+            if (this.atlasBytes < this.atlasBudget) break;
+            it.entry.pages = it.entry.pages.filter((p) => p !== it.page);
+            this._deletePage(it.page);
+        }
+    }
+
     /** Pages no recent composite asked for, then the least recently used, until the budget holds. */
     _evictAtlas() {
         const all = [];
@@ -1042,7 +1069,7 @@ export class GLCompositor {
             if (l.pixels) {
                 // a tile store: its visible tiles are uploaded into atlas slots and drawn instanced
                 const tiles = this._tileInstances(l, region);
-                if (!tiles) return null;
+                if (!tiles) { this._evictAtlas(); return null; }
                 if (tiles.length) prepared.push({ ...l, tiles });
                 continue;
             }

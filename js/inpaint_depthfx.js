@@ -169,11 +169,11 @@ export function applyHaze(src, p, info) {
     const guide = map.guide || null;
 
     for (let y = 0; y < H; y++) {
-        const py = origin[1] + y;
+        const py = origin[1] + y + 0.5;   // the pixel's centre, as the shader (pictureUv) and the dehaze / relight twins
         const row = y * W;
         for (let x = 0; x < W; x++) {
             const idx = (row + x) * 4;
-            const px_x = origin[0] + x;
+            const px_x = origin[0] + x + 0.5;
 
             const mx = m[0] * px_x + m[2] * py + m[4];
             const my = m[1] * px_x + m[3] * py + m[5];
