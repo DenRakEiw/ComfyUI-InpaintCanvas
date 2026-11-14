@@ -477,6 +477,9 @@ class InpaintEditor {
      * `set(key, { options, value, hidden, disabled, text })` changes a field without calling onChange again.
      */
     ask({ title = "", message = "", value = null, fields = null, linked = false, ok = "OK", cancel = "Cancel", danger = false, onChange = null } = {}) {
+        // one question at a time: an earlier one (asked again from the native menu while it is open) answers null as
+        // Cancel does, or its backdrop, its key listener and its caller's promise would stay behind for good
+        this.closeAsk();
         return new Promise((resolve) => {
             const wrap = el("div", "ipc-ask");
             const box = el("div", "ipc-askbox");
@@ -879,7 +882,9 @@ class InpaintEditor {
      * Upload every edited layer and mask. One pass at a time per document (the 15 s autosave and a save before closing
      * can ask at once: the second waits for the first, so it never finds a layer "clean" whose upload is still running).
      * A layer counts as clean from the start of its upload, so a change during the upload marks it again for the next
-     * pass; a failed upload marks it again too.
+     * pass; a failed upload marks it again too. While its upload runs it carries `_uploading` (`_maskUploading`): a copy
+     * or an undo record taken then has the new pixels but not yet the new file, so it counts as dirty
+     * (duplicateLayer, snapshotLayer).
      */
     syncLayers() {
         const pass = (this._syncing || Promise.resolve()).catch(() => {}).then(() => this.syncLayersOnce());
@@ -891,22 +896,28 @@ class InpaintEditor {
         for (const layer of this.layers) {
             if (layer.dirty && layer.px) {
                 layer.dirty = false;
+                layer._uploading = true;
                 try {
                     const { ref } = await uploadPixels(layer.px, `n${this.node.id}_layer`);
                     layer.ref = ref;
                 } catch (err) {
                     layer.dirty = true;
                     throw err;
+                } finally {
+                    delete layer._uploading;
                 }
             }
             if (layer.maskDirty && layer.maskPx) {
                 layer.maskDirty = false;
+                layer._maskUploading = true;
                 try {
                     const { ref } = await uploadPixels(layer.maskPx, `n${this.node.id}_lmask`);
                     layer.maskRef = ref;
                 } catch (err) {
                     layer.maskDirty = true;
                     throw err;
+                } finally {
+                    delete layer._maskUploading;
                 }
             }
         }
@@ -1314,6 +1325,7 @@ class InpaintEditor {
     // ---- persistence -------------------------------------------------------
 
     notifyChanged() {
+        if (this.syncWraps) this.syncWraps();   // a wrap's source moved, undone or redone: its wrap follows (Deep paint)
         if (this.boxes) this.boxes.refresh();   // a box written, an undo or redo of one, a restored workflow
         host.changed(this);
     }

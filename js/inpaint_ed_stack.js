@@ -348,8 +348,14 @@ export class StackPart {
         return Math.max(TILE_SIZE, Math.min(2048, rows, Math.floor((max - 2 * prog.reach) / TILE_SIZE) * TILE_SIZE));
     }
 
-    /** One filter layer over `input` (a surface or a canvas of a band whose corner is `origin` in the picture), as `filteredCanvas` runs it in a pass at full resolution; the input again when the filter gave nothing. */
-    bandFilter(layer, input, origin, forRun) {
+    /**
+     * One filter layer over `input` (a surface or a canvas of a band whose corner is `origin` in the picture), as
+     * `filteredCanvas` runs it in a pass at full resolution; the input again when the filter gave nothing. `plain`: the
+     * step is drawn as the picture itself (no blend mode, opacity, mask or clip). A step that is not plain takes the
+     * limit's weight into the result's alpha (`limitOver`), as `filteredCanvas` does, and answers null where a depth
+     * limit has no map: such a layer shows nothing, so the band is left as it is.
+     */
+    bandFilter(layer, input, origin, forRun, plain = true) {
         if (!layer._fxCacheSample) layer._fxCacheSample = {};
         const info = this.filterInfo(layer, {
             scale: 1,
@@ -360,11 +366,13 @@ export class StackPart {
             chain: "bands",
             site: "bandFilter",
         });
+        info.limitOver = !plain;
         let out = null;
         beginScope();
         try { out = applyFilter(layer.filter, input, layer.params, info); }
         catch (err) { console.error(err); }
         out = endScope(out);
+        if (!plain && info.limitMissing && (!out || out === input)) return null;
         return out || input;
     }
 
@@ -458,7 +466,8 @@ export class StackPart {
                 const input = gpu || timed("upload", () => surfaceFromBytes(A, pw, ph));
                 if (!input) throw new Error(NO_PROGRAM);
                 gpu = input;
-                const out = timed("filter", () => this.bandFilter(st.filter, input, [px0, py0], prog.forRun));
+                const out = timed("filter", () => this.bandFilter(st.filter, input, [px0, py0], prog.forRun, st.plain));
+                if (out === null) continue;   // a depth limit without a map over the picture: the layer shows nothing, the band stays
                 if (st.plain) { if (out !== input) free(input); gpu = out; continue; }
                 // at an opacity, in a blend mode or through a mask: the filtered band over the band it was made from
                 if (!prog.b || prog.b.byteLength < bytes) prog.b = new SharedArrayBuffer(bytes);

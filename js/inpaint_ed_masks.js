@@ -90,8 +90,8 @@ export class MasksPart {
     async applyCutoutFile(info) {
         const pending = this.cutoutPending;
         if (!pending) return;
-        const layer = pending.layer;
-        if (!this.layers.includes(layer)) { this.cutoutPending = null; this.renderLayers(); return; }
+        // by id: an undo or redo of a layers step meanwhile rebuilds every layer object (applyCutoutImage looks again)
+        if (!this.layers.some((l) => l.id === pending.layer.id)) { this.cutoutPending = null; this.renderLayers(); return; }
         try {
             const img = await loadImageEl(viewUrl({ filename: info.filename, subfolder: info.subfolder || SUBFOLDER, type: info.type || "temp" }));
             await this.applyCutoutImage(img, pending);
@@ -105,8 +105,14 @@ export class MasksPart {
 
     /** A grayscale mask (any size, white = keep) for the pending cutout's layer -> its transparency mask; true when applied. */
     async applyCutoutImage(img, pending) {
-        const layer = pending.layer;
+        // the layer as it is now: an undo or redo of a layers step while the model ran rebuilds every layer object
+        // with the same id, and a delete takes it away; the mask goes onto the live layer, or nowhere
+        const layer = this.layers.find((l) => l.id === pending.layer.id);
         try {
+            if (!layer || layer.px !== pending.layer.px) {
+                this.setStatus(`${pending.layer.name}: ${layer ? "its pixels changed" : "the layer went away"} while the background was removed; nothing was applied.`);
+                return false;
+            }
             const W = layer.px.width, H = layer.px.height;
             // the model's grey answer (not a mask yet) scaled to the layer's own pixels, its R channel becomes the alpha
             const tmp = makeCanvas(W, H);
@@ -274,20 +280,22 @@ export class MasksPart {
         }
 
         if (this._maskOpToken !== token) return false;
+        // the live layer by id: an undo or redo of a layers step during the resample rebuilds every layer object (with
+        // the same px), so the mask goes onto that copy, not onto the object handed in
         const curTarget = this.layers.find((l) => l.id === target.id);
         if (!curTarget || curTarget.px !== target.px) {
             this.setStatus("That layer is gone.");
             return false;
         }
 
-        this.pushUndo({ kind: "mask", id: target.id, label: "Mask from layer" });
-        target.maskPx = m;
-        target.maskOff = false;
-        target.maskEdit = false;
-        this.markMaskChanged(target);
+        this.pushUndo({ kind: "mask", id: curTarget.id, label: "Mask from layer" });
+        curTarget.maskPx = m;
+        curTarget.maskOff = false;
+        curTarget.maskEdit = false;
+        this.markMaskChanged(curTarget);
         this.renderLayers();
         this.draw();
-        this.setStatus(`${target.name}: mask copied from ${source.name}.`);
+        this.setStatus(`${curTarget.name}: mask copied from ${source.name}.`);
         return true;
     }
 
@@ -311,6 +319,21 @@ export class MasksPart {
                 if (!need() || this.maskBlocked(layer)) return false;
                 // a filter layer's pixels are never drawn: its mask is all that limits the filter
                 if (layer.kind === "filter") { this.setStatus(`${layer.name} is a filter layer: it has no pixels to bake the mask into.`); return false; }
+                if (layer.kind === "text") {
+                    // a text layer's pixels are rendered from its description, so the next text edit would bring the
+                    // hidden parts back: the text becomes pixels first (one "layers" step: undo brings the text back)
+                    this.pushUndo({ kind: "layers", label: "Apply mask" });
+                    layer.kind = "paint";
+                    delete layer.text;
+                    layer._textToken = (layer._textToken || 0) + 1;   // a render on its way must not land on the pixels
+                    clearTimeout(layer._textTimer); layer._textTimer = null; layer._textRendering = 0;
+                    if (layer._textUndo) this.releaseSnapshot(layer._textUndo);
+                    layer._textUndo = null;
+                    this.applyMask(layer, { silent: true, undo: false });
+                    this.renderLayers(); this.draw();
+                    this.setStatus(`${layer.name}: mask applied; the text is pixels now (Undo brings the editable text back).`);
+                    return true;
+                }
                 this.applyMask(layer);
                 return true;
             case "remove": if (!need() || this.maskBlocked(layer)) return false; this.removeMask(layer); return true;

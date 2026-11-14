@@ -19,6 +19,8 @@ import { FREQ_MAX_PX, cpuDab, makeCanvas } from "./inpaint_consts.js";
 import { DISSOLVE_CLIP_SHADER, DISSOLVE_SHADER, EMULATED_BLEND_CLIP_SHADER, EMULATED_BLEND_SHADER, RANGE_PREVIEW_SHADER } from "./inpaint_shaders.js";
 import { UploadCache, sourceTag } from "./inpaint_strokebuf.js";
 import { canvasRows, loadImageEl, viewUrl } from "./inpaint_load.js";
+import { defaultLight, normalizeLights } from "./inpaint_relight.js";
+import { wrapBox, wrapDecal, wrapGrow } from "./inpaint_wrap.js";
 
 export class FiltersPart {
     /**
@@ -179,7 +181,15 @@ export class FiltersPart {
         const r = radius > 0 ? Math.max(1, Math.min(200, Math.round(radius))) : Math.max(2, Math.round(Math.min(this.width, this.height) * 0.004));
         markStep("freqsep", "start", { w, h, radius: r });   // the K0b harness (docs/PLAN_WASM_BUILD.md §4.9): read, split (the blur in it since K27), written
         this.setStatus(`Frequency separation (${r} px) ...`);
+        // the picture as it was when the box was taken: a crop, a turn, an undo or a new picture during the read moves
+        // the box off what it was cut from (an undo can bring the size back, so the size and the base count too)
+        const seq = this.geometrySeq, W0 = this.width, H0 = this.height, base0 = this.base;
         const src = await this.readBoxBytes(box, { forRun: true });
+        if (this.geometrySeq !== seq || this.width !== W0 || this.height !== H0 || this.base !== base0) {
+            markStep("freqsep", "done");
+            this.setStatus("Frequency separation stopped: the picture changed while it was read. Run it again.");
+            return null;
+        }
         const I = new Uint8ClampedArray(w * h * 4);
         I.set(src.data.subarray ? src.data.subarray(0, w * h * 4) : src.data);
         markStep("freqsep", "read");
@@ -320,6 +330,8 @@ export class FiltersPart {
         if (id === "relight") {
             const relightConf = host.getRelightSettings ? host.getRelightSettings() : null;
             params.route = "app";
+            // SP6: a picture with surface maps lights its own colour (docs/PLAN_SURFACE_PAINT.md); a layer made before stays
+            if (this.hasSurfaceMaps && this.hasSurfaceMaps()) params.surface = true;
             if (relightConf) {
                 if (relightConf.strength !== undefined) params.strength = relightConf.strength;
                 if (relightConf.style !== undefined) params.style = relightConf.style;
@@ -340,8 +352,203 @@ export class FiltersPart {
         return layer;
     }
 
+    /**
+     * A Deep paint layer (docs/PLAN_SURFACE_PAINT.md SP4): a filter layer `surface` over the whole picture whose own
+     * pixels are the paint. Needs the surface maps. -> the layer, or null (the status line says why)
+     */
+    addSurfaceLayer() {
+        if (!this.width) { this.setStatus("Load an image first."); return null; }
+        if (!this.hasSurfaceMaps()) { this.setStatus("Deep paint needs the surface maps: Image › Surface Maps › Compute Surface Maps.", "warn"); return null; }
+        const layer = this.addFilterLayer("surface");
+        if (!layer) return null;
+        layer.name = `Deep paint ${this.filterCounter}`;
+        this.renderLayers();
+        this.setStatus(`${layer.name} added. What you paint on it takes the picture's light and reflections.`);
+        return layer;
+    }
+
+    /**
+     * *Layer › New Deep Paint Layer* (SP5): the surface maps first when the picture has none (Compute Surface Maps' run,
+     * with its sentences), then the layer, active, with the brush picked. Null when the maps could not be made (the status
+     * line says why).
+     */
+    async newDeepPaintLayer() {
+        if (!this.width) { this.setStatus("Load an image first."); return null; }
+        if (!this.hasSurfaceMaps()) {
+            try { await this.computeSurfaceMaps(); } catch (_) { return null; }   // the status line says why
+            if (!this.hasSurfaceMaps()) return null;   // dropped by a turn or a crop meanwhile
+        }
+        const layer = this.addSurfaceLayer();
+        if (!layer) return null;
+        this.activeLayerId = layer.id;
+        this.setTool("paint");
+        this.renderLayers();
+        this.setStatus(`${layer.name} added. Paint on it: the colour takes the picture's light and reflections. Alt+click picks the surface's own colour.`);
+        return layer;
+    }
+
+    /**
+     * *Layer › New Light Brush Layer* (SP6): a relight layer with one warm sun from the upper left and a mask that hides
+     * all of it, the mask in edit and the brush picked, so painting brings the light in where it is painted (the light
+     * follows the surfaces' facing from the depth map, and with the surface maps it lights the picture's own colour and
+     * keeps its reflections). The depth map is made by the relight layer as before. One undo step for the mask (adding
+     * a layer is none).
+     */
+    newLightBrushLayer() {
+        if (!this.width) { this.setStatus("Load an image first."); return null; }
+        const layer = this.addFilterLayer("relight");
+        if (!layer) return null;
+        layer.name = `Light brush ${this.filterCounter}`;
+        const size = { width: this.width, height: this.height };
+        const sun = { ...defaultLight(0, size), type: "sun", x: Math.round(this.width * 0.25), y: Math.round(this.height * 0.2), color: 4500, intensity: 120 };
+        layer.params = { ...layer.params, lights: normalizeLights([sun], size) };
+        this.fillLayerMask(layer, false);
+        layer.maskEdit = true;
+        this.activeLayerId = layer.id;
+        this.setTool("paint");
+        this.markFilterChanged(layer);
+        this.renderLayers();
+        this.setStatus(`${layer.name} added. Paint where the light should fall (the brush paints its mask, E takes the light away); the Lights tool (L) moves the light, its colour and strength are in the layer list.`);
+        return layer;
+    }
+
+    /**
+     * *Layer › Wrap onto Surface* (SP7, `inpaint_wrap.js`): the layer's picture, as it is placed (its centre and size;
+     * `angle` degrees clockwise on top), laid onto the surface by arc length from its centre and baked into a new Deep
+     * paint layer above it, so it takes the picture's light and reflections; within the selection when there is one.
+     * The layer itself is hidden and stays active with the Transform tool: moving or scaling it wraps it again live
+     * (`syncWraps`; the wrap layer keeps `wrap`, its source and placement). One undo step ("layers"). Null with a
+     * status line when it cannot.
+     */
+    wrapLayer(layer, { angle = 0 } = {}) {
+        if (!this.width) { this.setStatus("Load an image first."); return null; }
+        if (!layer || !layer.px || layer.kind === "filter") { this.setStatus("Select a picture, paint or text layer to wrap (a logo, a pattern, a word)."); return null; }
+        if (!this.hasSurfaceMaps() || !(this.maps && this.maps.normals && this.maps.normals.data)) { this.setStatus("Wrap needs the surface maps: Image › Surface Maps › Compute Surface Maps.", "warn"); return null; }
+        if (this.pending && this.pending.layer === layer) { this.setStatus(`Apply or cancel the transform of ${layer.name} first.`); return null; }
+        const t0 = performance.now();
+        const made = this.wrapPixels(layer, Number(angle) || 0);
+        if (!made || made.error) { this.setStatus(made ? made.error : `${layer.name} lies outside the picture: nothing to wrap.`); return null; }
+        this.pushUndo({ kind: "layers", label: "Wrap onto surface" });
+        const out = this.addSurfaceLayer();
+        if (!out) return null;
+        out.name = `Wrap: ${layer.name}`;
+        // above the source layer, not on top of the stack
+        const at = this.layers.indexOf(layer), now = this.layers.indexOf(out);
+        if (at >= 0 && now > at + 1) { this.layers.splice(now, 1); this.layers.splice(at + 1, 0, out); }
+        if (layer.group) out.group = layer.group;
+        this.putWrap(out, layer, made);
+        layer.visible = false;
+        // a wrap within a selection is a bake: wrapping it again later could only use the selection of that moment
+        if (made.limited) out.wrap = null;
+        // the hidden source stays active with the Transform tool: moving it wraps it again (syncWraps)
+        this.activeLayerId = layer.id;
+        if (this.setTool) this.setTool("transform");
+        this.uploaded.baseHash = null;
+        this.sceneSig = null;
+        this.renderLayers();
+        this.draw();
+        this.setStatus(`${layer.name} wrapped onto the surface in ${Math.round(performance.now() - t0)} ms, as ${out.name}: it takes the picture's light and reflections. ` + (out.wrap ? `Move or scale ${layer.name} with the Transform tool and the wrap follows.` : "Wrapped within the selection, it stays as it is: to move it, undo and wrap again."));
+        return out;
+    }
+
+    /**
+     * The wrapped pixels of `src` at its placement now: `{ box, data, place }`, `{ error }` when the selection does not
+     * reach it, null outside the picture. The selection of this moment limits it, as a fresh wrap.
+     */
+    wrapPixels(src, angle, { useSelection = true } = {}) {
+        const place = { cx: src.x + src.w / 2, cy: src.y + src.h / 2, w: src.w, h: src.h, angle };
+        const box = wrapBox(place, this.width, this.height, this.maps.points ? wrapGrow(this.maps.points, place.cx, place.cy) : 1);
+        if (!box) return null;
+        const [x0, y0, x1, y1] = box, bw = x1 - x0, bh = y1 - y0;
+        let sel = null;
+        if (useSelection && this.sel && this.getBounds()) {
+            const a = this.sel.readRect(x0, y0, bw, bh).data;
+            sel = new Uint8Array(bw * bh);
+            let any = false;
+            for (let i = 0; i < sel.length; i++) { sel[i] = a[4 * i + 3]; if (sel[i]) any = true; }
+            if (!any) return { error: "The selection does not reach the layer: nothing to wrap." };
+        }
+        const decal = src.px.readRect(0, 0, src.px.width, src.px.height);
+        return { box, place, limited: !!sel, data: wrapDecal({ map: this.maps.normals, box, decal, place, sel, points: this.maps.points || null }) };
+    }
+
+    /** `made` (wrapPixels) into the wrap layer `out`: the box of the wrap before cleared, the new one written; no undo. */
+    putWrap(out, src, made) {
+        const old = out.wrap && out.wrap.box;
+        let changed = made ? made.box.slice() : null;
+        if (old) {
+            const ow = old[2] - old[0], oh = old[3] - old[1];
+            if (ow > 0 && oh > 0) out.px.writeRect({ data: new Uint8ClampedArray(ow * oh * 4), width: ow, height: oh }, old[0], old[1], "copy");
+            changed = changed ? [Math.min(changed[0], old[0]), Math.min(changed[1], old[1]), Math.max(changed[2], old[2]), Math.max(changed[3], old[3])] : old.slice();
+        }
+        if (made && made.data) {
+            const [x0, y0, x1, y1] = made.box;
+            out.px.writeRect({ data: made.data, width: x1 - x0, height: y1 - y0 }, x0, y0, "copy");
+        }
+        // geo: the document's geometry the link is in (a turn, crop, resize or extend leaves the wrap as it is)
+        // a new object: an undo step's copy of the layer keeps its own. The pixels are written in place, so the same
+        // number goes on them and on the link: an undo step that puts back an older link over these pixels shows as a
+        // mismatch and is wrapped again (syncWraps)
+        const stamp = (this._wrapSeq = (this._wrapSeq || 0) + 1);
+        out.px._wrapStamp = stamp;
+        out.wrap = { source: src.id, angle: made && made.place ? made.place.angle : (out.wrap ? out.wrap.angle : 0), x: src.x, y: src.y, w: src.w, h: src.h, box: made ? made.box.slice() : null, stamp, geo: this.geometryToken() };
+        out.dirty = true;
+        // markLayerChanged drops the link of a wrap changed by any other hand (the brush, Fill, Delete): not for this write
+        this._wrapWriting = true;
+        try { if (changed) this.markLayerChanged(out, changed); } finally { this._wrapWriting = false; }
+    }
+
+    /**
+     * Every wrap layer whose source was moved, scaled, undone or redone since it was made is wrapped again from the
+     * source's placement now (no undo step of its own: the source's step is the change, and an undo of it brings the
+     * wrap back with it). A source that is gone leaves its wrap as it is. `live`: during a drag, skipped for a decal
+     * above about 6 MP (it lands on the release).
+     */
+    syncWraps({ live = false } = {}) {
+        if (this._syncingWraps || !this.layers || !this.maps || !this.maps.normals) return false;
+        this._syncingWraps = true;
+        let any = false;
+        try {
+            for (const l of this.layers) {
+                const w = l.wrap;
+                if (!w || l.kind !== "filter") continue;
+                // a link read from a file or the autosave takes the document's geometry as it is now
+                if (w.geo === undefined) w.geo = this.geometryToken();
+                // the picture turned, cropped, resized or extended since: the wrap stays as that operation left it
+                if (w.geo !== this.geometryToken()) { l.wrap = null; continue; }
+                const src = this.layers.find((x) => x.id === w.source);
+                if (!src || !src.px || (this.pending && this.pending.layer === src)) continue;
+                const stale = l.px && l.px._wrapStamp !== undefined && w.stamp !== undefined && l.px._wrapStamp !== w.stamp;
+                if (!stale && src.x === w.x && src.y === w.y && src.w === w.w && src.h === w.h) continue;
+                if (live && src.w * src.h > 6e6) continue;
+                const made = this.wrapPixels(src, w.angle || 0, { useSelection: false });
+                this.putWrap(l, src, made && !made.error ? made : null);
+                any = true;
+            }
+        } finally {
+            this._syncingWraps = false;
+        }
+        if (any) { this.uploaded.baseHash = null; this.sceneSig = null; }
+        return any;
+    }
+
+    /** During a move or scale of a wrap's source: wrap it again at most every 40 ms, drawn when it lands. */
+    syncWrapsSoon() {
+        if (this._wrapTimer || !this.layers.some((l) => l.wrap)) return;
+        this._wrapTimer = setTimeout(() => {
+            this._wrapTimer = null;
+            if (this.syncWraps({ live: true })) this.draw();
+        }, 40);
+    }
+
+    /** A filter layer whose own pixels are an input (Deep paint): the brush and the eraser paint into its `px`. */
+    hasOwnPixels(layer) {
+        return !!(layer && layer.kind === "filter" && layer.px && FILTERS[layer.filter] && FILTERS[layer.filter].ownPixels);
+    }
+
     setFilterType(layer, id) {
         if (!FILTERS[id] || layer.filter === id) return;
+        if (FILTERS[id].ownPixels || (FILTERS[layer.filter] && FILTERS[layer.filter].ownPixels)) return;   // Deep paint keeps its type
         this.pushUndo({ kind: "filter", id: layer.id, label: "Filter type" });
         // a fill switched to a gradient keeps its colour (to transparent) and back; other types start in the paint colour
         const was = layer.filter, prev = layer.params || {};
@@ -503,6 +710,11 @@ export class FiltersPart {
         if (readsMap) {
             baseKey.push(this.mapsVersion || 0);
         }
+        if (FILTERS[layer.filter] && FILTERS[layer.filter].ownPixels) {
+            baseKey.push(layer.px ? layer.px.version : -1);
+            // a stroke on the layer is drawn over its pixels per pass (`ownPixelsFor`): every dab moves `pixelVersion`
+            if (!forRun && this.liveStrokeOn(layer)) baseKey.push("stroke", this.pixelVersion);
+        }
         const isEffectView = this.effectViewOf(layer, forRun);
         if (isEffectView) baseKey.push(true);
         if (layer.params && layer.params.limit) baseKey.push(!!plain);
@@ -542,6 +754,9 @@ export class FiltersPart {
             if (!this._lastFilterInfoBySite) this._lastFilterInfoBySite = {};
             this._lastFilterInfoBySite[pass.site] = info;
         }
+        // a layer whose own pixels are an input (Deep paint): its pixels for the pass, asked for once the filter knows
+        // its input's size (a scratch of that size with the pass's transform, as the filter mask's region view)
+        if (def && def.ownPixels) info.own = (w, h) => this.ownPixelsFor(layer, pass, w, h);
         if (layer.filter === "relight") {
             info.layer = layer;
             info.relight = layer._relight;
@@ -551,6 +766,46 @@ export class FiltersPart {
         }
         if (this._filterInfoHook) this._filterInfoHook(info, layer, pass);
         return info;
+    }
+
+    /**
+     * A filter layer's own pixels (Deep paint's paint) for a pass `w` x `h` whose corner is `pass.origin` in the
+     * picture at `pass.full` / the picture's size: straight RGBA8 `{ data, width, height }`, from the tiles at the pass's
+     * level (the region view's way) or the canvas backend's pixels. Read back once per pass and filter.
+     */
+    ownPixelsFor(layer, pass, w, h) {
+        const W = this.width, H = this.height;
+        if (!layer.px || !(w > 0) || !(h > 0) || !W || !H) return null;
+        const full = pass.full || [w, h];
+        const sx = full[0] / W, sy = full[1] / H;
+        const o = pass.origin || [0, 0];
+        const x0 = o[0] / sx, y0 = o[1] / sy;
+        const c = this.passScratch("_ownPixels", w, h);
+        const ctx = c.getContext("2d");
+        // the screen during a brush or eraser stroke on this layer: the stroke over the layer's pixels, as the filter
+        // mask's stroke in `applyFilterLayer` (a run and an export never see a stroke that is not committed)
+        const p = !pass.forRun && this.liveStrokeOn(layer) && this.pointer.kind === "layerpaint" ? this.pointer : null;
+        const op = p ? (p.erase ? "destination-out" : (layer.alphaLock ? "source-atop" : "source-over")) : null;
+        ctx.save();
+        try {
+            ctx.setTransform(1, 0, 0, 1, 0, 0);
+            ctx.globalAlpha = 1;
+            ctx.globalCompositeOperation = "source-over";
+            ctx.clearRect(0, 0, w, h);
+            if (isTilePixels(layer.px)) {
+                const vp = { x: x0, y: y0, w: w / sx, h: h / sy, sx, sy };
+                ctx.setTransform(sx, 0, 0, sy, -x0 * sx, -y0 * sy);
+                this.drawTilesInto(ctx, layer.px, 0, 0, W, H, vp);
+                if (p) this.drawStrokeInto(ctx, { x: 0, y: 0, w: W, h: H }, layer.px, op, vp, [0, 0, w, h]);
+            } else if (p) {
+                ctx.drawImage(this.layerWithStroke(layer), x0, y0, w / sx, h / sy, 0, 0, w, h);   // as `drawTo` draws
+            } else {
+                layer.px.drawTo(ctx, x0, y0, w / sx, h / sy, 0, 0, w, h);
+            }
+        } finally {
+            ctx.restore();
+        }
+        return ctx.getImageData(0, 0, w, h);
     }
 
     /**
@@ -1216,7 +1471,8 @@ export class FiltersPart {
             // result would hide the live change: show the layers unfiltered instead.
             const p = this.pointer;
             const gestureLayer = (p && p.layer) || (this.pending && this.pending.layer) || null;
-            if (gestureLayer && gestureLayer !== layer) {
+            // a hidden layer changes nothing below: the filter stays (a wrap's source moved while its wrap follows)
+            if (gestureLayer && gestureLayer !== layer && this.shown(gestureLayer)) {
                 const gi = this.layers.indexOf(gestureLayer);
                 if (gi >= 0 && gi < index) return chain;
             }

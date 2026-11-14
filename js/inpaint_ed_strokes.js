@@ -437,8 +437,11 @@ export class StrokesPart {
         // the undo step is a copy of what the stroke touched, taken before it is applied
         // a heal that blended in a worker is an edit an undo pressed meanwhile waited for (`trackEdit`): its step is that
         // undo's to take back, so it does not count as an edit made after the key
-        if (!p.noUndo) this.pushUndoSnapshot(this.strokeUndo(p, target), { label: this.strokeLabel(p), tracked: !!p.healing });
-        if (!p.stroke || p.stroke.empty) return;
+        // a stroke that wrote nothing (a gradient or shape click without a drag) pushes no step: a push drops the redo
+        // steps, and with no box its copy is of the whole layer. A heal keeps its tracked step (an undo waits for it)
+        const empty = !p.stroke || p.stroke.empty;
+        if (!p.noUndo && (!empty || p.healing)) this.pushUndoSnapshot(this.strokeUndo(p, target), { label: this.strokeLabel(p), tracked: !!p.healing });
+        if (empty) return;
         // what the release froze for a heal that blended in a worker (`healBlend`), else as it is now
         const opacity = p.opacity != null ? p.opacity : this.brushOpacity;
         const op = p.op || (p.erase ? "destination-out" : (p.kind === "layerpaint" && p.layer.alphaLock ? "source-atop" : "source-over"));

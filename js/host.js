@@ -182,6 +182,10 @@ export const host = {
     async pictureInput() { return null; },
     async pictureInputBox() { return null; },
     async depthInApp() { throw new Error("depth is a Scumble feature"); },
+    // Deep paint (Scumble 0.1.56): the surface maps, the Deep paint layer, the light brush and Wrap are app-only
+    surfaceSupported: false,
+    surfaceModels() { return null; },
+    async surfaceAnalysis() { throw new Error("Deep paint is a Scumble feature"); },
     async depthDetail() { return null; },
     depthDetailSetting: "standard",
     getDepthDetail() { return "standard"; },

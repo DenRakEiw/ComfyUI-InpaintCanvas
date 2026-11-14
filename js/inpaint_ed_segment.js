@@ -2,13 +2,16 @@
 // select by text, prompt upsampling, SAM objects and mask files: moved out of inpaint_canvas.js (item 56 S5, docs/PLAN_SPLIT.md), text unchanged.
 
 import { api, host } from "./host.js";
-import { selectionGco } from "./inpaint_raster.js";
+import { bytesSource, selectionGco } from "./inpaint_raster.js";
 import { SUBFOLDER, uploadCanvas } from "./inpaint_upload.js";
 import { checkNote, compare, namesFor, normalize, parse, remap } from "./reftokens.js";
 import { failKind, refusal } from "./inpaint_status.js";
 import { RUN_GOING_TEXT, hostText, makeCanvas } from "./inpaint_consts.js";
 import { OBJECT_BACKEND, SEGMENT_BACKENDS, availableSegmentBackends, availableUpsampleBackends, objectBackendAvailable, segmentTermInstruction, upsampleInstruction, withSpecDefaults } from "./inpaint_backends.js";
 import { loadImageEl, viewUrl } from "./inpaint_load.js";
+
+/** Rows per band when a helper's mask is merged into the selection (applyMaskFile). */
+const MASK_BAND_ROWS = 1024;
 
 export class SegmentPart {
     // ---- text segmentation -----------------------------------------------------
@@ -495,40 +498,87 @@ export class SegmentPart {
         this.segBtn.disabled = false;
         try {
             const img = await loadImageEl(viewUrl({ filename: info.filename, subfolder: info.subfolder || SUBFOLDER, type: info.type || "temp" }));
-            if (!this.sel) return;
-            this.pushUndo({ kind: "selection", label: "Select by text" });
-            const tmp = makeCanvas(this.width, this.height);
-            const tctx = tmp.getContext("2d");
-            tctx.drawImage(img, 0, 0, this.width, this.height);
-            const src = tctx.getImageData(0, 0, this.width, this.height).data;
-            const clip = pending.layer ? this.layerAlpha(pending.layer) : null;
-            const shape = makeCanvas(this.width, this.height);
-            const sh = shape.getContext("2d");
-            const out = sh.createImageData(this.width, this.height);
-            const d = out.data;
-            let count = 0;
-            for (let i = 0, j = 0; i < src.length; i += 4, j++) {
-                const on = src[i] > 127 && (!clip || clip[j]);
-                d[i] = 255; d[i + 1] = 0; d[i + 2] = 0; d[i + 3] = on ? 255 : 0;
-                if (on) count++;
-            }
-            sh.putImageData(out, 0, 0);
-            const gco = selectionGco(pending.mode || "replace");
-            if (pending.mode === "replace") this.sel.clear();
-            this.sel.drawInto(null, (sctx) => {
-                sctx.globalCompositeOperation = gco.op;
-                sctx.drawImage(shape, 0, 0);
-            });
-            this.markSelectionChanged();
-            this.draw();
-            const pct = Math.round(100 * count / (this.width * this.height));
-            const term = (info.label || pending.text || "").trim();
-            if (pending.fromPrompt && term && !this.segInput.value.trim()) this.segInput.value = term;
-            if (count) this.selectionLabel = pending.mode === "replace" ? term : [this.selectionLabel, term].filter(Boolean).join(", ");
-            this.setStatus(count ? `Selected "${term}" (${pct}% of the image, ${pending.mode}${pending.fromPrompt ? ", derived from the prompt" : ""}).` : `Nothing found for "${term}". Lower the threshold or rephrase.`);
+            this.applyMaskImage(img, pending, info.label);
         } catch (err) {
             console.error(err);
             this.setStatus("Could not apply the mask: " + (err.message || err), failKind(err));
         }
+    }
+
+    /**
+     * A helper's grey mask (any size, white = selected) into the selection under `pending.mode`, clipped by
+     * `pending.layer`'s alpha when it names one; one undo step. Answers the number of pixels the mask selected.
+     */
+    applyMaskImage(img, pending, label = "") {
+        if (!this.sel) return 0;
+        this.pushUndo({ kind: "selection", label: "Select by text" });
+        // in bands of rows (no picture-size shape, readback or clip: about 3 GB of them at 15k): each band's mask
+        // pixels, clipped by the layer's alpha inside the layer's box only, combined into the selection as bytes
+        const W = this.width, H = this.height;
+        const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+        let scaled = null;
+        if (iw !== W || ih !== H) {   // a mask at another size is scaled to the picture once, as before
+            scaled = makeCanvas(W, H);
+            scaled.getContext("2d").drawImage(img, 0, 0, W, H);
+        }
+        const mode = pending.mode || "replace";
+        const layer = pending.layer || null;
+        const lp = layer ? this.layerPixels(layer) : null;
+        const lb = layer ? [Math.max(0, Math.floor(layer.x)), Math.max(0, Math.floor(layer.y)), Math.min(W, Math.ceil(layer.x + layer.w)), Math.min(H, Math.ceil(layer.y + layer.h))] : null;
+        const ROWS = Math.min(MASK_BAND_ROWS, H);
+        const band = scaled ? null : makeCanvas(W, ROWS);
+        const bctx = band ? band.getContext("2d", { willReadFrequently: true }) : null;
+        const sctxRead = scaled ? scaled.getContext("2d", { willReadFrequently: true }) : null;
+        const lw = lb ? Math.max(0, lb[2] - lb[0]) : 0;
+        const lcan = lw > 0 ? makeCanvas(lw, ROWS) : null;
+        const lctx = lcan ? lcan.getContext("2d", { willReadFrequently: true }) : null;
+        const alpha = new Uint8Array(W * ROWS);
+        // an intersect keeps the selection where the mask is on: the complement is subtracted band by band
+        const bandMode = mode === "intersect" || mode === "subtract" ? "subtract" : "add";
+        if (mode === "replace") this.sel.clear();
+        let count = 0;
+        for (let y0 = 0; y0 < H; y0 += ROWS) {
+            const bh = Math.min(ROWS, H - y0);
+            let src;
+            if (scaled) src = sctxRead.getImageData(0, y0, W, bh).data;
+            else {
+                bctx.clearRect(0, 0, W, ROWS);
+                bctx.imageSmoothingEnabled = false;
+                bctx.drawImage(img, 0, y0, W, bh, 0, 0, W, bh);
+                src = bctx.getImageData(0, 0, W, bh).data;
+            }
+            // the layer's alpha over the band's part of its box (nothing is on outside the box)
+            let la = null, ly0 = 0, ly1 = 0;
+            if (layer) {
+                ly0 = Math.max(y0, lb[1]); ly1 = Math.min(y0 + bh, lb[3]);
+                if (lctx && ly1 > ly0) {
+                    lctx.clearRect(0, 0, lw, ROWS);
+                    lctx.drawImage(lp, layer.x - lb[0], layer.y - y0, layer.w, layer.h);
+                    la = lctx.getImageData(0, 0, lw, bh).data;
+                }
+            }
+            const inv = mode === "intersect";
+            let on = 0;
+            for (let y = 0; y < bh; y++) {
+                const row = y * W, inL = !!la && y0 + y >= ly0 && y0 + y < ly1;
+                for (let x = 0; x < W; x++) {
+                    const i = row + x;
+                    let v = src[i * 4] > 127;
+                    if (v && layer) v = inL && x >= lb[0] && x < lb[2] && la[(y * lw + x - lb[0]) * 4 + 3] > 0;
+                    if (v) on++;
+                    alpha[i] = v !== inv ? 255 : 0;
+                }
+            }
+            count += on;
+            if ((inv ? W * bh - on : on) > 0) this.sel.combine(bytesSource(alpha, 0, y0, W, bh), bandMode);
+        }
+        this.markSelectionChanged();
+        this.draw();
+        const pct = Math.round(100 * count / (this.width * this.height));
+        const term = (label || pending.text || "").trim();
+        if (pending.fromPrompt && term && !this.segInput.value.trim()) this.segInput.value = term;
+        if (count) this.selectionLabel = pending.mode === "replace" ? term : [this.selectionLabel, term].filter(Boolean).join(", ");
+        this.setStatus(count ? `Selected "${term}" (${pct}% of the image, ${pending.mode}${pending.fromPrompt ? ", derived from the prompt" : ""}).` : `Nothing found for "${term}". Lower the threshold or rephrase.`);
+        return count;
     }
 }

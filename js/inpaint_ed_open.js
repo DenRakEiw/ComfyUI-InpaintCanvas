@@ -139,6 +139,9 @@ export class OpenPart {
 
     async loadFile(file, { size = null, ask = true } = {}) {
         if (!file) return;
+        // a document still restoring (setValue) goes on after each await and would put its remaining layers, selection,
+        // maps and history over this picture: the open waits for it, as the other pixel jobs do (host_pictures)
+        if (this._loading) { this.setStatus("The document is still loading: open the picture when it is in.", "info"); return; }
         // an open that is still decoding (a large file in a worker takes seconds, the window stays usable) must not land
         // over a later one: the last file asked for is the base
         const token = (this._openToken = (this._openToken || 0) + 1);

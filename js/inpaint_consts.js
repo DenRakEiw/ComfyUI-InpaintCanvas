@@ -36,7 +36,7 @@ const MAX_SNAPSHOTS = 8;                    // named snapshots of the whole docu
  * snapshot or a copy: a record holding one would bring the edit back half done (docs/PLAN_RELIGHT_FIXES.md F3).
  */
 const LAYER_PENDING_KEYS = ["_undoPending", "_textUndo", "_matchUndo", "_hoverSnap", "_nudgePending", "_wheelPending", "_wheelLabel",
-    "_flushNudge", "_flushWheel", "_nudgeRelightTimer", "_wheelRelightTimer"];
+    "_flushNudge", "_flushWheel", "_nudgeRelightTimer", "_wheelRelightTimer", "_uploading", "_maskUploading"];
 /** Said when a run holds the document (the app's host; the node's sets no `providerPending`). */
 const RUN_GOING_TEXT = "A run is still going on this document: wait for it, or Cancel.";
 /**

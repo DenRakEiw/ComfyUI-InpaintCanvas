@@ -740,6 +740,17 @@ export class RelightPart {
                     ctx.restore();
                 }
             }
+        } else if (this.mapView && this.mapView !== "depth" && !this.spaceDown) {
+            // Deep paint's surface maps (inpaint_ed_depth.js surfaceProxy): the light, the reflections or the normals
+            const map = this.maps && this.maps[this.mapView];
+            const proxy = map ? this.surfaceProxy(this.mapView) : null;
+            if (proxy) {
+                ctx.save();
+                ctx.imageSmoothingEnabled = true;
+                ctx.transform(...(map.xf || [this.width, 0, 0, this.height, 0, 0]));
+                ctx.drawImage(proxy, 0, 0, 1, 1);
+                ctx.restore();
+            }
         } else if (this.showDepthMap && this.depth && !this.spaceDown) {
             this.drawDepthOverlay(ctx);
         }

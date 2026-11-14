@@ -119,6 +119,9 @@ function readV1(r, version, count) {
     return { brushes: out, computed, presets: out.length + computed };
 }
 
+/** The next multiple of four, in plain arithmetic (no int32 truncation). */
+const pad4 = (n) => n + ((4 - (n % 4)) % 4);
+
 /** The 8BIM blocks of a version 6 / 10 file: key -> [start, length]. Blocks are padded to four bytes. */
 function blocks(r) {
     const out = new Map();
@@ -127,7 +130,9 @@ function blocks(r) {
         const key = r.tag();
         const len = r.u32();
         if (!out.has(key)) out.set(key, [r.pos, len]);
-        r.pos = (r.pos + len + 3) & ~3;
+        // plain arithmetic: `& ~3` truncates to int32, so a huge len from the file wrapped back and looped forever
+        if (len > r.length - r.pos) break;
+        r.pos = pad4(r.pos + len);
     }
     return out;
 }
@@ -140,7 +145,7 @@ function sampled(r, end, subversion) {
         r.pos = pos;
         if (r.pos + 4 > end) break;
         const len = r.u32();
-        pos = (r.pos + len + 3) & ~3;          // brushes are padded to four bytes
+        pos = len > end - r.pos ? end : pad4(r.pos + len);   // padded to four bytes; never back (the int32 wrap)
         try {
             const start = r.pos;
             const uuid = r.pstr();

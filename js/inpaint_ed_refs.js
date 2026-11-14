@@ -91,7 +91,28 @@ export class RefsPart {
         const n = r(this.negativeText);
         if (n !== this.negativeText) this.setNegativeText(n);
         this.remapOthers(r);
+        this.remapBoxDescs(r);
         this.refMap = after;
+    }
+
+    /**
+     * The boxes' descriptions (pluginData.boxes: the app's Boxes plugin and the node's own boxes) name references by
+     * @img number too and are resolved only at send time: remapped with the prompt, in place and without an undo step of
+     * their own, and in every undo and redo step that carries a copy of them (a data, canvas or turn step), as the
+     * prompt field's own history is. Not in remapOthers: a turn snapshot that brings the layers back brings these too.
+     */
+    remapBoxDescs(r) {
+        const fix = (pd) => {
+            const d = pd && typeof pd === "object" ? pd.boxes : null;
+            if (!d || !Array.isArray(d.boxes)) return;
+            d.boxes = d.boxes.map((b) => {
+                if (!b || typeof b.desc !== "string") return b;
+                const desc = r(b.desc);
+                return desc === b.desc ? b : { ...b, desc };
+            });
+        };
+        fix(this.pluginData);
+        for (const s of [...(this.undo || []), ...(this.redo || [])]) if (s && s.pluginData) fix(s.pluginData);
     }
 
     /**

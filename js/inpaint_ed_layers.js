@@ -303,10 +303,12 @@ export class LayersPart {
         if (!layer) { this.setStatus("Select a layer to duplicate."); return null; }
         this.pushUndo({ kind: "layers", label: "Duplicate layer" });
         this.layerCounter += 1;
+        // a layer whose upload is still running has new pixels and the old file: the copy stores its own (syncLayersOnce)
+        const pxDirty = !!layer.dirty || !!layer._uploading, maskDirty = !!layer.maskDirty || !!layer._maskUploading;
         const copy = {
             ...layer, id: "L" + Date.now().toString(36) + this.layerCounter, name: layer.name + " copy",
-            ref: layer.dirty ? null : layer.ref, dirty: !!layer.dirty || !layer.ref, exportRef: null, locked: false,
-            maskRef: layer.maskDirty ? null : layer.maskRef, maskDirty: !!layer.maskPx && (!!layer.maskDirty || !layer.maskRef), maskEdit: false,
+            ref: pxDirty ? null : layer.ref, dirty: pxDirty || !layer.ref, exportRef: null, locked: false,
+            maskRef: maskDirty ? null : layer.maskRef, maskDirty: !!layer.maskPx && (maskDirty || !layer.maskRef), maskEdit: false,
             _masked: null, _maskedValid: false, _mcache: null, _fcache: null, _fxCache: null, _textUndo: null, _undoPending: null,
             _relight: null, _bstats: null, _bstatsRun: null,
         };
@@ -323,7 +325,7 @@ export class LayersPart {
         if (layer.match) copy.match = { ...layer.match };
         if (layer.lut) copy.lut = { ...layer.lut };
         if (layer.plate) copy.plate = { ...layer.plate };
-        if (layer.kind === "filter") copy.dirty = false;
+        if (layer.kind === "filter" && !(FILTERS[layer.filter] && FILTERS[layer.filter].ownPixels)) copy.dirty = false;   // Deep paint's paint is its own file
         // the copy of a reference goes below the lowest reference, so it takes the next number and none of the others moves
         const below = host.refTokens && this.isReference(layer);
         const i = below ? this.layers.findIndex((l) => this.isReference(l)) : this.layers.indexOf(layer) + 1;
@@ -355,6 +357,9 @@ export class LayersPart {
             try {
                 this.setStatus(`Merging ${layer.name} into the base ...`);
                 before = this.snapshot({ kind: "canvas" });
+                // what the step and the new base are of: an edit or a landing result during the upload is in neither, so
+                // the commit below would drop it (as in flattenNow)
+                const gen = this.historyGen, ver = this.compositeVersion, ids = this.layers.map((l) => l.id).join(",");
                 const c = makeCanvas(this.width, this.height);
                 const ctx = c.getContext("2d");
                 this.drawBaseInto(ctx, 0, 0, this.width, this.height);
@@ -367,6 +372,11 @@ export class LayersPart {
                 ctx.globalAlpha = 1;
                 ctx.globalCompositeOperation = "source-over";
                 const { ref } = await uploadCanvas(c, `n${this.node.id}_base`);
+                if (this.historyGen !== gen || this.compositeVersion !== ver || this.layers.map((l) => l.id).join(",") !== ids || this.gestureHeld()) {
+                    this.releaseSnapshot(before); before = null;
+                    this.setStatus(`The picture changed while ${layer.name} was being merged, so nothing was merged. Merge it again.`, "warn");
+                    return;
+                }
                 const px = this.pixels.Layer.fromCanvas(c);   // C6 (d): not the upload decoded again
                 pushed = true;
                 this.pushUndoSnapshot(before, { tracked: true, label: "Merge into base" });
@@ -1221,6 +1231,39 @@ export class LayersPart {
      * @param {any} p
      * @param {HTMLElement} anchor
      */
+    /**
+     * A small list of actions under a button (`items`: { label, title, run }), placed as the choice lists are; a click
+     * runs one and closes the list, a click outside or the button again closes it.
+     */
+    openActionList(anchor, items) {
+        if (this.flyout && this.flyout.group && this.flyout.group.btn === anchor) { this.closeFlyout(); return; }
+        this.closeFlyout();
+        const fly = el("div", "ipc-flyout ipc-choices");
+        for (const it of items) {
+            const row = el("button", "ipc-choice-item ipc-choice-row");
+            row.type = "button";
+            row.textContent = it.label;
+            row.title = it.title || it.label;
+            row.addEventListener("click", (e) => { e.stopPropagation(); this.closeFlyout(); it.run(); });
+            fly.appendChild(row);
+        }
+        for (const type of ["pointerdown", "mousedown", "click", "wheel"]) fly.addEventListener(type, (e) => e.stopPropagation());
+        this.root.appendChild(fly);
+        const r = anchor.getBoundingClientRect(), rr = this.root.getBoundingClientRect();
+        let left = r.right - rr.left + 6;
+        if (left + fly.offsetWidth > rr.width - 4) left = Math.max(4, r.left - rr.left - fly.offsetWidth - 6);
+        fly.style.left = `${left}px`;
+        fly.style.top = `${Math.max(4, Math.min(r.top - rr.top, rr.height - fly.offsetHeight - 8))}px`;
+        this.flyout = { el: fly, group: { btn: anchor }, onClose: () => {} };
+        if (!this._flyDocDown) {
+            this._flyDocDown = (e) => {
+                const t = e.target instanceof Node ? e.target : null;
+                if (this.flyout && (!t || (!this.flyout.el.contains(t) && !(this.flyout.group && this.flyout.group.btn && this.flyout.group.btn.contains(t))))) this.closeFlyout();
+            };
+            window.addEventListener("pointerdown", this._flyDocDown, true);
+        }
+    }
+
     openChoiceList(layer, p, anchor) {
         if (this.flyout && this.flyout.group && this.flyout.group.btn === anchor) {
             this.closeFlyout();

@@ -72,6 +72,7 @@ import { Px } from "./px/px.js";
 import { hash32, mul255 } from "./blend_modes.js";
 import { detailRatio } from "./inpaint_relight.js";
 import { countTileCells, labelParts } from "./inpaint_areas.js";
+import { surfaceMaps } from "./inpaint_surface.js";
 
 const TILE = 256, LEVELS = 5, TILE_BYTES = TILE * TILE * 4;
 const now = () => performance.now();
@@ -1635,6 +1636,22 @@ function liquifyJob(msg) {
     return { tiles, stats, transfer, timing: { op: "liquify", kernels: kernelsInUse(), tiles: msg.txs.length, total: now() - t0 } };
 }
 
+/** Deep paint's shading and residual maps from the decomposition (inpaint_surface.js `surfaceMaps`). */
+function surfaceMapsJob(msg) {
+    const t0 = now();
+    const f32 = (v) => (v instanceof Float32Array ? v : new Float32Array(v));
+    const u8 = (v) => (v instanceof Uint8Array ? v : new Uint8Array(v));
+    const res = surfaceMaps({
+        albedo: f32(msg.albedo), shading: f32(msg.shading), residual: f32(msg.residual), model: u8(msg.model),
+        mw: msg.mw, mh: msg.mh, picture: u8(msg.picture), gw: msg.gw, gh: msg.gh, box: boxBlurs, mode: msg.mode || "model",
+    });
+    return {
+        shading: res.shading.buffer, residual: res.residual.buffer, sScale: res.sScale, a: res.a, b: res.b, r: res.r,
+        identity: res.identity, clampedA: res.clampedA, zeroA: res.zeroA,
+        transfer: [res.shading.buffer, res.residual.buffer], timing: { op: "surface_maps", total: now() - t0 },
+    };
+}
+
 function depthGuide(msg) {
     const t0 = now();
     const raw = msg.raw instanceof Float32Array ? msg.raw : new Float32Array(msg.raw);
@@ -1973,6 +1990,7 @@ async function run(msg) {
     if (msg.op === "range_select") return rangeSelectJob(msg);
     if (msg.op === "area_cells") return areaCellsJob(msg);
     if (msg.op === "depth_guide") return depthGuide(msg);
+    if (msg.op === "surface_maps") return surfaceMapsJob(msg);
     if (msg.op === "depth_fuse") return depthFuse(msg);
     if (msg.op === "resample") return resampleJob(msg);
     if (msg.op === "liquify") return liquifyJob(msg);

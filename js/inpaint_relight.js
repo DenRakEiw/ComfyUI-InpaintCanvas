@@ -11,6 +11,46 @@ import { registerGLFilter } from "./inpaint_filters_gl.js";
 import { bilinearResize } from "./inpaint_depth.js";
 import { heightNormals, shadowMarch, boxBlurs } from "./px/kernels.js";
 import { CancelledError } from "./inpaint_pool.js";
+import { RGB16_GLSL, rgb16Bilinear, rgb16Views } from "./inpaint_surfacefx.js";
+
+/**
+ * Whether a relight pass lights the surface maps' own colour (SP6, docs/PLAN_SURFACE_PAINT.md): the layer's `surface`
+ * switch on and both maps (shading, residual) present as rgb16. Otherwise the fitted colour of before, unchanged.
+ */
+export function relightSurfaceOn(params, info) {
+    const m = info && info.maps;
+    return !!(params && params.surface && m && m.shading && m.residual && m.shading.enc === "rgb16" && m.residual.enc === "rgb16");
+}
+
+/**
+ * With the surface maps on (SP6) and a normals map in the document, the light's facing comes from MoGe-2's normals
+ * instead of the depth map's gradient: the normals map (rgba8, (n + 1) / 2) and the 2 x 2 matrix [a, b, c, d] that takes
+ * its vector's x, y (its own frame) into the depth map's (relight works in the depth map's frame): the normals map's
+ * frame into the document's, then the document's into the depth map's (both a turn or a mirror, so the inverse is the
+ * transpose). MoGe's z points away from the viewer, relight's towards it: z changes sign. Null when not in use.
+ */
+export function relightNormalsOf(params, info) {
+    if (!relightSurfaceOn(params, info)) return null;
+    const N = info.maps.normals, D = info.maps.depth;
+    if (!N || N.enc !== "rgba8" || !N.data || !D) return null;
+    const fr = (map) => {
+        const xf = map.xf || [map.w, 0, 0, map.h, 0, 0];
+        const la = Math.hypot(xf[0], xf[1]) || 1, lb = Math.hypot(xf[2], xf[3]) || 1;
+        return [xf[0] / la, xf[1] / la, xf[2] / lb, xf[3] / lb];   // columns: the map's x and y in the document
+    };
+    const [nax, nay, nbx, nby] = fr(N), [dax, day, dbx, dby] = fr(D);
+    // doc = Fn * v; depth = Fd^T * doc
+    const m = [dax * nax + day * nay, dax * nbx + day * nby, dbx * nax + dby * nay, dbx * nbx + dby * nby];
+    return { map: N, m };
+}
+
+/** A relight normal (towards the viewer) from MoGe-2's packed normal at a pixel: the map's bytes / 255 in, [x, y, z] out. */
+export function relightNormalFromMoge(r, g, b, m) {
+    const mx = 2 * r - 1, my = 2 * g - 1, mz = 2 * b - 1;
+    const x = m[0] * mx + m[1] * my, y = m[2] * mx + m[3] * my, z = -mz;
+    const len = Math.hypot(x, y, z);
+    return len > 1e-6 ? [x / len, y / len, z / len] : [0, 0, 1];
+}
 
 // ---- the march on the pool in stripes (K12, docs/PLAN_WASM_BUILD.md section 4.5) ---------------------------------------------
 
@@ -260,6 +300,15 @@ function sampleRgbaBilinear(data, w, h, x, y) {
     ];
 }
 
+
+/**
+ * Where the surface maps' light S is too dark to divide by (docs/PLAN_SURFACE_PAINT.md, the hand test of 2026-11-14):
+ * the colour (p - R) / S multiplies every bit of noise by 1 / S, 15 to 40 times in a shadow, and S's channels differ
+ * there, so a deep shadow came out speckled and falsely coloured. The trust w = smoothstep(lo, hi, luma(S)): at w = 1
+ * (S's luma at `hi` or above, so 1 / S stays under about 3, the fitted route's Recover) the surface branch as before; below it S's channels go towards their luma (no false colour)
+ * and the result towards the fitted route (surface off), which it is at w = 0.
+ */
+export const RELIGHT_SURFACE_TRUST = Object.freeze([0.1, 0.35]);
 
 export const LIGHT_MAX = 4;
 export const LIGHT_TYPES = Object.freeze(["point", "sun", "spot"]);
@@ -952,9 +1001,13 @@ export function relightShoulder(base, x) {
  * @param {object} [params=null] - Filter parameters (original, ambient, shadows, recover)
  * @param {{ l0: [number, number, number], ka: number, kd: number }|null} [fit=null]
  * @param {number[]|null} [visValues=null] - Shadow visibility for each light (0..1)
+ * @param {{ s: number[], r: number[] }|null} [surf=null] - the surface maps at the pixel (SP6): the light S (times its
+ *   sScale) and the reflections R, linear; the colour lit is then A = clamp((p - R) / S) and what stays of the picture
+ *   R + original A S, in place of the fitted colour p / S_fit and original p; where S is dark this goes towards the
+ *   fitted route by the trust of RELIGHT_SURFACE_TRUST
  * @returns {[number, number, number, number]} Output pixel RGBA in 0..255
  */
-export function shadePixel(srcRgba, normal, mapCoord, lights, params = null, fit = null, visValues = null) {
+export function shadePixel(srcRgba, normal, mapCoord, lights, params = null, fit = null, visValues = null, surf = null) {
     const sr = Number(srcRgba[0]) / 255.0;
     const sg = Number(srcRgba[1]) / 255.0;
     const sb = Number(srcRgba[2]) / 255.0;
@@ -1015,9 +1068,29 @@ export function shadePixel(srcRgba, normal, mapCoord, lights, params = null, fit
         gain = 1.0 + (gain - 1.0) * fade;
     }
 
-    const fr = pr * gain;
-    const fg = pg * gain;
-    const fb = pb * gain;
+    let fr = pr * gain;
+    let fg = pg * gain;
+    let fb = pb * gain;
+    // what stays of the picture's own light at Original light o: o p, or with the surface maps R + o A S (= p at o = 1)
+    let keepR = pr, keepG = pg, keepB = pb;
+    // the reflections that stay whole, times the trust (0 without the surface maps)
+    let rR = 0, rG = 0, rB = 0;
+    if (surf) {
+        const sY = 0.2126 * surf.s[0] + 0.7152 * surf.s[1] + 0.0722 * surf.s[2];
+        const [t0, t1] = RELIGHT_SURFACE_TRUST;
+        const tt = Math.max(0, Math.min(1, (sY - t0) / (t1 - t0)));
+        const w = tt * tt * (3 - 2 * tt);
+        if (w > 0) {
+            const se = [sY + (surf.s[0] - sY) * w, sY + (surf.s[1] - sY) * w, sY + (surf.s[2] - sY) * w];
+            const al = (v, c) => { const d = se[c]; const a = d > 1e-4 ? (v - surf.r[c]) / d : 0; return a < 0 ? 0 : a > 1 ? 1 : a; };
+            const ar = al(pr, 0), ag = al(pg, 1), ab = al(pb, 2);
+            fr += (ar - fr) * w; fg += (ag - fg) * w; fb += (ab - fb) * w;
+            keepR = pr + (ar * se[0] - pr) * w; keepG = pg + (ag * se[1] - pg) * w; keepB = pb + (ab * se[2] - pb) * w;
+            // the reflections as this pixel's own: p - A S, which is R where A is not clamped and keeps the picture's
+            // detail finer than the maps (they are at most 4096 px wide) where it is, so R + o A S is p at o = 1
+            rR = (pr - ar * se[0]) * w; rG = (pg - ag * se[1]) * w; rB = (pb - ab * se[2]) * w;
+        }
+    }
 
     // Accumulate virtual lights
     let lsumR = 0, lsumG = 0, lsumB = 0;
@@ -1182,10 +1255,12 @@ export function shadePixel(srcRgba, normal, mapCoord, lights, params = null, fit
     const addedB = fb * ((1.0 - o) * ambient + lsumB);
 
     // the knee's base: the picture without the lights (Original light and the Ambient fill that replaces the rest)
+    // with the surface maps the reflections R stay whole: base R + o A S
     const fill = (1.0 - o) * ambient;
-    const outLinR = relightShoulder(Math.min(1.0, o * pr + fr * fill), o * pr + addedR);
-    const outLinG = relightShoulder(Math.min(1.0, o * pg + fg * fill), o * pg + addedG);
-    const outLinB = relightShoulder(Math.min(1.0, o * pb + fb * fill), o * pb + addedB);
+    const baseR = rR + o * keepR, baseG = rG + o * keepG, baseB = rB + o * keepB;
+    const outLinR = relightShoulder(Math.min(1.0, baseR + fr * fill), baseR + addedR);
+    const outLinG = relightShoulder(Math.min(1.0, baseG + fg * fill), baseG + addedG);
+    const outLinB = relightShoulder(Math.min(1.0, baseB + fb * fill), baseB + addedB);
 
     const outSrgbR = Math.max(0, Math.min(255, Math.round(linearToSrgb(outLinR) * 255)));
     const outSrgbG = Math.max(0, Math.min(255, Math.round(linearToSrgb(outLinG) * 255)));
@@ -1605,6 +1680,12 @@ export function applyRelight(src, params, info = {}) {
     const mappedLights = lightsList.map((l) => ({ ...l, ...lightToMap(l, map, { depth_scale: depthScale }), rgbLin: kelvinToRgb(l.color) }));
     const scaleVisX = visW / map.w;
     const scaleVisY = visH / map.h;
+    // SP6: the surface maps at each pixel's centre, as Deep paint samples them (inpaint_surfacefx.js)
+    const SM = relightSurfaceOn(p, info) ? info.maps.shading : null, RM = SM ? info.maps.residual : null;
+    const sScaleS = SM ? (SM.meta && SM.meta.sScale) || 1 : 1;
+    const msS = SM ? passToMap(SM, scale) : null, msR = SM ? passToMap(RM, scale) : null;
+    const surf = SM ? { s: [0, 0, 0], r: [0, 0, 0] } : null;
+    const mn = relightNormalsOf(p, info), mnM = mn ? passToMap(mn.map, scale) : null;
 
     for (let y = 0; y < H; y++) {
         const py = origin[1] + y + 0.5;
@@ -1701,13 +1782,23 @@ export function applyRelight(src, params, info = {}) {
                 }
             }
 
-            const nx = (nRgba[0] - 127.5) / 127.5;
-            const ny = (nRgba[1] - 127.5) / 127.5;
-            const nz = (nRgba[2] - 127.5) / 127.5;
+            let nx = (nRgba[0] - 127.5) / 127.5;
+            let ny = (nRgba[1] - 127.5) / 127.5;
+            let nz = (nRgba[2] - 127.5) / 127.5;
+            if (mn) {
+                // MoGe-2's normal at the pixel's centre, bilinear (the shader's linear filter on the same bytes)
+                const q = sampleRgbaBilinear(mn.map.data, mn.map.w, mn.map.h, mnM[0] * px_x + mnM[2] * py + mnM[4], mnM[1] * px_x + mnM[3] * py + mnM[5]);
+                [nx, ny, nz] = relightNormalFromMoge(q[0] / 255, q[1] / 255, q[2] / 255, mn.m);
+            }
 
             const vVals = [vRgba[0] / 255.0, vRgba[1] / 255.0, vRgba[2] / 255.0, vRgba[3] / 255.0];
 
-            const outRgba = shadePixel([sr, sg, sb, sa], [nx, ny, nz], [mx, my, (1.0 - far) * scaleZ], mappedLights, p, fit, vVals);
+            if (surf) {
+                rgb16Bilinear(SM.data, SM.w, SM.h, msS[0] * px_x + msS[2] * py + msS[4], msS[1] * px_x + msS[3] * py + msS[5], surf.s);
+                rgb16Bilinear(RM.data, RM.w, RM.h, msR[0] * px_x + msR[2] * py + msR[4], msR[1] * px_x + msR[3] * py + msR[5], surf.r);
+                surf.s[0] *= sScaleS; surf.s[1] *= sScaleS; surf.s[2] *= sScaleS;
+            }
+            const outRgba = shadePixel([sr, sg, sb, sa], [nx, ny, nz], [mx, my, (1.0 - far) * scaleZ], mappedLights, p, fit, vVals, surf);
             px[idx] = outRgba[0];
             px[idx + 1] = outRgba[1];
             px[idx + 2] = outRgba[2];
@@ -1727,6 +1818,7 @@ float w_sstep(float a, float b, float x) {
 
 ${SAMPLE_GLSL}
 ${SNAP_GLSL}
+${RGB16_GLSL}
 
 float rl_srgbToLinear(float c) {
     c = clamp(c, 0.0, 1.0);
@@ -1905,6 +1997,14 @@ vec4 shade(vec4 c, vec2 uv) {
         normal = nLen > 1e-5 ? nRaw / nLen : vec3(0.0, 0.0, 1.0);
         vis = vTex;
     }
+    if (u_mnOn == 1) {
+        // MoGe-2's normal (SP6): its frame into the depth map's, z towards the viewer
+        vec2 mq = vec2(dot(u_mn0.xy, pp) + u_mn1.x, dot(u_mn0.zw, pp) + u_mn1.y);
+        vec3 m3 = texture(u_mn, mq / vec2(textureSize(u_mn, 0))).xyz * 2.0 - 1.0;
+        vec3 rn = vec3(u_mnF.x * m3.x + u_mnF.y * m3.y, u_mnF.z * m3.x + u_mnF.w * m3.y, -m3.z);
+        float rl = length(rn);
+        normal = rl > 1e-6 ? rn / rl : vec3(0.0, 0.0, 1.0);
+    }
 
     vec3 mpos = vec3(mpx.x, mpx.y, (1.0 - far) * u_depth_scale);
 
@@ -1923,6 +2023,22 @@ vec4 shade(vec4 c, vec2 uv) {
         gain = 1.0 + (gain - 1.0) * fade;
     }
     vec3 fLin = pLin * gain;
+    // SP6: with the surface maps the colour lit is A = clamp((p - R) / S) and what stays of the picture R + o A S
+    vec3 sS = vec3(1.0), sR = vec3(0.0);
+    if (u_surf == 1) {
+        sS = rgb16Bilinear(u_s1, u_s2, vec2(dot(u_ms0.xy, pp) + u_ms1.x, dot(u_ms0.zw, pp) + u_ms1.y)) * u_sScale;
+        sR = rgb16Bilinear(u_r1, u_r2, vec2(dot(u_mr0.xy, pp) + u_mr1.x, dot(u_mr0.zw, pp) + u_mr1.y));
+    }
+    vec3 keepLin = u_original * pLin;
+    if (u_surf == 1) {
+        // RELIGHT_SURFACE_TRUST: a dark S goes towards its luma and the result towards the fitted route
+        float sY = dot(sS, vec3(0.2126, 0.7152, 0.0722));
+        float w = smoothstep(u_trust.x, u_trust.y, sY);
+        vec3 se = mix(vec3(sY), sS, w);
+        vec3 a = clamp(vec3(se.r > 1e-4 ? (pLin.r - sR.r) / se.r : 0.0, se.g > 1e-4 ? (pLin.g - sR.g) / se.g : 0.0, se.b > 1e-4 ? (pLin.b - sR.b) / se.b : 0.0), 0.0, 1.0);
+        fLin = mix(fLin, a, w);
+        keepLin = w * (pLin - a * se) + u_original * mix(pLin, a * se, w);   // p - A S: R with the picture's fine detail
+    }
 
     vec3 lsum = vec3(0.0);
     lsum += rl_evalLight(u_l0_pos, u_l0_col, u_l0_cone, u_l0_edge, u_lkind.x, u_lmask.x, u_lspec.x, u_lgobo.x, vis.r, normal, mpos);
@@ -1936,8 +2052,8 @@ vec4 shade(vec4 c, vec2 uv) {
     }
 
     vec3 added = fLin * (vec3((1.0 - u_original) * u_ambient) + lsum);
-    vec3 outLin = u_original * pLin + added;
-    vec3 baseLin = min(vec3(1.0), u_original * pLin + fLin * ((1.0 - u_original) * u_ambient));
+    vec3 outLin = keepLin + added;
+    vec3 baseLin = min(vec3(1.0), keepLin + fLin * ((1.0 - u_original) * u_ambient));
     outLin = vec3(rl_shoulder(baseLin.r, outLin.r), rl_shoulder(baseLin.g, outLin.g), rl_shoulder(baseLin.b, outLin.b));
 
     return vec4(rl_linearToSrgb(outLin), c.a);
@@ -1984,6 +2100,10 @@ export function registerRelightGL() {
             u_recover: "float",
             u_depth_scale: "float",
             u_mode: "int",
+            u_surf: "int",
+            u_s1: "sampler2D", u_s2: "sampler2D", u_r1: "sampler2D", u_r2: "sampler2D",
+            u_ms0: "vec4", u_ms1: "vec2", u_mr0: "vec4", u_mr1: "vec2", u_sScale: "float", u_trust: "vec2",
+            u_mnOn: "int", u_mn: "sampler2D", u_mn0: "vec4", u_mn1: "vec2", u_mnF: "vec4",
         },
         code: RELIGHT_GLSL,
         values: (params, info) => {
@@ -2081,6 +2201,12 @@ export function registerRelightGL() {
             const origPct = Number.isFinite(p.original) ? Number(p.original) : 100;
             const ambientPct = Number.isFinite(p.ambient) ? Number(p.ambient) : 15;
             const recoverVal = Number.isFinite(p.recover) ? Number(p.recover) : 3.0;
+            // SP6: the surface maps as Deep paint hands them over (two RGBA8 textures per rgb16 map)
+            const surfOn = relightSurfaceOn(p, info);
+            const SM = surfOn ? info.maps.shading : null, RM = surfOn ? info.maps.residual : null;
+            const sv = surfOn ? rgb16Views(SM) : null, rv = surfOn ? rgb16Views(RM) : null;
+            const msS = surfOn ? passToMap(SM, scale) : [1, 0, 0, 1, 0, 0], msR = surfOn ? passToMap(RM, scale) : [1, 0, 0, 1, 0, 0];
+            const mn = relightNormalsOf(p, info), mnM = mn ? passToMap(mn.map, scale) : [1, 0, 0, 1, 0, 0];
 
             return {
                 u_map: map ? rg8View(map) : DUMMY_RG8,
@@ -2117,6 +2243,16 @@ export function registerRelightGL() {
                 u_recover: recoverVal,
                 u_depth_scale: depthScaleMap,
                 u_mode: p.mode === 1 ? 1 : 0,
+                u_surf: surfOn ? 1 : 0,
+                u_s1: sv ? sv[0] : DUMMY_RGBA8, u_s2: sv ? sv[1] : DUMMY_RGBA8, u_r1: rv ? rv[0] : DUMMY_RGBA8, u_r2: rv ? rv[1] : DUMMY_RGBA8,
+                u_ms0: [msS[0], msS[2], msS[1], msS[3]], u_ms1: [msS[4], msS[5]],
+                u_mr0: [msR[0], msR[2], msR[1], msR[3]], u_mr1: [msR[4], msR[5]],
+                u_sScale: surfOn ? (SM.meta && SM.meta.sScale) || 1 : 1,
+                u_trust: [RELIGHT_SURFACE_TRUST[0], RELIGHT_SURFACE_TRUST[1]],
+                u_mnOn: mn ? 1 : 0,
+                u_mn: mn ? { data: mn.map.data, width: mn.map.w, height: mn.map.h, channels: 4, linear: true, static: true, key: "relight:mn:" + (mn.map.dataVersion || 0) + ":" + mn.map.w } : DUMMY_RGBA8,
+                u_mn0: [mnM[0], mnM[2], mnM[1], mnM[3]], u_mn1: [mnM[4], mnM[5]],
+                u_mnF: mn ? mn.m : [1, 0, 0, 1],
             };
         },
         skip: relightSkip,   // the CPU twin's own predicate (applyRelight), not a copy of it

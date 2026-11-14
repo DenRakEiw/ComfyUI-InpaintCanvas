@@ -19,8 +19,11 @@ export class PanelsPart {
         // a fill layer picks among the fills, a filter layer among the filters
         const fill = !!(FILTERS[layer.filter] && FILTERS[layer.filter].over);
         typeSel.title = fill ? "Fill type" : "Filter type";
+        // a layer with its own pixels (Deep paint) is no type to pick, nor one to switch away from
+        const own = !!(FILTERS[layer.filter] && FILTERS[layer.filter].ownPixels);
         for (const id of FILTER_IDS) {
             if (!!FILTERS[id].over !== fill) continue;
+            if (own ? id !== layer.filter : FILTERS[id].ownPixels) continue;
             const fdef = FILTERS[id];
             if (id !== layer.filter && !host.depthSupported) {
                 const needsDepth = (typeof fdef.maps === "function" && fdef.maps({}).includes("depth")) || (Array.isArray(fdef.maps) && fdef.maps.includes("depth"));
@@ -33,6 +36,7 @@ export class PanelsPart {
         const missing = !FILTERS[layer.filter];
         if (missing) { const o = document.createElement("option"); o.value = ""; o.textContent = `missing: ${layer.filter}`; o.disabled = true; typeSel.insertBefore(o, typeSel.firstChild); }
         typeSel.value = missing ? "" : layer.filter;
+        if (own) typeSel.disabled = true;
         typeSel.addEventListener("click", stop);
         typeSel.addEventListener("keydown", stop);
         typeSel.addEventListener("change", () => this.setFilterType(layer, typeSel.value));
@@ -81,6 +85,7 @@ export class PanelsPart {
         let presetSel = null;
         for (const p of def.params) {
             if (p.hidden) continue;
+            if (p.surfaceOnly && host.surfaceSupported !== true) continue;   // Deep paint's rows: not in the ComfyUI node
             if (p.onlyWithPlate && !layer.plate) continue;
             if (p.notWithPlate && layer.plate) continue;
             if (p.when) {

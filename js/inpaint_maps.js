@@ -13,11 +13,47 @@ export const snapXf = (m) => [m[0], m[1], m[2], m[3], snapNum(m[4]), snapNum(m[5
 let seq = 0;
 
 /**
+ * Map encodings (PLAN_SURFACE_PAINT.md SP1). `ch` values per pixel of `Type`, interleaved; `json` the name written as
+ * `enc`; `bands` the opaque RGB bands of the stored file, stacked top to bottom (`h * bands` rows, alpha always 255, so
+ * no value ever goes through premultiplication):
+ * - `u16`: one 16-bit value (depth). One band, R = high byte, G = low byte (`packRG16`, the files since 0.1.33).
+ * - `rgb16`: three 16-bit values (shading, residual, linear 0..1). Band 0 the high bytes, band 1 the low bytes.
+ * - `rgba8`: four bytes (normals and a mask). Band 0 RGB, band 1 R = A.
+ */
+export const MAP_ENC = Object.freeze({
+    u16: Object.freeze({ id: "u16", ch: 1, Type: Uint16Array, json: "u16rg", bands: 1, max: 65535 }),
+    rgb16: Object.freeze({ id: "rgb16", ch: 3, Type: Uint16Array, json: "rgb16", bands: 2, max: 65535 }),
+    rgba8: Object.freeze({ id: "rgba8", ch: 4, Type: Uint8Array, json: "rgba8", bands: 2, max: 255 }),
+});
+const ENC_OF_JSON = { u16rg: "u16", rgb16: "rgb16", rgba8: "rgba8" };
+
+/** The encoding of a map (a map made before SP1 has none: u16). */
+export function mapEnc(map) {
+    return MAP_ENC[(map && map.enc) || "u16"] || MAP_ENC.u16;
+}
+
+const sharedOk = () => typeof crossOriginIsolated !== "undefined" && crossOriginIsolated && typeof SharedArrayBuffer !== "undefined";
+
+/** `n` values of `Type` holding `src` (copied; a shared array of the right type is taken as it is when isolated). */
+function ownArray(Type, n, src) {
+    if (sharedOk()) {
+        if (src && src instanceof Type && src.buffer instanceof SharedArrayBuffer) return src;
+        const out = new Type(new SharedArrayBuffer(n * Type.BYTES_PER_ELEMENT));
+        if (src) out.set(src.subarray ? src.subarray(0, n) : src);
+        return out;
+    }
+    const out = new Type(n);
+    if (src) out.set(src.subarray ? src.subarray(0, n) : src);
+    return out;
+}
+
+/**
  * @typedef {{
  *   kind: string,
+ *   enc: string,
  *   w: number,
  *   h: number,
- *   data: Uint16Array,
+ *   data: Uint16Array | Uint8Array,
  *   guide: Uint8Array | null,
  *   xf: number[],
  *   meta: object,
@@ -39,23 +75,14 @@ let seq = 0;
  * @param {number[]} [xf]
  * @param {object} [meta]
  * @param {ArrayLike<number>} [guide]
+ * @param {string} [enc] "u16" (default), "rgb16" or "rgba8" (MAP_ENC); `data` holds `ch` values per pixel, interleaved
  * @returns {DocMap}
  */
-export function makeMap(kind, w, h, data, xf, meta = {}, guide = null) {
+export function makeMap(kind, w, h, data, xf, meta = {}, guide = null, enc = "u16") {
+    const e = MAP_ENC[enc || "u16"];
+    if (!e) throw new Error(`unknown map encoding "${enc}"`);
     const len = (w | 0) * (h | 0);
-    let u16;
-    if (typeof crossOriginIsolated !== "undefined" && crossOriginIsolated && typeof SharedArrayBuffer !== "undefined") {
-        if (data && data.buffer instanceof SharedArrayBuffer) {
-            u16 = data;
-        } else {
-            const sab = new SharedArrayBuffer(len * 2);
-            u16 = new Uint16Array(sab);
-            if (data) u16.set(data.subarray ? data.subarray(0, len) : data);
-        }
-    } else {
-        u16 = new Uint16Array(len);
-        if (data) u16.set(data.subarray ? data.subarray(0, len) : data);
-    }
+    const values = ownArray(e.Type, len * e.ch, data);
 
     let u8Guide = null;
     if (guide) {
@@ -79,9 +106,10 @@ export function makeMap(kind, w, h, data, xf, meta = {}, guide = null) {
     const v = ++seq;
     return {
         kind: String(kind || "depth"),
+        enc: e.id,
         w: w | 0,
         h: h | 0,
-        data: u16,
+        data: values,
         guide: u8Guide || null,
         xf: mapXf,
         meta: meta ? { ...meta } : {},
@@ -139,6 +167,72 @@ export function unpackRG16(rgba, w, h) {
 }
 
 /**
+ * Pack any map into an opaque RGBA8 canvas of `w` x `h * bands` (MAP_ENC); a u16 map gives `packRG16`'s canvas.
+ * @param {DocMap} map
+ * @returns {HTMLCanvasElement}
+ */
+export function packMap(map) {
+    const e = mapEnc(map);
+    if (e.id === "u16") return packRG16(map);
+    const w = map.w, h = map.h, n = w * h;
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h * e.bands;
+    const ctx = canvas.getContext("2d");
+    const imgData = ctx.createImageData(w, h * e.bands);
+    const d = imgData.data;
+    const src = map.data;
+    const lo = n * 4;
+    if (e.id === "rgb16") {
+        for (let i = 0; i < n; i++) {
+            const s = i * 3, o = i * 4;
+            const r = src[s], g = src[s + 1], b = src[s + 2];
+            d[o] = r >> 8; d[o + 1] = g >> 8; d[o + 2] = b >> 8; d[o + 3] = 255;
+            d[lo + o] = r & 255; d[lo + o + 1] = g & 255; d[lo + o + 2] = b & 255; d[lo + o + 3] = 255;
+        }
+    } else {
+        for (let i = 0; i < n; i++) {
+            const o = i * 4;
+            d[o] = src[o]; d[o + 1] = src[o + 1]; d[o + 2] = src[o + 2]; d[o + 3] = 255;
+            d[lo + o] = src[o + 3]; d[lo + o + 1] = 0; d[lo + o + 2] = 0; d[lo + o + 3] = 255;
+        }
+    }
+    ctx.putImageData(imgData, 0, 0);
+    return canvas;
+}
+
+/**
+ * Unpack the RGBA8 bytes of a `packMap` canvas (`w` x `h * bands`) back to the map's values.
+ * @param {Uint8Array|Uint8ClampedArray|ImageData} rgba
+ * @param {number} w
+ * @param {number} h the map's height (not the file's)
+ * @param {string} [enc]
+ * @returns {Uint16Array|Uint8Array}
+ */
+export function unpackMap(rgba, w, h, enc = "u16") {
+    const e = MAP_ENC[enc || "u16"];
+    if (!e) throw new Error(`unknown map encoding "${enc}"`);
+    if (e.id === "u16") return unpackRG16(rgba, w, h);
+    const d = rgba && rgba.data ? rgba.data : rgba;
+    const n = (w | 0) * (h | 0), lo = n * 4;
+    const out = new e.Type(n * e.ch);
+    if (e.id === "rgb16") {
+        for (let i = 0; i < n; i++) {
+            const s = i * 3, o = i * 4;
+            out[s] = (d[o] << 8) | d[lo + o];
+            out[s + 1] = (d[o + 1] << 8) | d[lo + o + 1];
+            out[s + 2] = (d[o + 2] << 8) | d[lo + o + 2];
+        }
+    } else {
+        for (let i = 0; i < n; i++) {
+            const o = i * 4;
+            out[o] = d[o]; out[o + 1] = d[o + 1]; out[o + 2] = d[o + 2]; out[o + 3] = d[lo + o];
+        }
+    }
+    return out;
+}
+
+/**
  * Create a new DocMap derived from an existing one, sharing unchanged buffers.
  * Inherits ref/dataVersion if data is unchanged, guideRef/guideVersion if guide is unchanged.
  * @param {DocMap} map
@@ -158,13 +252,10 @@ export function deriveMap(map, patch = {}) {
     let ref = map.ref;
     if (dataChanged) {
         data = patch.data;
-        if (data && typeof crossOriginIsolated !== "undefined" && crossOriginIsolated && typeof SharedArrayBuffer !== "undefined" && !(data.buffer instanceof SharedArrayBuffer)) {
-            const len = w * h;
-            const sab = new SharedArrayBuffer(len * 2);
-            const u16 = new Uint16Array(sab);
-            u16.set(data.subarray ? data.subarray(0, len) : data);
-            data = u16;
-        }
+        // the encoding stays the map's (a derived map never changes its kind of values); outside isolation the array is
+        // taken as it is, as before
+        const e = mapEnc(map);
+        if (data && (!(data instanceof e.Type) || (sharedOk() && !(data.buffer instanceof SharedArrayBuffer)))) data = ownArray(e.Type, w * h * e.ch, data);
         dataVersion = v;
         ref = patch.ref !== undefined ? patch.ref : null;
     } else if (patch.ref !== undefined) {
@@ -191,6 +282,7 @@ export function deriveMap(map, patch = {}) {
 
     return {
         kind: patch.kind || map.kind,
+        enc: mapEnc(map).id,
         w,
         h,
         data,
@@ -218,6 +310,7 @@ const RG8_VIEWS = new WeakMap();
  * @param {DocMap} map
  */
 export function rg8View(map) {
+    if (mapEnc(map).id !== "u16") return null;   // a colour map has views of its own (SP4)
     let bytes = RG8_VIEWS.get(map.data);
     if (!bytes) {
         bytes = new Uint8Array(map.data.buffer, map.data.byteOffset, map.data.byteLength);
@@ -262,7 +355,7 @@ export function mapToJSON(map) {
         w: map.w,
         h: map.h,
         xf: Array.from(map.xf),
-        enc: "u16rg",
+        enc: mapEnc(map).json,
         meta: map.meta ? JSON.parse(JSON.stringify(map.meta)) : {},
     };
     if (map.guide || map.guideRef) {
@@ -280,16 +373,24 @@ export function mapToJSON(map) {
  */
 export async function mapFromJSON(kind, j, loadImage) {
     if (!j || !j.ref || !j.w || !j.h) return null;
+    // a map written before SP1 says "u16rg" (or nothing); an encoding this version does not know is not guessed at
+    const encId = j.enc == null ? "u16" : ENC_OF_JSON[j.enc];
+    if (!encId) {
+        console.warn(`mapFromJSON: unknown encoding "${j.enc}" of map "${kind}"`);
+        return null;
+    }
+    const e = MAP_ENC[encId];
     try {
         const img = await loadImage(j.ref);
         if (!img) return null;
+        const fileH = j.h * e.bands;
         const canvas = document.createElement("canvas");
         canvas.width = j.w;
-        canvas.height = j.h;
+        canvas.height = fileH;
         const ctx = canvas.getContext("2d");
-        ctx.drawImage(img, 0, 0, j.w, j.h);
-        const imgData = ctx.getImageData(0, 0, j.w, j.h);
-        const data = unpackRG16(imgData.data, j.w, j.h);
+        ctx.drawImage(img, 0, 0, j.w, fileH);
+        const imgData = ctx.getImageData(0, 0, j.w, fileH);
+        const data = unpackMap(imgData.data, j.w, j.h, encId);
 
         let guide = null;
         if (j.guide) {
@@ -310,7 +411,7 @@ export async function mapFromJSON(kind, j, loadImage) {
             }
         }
 
-        const map = makeMap(kind, j.w, j.h, data, j.xf, j.meta, guide);
+        const map = makeMap(kind, j.w, j.h, data, j.xf, j.meta, guide, encId);
         map.ref = j.ref;
         if (guide) {
             map.guideRef = j.guide;
@@ -347,9 +448,40 @@ export function passToMap(map, scale = 1) {
  */
 export function sampleMap(map, docX, docY) {
     if (!map || !map.data || map.w <= 0 || map.h <= 0) return 0;
+    if (mapEnc(map).id !== "u16") return sampleMapPx(map, docX, docY)[0];
     const inv = xfInv(map.xf || [map.w, 0, 0, map.h, 0, 0]);
     const [ux, uy] = xfApply(inv, docX, docY);
     return u16Bilinear(map.data, map.w, map.h, ux * map.w, uy * map.h);
+}
+
+/**
+ * Sample every channel of a map at document coordinate (docX, docY), bilinear with edge clamp (u16Bilinear's pixel
+ * centres), normalised to 0..1. A normal map's vectors are in the map's own frame: a consumer turns them by `xf`.
+ * @param {DocMap} map
+ * @param {number} docX
+ * @param {number} docY
+ * @param {number[]} [out]
+ * @returns {number[]} `ch` values
+ */
+export function sampleMapPx(map, docX, docY, out = []) {
+    const e = mapEnc(map);
+    out.length = e.ch;
+    if (!map || !map.data || map.w <= 0 || map.h <= 0) return out.fill(0);
+    const w = map.w, h = map.h, ch = e.ch, d = map.data;
+    const inv = xfInv(map.xf || [w, 0, 0, h, 0, 0]);
+    const [ux, uy] = xfApply(inv, docX, docY);
+    const u = ux * w - 0.5, v = uy * h - 0.5;
+    const x0 = Math.floor(u), y0 = Math.floor(v);
+    const fx = u - x0, fy = v - y0;
+    const cx0 = Math.max(0, Math.min(w - 1, x0)), cx1 = Math.max(0, Math.min(w - 1, x0 + 1));
+    const cy0 = Math.max(0, Math.min(h - 1, y0)), cy1 = Math.max(0, Math.min(h - 1, y0 + 1));
+    const i00 = (cy0 * w + cx0) * ch, i10 = (cy0 * w + cx1) * ch, i01 = (cy1 * w + cx0) * ch, i11 = (cy1 * w + cx1) * ch;
+    for (let c = 0; c < ch; c++) {
+        const top = d[i00 + c] + (d[i10 + c] - d[i00 + c]) * fx;
+        const bot = d[i01 + c] + (d[i11 + c] - d[i01 + c]) * fx;
+        out[c] = (top + (bot - top) * fy) / e.max;
+    }
+    return out;
 }
 
 /**

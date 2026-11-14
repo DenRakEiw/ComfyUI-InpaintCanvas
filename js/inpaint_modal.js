@@ -436,6 +436,15 @@ function buildLayers(ed) {
     layersHead.appendChild(miniButton("image", "Import images as layers (one layer per file, part of the image, fitted to the canvas). Dropping files on this list does the same.", () => ed.imageInput.click()));
     layersHead.appendChild(miniButton("fx", "Add a filter layer (film grain, sharpen, blur, levels, curves, brightness / contrast, hue / saturation, colour balance, black & white, invert, LUT, vignette). It filters everything below it; give it a mask to limit where it applies.", () => ed.addFilterLayer()));
     layersHead.appendChild(miniButton("fill", "Add a fill layer (a colour, or a gradient: linear, reflected or radial; it starts in the paint colour). It covers everything below it; its blend mode, opacity and mask let the picture through. The fill's type is in its row.", () => ed.addFilterLayer("fill")));
+    // Deep paint (docs/PLAN_SURFACE_PAINT.md): the app's host only (the node has no surface maps)
+    if (host.surfaceSupported === true) {
+        const dp = miniButton("sparkle", "Deep paint: a layer whose paint takes the picture's light and reflections, a light brush, or the active layer wrapped onto the surface (the surface maps are made first when the picture has none).", () => ed.openActionList(dp, [
+            { label: "New Deep Paint Layer", title: "Paint that lands under the picture's own light and keeps its highlights", run: () => { ed.newDeepPaintLayer().catch(() => { /* the status line says why */ }); } },
+            { label: "New Light Brush Layer", title: "A light that shows where you paint", run: () => ed.newLightBrushLayer() },
+            { label: "Wrap onto Surface", title: "The active picture, paint or text layer laid round the surface it lies on", run: () => ed.wrapLayer(ed.activeLayer()) },
+        ]), "ipc-deeppaint-btn");
+        layersHead.appendChild(dp);
+    }
     layersHead.appendChild(miniButton("plus", "Add a paint layer (Ctrl+Shift+N)", () => ed.addPaintLayer()));
     ed.panes.image.appendChild(layersHead);
     ed.layerList = el("div", "ipc-list");

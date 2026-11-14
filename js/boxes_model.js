@@ -22,6 +22,8 @@ export const HELP = "Boxes tell a model that takes them (FLUX 3 Image, Ideogram 
 export const KIND_LABELS = { new: "New", keep: "Keep", move: "Move", remove: "Remove", from: "From reference", text: "Text" };
 /** An @img token in a description or the prompt (global: reset lastIndex after exec, or use tokenOf). */
 export const TOKEN = /@img([1-9][0-9]*)\b/g;
+/** A token parked by the prompt's remap (reftokens.js): `@img?<layer id>`, its reference hidden or gone. */
+const PARKED = /@img\?(L[0-9a-z]+)(?![\w-])/g;
 /** The ids a box gets by default, by its kind, and Selection -> box's edit_n: such a box is named after its words. */
 export const DEFAULT_ID = /^(?:box|keep|move|remove|ref|edit)_[1-9][0-9]*$/;
 
@@ -241,7 +243,10 @@ export const mapBoxes = (boxes, m) => boxes.map((x) => ({ ...x, rect: mapBox(x.r
 
 /** The desc a run gets: an @img token becomes a {@layer:id} marker the app resolves (`labels`: label -> layer id). */
 export function runDesc(b, labels) {
-    return (b.desc || "").replace(TOKEN, (m, n) => (labels.has("img" + n) ? `{@layer:${labels.get("img" + n)}}` : m));
+    // a parked token names its layer: the run then refuses it as it refuses a From box of a layer it does not send,
+    // instead of sending "@img?L12" as words
+    return (b.desc || "").replace(TOKEN, (m, n) => (labels.has("img" + n) ? `{@layer:${labels.get("img" + n)}}` : m))
+        .replace(PARKED, (m, id) => `{@layer:${id}}`);
 }
 
 /** The desc for the clipboard: an @img token as the model's picture name (<ref_image_k>, k the reference's number). */

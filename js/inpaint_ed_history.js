@@ -175,6 +175,9 @@ export class HistoryPart {
     snapshotLayer(l) {
         const c = { ...l };
         for (const k of LAYER_PENDING_KEYS) delete c[k];
+        // an upload still running: the record has the new pixels and the old file, so it stores its own (syncLayersOnce)
+        if (l._uploading) c.dirty = true;
+        if (l._maskUploading) c.maskDirty = true;
         if (l.text) c.text = JSON.parse(JSON.stringify(l.text));
         if (l.params && typeof l.params === "object") {
             c.params = { ...l.params };
@@ -355,6 +358,18 @@ export class HistoryPart {
         // the plugins' per-document data alone (scumble.documents.data(doc).set(patch, { undo })): a plugin's own change
         // of what it keeps with the document, no pixels; a canvas or turn step carries the same copy beside its pixels
         if (step.kind === "data") return { kind: "data", pluginData: this.pluginDataCopy() };
+        if (step.kind === "maps" && step.maps) {
+            // several maps in one step (Deep paint's shading, residual and normals: `setMaps`): each one's state now
+            const prevs = {};
+            let snapBytes = 0;
+            for (const kind of Object.keys(step.maps)) {
+                const prev = (this.maps && this.maps[kind]) || null, target = step.maps[kind];
+                prevs[kind] = prev;
+                if (prev && (!target || prev.data !== target.data)) snapBytes += prev.data ? prev.data.byteLength : 0;
+                if (prev && (!target || prev.guide !== target.guide)) snapBytes += prev.guide ? prev.guide.byteLength : 0;
+            }
+            return { kind: "maps", maps: prevs, bytes: snapBytes };
+        }
         if (step.kind === "maps") {
             const prev = (this.maps && this.maps[step.map]) || null;
             const target = step.prev;
@@ -601,16 +616,16 @@ export class HistoryPart {
             return;
         }
         if (snap.kind === "maps") {
-            const kind = snap.map;
             if (!this.maps) this.maps = {};
-            if (snap.prev) {
-                this.maps[kind] = snap.prev;
-            } else {
-                delete this.maps[kind];
+            const entries = snap.maps ? Object.entries(snap.maps) : [[snap.map, snap.prev]];
+            for (const [kind, prev] of entries) {
+                if (prev) this.maps[kind] = prev;
+                else delete this.maps[kind];
             }
             this.mapsVersion++;
+            const kinds = entries.map(([k]) => k || "depth");
             for (const l of this.layers) {
-                if (l.kind === "filter" && (l.params?.limit?.source === (kind || "depth") || this.mapsOf(l).includes(kind || "depth"))) {
+                if (l.kind === "filter" && kinds.some((kind) => l.params?.limit?.source === kind || this.mapsOf(l).includes(kind))) {
                     this.markFilterChanged(l);
                 }
             }

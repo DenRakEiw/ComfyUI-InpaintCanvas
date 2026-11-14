@@ -9,7 +9,27 @@ import { BRUSH_MAX, CURSOR_CLASSES, REMOVE_MARK, RULER_PX, brushSizeToSlider } f
 import { normDeg } from "./inpaint_orient.js";
 import { StrokeBuffer } from "./inpaint_strokebuf.js";
 
+/** The places of `layers` as one string, to tell a gesture that moved or scaled them from a click that did not. */
+const boxesOf = (layers) => layers.map((l) => `${l.x},${l.y},${l.w},${l.h}`).join(";");
+
 export class PointerPart {
+    /**
+     * A gesture's undo step, taken at the press and pushed at the release only when the gesture changed something
+     * (`landUndo`): a push drops the redo steps, so a click that changes nothing must not push one.
+     */
+    holdUndo(step) {
+        if (!this.sel) return null;   // no image loaded yet: nothing to undo (as pushUndo)
+        this.flushPendingDebounces();   // a nudge burst before the press is its own step, before this one
+        return this.snapshot(step);
+    }
+
+    landUndo(p, changed) {
+        const snap = p.undoSnap;
+        p.undoSnap = null;
+        if (!snap) return;
+        if (changed) this.pushUndoSnapshot(snap); else this.releaseSnapshot(snap);
+    }
+
     /** Hardness of the tool in use: the eraser has its own, softer default. */
     activeHardness() {
         return this.tool === "erase" ? this.eraseHardness : this.hardness;
@@ -318,6 +338,17 @@ export class PointerPart {
     // ---- pointer gestures --------------------------------------------------
 
     onPointerDown(e) {
+        // a second contact (a finger or a palm beside the pen or the mouse) while the first holds a gesture is ignored: it
+        // replaced the gesture, and the stroke in progress was never written. A held pointer still has its capture
+        const held = this.pointer;
+        if (held && held.pointerId != null && e.pointerId !== held.pointerId && !held.healing
+            && this.canvas.hasPointerCapture && this.canvas.hasPointerCapture(held.pointerId)) return;
+        this.pointerDownNow(e);
+        // the gesture this press started answers only its own pointer's moves and release
+        if (this.pointer && this.pointer !== held && e.pointerId != null) this.pointer.pointerId = e.pointerId;
+    }
+
+    pointerDownNow(e) {
         this.root.focus({ preventScroll: true });
         if (!this.width) return;
         // a heal stroke is held until its blend lands (`healBlend`): the next gesture waits for it
@@ -349,7 +380,8 @@ export class PointerPart {
         if (this.base) {
             const [cx, cy] = this.toCanvasPx(e);
             const dpr = window.devicePixelRatio || 1;
-            if (this.compare && Math.abs(cx - this.canvas.width * (this.compare.split ?? 0.5)) <= 6 * dpr) {
+            // only a compare with both sides has a divider to drag (drawOverlays draws it only then)
+            if (this.compare && this.compare.a && this.compare.b && Math.abs(cx - this.canvas.width * (this.compare.split ?? 0.5)) <= 6 * dpr) {
                 this.pointer = { kind: "split" };
                 return;
             }
@@ -385,7 +417,9 @@ export class PointerPart {
             return;
         } else if (this.tool === "rect" || this.tool === "ellipse") {
             const moveSel = selMode === "replace" && !e.ctrlKey && this.selectedAt(ix, iy);
-            this.pushUndo({ kind: "selection", label: moveSel ? "Move selection" : this.tool === "ellipse" ? "Ellipse selection" : "Rectangle selection" });
+            const step = { kind: "selection", label: moveSel ? "Move selection" : this.tool === "ellipse" ? "Ellipse selection" : "Rectangle selection" };
+            // a marquee's step is pushed at the release: a click in add / subtract / intersect mode changes nothing
+            const undoSnap = moveSel ? (this.pushUndo(step), null) : this.holdUndo(step);
             if (moveSel) {
                 // dragging inside the selection moves its outline (Photoshop's marquee tools)
                 const orig = this.sel.clone();   // the outline as it was, drawn back offset while dragging
@@ -396,7 +430,7 @@ export class PointerPart {
                 const ext = this.selectionExtent({ exact: true });
                 this.pointer = { kind: "selmove", start: [ix, iy], orig, origBounds: this.getBounds(), ext, lastExt: ext };
             } else {
-                this.pointer = { kind: "rect", ellipse: this.tool === "ellipse", square: e.ctrlKey, start: [ix, iy], cur: [ix, iy], startPx: this.toCanvasPx(e), mode: selMode };
+                this.pointer = { kind: "rect", ellipse: this.tool === "ellipse", square: e.ctrlKey, start: [ix, iy], cur: [ix, iy], startPx: this.toCanvasPx(e), mode: selMode, undoSnap };
             }
         } else if (this.tool === "lasso" || this.tool === "patch" || this.tool === "contentmove") {
             // patch and the content-aware move drag the selection when pressed inside it (the marquee's rule) and draw a
@@ -554,7 +588,8 @@ export class PointerPart {
                 this.draw();
                 return;
             }
-            if (layer && layer.kind === "filter") { this.setStatus("Filter layers have no pixels. Add a mask (from selection) and enable mask editing to limit where the filter applies."); return; }
+            // a Deep paint layer is a filter layer with pixels of its own: the brush and the eraser paint those
+            if (layer && layer.kind === "filter" && !this.hasOwnPixels(layer)) { this.setStatus("Filter layers have no pixels. Add a mask (from selection) and enable mask editing to limit where the filter applies."); return; }
             if (!layer) {
                 if (this.tool === "erase") { this.setStatus("The base layer cannot be erased. Select a layer or add a paint layer."); return; }
                 layer = this.addPaintLayer();
@@ -570,9 +605,9 @@ export class PointerPart {
                 // several layers selected: they move and scale as one box (filter and locked layers stay put)
                 const { layers, ...box } = group;
                 const handle = this.handleAt(ix, iy);
-                this.pushUndo({ kind: "transforms", ids: layers.map((l) => l.id), label: handle ? "Scale layers" : "Move layers" });
+                const undoSnap = this.holdUndo({ kind: "transforms", ids: layers.map((l) => l.id), label: handle ? "Scale layers" : "Move layers" });
                 const members = layers.map((l) => ({ layer: l, x: l.x, y: l.y, w: l.w, h: l.h }));
-                this.pointer = { kind: handle ? "scale" : "move", layer: { ...box }, group: members, handle, start: [ix, iy], orig: { ...box }, keepAspect: !!handle && handle.length === 2 && !e.shiftKey };
+                this.pointer = { kind: handle ? "scale" : "move", layer: { ...box }, group: members, handle, start: [ix, iy], orig: { ...box }, keepAspect: !!handle && handle.length === 2 && !e.shiftKey, undoSnap, boxes0: boxesOf(members.map((m) => m.layer)) };
                 this.draw();
                 return;
             }
@@ -588,12 +623,13 @@ export class PointerPart {
                 this.draw();
                 return;
             }
-            this.pushUndo({ kind: "transform", id: layer.id, label: handle ? "Scale" : "Move layer" });
+            this.settleTextUndo(layer);
+            const undoSnap = this.holdUndo({ kind: "transform", id: layer.id, label: handle ? "Scale" : "Move layer" });
             if (handle) {
                 const corner = handle.length === 2;
-                this.pointer = { kind: "scale", layer, handle, start: [ix, iy], orig: { x: layer.x, y: layer.y, w: layer.w, h: layer.h }, keepAspect: corner && !e.shiftKey };
+                this.pointer = { kind: "scale", layer, handle, start: [ix, iy], orig: { x: layer.x, y: layer.y, w: layer.w, h: layer.h }, keepAspect: corner && !e.shiftKey, undoSnap, boxes0: boxesOf([layer]) };
             } else {
-                this.pointer = { kind: "move", layer, start: [ix, iy], orig: { x: layer.x, y: layer.y } };
+                this.pointer = { kind: "move", layer, start: [ix, iy], orig: { x: layer.x, y: layer.y }, undoSnap, boxes0: boxesOf([layer]) };
             }
         } else if (this.tool === "text") {
             const hit = [...this.layers].reverse().find((l) => l.kind === "text" && this.shown(l) && this.textHitAt(l, ix, iy));
@@ -602,8 +638,9 @@ export class PointerPart {
                 this.renderLayers();
                 if ((e.detail >= 2 || isDouble) && !this.isLocked(hit)) { e.preventDefault(); this.beginTextEdit(hit); this.draw(); return; }
                 if (this.isLocked(hit)) { this.setStatus(`${hit.name} is locked.`); this.draw(); return; }
-                this.pushUndo({ kind: "transform", id: hit.id, label: "Move layer" });
-                this.pointer = { kind: "move", layer: hit, start: [ix, iy], orig: { x: hit.x, y: hit.y } };
+                this.settleTextUndo(hit);
+                const undoSnap = this.holdUndo({ kind: "transform", id: hit.id, label: "Move layer" });
+                this.pointer = { kind: "move", layer: hit, start: [ix, iy], orig: { x: hit.x, y: hit.y }, undoSnap, boxes0: boxesOf([hit]) };
             } else {
                 this.addTextLayer(ix, iy);
             }
@@ -735,6 +772,7 @@ export class PointerPart {
 
     onPointerMove(e) {
         if (!this.width) return;
+        if (this.pointer && this.pointer.pointerId != null && e.pointerId !== this.pointer.pointerId) return;   // another contact's moves
         const [ix, iy] = this.toImage(e);
         this.hover = [ix, iy];
         if (this.boxes && this.boxes.pointer("move", e, ix, iy)) return;
@@ -857,6 +895,7 @@ export class PointerPart {
             this.snapGuides = null;
             if (!e.altKey) this.snapLayer(p.layer, p);
             if (p.group) this.applyGroupBox(p);
+            this.syncWrapsSoon();   // a wrap's source: its wrap follows
         } else if (p.kind === "scale" && p.group) {
             this.applyScale(p, ix, iy);
             this.snapGuides = null;
@@ -876,6 +915,7 @@ export class PointerPart {
                 this.snapGuides = null;
                 if (!e.altKey) this.snapScale(p, ix, iy);
             }
+            this.syncWrapsSoon();
         } else if (p.kind === "guide") {
             p.pos = Math.round(p.axis === "x" ? ix : iy);
         } else if (p.kind === "split") {
@@ -961,12 +1001,14 @@ export class PointerPart {
     onPointerUp(e) {
         const p = this.pointer;
         if (!p || p.healing) return;
+        if (p.pointerId != null && e.pointerId !== p.pointerId) return;   // another contact ends no gesture of the first
         this.pointer = null;
         this.viewEl.classList.remove("ipc-panning");
         try { this.canvas.releasePointerCapture(e.pointerId); } catch (_) { /* ignore */ }
         if (p.kind === "boxes") { if (this.boxes) this.boxes.pointer("up", e, ...this.toImage(e)); return; }
         if (p.kind === "plugin") { host.pluginPointer(this, "up", e, ...this.toImage(e), p); return; }
         if (p.kind === "rect") {
+            this.landUndo(p, !(p.startPx && !p.moved && p.mode !== "replace"));
             if (p.startPx && !p.moved) {
                 // a click without a drag deselects, like the lasso below. Without the screen
                 // pixel threshold a hand that wobbles by one pixel left a small selection
@@ -1095,6 +1137,8 @@ export class PointerPart {
             this.releaseStrokeScratch();
             this.lastStrokeEnd = { layerId: p.layer.id, x: p.last[0], y: p.last[1], mask: true };
         } else if (p.kind === "move" || p.kind === "scale") {
+            // a click that moved nothing pushes no step (a push drops the redo steps)
+            this.landUndo(p, boxesOf(p.group ? p.group.map((m) => m.layer) : [p.layer]) !== p.boxes0);
             this.snapGuides = null;
             this.uploaded.baseHash = null;
             this.uploaded.controlHash = null;

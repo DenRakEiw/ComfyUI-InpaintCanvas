@@ -225,14 +225,29 @@ export class TextPart {
         sel.value = value || (list[0] && list[0].family) || "";
     }
 
+    /**
+     * The text fields' held step (`_textUndo`, taken on focus) pushed now under `label` when the text changed since it
+     * was taken, else released: before another step on this layer is pushed, so each undo takes back only its own edit.
+     */
+    settleTextUndo(layer, label = "Edit text") {
+        const s = layer && layer._textUndo;
+        if (!s) return;
+        layer._textUndo = null;
+        if (JSON.stringify(s.text) === JSON.stringify(layer.text)) this.releaseSnapshot(s);
+        else this.pushUndoSnapshot(s, { label });
+    }
+
     /** The controls of a text layer row: text, font, size, colour, style, alignment, spacing, outline. */
     buildTextControls(layer) {
         const t = layer.text;
         const box = el("div", "ipc-text");
         const stop = (e) => e.stopPropagation();
-        const begin = () => { if (!layer._textUndo) layer._textUndo = this.snapshot({ kind: "text", id: layer.id }); };
-        const commit = (label) => { if (layer._textUndo) { this.pushUndoSnapshot(layer._textUndo, { label }); layer._textUndo = null; } };
-        const change = (fn, label) => { this.pushUndo({ kind: "text", id: layer.id, label }); fn(); this.renderTextLayer(layer); };
+        // the fields' step is taken on focus and pushed on change. One held from an earlier focus is settled first (it was of
+        // the layer before every edit since, so its undo took those back too); one that changed nothing goes on blur
+        const begin = () => { this.settleTextUndo(layer); layer._textUndo = this.snapshot({ kind: "text", id: layer.id }); };
+        const commit = (label) => this.settleTextUndo(layer, label);
+        const drop = () => { const s = layer._textUndo; if (s && JSON.stringify(s.text) === JSON.stringify(layer.text)) { layer._textUndo = null; this.releaseSnapshot(s); } };
+        const change = (fn, label) => { this.settleTextUndo(layer); this.pushUndo({ kind: "text", id: layer.id, label }); fn(); this.renderTextLayer(layer); };
 
         const ta = document.createElement("textarea");
         ta.value = t.content;
@@ -241,6 +256,7 @@ export class TextPart {
         ta.addEventListener("pointerdown", stop);
         ta.addEventListener("keydown", (e) => { e.stopPropagation(); if (e.key === "Escape") { ta.blur(); this.root.focus({ preventScroll: true }); } });
         ta.addEventListener("focus", begin);
+        ta.addEventListener("blur", drop);
         ta.addEventListener("input", () => { t.content = ta.value; this.scheduleTextRender(layer); });
         ta.addEventListener("change", () => commit("Edit text"));
         box.appendChild(ta);
@@ -266,6 +282,7 @@ export class TextPart {
         col.type = "color"; col.value = t.color; col.title = "Text colour";
         col.addEventListener("click", stop);
         col.addEventListener("focus", begin);
+        col.addEventListener("blur", drop);
         col.addEventListener("input", () => { t.color = col.value; this.scheduleTextRender(layer); });
         col.addEventListener("change", () => commit("Text colour"));
         r1.appendChild(col);
@@ -295,6 +312,7 @@ export class TextPart {
         ocol.type = "color"; ocol.value = t.outlineColor || "#000000"; ocol.title = "Outline colour";
         ocol.addEventListener("click", stop);
         ocol.addEventListener("focus", begin);
+        ocol.addEventListener("blur", drop);
         ocol.addEventListener("input", () => { t.outlineColor = ocol.value; this.scheduleTextRender(layer); });
         ocol.addEventListener("change", () => commit("Outline colour"));
         r2.appendChild(ocol);

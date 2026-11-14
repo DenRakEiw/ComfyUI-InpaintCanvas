@@ -354,6 +354,8 @@ export class HistoryPanelPart {
      * leaves the preset to the caller.
      */
     async newCanvas(size = null, { keepRefs = false } = {}) {
+        // a restore in flight would put the old document's layers over the new canvas (see loadFile)
+        if (this._loading) { this.setStatus("The document is still loading: make the new canvas when it is in.", "info"); return; }
         const curW = this.width || 1024, curH = this.height || 1024;
         const what = this.base ? `This discards the current image, ${this.layers.length} layer${this.layers.length === 1 ? "" : "s"}, the selection and ${this.history.length} history entr${this.history.length === 1 ? "y" : "ies"} in this editor.` : "";
         let w, h;
@@ -382,6 +384,7 @@ export class HistoryPanelPart {
         }
         if (!(w >= 16) || !(h >= 16)) { this.setStatus("Width and height must be at least 16 pixels.", "warn"); return; }
         w = Math.min(16384, Math.round(w)); h = Math.min(16384, Math.round(h));
+        if (this._loading) { this.setStatus("The document is still loading: make the new canvas when it is in.", "info"); return; }
         try {
             this.setStatus(`Creating a ${w} × ${h} canvas ...`);
             if (this.pending) this.cancelPending();

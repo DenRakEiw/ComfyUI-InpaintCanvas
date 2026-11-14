@@ -7,6 +7,7 @@ import { isTilePixels } from "./inpaint_tiles.js";
 import { failKind } from "./inpaint_status.js";
 import { makeCanvas } from "./inpaint_consts.js";
 import { StrokeBuffer } from "./inpaint_strokebuf.js";
+import { surfaceAlbedo, surfaceK } from "./inpaint_surfacefx.js";
 
 let InpaintEditor = null;
 
@@ -277,8 +278,20 @@ export class ShapePart {
         const x = Math.max(0, Math.min(this.width - 1, Math.floor(ix))), y = Math.max(0, Math.min(this.height - 1, Math.floor(iy)));
         const r = this.eyedropperSize === 3 ? 1 : this.eyedropperSize === 5 ? 2 : 0;
         const x0 = Math.max(0, x - r), y0 = Math.max(0, y - r), x1 = Math.min(this.width, x + r + 1), y1 = Math.min(this.height, y + r + 1);
+        // on a Deep paint layer with Sample "image" (SP5): the surface's own colour under the picture below the layer, the
+        // light and the reflections taken out (`surfaceAlbedo`), so painted back on the layer it gives the picture again
+        const sample = this.fillOpts && this.fillOpts.sample;
+        const layer = this.activeLayer();
+        const surface = sample !== "layer" && this.hasOwnPixels(layer) && this.hasSurfaceMaps() ? layer : null;
         // the box composited, not the whole image (0.6 s on a 15k document)
-        const d = this.sampleRegion(this.fillOpts && this.fillOpts.sample, [x0, y0, x1, y1], 1).getContext("2d").getImageData(0, 0, x1 - x0, y1 - y0).data;
+        const d = this.sampleRegion(surface ? "image" : sample, [x0, y0, x1, y1], 1, surface ? { upTo: this.layers.indexOf(surface) } : undefined).getContext("2d").getImageData(0, 0, x1 - x0, y1 - y0).data;
+        if (surface) {
+            const k = surfaceK(surface.params), q = [0, 0, 0], bw = x1 - x0;
+            for (let i = 0, j = 0; i < d.length; i += 4, j++) {
+                surfaceAlbedo(this.maps, k, [d[i], d[i + 1], d[i + 2]], x0 + (j % bw) + 0.5, y0 + Math.floor(j / bw) + 0.5, q);
+                d[i] = q[0]; d[i + 1] = q[1]; d[i + 2] = q[2];
+            }
+        }
         let sr = 0, sg = 0, sb = 0, sa = 0;
         for (let i = 0; i < d.length; i += 4) { const a = d[i + 3]; sr += d[i] * a; sg += d[i + 1] * a; sb += d[i + 2] * a; sa += a; }
         if (sa === 0) { this.setStatus("Transparent here, nothing to pick."); return; }
@@ -286,15 +299,24 @@ export class ShapePart {
         this.color = hex;
         if (this.colorInput) this.colorInput.value = hex;
         const n = (x1 - x0) * (y1 - y0);
-        this.setStatus(n > 1 ? `Colour ${hex} picked, the mean of ${n} pixels.` : `Colour ${hex} picked.`);
+        const what = surface ? "Surface colour" : "Colour";
+        this.setStatus((n > 1 ? `${what} ${hex} picked, the mean of ${n} pixels.` : `${what} ${hex} picked.`) + (surface ? " The picture's light and reflections are taken out: painted here it looks as the picture does." : ""));
     }
 
-    /** Bucket: fill the area of similar colour under (ix, iy) on the active layer, within the selection. */
-    async bucketFill(ix, iy) {
+    /**
+     * Bucket: fill the area of similar colour under (ix, iy) on the active layer, within the selection. The flood takes
+     * seconds at 15k: an undo pressed meanwhile waits for the fill (trackEdit) instead of taking back the step below.
+     */
+    bucketFill(ix, iy) {
+        return this.trackEdit(this.bucketFillNow(ix, iy));
+    }
+
+    async bucketFillNow(ix, iy) {
         if (!this.width) return;
         let layer = this.activeLayer();
+        const gen = this.historyGen;
         if (layer && this.isLocked(layer)) { this.setStatus(`${layer.name} is locked.`); return; }
-        if (layer && layer.kind === "filter") { this.setStatus("Filter layers have no pixels. Select a paint or image layer."); return; }
+        if (layer && layer.kind === "filter" && !this.hasOwnPixels(layer)) { this.setStatus("Filter layers have no pixels. Select a paint or image layer."); return; }
         const x = Math.floor(ix), y = Math.floor(iy);
         if (x < 0 || y < 0 || x >= this.width || y >= this.height) return;
         const o = this.fillOpts || { tolerance: 32, contiguous: true, sample: "image" };
@@ -305,6 +327,12 @@ export class ShapePart {
         const r = await this.floodRegion(x, y, { tolerance: o.tolerance, contiguous: o.contiguous, sample: o.sample, color, clip: true, tiles });
         const fill = r.shape, n = r.count;
         if (!n) { if (r.close) fill.close(); this.setStatus("Nothing to fill here (outside the selection?)."); return; }
+        // an edit or a removed layer during the flood: the region was found in a picture that is not there any more
+        if (this.historyGen !== gen || (layer && !this.layers.includes(layer))) {
+            if (r.close) fill.close();
+            this.setStatus("The picture changed while filling; nothing was filled.");
+            return;
+        }
         if (!layer) layer = this.addPaintLayer();
         // the undo step is a copy of the box the fill can touch, in the layer's own pixels
         const target = layer.px;
@@ -316,7 +344,7 @@ export class ShapePart {
         const sx = target.width / layer.w, sy = target.height / layer.h;
         const [rx, ry, rw, rh] = r.tiles && r.bounds ? [r.bounds[0], r.bounds[1], r.bounds[2] - r.bounds[0], r.bounds[3] - r.bounds[1]] : [r.x, r.y, r.w, r.h];
         const lx = (rx - layer.x) * sx, ly = (ry - layer.y) * sy, lw = rw * sx, lh = rh * sy;
-        this.pushUndoSnapshot(this.snapshotRect(layer, { x: lx, y: ly, w: lw, h: lh }), { label: "Bucket fill" });
+        this.pushUndoSnapshot(this.snapshotRect(layer, { x: lx, y: ly, w: lw, h: lh }), { tracked: true, label: "Bucket fill" });
         // the fill is r.w x r.h at (r.x, r.y), scaled into the layer's pixels: it covers the box, nothing outside
         const box = [Math.floor(lx), Math.floor(ly), Math.ceil(lx + lw), Math.ceil(ly + lh)];
         const op = layer.alphaLock ? "source-atop" : "source-over";
