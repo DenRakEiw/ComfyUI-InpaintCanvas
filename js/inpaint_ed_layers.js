@@ -25,6 +25,8 @@ export class LayersPart {
     async addImageLayers(files, role = "reference", { place = "cascade", at = null, blank = false } = {}) {
         files = Array.from(files || []).filter((f) => f && ((f.type && f.type.startsWith("image/")) || LAYERED_EXT.test(f.name || "") || TIFF_EXT.test(f.name || "")));
         if (!files.length) return;
+        // a document still restoring (setValue) would put its remaining layers around these (loadFile refuses the same way)
+        if (this._loading) { this.setStatus("The document is still loading: add the pictures when it is in.", "info"); return; }
         if (!this.width && blank && role === "reference" && host.refTokens) {
             await this.newCanvas("1024x1024");
             if (!this.width) return;
@@ -108,6 +110,7 @@ export class LayersPart {
                 }
                 last = this.addLayer({ name: (file.name || "image").replace(/\.[a-z0-9]+$/i, ""), kind: "image", role, ref, px, x: lx, y: ly, w: lw, h: lh, dirty: !ref });
                 added.push(last);
+                if (this.layerLanded) this.layerLanded(last, role === "reference" ? "reference" : "paste");
                 n++;
             } catch (err) {
                 console.error(err);
@@ -335,6 +338,8 @@ export class LayersPart {
         this.uploaded.controlHash = null;
         this.refsMutated();
         this.renderLayers(); this.draw(); this.drawThumb(); this.notifyChanged();
+        // the copy has no file yet (its pixels were dirty, or Deep paint's own): stored like an edit, not only at the next one
+        if ((copy.dirty || copy.maskDirty) && typeof this.scheduleAutosave === "function") this.scheduleAutosave();
         const label = below ? this.refLabels().get(copy.id) : null;
         this.setStatus(below ? `${copy.name} added${label ? ` as @img${label}` : ""}, below the other references.` : `${copy.name} added above ${layer.name}.`);
         return copy;
@@ -536,7 +541,7 @@ export class LayersPart {
         if (!layer.maskPx) { layer.maskRef = null; layer.maskDirty = false; layer.maskEdit = false; layer.maskOff = false; }
         else layer.maskOff = !!layer.maskOff;
         if (!layer.match) layer.match = { strength: 0, source: "surroundings" };
-        this.historyGen++;   // no undo step, but a waiting restore of the layer list must not drop it
+        this.historyGen++;   // no undo step here (a caller that lands a layer pushes its own), but a waiting restore of the layer list must not drop it
         // a new reference goes below the others, so it takes the next number and none of them is renumbered
         const lowest = host.refTokens && layer.role === "reference" ? this.layers.findIndex((l) => this.isReference(l)) : -1;
         if (lowest >= 0) this.layers.splice(lowest, 0, layer);
@@ -641,6 +646,30 @@ export class LayersPart {
         return true;
     }
 
+    /**
+     * An edit of the layer list still in progress becomes its own undo step now: a text typed in a row (its field has the
+     * focus), a colour match slider held, a filter slider held (its row has the focus). A result landing rebuilds the list,
+     * which ends such an edit without its change event; the result's step would hold the edit's "before", and its undo
+     * would take the edit back with the result.
+     */
+    settlePanelEdits() {
+        const act = typeof document !== "undefined" ? document.activeElement : null;
+        const focused = (l) => {
+            const row = act && this.layerList ? this.layerList.querySelector(`[data-layer="${l.id}"]`) : null;
+            return !!(row && row !== act && row.contains(act));
+        };
+        for (const l of this.layers || []) {
+            if (l._textUndo && l._textUndo.kind === "text" && focused(l)) this.settleTextUndo(l);
+            if (l._matchUndo) { this.pushUndoSnapshot(l._matchUndo, { label: "Colour match strength" }); l._matchUndo = null; }
+            if (l.kind === "filter" && this.previewShown(l) && !l._hoverSnap && focused(l)) {
+                this.pushUndoSnapshot(l._undoPending, { label: "Filter" });
+                l._undoPending = null;
+                this.filterPreview = null;
+                this.markFilterChanged(l);
+            }
+        }
+    }
+
     async addResults(results) {
         for (const r of results || []) {
             if (!r || !r.filename) continue;
@@ -655,7 +684,13 @@ export class LayersPart {
                     continue;
                 }
                 const n = this.history.length + 1;
-                const layer = this.addLayer({ name: "Result " + n, kind: "result", ref, px: this.pixels.Layer.fromImage(img), x: r.x || 0, y: r.y || 0, w: r.width || img.naturalWidth, h: r.height || img.naturalHeight });
+                const px = this.pixels.Layer.fromImage(img);
+                // the landing is an undo step of its own (docs/PLAN_VARIANTS.md Q19), taken now: a run that lands late is
+                // pushed on top of whatever was done while it ran, so one Ctrl+Z takes exactly this result back and
+                // nothing before it, and Ctrl+Y brings it back (each area's result is a step of its own the same way)
+                this.settlePanelEdits();
+                this.pushUndo({ kind: "layers", label: "Result " + n });
+                const layer = this.addLayer({ name: "Result " + n, kind: "result", ref, px, x: r.x || 0, y: r.y || 0, w: r.width || img.naturalWidth, h: r.height || img.naturalHeight });
                 // a provider run says which seed the model got (null: none went, FLUX 3 Image); a local result is the editor's
                 // the texts of the click when the host kept them (S4), else the field's as the result lands (the node)
                 const refsNow = () => { const o = {}; for (const [id, k] of this.refLabels()) o["img" + k] = id; return Object.keys(o).length ? o : null; };
@@ -670,6 +705,7 @@ export class LayersPart {
                 this.renderHistory();
                 const al = r.align && r.align.aligned ? ` · aligned (shift ${r.align.shift[0]}, ${r.align.shift[1]} px, scale ${r.align.scale[0]}, ${r.align.scale[1]})` : "";
                 this.setStatus(`Result ${n} added (${r.width} × ${r.height} at ${r.x}, ${r.y})${r.via ? " · " + r.via : ""}${al}`);
+                if (this.layerLanded) this.layerLanded(layer, "result");
             } catch (err) {
                 console.error(err);
                 this.setStatus(String(err.message || err), failKind(err));
@@ -1032,10 +1068,10 @@ export class LayersPart {
         const editBtn = miniButton("maskEdit", "Edit the mask with the paint (reveal) and erase (hide) tools", () => this.toggleMaskEdit(layer), layer.maskEdit ? "ipc-on" : "");
         editBtn.disabled = !layer.maskPx;
         maskRow.appendChild(editBtn);
-        const applyBtn = miniButton("check", "Apply the mask to the pixels", () => this.applyMask(layer));
+        const applyBtn = miniButton("check", "Apply the mask to the pixels", () => this.maskOp(layer, "apply"));   // maskOp: a text layer becomes pixels first, a pending transform refuses
         applyBtn.disabled = !layer.maskPx || isFx;
         maskRow.appendChild(applyBtn);
-        const delMask = miniButton("trash", "Remove the mask (the pixels stay)", () => this.removeMask(layer), "ipc-del");
+        const delMask = miniButton("trash", "Remove the mask (the pixels stay)", () => this.maskOp(layer, "remove"), "ipc-del");
         delMask.disabled = !layer.maskPx;
         maskRow.appendChild(delMask);
         return maskRow;

@@ -142,6 +142,10 @@ export function buildRangeBar(range, {
     onEnter = null,
 } = {}) {
     let curRange = { ...RANGE_DEFAULTS, ...range };
+    // What the bar hands preview / commit: only the fields it owns. A colour or a tolerance the caller keeps (the Limit
+    // row's swatch, its Tolerance field) is never sent back from the copy taken at mount, so a drag after the swatch
+    // changed the colour keeps the new one; the bar's own Pick hands its colour with that one commit.
+    const own = () => ({ lo: curRange.lo, hi: curRange.hi, fLo: curRange.fLo, fHi: curRange.fHi, invert: !!curRange.invert });
     let currentHist = null;
     let drag = null;
     let hovering = false;
@@ -195,11 +199,11 @@ export function buildRangeBar(range, {
                     if (hi === 1) lo = Math.max(0, 1 - w);
                     curRange = { ...curRange, lo, hi };
                     draw();
-                    if (commit) commit({ ...curRange });
+                    if (commit) commit(own());
                 } else if (typeof val === "string" && val.startsWith("#")) {
                     curRange = { ...curRange, color: val };
                     draw();
-                    if (commit) commit({ ...curRange });
+                    if (commit) commit({ ...own(), color: val });
                 }
             } catch (err) {
                 console.error("Eyedropper pick failed:", err);
@@ -218,7 +222,7 @@ export function buildRangeBar(range, {
         curRange = { ...curRange, invert: !curRange.invert };
         invBtn.classList.toggle("ipc-active", !!curRange.invert);
         draw();
-        if (commit) commit({ ...curRange });
+        if (commit) commit(own());
     });
     head.appendChild(invBtn);
     wrap.appendChild(head);
@@ -521,7 +525,7 @@ export function buildRangeBar(range, {
             curRange = dragTo(curRange, drag.handle, x01, drag.startRange, drag.startX01);
             draw();
             if (typeof preview === "function") {
-                preview({ ...curRange });
+                preview(own());
             }
             return;
         }
@@ -547,7 +551,7 @@ export function buildRangeBar(range, {
         drag = null;
         draw();
         if (typeof commit === "function") {
-            commit({ ...curRange });
+            commit(own());
         }
         if (typeof stop === "function") {
             stop();
@@ -599,7 +603,7 @@ export function buildRangeBar(range, {
             syncButtons();
             draw();
             if (typeof commit === "function") {
-                commit({ ...curRange });
+                commit({ ...own(), ...nextRange });
             }
         },
         refresh() {
@@ -613,11 +617,11 @@ export function buildRangeBar(range, {
         },
         preview(r) {
             if (r !== undefined) curRange = { ...curRange, ...r };
-            if (typeof preview === "function") preview(r !== undefined ? r : { ...curRange });
+            if (typeof preview === "function") preview(r !== undefined ? { ...own(), ...r } : own());
         },
         commit(r) {
             if (r !== undefined) curRange = { ...curRange, ...r };
-            if (typeof commit === "function") commit({ ...curRange });
+            if (typeof commit === "function") commit(r !== undefined ? { ...own(), ...r } : own());
         },
         stop() {
             if (typeof stop === "function") stop();

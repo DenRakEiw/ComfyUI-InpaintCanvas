@@ -572,7 +572,8 @@ export class SelectPart {
             if (mode === "replace") {
                 hint = unionBounds;
             } else if (mode === "add") {
-                hint = this.boundsAfter("add", unionBounds || [0, 0, W, H]);
+                // nothing matched (unionBounds null, as replace reads it): the old box stays as it is known
+                hint = this.boundsAfter("add", unionBounds || [0, 0, 0, 0]);
             } else {
                 hint = oldBounds ? { within: oldBounds } : null;
             }
@@ -1350,6 +1351,7 @@ export class SelectPart {
 
     /** Paste the clipboard as a new layer at the place it was copied from. */
     pasteClipboard() {
+        if (this._loading) { this.setStatus("The document is still loading: paste when it is in.", "info"); return null; }
         if (!this.clipboard) { this.setStatus("Nothing copied yet: Ctrl+C copies the selection, or the whole layer when nothing is selected."); return null; }
         if (!this.width) { this.setStatus("Load an image first."); return null; }
         this.pasteCounter = (this.pasteCounter || 0) + 1;
@@ -1360,6 +1362,7 @@ export class SelectPart {
         const name = src && !/^the visible image/.test(src) ? `${src} copy` : `Paste ${this.pasteCounter}`;
         const layer = this.addLayer({ name, kind: "image", ref: null, px: this.pixels.Layer.fromCanvas(copy), x, y, w: canvas.width, h: canvas.height, dirty: true });
         this.setStatus(`${layer.name} added (${canvas.width} × ${canvas.height} at ${x}, ${y}). Move it with T.`);
+        if (this.layerLanded) this.layerLanded(layer, "paste");
         return layer;
     }
 

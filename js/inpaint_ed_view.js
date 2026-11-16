@@ -689,11 +689,13 @@ export class ViewPart {
         if (this.viewTilt()) {
             ctx.save();
             this.applyTilt(ctx);
+            if (this._shadowOverlay) this.drawShadowOverlay(ctx);
             host.pluginOverlay(this, ctx);
             if (this.boxes) this.boxes.draw(ctx);
             if (this.tool === "lights" && this.isRelightActive()) this.drawLightsOverlay(ctx);
             ctx.restore();
         } else {
+            if (this._shadowOverlay) this.drawShadowOverlay(ctx);
             host.pluginOverlay(this, ctx);
             if (this.boxes) this.boxes.draw(ctx);
             if (this.tool === "lights" && this.isRelightActive()) this.drawLightsOverlay(ctx);

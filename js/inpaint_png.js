@@ -282,6 +282,7 @@ export async function readPng(blob, { onHeader = null, onRows, rowsPerBand = 256
     const reader = ds.readable.getReader();
 
     // -- the bytes of the file -> chunks; IDAT payload -> the inflater --
+    let damaged = null;                                 // the framing's own refusal, reported over the inflater's
     const feed = (async () => {
         const src = blob.slice(8).stream().getReader();
         const header = new Uint8Array(8);
@@ -307,7 +308,12 @@ export async function readPng(blob, { onHeader = null, onRows, rowsPerBand = 256
                         if (have < 8) continue;
                         left = new DataView(header.buffer).getUint32(0);
                         type = String.fromCharCode(header[4], header[5], header[6], header[7]);
-                        small = type === "PLTE" || type === "tRNS" || (type === "tEXt" && left < 4 * 1048576) ? new Uint8Array(left) : null;
+                        // PLTE holds at most 256 entries of 3 bytes, tRNS at most 256 bytes (the PNG spec): a larger
+                        // length is a damaged or crafted file and must not size an allocation.
+                        if ((type === "PLTE" && (left > 768 || left % 3 !== 0)) || (type === "tRNS" && left > 256)) {
+                            throw (damaged = new Error(`PNG ${type} chunk of ${left} bytes is damaged`));
+                        }
+                        small = type === "PLTE" || type === "tRNS" || (type === "tEXt" && left < 4 * 1048576 && left <= blob.size) ? new Uint8Array(left) : null;
                         smallAt = 0;
                         if (left === 0) { have = 0; skipCrc = 4; if (type === "IEND") done = true; }
                         continue;
@@ -433,7 +439,7 @@ export async function readPng(blob, { onHeader = null, onRows, rowsPerBand = 256
     const drain = (async () => {
         try { await drainRows(); } catch (err) { reader.cancel().catch(() => {}); throw err; }   // the feeding side stops with it
     })();
-    await Promise.all([feed, drain]);
+    try { await Promise.all([feed, drain]); } catch (err) { throw damaged || err; }
     if (y !== height) throw new Error(`the PNG ended after ${y} of ${height} rows`);
     return { width, height, bitDepth, colorType, texts, spent };
 }

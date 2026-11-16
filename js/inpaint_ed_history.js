@@ -132,6 +132,8 @@ export class HistoryPart {
             if (l._textUndo) { this.releaseSnapshot(l._textUndo); l._textUndo = null; }
             if (l._matchUndo) { this.releaseSnapshot(l._matchUndo); l._matchUndo = null; }
         }
+        // a record taken during a text edit on canvases holds the text before it, not its pixels (snapshotLayer): drawn now
+        for (const l of this.layers) if (l && l._textRedraw) { delete l._textRedraw; if (l.text) this.renderTextLayer(l); }
     }
 
     releaseSnapshot(snap) {
@@ -190,6 +192,29 @@ export class HistoryPart {
         const committed = this.committedFilter(l);
         if (committed) { c.params = committed.params; if (committed.name) c.name = committed.name; }
         for (const k of ["match", "lut", "plate"]) if (l[k] && typeof l[k] === "object") c[k] = { ...l[k] };
+        // the same for an edit of a live layer still in progress (a result can land meanwhile: its step records the layers
+        // as they are): the record holds the edit's "before", never the edit half done (LAYER_PENDING_KEYS). A text typed
+        // on the canvas or in the panel, a colour match drag, a move or scale held; the edit itself goes on
+        if (this.layers && this.layers.includes(l)) {
+            // the panel's held step only while its field has the focus: one left from a blur is settled later and is no edit
+            // in progress (the layer may have changed by other ways since)
+            const act = typeof document !== "undefined" ? document.activeElement : null;
+            const row = act && this.layerList ? this.layerList.querySelector(`[data-layer="${l.id}"]`) : null;
+            const typing = !!(row && row !== act && row.contains(act));
+            const tb = this.textEdit && this.textEdit.layer === l ? this.textEdit.before : typing && l._textUndo && l._textUndo.kind === "text" ? l._textUndo : null;
+            if (tb && l.text) {
+                c.text = JSON.parse(JSON.stringify(tb.text));
+                Object.assign(c, { x: tb.x, y: tb.y, w: tb.w, h: tb.h, dirty: true });
+                // tiles: the "before" pixels themselves; canvases keep them as a PNG, so the text is drawn again when the record comes back
+                if (tb.px) c.px = tb.px.clone(); else c._textRedraw = true;
+            }
+            // a text whose render is still on its way (typed, debounced): the record's pixels are older than its text
+            if (!tb && l.text && (l._textTimer || l._textRendering)) c._textRedraw = true;
+            if (l._matchUndo && l._matchUndo.match) c.match = { ...l._matchUndo.match };
+            const held = this.pointer && this.pointer.undoSnap;
+            const g = !held ? null : held.kind === "transform" ? (held.id === l.id ? held : null) : held.kind === "transforms" ? held.items.find((i) => i.id === l.id) : null;
+            if (g) Object.assign(c, { x: g.x, y: g.y, w: g.w, h: g.h });
+        }
         return c;
     }
 
@@ -211,7 +236,8 @@ export class HistoryPart {
         const pixels = [];
         const layers = this.layers.map((l) => {
             const record = this.snapshotLayer(l);
-            pixels.push({ id: l.id, px: l.px ? l.px.clone() : null, maskPx: l.maskPx ? l.maskPx.clone() : null });
+            // a text edit in progress: the record holds its "before" pixels (snapshotLayer), already a clone
+            pixels.push({ id: l.id, px: record.px && record.px !== l.px ? record.px : l.px ? l.px.clone() : null, maskPx: l.maskPx ? l.maskPx.clone() : null });
             // the restore takes the clones above; the record's own references to the live pixels and the layer's caches
             // would only keep what the document replaces later alive (a named snapshot lives as long as the user wants)
             record.px = null; record.maskPx = null;
@@ -380,7 +406,16 @@ export class HistoryPart {
             }
             return { kind: "maps", map: step.map, prev, bytes: snapBytes };
         }
-        if (step.kind === "layers") return { kind: "layers", layers: this.layers.map((l) => this.snapshotLayer(l)), groups: this.groupsCopy(), activeLayerId: this.activeLayerId };
+        // `data: "<plugin id>"`: the step holds that one plugin's per-document data too (a plugin whose layers and data
+        // change together: the 3D object plugin's placement and its parameters), and only that plugin's: another
+        // plugin's data written meanwhile without a step of its own is not taken back. Its other side (`dataKey` on the
+        // step) keeps the same key.
+        if (step.kind === "layers") {
+            const key = typeof step.data === "string" && step.data ? step.data : typeof step.dataKey === "string" ? step.dataKey : null;
+            const snap = { kind: "layers", layers: this.layers.map((l) => this.snapshotLayer(l)), groups: this.groupsCopy(), activeLayerId: this.activeLayerId };
+            if (key) Object.assign(snap, this.pluginDataSlice(key));
+            return snap;
+        }
         if (step.kind === "transforms") {
             // the places of several layers moved or scaled together (a multi-selection): one step, no pixels
             const ids = step.ids || step.items.map((i) => i.id);
@@ -418,10 +453,20 @@ export class HistoryPart {
             return { kind: "filter", id: layer.id, filter: layer.filter, params: p, lut: layer.lut ? { ...layer.lut } : null, lutData: layer._lutData || null, plate: layer.plate ? { ...layer.plate } : null, plateImg: layer._plateImg || null, name: layer.name, _selectedLightId: layer._selectedLightId || null, _deselected: !!layer._deselected };
         }
         if (step.kind === "text") return { kind: "text", id: layer.id, text: JSON.parse(JSON.stringify(layer.text || TEXT_DEFAULTS)), ...pixelsOf(layer.px), cw: layer.px.width, ch: layer.px.height, x: layer.x, y: layer.y, w: layer.w, h: layer.h,
-            behind: !!layer._textRendering };
+            behind: !!(layer._textRendering || layer._textTimer) };   // a render on its way, or a typed one still debounced
         if (step.kind === "layerfull") return { kind: "layerfull", id: layer.id, ...pixelsOf(layer.px), cw: layer.px.width, ch: layer.px.height, x: layer.x, y: layer.y, w: layer.w, h: layer.h,
             ...maskOf(layer.maskPx), mw: layer.maskPx ? layer.maskPx.width : 0, mh: layer.maskPx ? layer.maskPx.height : 0, maskOff: !!layer.maskOff };
         return null;
+    }
+
+    /**
+     * One plugin's per-document data as a layers step keeps it: `dataKey` the plugin id, `dataValue` a copy (undefined
+     * when the plugin has none), `bytes` the copy's size on the undo budget (two bytes a character, as a string costs).
+     */
+    pluginDataSlice(key) {
+        const v = this.pluginData && typeof this.pluginData === "object" && Object.prototype.hasOwnProperty.call(this.pluginData, key) ? this.pluginData[key] : undefined;
+        const json = v === undefined ? null : JSON.stringify(v);
+        return { dataKey: key, dataValue: json == null ? undefined : JSON.parse(json), bytes: json == null ? 0 : json.length * 2 };
     }
 
     pushUndo(step) {
@@ -593,6 +638,11 @@ export class HistoryPart {
             // (a clean-up, a file removed by hand) is uploaded from its pixels
             this.recheckRestoredFiles({ layers: this.layers, outgoing });
             this.groups = (snap.groups || []).map((g) => ({ ...g }));
+            if (typeof snap.dataKey === "string") {
+                if (!this.pluginData || typeof this.pluginData !== "object") this.pluginData = {};
+                if (snap.dataValue === undefined) delete this.pluginData[snap.dataKey];
+                else this.pluginData[snap.dataKey] = JSON.parse(JSON.stringify(snap.dataValue));
+            }
             this.activeLayerId = this.layers.some((l) => l.id === snap.activeLayerId) ? snap.activeLayerId : null;
             this.uploaded.baseHash = null;
             this.uploaded.controlHash = null;
@@ -823,6 +873,7 @@ export class HistoryPart {
                 // description that is being undone on top of the restored one
                 layer._textToken = (layer._textToken || 0) + 1;
                 layer._textRendering = 0;
+                clearTimeout(layer._textTimer); layer._textTimer = null;   // the same for one still debounced (typing)
                 layer.px = snap.px || this.pixels.Layer.fromImage(needImage(images.url), snap.cw, snap.ch);   // replaced: rule 2
                 snap.px = null;   // the document's now (C4)
                 Object.assign(layer, { x: snap.x, y: snap.y, w: snap.w, h: snap.h });

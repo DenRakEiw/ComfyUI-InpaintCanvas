@@ -15,6 +15,14 @@ import { drawMesh, homography } from "./inpaint_mesh.js";
 
 /** A filter layer whose own pixels are an input (Deep paint): its pixels follow every change of the picture's geometry. */
 function ownPx(l) { return !!(l && l.kind === "filter" && FILTERS[l.filter] && FILTERS[l.filter].ownPixels); }
+/** A plain filter layer's px is an empty store of the canvas size (its mask is made at that size): a geometry op gives it a
+ *  new one of the new size (the undo step holds the old one by reference). */
+function plainFilterPx(ed, l, nw, nh) { if (l.kind === "filter" && !ownPx(l) && l.px) l.px = ed.pixels.Layer.empty(nw, nh); }
+/** Layers whose pixels the op replaced (Deep paint's paint, an extend's kept layers) are stored at once, as a turn's are: the
+ *  session written 1.5 s later holds the new size, and a crash before the next edit would put the old files into it. */
+function storeGeometryFiles(ed, what) {
+    if (ed.layers.some((l) => (l.dirty && l.px) || (l.maskDirty && l.maskPx))) ed.syncLayers().catch((err) => console.warn(`Inpaint Canvas: the ${what} layers could not be stored`, err));
+}
 
 export class GeometryPart {
     setTransformMode(mode) {
@@ -685,7 +693,7 @@ export class GeometryPart {
                     // the whole canvas: the size follows; its pixels are empty and stay as crop leaves them, but Deep paint's
                     // are its paint and turn with the picture
                     l.w = nw; l.h = nh;
-                    if (t.px) l.px = t.px;
+                    if (t.px) l.px = t.px; else plainFilterPx(this, l, nw, nh);
                 } else {
                     [l.x, l.y, l.w, l.h] = turnRect(op, l.x, l.y, l.w, l.h, W, H);
                     // new pixels (the canvas step holds the old ones), turned in their own resolution
@@ -1050,7 +1058,7 @@ export class GeometryPart {
             for (const l of this.layers) {
                 const p = plan.get(l);
                 if (!p) continue;
-                if (l.kind === "filter") { l.w = nw; l.h = nh; if (p.maskPx) l.maskPx = p.maskPx; if (p.px) l.px = p.px; continue; }
+                if (l.kind === "filter") { l.w = nw; l.h = nh; if (p.maskPx) l.maskPx = p.maskPx; if (p.px) l.px = p.px; else plainFilterPx(this, l, nw, nh); continue; }
                 if (p.rect) [l.x, l.y, l.w, l.h] = p.rect;
                 if (p.px) l.px = p.px;
                 if (p.maskPx) l.maskPx = p.maskPx;
@@ -1225,6 +1233,7 @@ export class GeometryPart {
         if (this.frameCustomRow) this.frameCustomRow.hidden = this.tool !== "canvas" || this.frameAspect !== "custom";
         if (this.frameStraightenBtn) this.frameStraightenBtn.classList.toggle("ipc-on", !!this.frameStraighten);
         if (this.canvasInfo) this.canvasInfo.textContent = this.frameInfoText();
+        this.syncExtendGenerate();
     }
 
     /**
@@ -1237,6 +1246,24 @@ export class GeometryPart {
         // a job that would land in the old geometry: the frame stays for when it is in
         const blocked = this.turnBlocked();
         if (blocked) { this.setStatus(blocked); return false; }
+        // item 63: with Generate the new border on, a run that costs money is asked once per apply, before anything
+        // changes (the switch holds for every tab); No still extends, and generates nothing
+        let generateNo = false;
+        const grows = !f.angle && (f.y < 0 || f.x < 0 || f.x + f.w > this.width || f.y + f.h > this.height);
+        if (grows && this.extendGenerate) {
+            const s = this.resultInputState();
+            if (s.provider && s.charged) {
+                const yes = await this.ask({
+                    title: "Generate the new border",
+                    message: `After the extend, Generate runs on the new border with ${s.recipeName || "the selected recipe"} on ${s.label || "an API provider"}: a paid run, charged as any Generate. Cancel extends the canvas and generates nothing.`,
+                    ok: "Extend and generate",
+                });
+                if (this.frame() !== f || !this.framePending()) { this.setStatus("The frame changed while the question was open: apply it again."); return false; }
+                const again = this.turnBlocked();
+                if (again) { this.setStatus(again); return false; }
+                generateNo = !yes;
+            }
+        }
         // taken off at once (a second Enter during the run must not apply it again), put back when the apply was refused
         this.canvasFrame = null;
         this.frameStraighten = false;
@@ -1260,14 +1287,68 @@ export class GeometryPart {
                 this.draw();
                 return false;
             }
-            if (Object.values(pos).some((x) => x > 0)) await this.extendCanvas(pos);
+            let extended = false;
+            if (extending) {
+                await this.extendCanvas(pos);
+                extended = this.base !== base0 && this.width === W + pos.left + pos.right && this.height === H + pos.top + pos.bottom;
+            }
             if (Object.values(neg).some((x) => x < 0)) await this.cropCanvas(neg);
             ok = this.base !== base0;
+            // item 63: "Generate the new border" starts Generate on the border the extend selected (not awaited: a run
+            // takes as long as it takes, the frame is applied)
+            if (extended && this.extendGenerate) {
+                if (generateNo) this.setStatus(`Canvas is ${this.width} × ${this.height}; the new border is selected and was not generated (the question was cancelled): press Generate to outpaint it.`);
+                else this.generateAfterExtend();
+            }
         }
         if (!ok && this.base === base0 && this.width === W && this.height === H && !this.canvasFrame) this.canvasFrame = f;
         this.syncFrameControls({ force: true });
         this.draw();
         return !!ok;
+    }
+
+    /**
+     * Item 63: the selected recipe's Generate on the new border, as the Generate button starts it (its refusals, its
+     * run and its result layer are Generate's own; the extend stays its own undo step). Returns Generate's promise.
+     */
+    generateAfterExtend() {
+        // the result's landing is an undo step of its own (addResults), so Ctrl+Z takes the result back first and the
+        // extend with the next one
+        this.lastExtendGenerate = this.generate();
+        return this.lastExtendGenerate;
+    }
+
+    /**
+     * Item 63: the Canvas tool's "Generate the new border" switch, off unless set; remembered per machine, so every tab
+     * reads the one value (this tab's own copy only where there is no storage).
+     */
+    get extendGenerate() {
+        try { const v = localStorage.getItem("ipc.extendGenerate"); if (v !== null) return v === "1"; } catch (_) { /* no storage */ }
+        return !!this._extendGenerate;
+    }
+
+    setExtendGenerate(on) {
+        this._extendGenerate = !!on;
+        try { localStorage.setItem("ipc.extendGenerate", on ? "1" : "0"); } catch (_) { /* no storage */ }
+        this.syncExtendGenerate();
+    }
+
+    /** Every checkbox of the switch set from it (another tab may have changed it). */
+    syncExtendGenerate() {
+        if (!this.extendGenerateInputs) return;
+        const on = this.extendGenerate;
+        for (const c of this.extendGenerateInputs) c.checked = on;
+    }
+
+    /** A checkbox for the switch (the options bar's and the Canvas section's). */
+    extendGenerateInput() {
+        const c = document.createElement("input");
+        c.type = "checkbox";
+        c.checked = this.extendGenerate;
+        c.title = "After an extend, start Generate with the selected recipe on the new border (it is selected already); an API recipe is charged as for Generate";
+        c.addEventListener("change", () => { this.setExtendGenerate(c.checked); if (this.root) this.root.focus({ preventScroll: true }); });
+        (this.extendGenerateInputs || (this.extendGenerateInputs = [])).push(c);
+        return c;
     }
 
     /** The frame as sides in frame space (positive: added, negative: cut off): what the Canvas section shows. */
@@ -1317,6 +1398,7 @@ export class GeometryPart {
                     // a new object (the canvas undo step holds the old one): the old mask placed at -left, -top
                     if (l.maskPx) { l.maskPx = l.maskPx.resized(nw, nh, { x: -left, y: -top }); l.maskDirty = true; }
                     if (ownPx(l) && l.px) { l.px = l.px.resized(nw, nh, { x: -left, y: -top }); l.dirty = true; }
+                    else plainFilterPx(this, l, nw, nh);
                 } else {
                     l.x -= left; l.y -= top;
                 }
@@ -1332,6 +1414,7 @@ export class GeometryPart {
             this.selectionDataUrl = null; this.selectionEncoded = false;
             this.followGeometry("crop", xfTranslate(-left, -top), { width: W, height: H }, { width: nw, height: nh });
             this.renderLayers(); this.renderHistory(); this.renderInfo(); this.fitView(); this.drawThumb(); this.notifyChanged();
+            storeGeometryFiles(this, "cropped");
             this.setStatus(`Canvas cropped to ${nw} × ${nh}; the layers keep their pixels (Ctrl+Z takes it back).`);
         } catch (err) {
             if (!pushed) this.releaseSnapshot(before);
@@ -1398,6 +1481,7 @@ export class GeometryPart {
                     if (l.maskPx) { const m = makeCanvas(nw, nh); const mc = m.getContext("2d"); mc.imageSmoothingEnabled = true; l.maskPx.drawTo(mc, 0, 0, nw, nh); l.maskPx = this.pixels.Mask.fromCanvas(m); l.maskDirty = true; }
                     // Deep paint's paint is resampled to the new size (a new object: the canvas step holds the old one)
                     if (ownPx(l) && l.px) { const c = makeCanvas(nw, nh); const cc = c.getContext("2d"); cc.imageSmoothingEnabled = true; cc.imageSmoothingQuality = "high"; l.px.drawTo(cc, 0, 0, nw, nh); l.px = this.pixels.Layer.fromCanvas(c); l.dirty = true; }
+                    else plainFilterPx(this, l, nw, nh);
                 } else {
                     l.x = Math.round(l.x * sx); l.y = Math.round(l.y * sy);
                     l.w = Math.max(1, Math.round(l.w * sx)); l.h = Math.max(1, Math.round(l.h * sy));
@@ -1418,6 +1502,7 @@ export class GeometryPart {
             this.selectionDataUrl = null; this.selectionEncoded = false;
             this.followGeometry("resize", xfScale(sx, sy), { width: W, height: H }, { width: nw, height: nh });
             this.renderLayers(); this.renderHistory(); this.renderInfo(); this.fitView(); this.drawThumb(); this.notifyChanged();
+            storeGeometryFiles(this, "resized");
             let scaledNote = scaledFilters ? ` The sizes in pixels of ${scaledFilters} filter layer${scaledFilters === 1 ? "" : "s"} scaled along.` : "";
             if (keptFilters) scaledNote += keptFilters === 1 ? " 1 filter layer of a plugin that is off kept its sizes." : ` ${keptFilters} filter layers of plugins that are off kept their sizes.`;
             this.setStatus(`Image ${base ? "upscaled" : "resized"} to ${nw} × ${nh} (Ctrl+Z takes it back). Layers keep their own resolution.${scaledNote}`);
@@ -1575,6 +1660,7 @@ export class GeometryPart {
                     l.x = 0; l.y = 0; l.w = nw; l.h = nh;   // a filter covers the whole canvas
                     if (l.maskPx && l.maskPx.width === W && l.maskPx.height === H) { l.maskPx = l.maskPx.resized(nw, nh, { x: left, y: top }); l.maskDirty = true; l._maskedValid = false; }
                     if (ownPx(l) && l.px && l.px.width === W && l.px.height === H) l.px = l.px.resized(nw, nh, { x: left, y: top });
+                    else plainFilterPx(this, l, nw, nh);
                 } else if (l.kind === "paint" && l.px && l.px.width === W && l.px.height === H && l.w === W && l.h === H) {
                     // a new object (the canvas undo step holds the old one): the old pixels placed at left, top
                     l.px = l.px.resized(nw, nh, { x: left, y: top });
@@ -1583,7 +1669,8 @@ export class GeometryPart {
                 } else {
                     l.x += left; l.y += top;
                 }
-                l.dirty = true;
+                // a plain filter layer's px is an empty store with no file of its own to upload
+                l.dirty = l.kind !== "filter" || ownPx(l);
             }
             this.layers = kept;
             this.activeLayerId = null;
@@ -1607,6 +1694,7 @@ export class GeometryPart {
             this.fitView();
             this.drawThumb();
             this.notifyChanged();
+            storeGeometryFiles(this, "extended");
             const hiddenNote = hiddenKept ? ` ${hiddenKept} hidden layer${hiddenKept === 1 ? " stays a layer" : "s stay layers"}, moved with the picture.` : "";
             this.setStatus(`Canvas is ${nw} × ${nh}. The new border is selected; press Generate to outpaint it (Ctrl+Z takes the extension back).${hiddenNote}`);
         } catch (err) {

@@ -65,6 +65,8 @@ import { RelightPart } from "./inpaint_ed_relight.js";
 import { ChromePart } from "./inpaint_ed_chrome.js";
 import { ViewPart } from "./inpaint_ed_view.js";
 import { RefsPart } from "./inpaint_ed_refs.js";
+import { ShadowPart } from "./inpaint_ed_shadow.js";
+import { ScopePart } from "./inpaint_ed_scope.js";
 
 // ---------------------------------------------------------------------------
 // the editor
@@ -196,6 +198,8 @@ class InpaintEditor {
         this._pyramidBudget = Infinity; // new levels allowed in this frame (drawScene sets it to 1)
         this._pyramidPending = false;
         this.sceneCanvas = null;        // last composited view; overlays are drawn on top of it every frame
+        this._sceneSeq = 0;             // bumped each time sceneCanvas is drawn again (the clipping warning keys on it)
+        this.clipWarning = false;       // the clipping warning over the screen (Alt+J, inpaint_ed_scope.js): a view, never saved
         this.sceneSig = null;
         this.viewCanvas = null;         // the visible region, composited at screen resolution
         this.viewPass = null;           // {x, y, w, h, sx, sy} while a region is being composited
@@ -208,6 +212,10 @@ class InpaintEditor {
         this.filterPreview = null;      // id of the filter layer whose slider is being dragged (low-res preview)
         this.hideLightHandles = false;  // view toggle: hide 3D light handles and overlays on canvas
         this.seenResults = new Set();
+        // (layer, why) where a result, a paste, a cutout or a reference lands ("result", "paste", "cutout", "reference"):
+        // the app names it (Florence-2, host_vlm.js); null in the node
+        this.layerLanded = null;
+        this.vlmUsed = false;           // the app's caption model ran (host_vlm.js): a local Generate frees the helpers first
         this.layerCounter = 0;
         this.paintCounter = 0;
         this.pointer = null;
@@ -398,6 +406,8 @@ class InpaintEditor {
         this.flatCache = null;
         this.sceneCanvas = null;
         this.sceneSig = null;
+        if (this._scopeTimer) { clearTimeout(this._scopeTimer); this._scopeTimer = null; }
+        this.dropClipMarks();
         this.root.remove();
         this.drawThumb();
         this.notifyChanged();
@@ -921,6 +931,9 @@ class InpaintEditor {
                 }
             }
         }
+        // a map whose upload failed when it was made (setMap / setMaps): tried again on every pass, quietly (a save's
+        // flush, the host's flushEditor, asks storeMaps itself and refuses in words)
+        await this.storeMaps({ quiet: true });
         this.notifyChanged();
     }
 
@@ -932,7 +945,7 @@ class InpaintEditor {
     }
 
     /** A skin was switched (renderer/skins.js): redraw what took its colours from THEME. */
-    themeChanged() { try { this.renderLayers(); } catch (err) { console.warn("theme: layers", err); } try { this.syncTipControls(); } catch (err) { console.warn("theme: tip", err); } this.drawSoon(); }
+    themeChanged() { try { this.renderLayers(); } catch (err) { console.warn("theme: layers", err); } try { this.syncTipControls(); } catch (err) { console.warn("theme: tip", err); } try { this.drawScope(); } catch (err) { console.warn("theme: scope", err); } this.drawSoon(); }
 
     // ---- queue -------------------------------------------------------------
 
@@ -1156,6 +1169,8 @@ class InpaintEditor {
             if (this[name]) { freed += px(this[name].c || this[name]); this[name] = null; }
         }
         if (this._brushRead) { for (const c of this._brushRead) if (c) freed += px(c); this._brushRead = null; }
+        // the clipping warning's marks: the CPU fallback's own canvas; the GL pass's shared buffers shrink with them
+        if (this._clipMarks) { if (!this._clipMarks.gl) freed += px(this._clipMarks.canvas); this.dropClipMarks(); }
         if (this._walkScratches) { for (const c of this._walkScratches.values()) freed += px(c); this._walkScratches = null; }
         releaseBoxBuffers();
         if (this.flatCache) { freed += px(this.flatCache.canvas); this.flatCache = null; }
@@ -1255,6 +1270,7 @@ class InpaintEditor {
         const mb = Math.round(freed / 1048576);
         this.drawSoon();
         try { await host.freeHelpers(); } catch (err) { console.warn(err); }
+        this.vlmUsed = false;
         if (!host.connected) { this.helperUsed = false; this.setStatus(`Freed ${mb} MB of caches; the in-app helper models are unloaded too.`); return; }
         try {
             this.setStatus(`Freed ${mb} MB of caches. Freeing helper models (SAM, Qwen-VL) from VRAM ...`);
@@ -1308,6 +1324,8 @@ class InpaintEditor {
             // instances, invisible to ComfyUI's model management. Before a local run they are freed, so a big
             // model such as Flux.2 gets the whole card; in API mode they simply stay resident.
             if (this.genSettings.mode === "local" && this.helperUsed) await this.freeHelperModels();
+            // the app's caption model (Florence-2) in VRAM: its process let go, nothing asked of ComfyUI
+            else if (this.genSettings.mode === "local" && this.vlmUsed) { this.vlmUsed = false; try { await host.freeHelpers(); } catch (err) { console.warn(err); } }
             this.setStatus(wired ? `Queueing (${this.genSettings.mode}, seed ${this.genSettings.seed}, result from ${name}) ...` : `Queueing, but nothing is wired into "result" or "result_local": the result will not come back into the canvas.`);
             await host.queueGenerate(this, area ? { refs, area } : { refs });
         } catch (err) {
@@ -1318,7 +1336,10 @@ class InpaintEditor {
             return { error: this.lastRunError };
         } finally {
             this.generateBtn.disabled = false;
-            if (this.isOpen) this.root.focus({ preventScroll: true });
+            // not out of a text being typed meanwhile (on the canvas or in a field): its blur would end the edit half done
+            const a = document.activeElement;
+            const typing = !!this.textEdit || !!(a && a !== this.root && this.root.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName));
+            if (this.isOpen && !typing) this.root.focus({ preventScroll: true });
         }
     }
 
@@ -1494,6 +1515,7 @@ class InpaintEditor {
         addPixels(scratch, "selection", this.sel);
         for (const name of ["sceneCanvas", "viewCanvas", "flatCanvas", "strokePreview", "maskPreview", "maskedPreview", "antsCanvas", "strokeView", "strokeMaskView", "_strokePatch", "_strokeClip", "_strokeDev", "filterMaskCanvas", "_passView", "_passMaskView", "_filterMaskView"]) add(scratch, name, this[name]);
         add(scratch, "flatCache", this.flatCache && this.flatCache.canvas);
+        add(scratch, "clipMarks", this._clipMarks && this._clipMarks.canvas);   // the clipping warning's (inpaint_ed_scope.js)
 
         // undo / redo: the rect copies plus the canvases (or tiles) the "layers" / "canvas" snapshots
         // hold that the live document does not
@@ -1591,9 +1613,10 @@ class InpaintEditor {
         this.clearSnapshots();
         try { this.resizeObserver.disconnect(); } catch (_) { /* ignore */ }
         try { this.thumbObserver.disconnect(); } catch (_) { /* ignore */ }
+        if (this.scopeObserver) { try { this.scopeObserver.disconnect(); } catch (_) { /* ignore */ } }
     }
 }
-installParts(InpaintEditor, [PanelsPart, LayersPart, HistoryPanelPart, TextPart, TipsPart, HealPart, LiquifyPart, ShapePart, SelectPart, StackPart, SegmentPart, MasksPart, GeometryPart, PointerPart, DepthPart, FiltersPart, HistoryPart, PersistPart, ExportPart, OpenPart, StrokesPart, DisplayPart, CompositePart, MatchPart, DrawPart, RelightPart, ChromePart, ViewPart, RefsPart]);
+installParts(InpaintEditor, [PanelsPart, LayersPart, HistoryPanelPart, TextPart, TipsPart, HealPart, LiquifyPart, ShapePart, SelectPart, StackPart, SegmentPart, MasksPart, GeometryPart, PointerPart, DepthPart, FiltersPart, HistoryPart, PersistPart, ExportPart, OpenPart, StrokesPart, DisplayPart, CompositePart, MatchPart, DrawPart, RelightPart, ChromePart, ViewPart, RefsPart, ShadowPart, ScopePart]);
 bindDisplay(InpaintEditor);
 bindComposite(InpaintEditor);
 bindExport(InpaintEditor);

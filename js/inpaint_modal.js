@@ -32,6 +32,7 @@ export function buildEditorModal(ed) {
     buildLayers(ed);
     buildReferences(ed);
     buildUndoHistory(ed, section);
+    ed.buildScopeSection(section);
     buildSelection(ed, section);
     buildCanvasPanel(ed, section);
     buildExport(ed, section);
@@ -838,7 +839,8 @@ function buildRangeSelect(ed, d) {
     ed.rangeInvertInput.title = "Select what lies outside the range";
     ed.rangeInvertInput.addEventListener("change", () => {
         ed.rangeLimit.invert = ed.rangeInvertInput.checked;
-        if (ed.rangeBar) ed.rangeBar.refresh();
+        // the bar hands its own invert on a drag (inpaint_rangebar.js own()): it takes the checkbox's
+        if (ed.rangeBar) ed.rangeBar.set({ invert: ed.rangeLimit.invert });
         if (ed._rangeTint) ed.setRangePreview(ed.rangeLimit);
     });
     invLab.appendChild(ed.rangeInvertInput); invLab.appendChild(el("span", null, "Invert"));
@@ -868,6 +870,11 @@ function buildCanvasPanel(ed, section) {
         ed.extendFillSel.addEventListener("change", () => { ed.cropSettings.extendFill = ed.extendFillSel.value; ed.notifyChanged(); });
         fillLab.appendChild(ed.extendFillSel);
         sec.appendChild(fillLab);
+        // item 63: Generate on the new border right after an extend (the canvas tool's options bar has the same switch)
+        const genLab = el("label", null);
+        genLab.appendChild(ed.extendGenerateInput());
+        genLab.appendChild(el("span", null, "Generate the new border"));
+        sec.appendChild(genLab);
         const ext = iconButton("extend", "Apply the canvas frame: the pixels above extend the canvas (outpainting; the new border becomes the selection), negative values crop; with an angle the picture is straightened and cropped in one step. The canvas tool (C) sets the frame by dragging; Enter applies.", () => ed.applyFrame(), "Apply");
         ext.classList.add("ipc-small");
         sec.appendChild(ext);

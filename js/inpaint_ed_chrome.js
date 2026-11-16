@@ -518,6 +518,8 @@ export class ChromePart {
         const ov = selectInput(["thirds", "golden", "grid", "diagonal", "none"], this.frameOverlay, "Lines over the frame to compose by");
         ov.addEventListener("change", () => { this.frameOverlay = ov.value; try { localStorage.setItem("ipc.cropOverlay", ov.value); } catch (_) { /* no storage */ } this.draw(); this.root.focus({ preventScroll: true }); });
         row("canvas", "Lines", ov);
+        // item 63: Generate on the new border right after an extend
+        row("canvas", this.extendGenerateInput(), "Generate the new border");
         row("canvas", iconButton("check", "Apply the frame (Enter, or a double click inside it)", () => this.applyFrame(), "Apply"));
         row("canvas", iconButton("close", "Reset the frame (Esc)", () => { this.resetFrame(); this.setStatus(this.frameStatus()); }, "Reset"));
         this.optsHint = el("span", "ipc-hint", "");
@@ -533,6 +535,7 @@ export class ChromePart {
         this.optsBar.hidden = !on;
         if (!on) return;
         for (const lab of this.optsBar.querySelectorAll("label")) lab.hidden = !(lab.dataset.for || "").split(" ").includes(tool);
+        if (tool === "canvas") this.syncExtendGenerate();   // item 63: another tab may have changed the switch
         if (tool === "shape") {
             const o = this.shapeOpts, open = o.kind === "polyline";
             this.shapeFillRow.hidden = open;                       // an open line has nothing to fill

@@ -57,7 +57,6 @@ export function limitStage(src, out, limitIn, info = {}, def = null) {
     if (!limitIn) return out;
     const limit = normalizeStoredLimit(limitIn);
     if (!limit) return out;
-    if (out === src) return src;
     if (limit.lo <= 0 && limit.hi >= 1 && !limit.invert) return out;
     if (limit.source === "depth" && (!info || !info.maps || !info.maps.depth)) {
         if (info) info.limitMissing = true;
@@ -69,6 +68,9 @@ export function limitStage(src, out, limitIn, info = {}, def = null) {
     // caller): with \`mix(in, out, w)\` under a blend mode the picture would be blended with itself where
     // the limit is 0 (multiply darkens, screen lightens), while the painted mask leaves it alone there.
     const over = !!(def && def.over) || !!info.limitOver;
+    // a filter at identity hands its input back: plain, that is the answer; drawn over the picture (limitOver) the
+    // limit's weight must still go into the alpha, or the band is blended with itself outside the limit
+    if (out === src && !over) return src;
     if (!info.cpu) {
         try {
             const map = limit.source === "depth" ? (info.maps && info.maps.depth) : null;

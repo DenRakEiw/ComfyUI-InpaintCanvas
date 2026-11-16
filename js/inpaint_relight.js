@@ -52,6 +52,25 @@ export function relightNormalFromMoge(r, g, b, m) {
     return len > 1e-6 ? [x / len, y / len, z / len] : [0, 0, 1];
 }
 
+/**
+ * The normal relight uses where MoGe-2's normals are on (SP6): MoGe's where its mask (the normals map's A, bilinear) is
+ * full, the depth map's (nx, ny, nz) where it is 0 (the sky, where MoGe saw no surface: Wrap keeps the depth's way there
+ * too), the two mixed along the mask's soft edge. The shader's u_mnOn branch is the same.
+ * @param {number} nx @param {number} ny @param {number} nz the depth map's normal
+ * @param {number[]} moge MoGe-2's normal (relightNormalFromMoge)
+ * @param {number} a the mask, 0..1
+ * @returns {number[]}
+ */
+export function relightNormalOnMask(nx, ny, nz, moge, a) {
+    if (a >= 254.5 / 255) return moge;   // a bilinear sum of 255s can fall a hair under 255
+    if (!(a > 0)) return [nx, ny, nz];
+    const dl = Math.hypot(nx, ny, nz);
+    const d = dl > 1e-5 ? [nx / dl, ny / dl, nz / dl] : [0, 0, 1];
+    const x = d[0] + (moge[0] - d[0]) * a, y = d[1] + (moge[1] - d[1]) * a, z = d[2] + (moge[2] - d[2]) * a;
+    const len = Math.hypot(x, y, z);
+    return len > 1e-6 ? [x / len, y / len, z / len] : [0, 0, 1];
+}
+
 // ---- the march on the pool in stripes (K12, docs/PLAN_WASM_BUILD.md section 4.5) ---------------------------------------------
 
 /** The fewest rows a stripe of a march takes (about 45 ms of a point light's full march at 4096 x 2731). */
@@ -1788,7 +1807,7 @@ export function applyRelight(src, params, info = {}) {
             if (mn) {
                 // MoGe-2's normal at the pixel's centre, bilinear (the shader's linear filter on the same bytes)
                 const q = sampleRgbaBilinear(mn.map.data, mn.map.w, mn.map.h, mnM[0] * px_x + mnM[2] * py + mnM[4], mnM[1] * px_x + mnM[3] * py + mnM[5]);
-                [nx, ny, nz] = relightNormalFromMoge(q[0] / 255, q[1] / 255, q[2] / 255, mn.m);
+                [nx, ny, nz] = relightNormalOnMask(nx, ny, nz, relightNormalFromMoge(q[0] / 255, q[1] / 255, q[2] / 255, mn.m), q[3] / 255);
             }
 
             const vVals = [vRgba[0] / 255.0, vRgba[1] / 255.0, vRgba[2] / 255.0, vRgba[3] / 255.0];
@@ -2000,10 +2019,18 @@ vec4 shade(vec4 c, vec2 uv) {
     if (u_mnOn == 1) {
         // MoGe-2's normal (SP6): its frame into the depth map's, z towards the viewer
         vec2 mq = vec2(dot(u_mn0.xy, pp) + u_mn1.x, dot(u_mn0.zw, pp) + u_mn1.y);
-        vec3 m3 = texture(u_mn, mq / vec2(textureSize(u_mn, 0))).xyz * 2.0 - 1.0;
+        vec4 mt = texture(u_mn, mq / vec2(textureSize(u_mn, 0)));
+        vec3 m3 = mt.xyz * 2.0 - 1.0;
         vec3 rn = vec3(u_mnF.x * m3.x + u_mnF.y * m3.y, u_mnF.z * m3.x + u_mnF.w * m3.y, -m3.z);
         float rl = length(rn);
-        normal = rl > 1e-6 ? rn / rl : vec3(0.0, 0.0, 1.0);
+        vec3 mg = rl > 1e-6 ? rn / rl : vec3(0.0, 0.0, 1.0);
+        // its mask (A): MoGe's normal where full, the depth map's where 0 (the sky), mixed on the edge (relightNormalOnMask)
+        if (mt.a >= 254.5 / 255.0) normal = mg;
+        else if (mt.a > 0.0) {
+            vec3 bn = mix(normal, mg, mt.a);
+            float bl = length(bn);
+            normal = bl > 1e-6 ? bn / bl : vec3(0.0, 0.0, 1.0);
+        }
     }
 
     vec3 mpos = vec3(mpx.x, mpx.y, (1.0 - far) * u_depth_scale);

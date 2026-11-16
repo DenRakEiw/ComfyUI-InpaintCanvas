@@ -15,6 +15,18 @@ import { failKind } from "./inpaint_status.js";
 import { makeCanvas } from "./inpaint_consts.js";
 import { el, iconButton } from "./inpaint_dom.js";
 
+/** A map's guide (RGBA8 at the map's size) as a canvas for its upload. */
+function guideCanvas(map) {
+    const gc = document.createElement("canvas");
+    gc.width = map.w;
+    gc.height = map.h;
+    const gctx = gc.getContext("2d");
+    const imgData = gctx.createImageData(map.w, map.h);
+    imgData.data.set(map.guide);
+    gctx.putImageData(imgData, 0, 0);
+    return gc;
+}
+
 export class DepthPart {
     // ---- depth estimation (Nik-9 Parity R1-S3b / F8) --------------------------------
 
@@ -370,6 +382,41 @@ export class DepthPart {
         this.draw();
         this.notifyChanged();
         return true;
+    }
+
+    /**
+     * The maps the document holds with no stored file yet (setMap / setMaps go on when their upload fails, so the map
+     * works on screen): their kinds, a map without `ref` or a guide without `guideRef`. getValue leaves such a map out
+     * (mapToJSON's ref), so a save then would lose it.
+     * @returns {string[]}
+     */
+    mapsUnstored() {
+        return Object.entries(this.maps || {}).filter(([, m]) => m && m.data && (!m.ref || (m.guide && !m.guideRef))).map(([k]) => k);
+    }
+
+    /**
+     * Store the maps mapsUnstored names (their packed files into the mirror / onto the server). `quiet` (syncLayersOnce:
+     * the autosave, a run): a failure is logged and the next pass tries again; otherwise (the host's flushEditor, before a save
+     * or a copy) it throws in plain words, so the file never goes without the map. -> the kinds still not stored (quiet)
+     * @returns {Promise<string[]>}
+     */
+    async storeMaps({ quiet = false } = {}) {
+        const nodeId = (this.node && this.node.id != null) ? this.node.id : "0";
+        const failed = [];
+        for (const kind of this.mapsUnstored()) {
+            // a map dropped, or replaced by one already stored, while an earlier one uploaded (setMaps, an undo)
+            const map = this.maps && this.maps[kind];
+            if (!map || !this.mapsUnstored().includes(kind)) continue;
+            try {
+                if (!map.ref) map.ref = (await uploadCanvas(packMap(map), `n${nodeId}_${kind}`)).ref;
+                if (map.guide && !map.guideRef) map.guideRef = (await uploadCanvas(guideCanvas(map), `n${nodeId}_${kind}guide`)).ref;
+            } catch (err) {
+                const why = String((err && err.message) || err);
+                if (quiet) { console.warn(`Inpaint Canvas: the ${kind} map could not be stored, the next pass tries again`, err); failed.push(kind); continue; }
+                throw new Error(`The ${kind} map could not be stored (${why}), so the file would go without it. Try again; Compute the maps again if it keeps failing.`);
+            }
+        }
+        return failed;
     }
 
     /**
@@ -836,14 +883,7 @@ export class DepthPart {
         }
         if (map && map.guide && !map.guideRef) {
             try {
-                const gc = document.createElement("canvas");
-                gc.width = map.w;
-                gc.height = map.h;
-                const gctx = gc.getContext("2d");
-                const imgData = gctx.createImageData(map.w, map.h);
-                imgData.data.set(map.guide);
-                gctx.putImageData(imgData, 0, 0);
-                const { ref } = await uploadCanvas(gc, `n${nodeId}_${kind || "depth"}guide`);
+                const { ref } = await uploadCanvas(guideCanvas(map), `n${nodeId}_${kind || "depth"}guide`);
                 map.guideRef = ref;
             } catch (_) {
                 // Standalone / offline / test mode

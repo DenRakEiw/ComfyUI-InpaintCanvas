@@ -633,6 +633,7 @@ export class RelightPart {
             this._pyramidBudget = 1;
             this._pyramidPending = false;
             this.drawSceneImage(sctx, W, H);
+            this._sceneSeq = (this._sceneSeq || 0) + 1;
             this._pyramidBudget = Infinity;
             this.sceneSig = this.sceneSignature();   // caches filled while drawing count as part of this scene
             if (this._pyramidPending) {
@@ -642,6 +643,8 @@ export class RelightPart {
             }
         }
         ctx.drawImage(this.sceneCanvas, 0, 0);
+        // the clipping warning (Alt+J): over the picture as the screen shows it, under the selection and the handles
+        if (this.clipWarning) this.drawClipWarning(ctx, W, H);
         this.applyViewTransform(ctx);
         ctx.imageSmoothingEnabled = s < 1;
         this.drawSceneOverlays(ctx);

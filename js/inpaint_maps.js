@@ -344,6 +344,17 @@ export function guideView(map) {
 }
 
 /**
+ * A map's meta as it is stored: no typed array (a Float32Array stringifies as one key per element; the depth
+ * models' raw disparity in `meta.raw` made ~11 MB of JSON per getValue, 300+ MB for a 15k Depth from layer) and no
+ * `raw` kept as a plain object by an older file. Only sample_depth's raw_disparity read it; it answers null after a
+ * reopen.
+ */
+function storedMeta(meta) {
+    if (!meta) return {};
+    return JSON.parse(JSON.stringify(meta, (k, v) => (k === "raw" || ArrayBuffer.isView(v) || v instanceof ArrayBuffer) ? undefined : v)) || {};
+}
+
+/**
  * Serialize map metadata and reference for persistence.
  * @param {DocMap} map
  */
@@ -356,7 +367,7 @@ export function mapToJSON(map) {
         h: map.h,
         xf: Array.from(map.xf),
         enc: mapEnc(map).json,
-        meta: map.meta ? JSON.parse(JSON.stringify(map.meta)) : {},
+        meta: storedMeta(map.meta),
     };
     if (map.guide || map.guideRef) {
         out.genc = "rgba8";
@@ -411,7 +422,7 @@ export async function mapFromJSON(kind, j, loadImage) {
             }
         }
 
-        const map = makeMap(kind, j.w, j.h, data, j.xf, j.meta, guide, encId);
+        const map = makeMap(kind, j.w, j.h, data, j.xf, j.meta ? storedMeta(j.meta) : j.meta, guide, encId);
         map.ref = j.ref;
         if (guide) {
             map.guideRef = j.guide;

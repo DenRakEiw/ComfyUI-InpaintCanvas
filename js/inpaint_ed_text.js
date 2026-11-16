@@ -102,6 +102,8 @@ export class TextPart {
     async renderTextLayer(layer, { keepScale = true, adopt = null } = {}) {
         if (!layer || layer.kind !== "text" || !layer.text) return;
         const token = (layer._textToken = (layer._textToken || 0) + 1);
+        // this render draws the description as it is now: a debounced one still waiting has nothing left to do
+        clearTimeout(layer._textTimer); layer._textTimer = null;
         layer._textRendering = token;   // a text undo step taken meanwhile knows its pixels are behind
         const r = await renderText(layer.text);
         const { canvas, res, missing } = r;

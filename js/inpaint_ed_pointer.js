@@ -229,6 +229,8 @@ export class PointerPart {
         if (ctrl && k === "v") { e.preventDefault(); this.pasteClipboard(); return; }
         if (ctrl && k === "i") { e.preventDefault(); this.invertSelection(); return; }
         if (ctrl && k === "s") { e.preventDefault(); this.exportImage(); return; }
+        // Alt+J: the clipping warning (J itself is the healing brush); by the key, as Ctrl+Alt+G above
+        if (!ctrl && e.altKey && !altGr && !e.shiftKey && e.code === "KeyJ") { e.preventDefault(); if (!e.repeat) this.toggleClipWarning(); return; }
         if (ctrl || (e.altKey && !altGr)) return;
         if (e.shiftKey && k === "f") { this.fillSelection(); return; }
         if (e.shiftKey && k === "l") { this.setTool("polygon"); return; }

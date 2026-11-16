@@ -133,6 +133,7 @@ export class MasksPart {
             this.draw();
             const pct = Math.round(100 * sum / (255 * W * H));
             this.setStatus(`${layer.name}: background removed with ${pending.backend.label}, ${pct}% kept. Enable mask editing to touch it up with P / E.`);
+            if (this.layerLanded) this.layerLanded(layer, "cutout");
             return true;
         } catch (err) {
             console.error(err);
@@ -320,6 +321,8 @@ export class MasksPart {
                 // a filter layer's pixels are never drawn: its mask is all that limits the filter
                 if (layer.kind === "filter") { this.setStatus(`${layer.name} is a filter layer: it has no pixels to bake the mask into.`); return false; }
                 if (layer.kind === "text") {
+                    // the text edited on the canvas would be written back onto the layer when its editor closes
+                    if (this.textEdit && this.textEdit.layer === layer) { this.setStatus("Finish the text edit first (Enter / Escape)."); return false; }
                     // a text layer's pixels are rendered from its description, so the next text edit would bring the
                     // hidden parts back: the text becomes pixels first (one "layers" step: undo brings the text back)
                     this.pushUndo({ kind: "layers", label: "Apply mask" });
@@ -437,7 +440,10 @@ export class MasksPart {
                     onClick: () => { const l = live(); if (l.length) this.groupLayersNow(l); } },
                 ...(many ? [] : [{ icon: "contentmove", label: "Match edges to the layer below",
                     title: "An inpaint that came back slightly shifted or scaled: fit the layer's own edge to the picture under it and move or resample it to match (one undo step; refused when the fit is not plausible)",
-                    onClick: () => { const l = live()[0]; if (l) this.matchEdges(l); } }]),
+                    onClick: () => { const l = live()[0]; if (l) this.matchEdges(l); } },
+                { icon: "lights", label: "Add contact shadow...",
+                    title: "A soft shadow from the layer's shape, darkest where it meets the ground, as a multiply layer of its own under it (one undo step)",
+                    onClick: () => { const l = live()[0]; if (l) this.contactShadowDialog(l); } }]),
                 { sep: true },
                 { icon: "merge", label: many ? `Merge ${sel.length} layers` : "Merge down", key: "Ctrl+E", title: many ? "Merge the selected layers into one, at the place of the topmost" : "Merge into the layer below",
                     onClick: () => (many ? this.mergeSelected() : this.mergeDown(live()[0])) },

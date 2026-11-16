@@ -18,6 +18,24 @@ import { HUGE_MAX_PIXELS, HUGE_MAX_SIDE, hugePngSize, imageFileSize, imageOfBlob
 
 let InpaintEditor = null;
 
+/** Chromium's refusal to read a File that changed on disk after it was picked (its cause chain looked at too). */
+const notReadable = (e, depth = 0) => !!e && depth < 4 && (e.name === "NotReadableError" || notReadable(e.cause, depth + 1));
+
+/**
+ * An ORA stays the file while it opens (K20c: its directory, stack.xml and layers are read as slices of it). Another
+ * program that saves over it meanwhile makes Chromium refuse every later read (NotReadableError), and a decoder handed
+ * such a slice only says it cannot decode. -> a plain error naming the file when `err` is that refusal or the file no
+ * longer reads (one byte tried), else null (`err` stands as it is).
+ */
+async function changedOnDisk(file, err) {
+    if (err instanceof CancelledError) return null;
+    let changed = notReadable(err);
+    if (!changed && file && typeof file.slice === "function") {
+        try { await file.slice(0, 1).arrayBuffer(); } catch (e) { changed = notReadable(e); }
+    }
+    return changed ? new Error(`${file.name || "The file"} changed on disk while it was opened; open it again.`) : null;
+}
+
 export class OpenPart {
     // ---- layers: management ------------------------------------------------
 
@@ -27,6 +45,10 @@ export class OpenPart {
      * goes with the old one, as in loadFile (Generate new's own base, setBaseFromCanvas, keeps it: the run writes it).
      */
     async setBaseFromRef(ref) {
+        // a document still restoring would put its remaining layers over this picture (loadFile refuses the same way)
+        if (this._loading) throw new Error("The document is still loading: load the picture when it is in.");
+        // an open still decoding must not land over this one: the last picture asked for is the base
+        this._openToken = (this._openToken || 0) + 1;
         const before = this.base;
         try {
             if (TIFF_EXT.test(ref.filename || "")) {
@@ -154,6 +176,7 @@ export class OpenPart {
             if (await isTiffFile(file)) { await this.loadTiff(file, later); return; }
             if (isSvgFile(file)) {
                 const target = await this.svgTarget(file, { size, ask });
+                if (later()) return;   // a document opened into this tab while the size dialog was up
                 if (!target) { this.setStatus("Import cancelled."); return; }
                 this.setStatus(`Rasterising ${file.name || "the SVG"} at ${target.width} × ${target.height} ...`);
                 file = await rasterizeSvg(file, target);
@@ -260,7 +283,7 @@ export class OpenPart {
         // the size is checked from the header before anything else is read or made (H1 S5), as the pool route does
         const onHeader = (h) => this.checkLayeredSize(h.width, h.height);
         const doc = kind === "psd" ? await readPsd(bytes, { inflate: (b, cap) => timed(b, "deflate", cap), onHeader })
-            : await readOraBlob(file, { inflateRaw: (b, cap) => timed(b, "deflate-raw", cap), onHeader });
+            : await readOraBlob(file, { inflateRaw: (b, cap) => timed(b, "deflate-raw", cap), onHeader }).catch(async (err) => { throw (await changedOnDisk(file, err)) || err; });
         markStep("layered_open", "parsed", { inflateMs, inflates });
         this.checkLayeredSize(doc.width, doc.height);
         // the bottom layer's PNG, kept for loadLayered's base upload (oraBaseUpload): the decode below lets go of L.pngBlob
@@ -295,7 +318,7 @@ export class OpenPart {
                 if (x.px) { x.px.release(); x.px = null; }
                 if (x.maskPx) { x.maskPx.release(); x.maskPx = null; }
             }
-            throw err;
+            throw (kind === "ora" && (await changedOnDisk(file, err))) || err;
         }
         markStep("layered_open", "layers", { maskMs, rgbaMs, ...spent });
         return doc;
@@ -319,7 +342,8 @@ export class OpenPart {
                     L.px = px; L.w = px.width; L.h = px.height; L.pngBlob = null;
                     return;
                 } catch (err) {
-                    if ((err && err.partedRefused) || h.width * h.height > CANVAS_MAX_PIXELS) throw err;
+                    // a file changed on disk is no stream fault: the image decoder would only fail on the same slice
+                    if ((err && err.partedRefused) || notReadable(err) || h.width * h.height > CANVAS_MAX_PIXELS) throw err;
                     console.warn("Inpaint Canvas: an ORA layer could not be read as a stream, using the image decoder:", (err && err.message) || err);
                 } finally { spent.streamMs += performance.now() - t0; }
             }
@@ -484,7 +508,10 @@ export class OpenPart {
         else basePx = this.pixels.Layer.empty(W, H);
         if (doc.compositePx && basePx !== doc.compositePx) { doc.compositePx.release(); doc.compositePx = null; }
         this.setStatus(`Storing ${file.name || "the file"} ...`);
-        const raw = kind === "ora" && basePx === b?.px ? await this.oraBaseUpload(doc, file) : null;
+        let raw = null;
+        if (kind === "ora" && basePx === b?.px) {
+            try { raw = await this.oraBaseUpload(doc, file); } catch (err) { dropDoc(basePx); throw (await changedOnDisk(file, err)) || err; }
+        }
         const ref = raw || (await uploadPixels(basePx, layeredStem(file))).ref;
         markStep("layered_open", "stored");
         if (later()) { dropDoc(basePx); return; }

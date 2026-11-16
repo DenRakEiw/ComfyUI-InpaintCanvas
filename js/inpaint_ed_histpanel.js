@@ -183,9 +183,14 @@ export class HistoryPanelPart {
      * (hidden ones too), every other layer goes (26f). Returns { width, height, kept, dropped } (layers).
      */
     async setBaseFromCanvas(canvas, { keepLayers = false, keepRefs = false } = {}) {
+        // a document still restoring (setValue) goes on after each await: the new base (a paid answer, often) waits for it
+        // instead of being mixed into it, before the upload and again after it
+        const untilLoaded = async () => { while (this._loading && !this._destroyed) await new Promise((r) => setTimeout(r, 100)); };
+        await untilLoaded();
         if (this.pending) this.cancelPending();
         if (this.textEdit) this.endTextEdit(false);
         const { ref } = await uploadCanvas(canvas, `n${this.node.id}_base`);
+        await untilLoaded();
         // C6 (d): a copy of the caller's canvas (the canvas backend adopts a canvas it is given), not the upload decoded again
         const px = this.pixels.Layer.fromImage(canvas, canvas.width, canvas.height);
         const keep = keepRefs && !keepLayers ? this.layers.filter((l) => this.isReference(l)) : null;
@@ -467,10 +472,13 @@ export class HistoryPanelPart {
                 const inv = xfMul(xfScale(fw, fh), xfMul(xfInv(h.xf), [rect[2] / npw, 0, 0, rect[3] / nph, rect[0], rect[1]]));
                 const turned = px.transformed(pixelMap(inv), npw, nph);
                 px.release();
+                this.pushUndo({ kind: "layers", label: `Restore ${h.name}` });
                 layer = this.addLayer({ name: h.name, kind: "result", ref: null, px: turned, x: rect[0], y: rect[1], w: rect[2], h: rect[3], dirty: true });
             } else {
                 for (const op of orientOps(h.orient)) px = px.turned(op);
                 const up = orientIsUp(h.orient);
+                // a result put back from the history is an undo step, as its landing was
+                this.pushUndo({ kind: "layers", label: `Restore ${h.name}` });
                 layer = this.addLayer({ name: h.name, kind: "result", ref: up ? h.ref : null, px, x: h.x, y: h.y, w: h.w, h: h.h, ...(up ? {} : { dirty: true }) });
             }
             h.layerId = layer.id;
