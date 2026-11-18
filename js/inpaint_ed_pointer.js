@@ -598,6 +598,9 @@ export class PointerPart {
             }
             const stroke = new StrokeBuffer(layer.px, this.pixels);
             this.pointer = { kind: "layerpaint", layer, stroke, clip: this.strokeClip(layer, layer.px), erase: this.tool === "erase", last: [ix, iy], pressure, flow: this.brushFlow, stab: this.newStabiliser(ix, iy, pressure) };
+            // Stay on surface: a stroke on a Deep paint layer keeps to the surface it begins on (surfaceClipAt)
+            const surf = this.surfaceClipAt(layer, ix, iy);
+            if (surf) this.pointer.surf = surf;
             if (lineFrom && !prev.mask) this.layerDab(this.pointer, lineFrom[0], lineFrom[1], ix, iy); else this.layerDab(this.pointer, ix, iy, ix, iy);
         } else if (this.tool === "transform") {
             const layer = this.activeLayer();

@@ -59,6 +59,7 @@ export class MasksPart {
         if (this.cutoutPending) { this.setStatus(`Still removing the background of ${this.cutoutPending.layer.name} ...`); return false; }
         try {
             this.cutoutPending = { layer, backend };
+            this.cutoutPromptId = null;   // the last run's: this one has none until the queue answers (and never, in-app)
             this.renderLayers();
             this.setStatus(`Removing the background of ${layer.name} with ${backend.label} ...`);
             if (backend.inApp) { const img = await host.cutoutInApp(this, layer, backend); return (await this.applyCutoutImage(img, this.cutoutPending)) ? "done" : false; }

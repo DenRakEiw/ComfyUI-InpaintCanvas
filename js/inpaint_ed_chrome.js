@@ -313,6 +313,20 @@ export class ChromePart {
         });
         this.eyedropperSizeSel = dsize;
         row("eyedropper", "Size", dsize);
+        // Deep paint's brush and eraser: a stroke keeps to the surface it begins on (surfaceClipAt); on unless the user
+        // turned it off, kept like the eyedropper's size; shown only while the active layer is a Deep paint layer
+        this.surfaceStay = true;
+        try { if (localStorage.getItem("ipc.surfaceStay") === "0") this.surfaceStay = false; } catch (_) { /* no storage */ }
+        const stay = document.createElement("input");
+        stay.type = "checkbox"; stay.checked = this.surfaceStay;
+        stay.title = "Stay on surface: a stroke or a bucket fill lands only on the surface it begins on. What lies in front of it (an arm before a wall) or behind it stays free. Off: it paints every surface under it";
+        stay.addEventListener("change", () => {
+            this.surfaceStay = stay.checked;
+            try { localStorage.setItem("ipc.surfaceStay", stay.checked ? "1" : "0"); } catch (_) { /* ignore */ }
+            this.root.focus({ preventScroll: true });
+        });
+        this.surfaceStayBox = stay;
+        this.surfaceStayRow = row("paint erase bucket", stay, "Stay on surface");
         const gtype = selectInput(["linear", "radial"], "linear", "Gradient shape");
         gtype.addEventListener("change", () => { this.gradientOpts.type = gtype.value; });
         row("gradient", "Type", gtype);
@@ -535,6 +549,7 @@ export class ChromePart {
         this.optsBar.hidden = !on;
         if (!on) return;
         for (const lab of this.optsBar.querySelectorAll("label")) lab.hidden = !(lab.dataset.for || "").split(" ").includes(tool);
+        this.syncSurfaceStayRow();
         if (tool === "canvas") this.syncExtendGenerate();   // item 63: another tab may have changed the switch
         if (tool === "shape") {
             const o = this.shapeOpts, open = o.kind === "polyline";
@@ -562,6 +577,13 @@ export class ChromePart {
         if (tool === "canvas") this.syncFrameControls();
         const hints = { canvas: "Edges crop or extend, outside turns, Ctrl+drag straightens; Enter or a double click applies, Esc resets", shape: shapeHints[this.shapeOpts.kind] || "", select: "Paint to select, Alt subtracts", deselect: "Paint to deselect", paint: "Alt+click picks a colour, Shift+click draws a line", erase: "Shift+click draws a line", wand: "Click to select the similar area; Shift adds, Alt subtracts, Shift+Alt intersects", bucket: "Click to fill; Shift+F fills the whole selection", gradient: "Drag from the colour to where it should have faded", eyedropper: "Click to pick a colour", smudge: this.smudgeOpts && this.smudgeOpts.mode === "blur" ? "Paint over what should soften" : this.smudgeOpts && this.smudgeOpts.mode === "sharpen" ? "Paint over what should crisp up; a little goes a long way" : "Drag across an edge to soften it", tone: this.toneHint(), remove: "Brush over what should go: it is filled from its surroundings when you let go", patch: this.patchOpts.mode === "destination" ? "Lasso what to copy, then drag the selection to where the copy should go" : "Lasso the spot, then drag the selection to where the picture is right", contentmove: this.moveOpts.mode === "extend" ? "Lasso what to copy, then drag it: the copy blends in where you let go" : "Lasso the object, then drag it: it blends in where you let go, and its old place is filled", liquify: this.liquifyHint(), clone: this.cloneSource ? "Paint to copy from the source (Alt+click moves it)" : "Alt+click sets the source point", heal: this.cloneSource ? "Paint to repair with the source's texture (Alt+click moves it)" : "Alt+click sets the source point" };
         this.optsHint.textContent = hints[tool] || "";
+    }
+
+    /** The Stay on surface switch shows with the brush, the eraser or the bucket while the active layer is a Deep paint layer. */
+    syncSurfaceStayRow() {
+        if (!this.surfaceStayRow) return;
+        const on = (this.tool === "paint" || this.tool === "erase" || this.tool === "bucket") && this.hasOwnPixels(this.activeLayer());
+        if (this.surfaceStayRow.hidden === on) this.surfaceStayRow.hidden = !on;
     }
 
     updateSubbar() {

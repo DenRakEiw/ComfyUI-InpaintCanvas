@@ -316,3 +316,110 @@ export function surfaceModelSize(W, H, long = 768) {
     const s = Math.min(1, long / Math.max(W, H));
     return [Math.max(16, Math.round(W * s)), Math.max(16, Math.round(H * s))];
 }
+
+/**
+ * Stay on surface (Deep paint's brush): how far a point may lie off the line through two others to its sides and
+ * still be the same surface, in the lengths one map pixel has at its depth. On a plane the disparity 1 / z is linear in
+ * the pixel, however the plane is tilted, so a continuous surface is near 0 and an object in front of it is its
+ * distance in such lengths (an arm 8 cm before a wall 3 m away: about 19).
+ */
+export const REGION_TOL = 2;
+/** And how far a neighbour may lie from the pixel itself, in the same lengths: a surface seen at up to about 85 degrees. */
+export const REGION_STEP = 12;
+/**
+ * The reach of the test, in map pixels to each side: between direct neighbours it finds a jump in depth; over this
+ * reach it also finds the crease where an object stands on the surface (a cup on a table, a hand on a wall), which the
+ * model smooths over a few pixels.
+ */
+export const REGION_SPAN = 4;
+
+/**
+ * The surface under a pixel of MoGe-2's points map: the pixels reached from (mx, my) over neighbours (left, right, up,
+ * down) between which the surface goes on. Two neighbours c and q are one surface when the disparity's step between
+ * them is at most REGION_STEP and its second difference centred on each of the two is at most `tol`, both in units of
+ * d / f (one map pixel's length at that depth, as a disparity); the second difference is taken between direct
+ * neighbours and over REGION_SPAN pixels to each side. The long reach leaves a margin of that many pixels free at every
+ * border, so the region then grows back over at most as many steps by the direct neighbours' test alone: up to the
+ * jump in depth, and no further than the reach onto an object that touches the surface. A start inside such a margin
+ * (or on something narrower than the reach) begins from what the direct test reaches around it, and with a shorter
+ * reach when that finds next to nothing. A pixel the mask drops (the sky) is one surface with the dropped pixels
+ * around it. Only what is connected is reached: a part of the same surface behind something that cuts it in two is
+ * another region (two ways to follow it there were tried and dropped, docs/BUGS.md).
+ * -> { mask (255 on the surface), w, h, count }, or null when the map cannot say
+ * @param {{ data: Uint16Array, w: number, h: number, meta: { lo: number[], hi: number[], f: number } }} pmap packPoints' map
+ * @param {{ data: Uint8Array|Uint8ClampedArray, w: number, h: number }|null} nmap the normals map, for its mask (same size), or null
+ * @param {number} mx the pixel, in the map's own pixels
+ * @param {number} my
+ * @param {number} tol
+ */
+export function surfaceRegion(pmap, nmap, mx, my, tol = REGION_TOL) {
+    const meta = pmap && pmap.meta;
+    if (!meta || !pmap.data || !Array.isArray(meta.lo) || !Array.isArray(meta.hi) || !(meta.f > 0)) return null;
+    const w = pmap.w, h = pmap.h, n = w * h, pd = pmap.data;
+    if (!(w > 0) || !(h > 0) || pd.length < 3 * n) return null;
+    const useMask = !!(nmap && nmap.data && nmap.w === w && nmap.h === h);
+    const zlo = meta.lo[2], zsp = meta.hi[2] - meta.lo[2];
+    // the disparity of each kept pixel, 0 for a dropped one
+    const d = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+        const kept = useMask ? nmap.data[4 * i + 3] >= 128 : (pd[3 * i] | pd[3 * i + 1] | pd[3 * i + 2]) !== 0;
+        if (!kept) continue;
+        const z = zlo + (pd[3 * i + 2] / 65535) * zsp;
+        if (z > 0) d[i] = 1 / z;
+    }
+    const sx = Math.min(w - 1, Math.max(0, Math.floor(mx))), sy = Math.min(h - 1, Math.max(0, Math.floor(my)));
+    const seed = sy * w + sx, sky = !(d[seed] > 0);
+    const f = meta.f;
+    // the second difference centred on pixel i at (x, y), `k` pixels to each side along the axis of `step` (1 or w): fine
+    // when it is within `tol`, or when a side is beyond the map or dropped
+    const straight = (i, pos, len, step, k, unit) => {
+        if (pos < k || pos + k >= len) return true;
+        const a = d[i - k * step], b = d[i + k * step];
+        return !(a > 0) || !(b > 0) || Math.abs(a - 2 * d[i] + b) <= tol * unit;
+    };
+    // c -> q, neighbours along the axis of `step`, c at `pos` of `len` on that axis and q at `qpos`; `span`: the reach
+    const joins = (c, q, pos, qpos, len, step, span) => {
+        const dc = d[c], dq = d[q];
+        if (sky) return !(dq > 0);
+        if (!(dq > 0)) return false;
+        const unit = Math.max(dc, dq) / f;
+        if (Math.abs(dq - dc) > REGION_STEP * unit) return false;
+        if (!straight(c, pos, len, step, 1, unit) || !straight(q, qpos, len, step, 1, unit)) return false;
+        return span < 2 || (straight(c, pos, len, step, span, unit) && straight(q, qpos, len, step, span, unit));
+    };
+    const mask = new Uint8Array(n), stack = new Int32Array(n);
+    let count = 0;
+    // flood from the pixels on `stack[0 .. top)` (already marked) with reach `span`; `steps` > 0 limits how far it goes
+    const flood = (top, span, steps) => {
+        let from = 0, end = top, round = 0;
+        // a queue in rounds, so `steps` counts the distance
+        while (from < end && (!steps || round < steps)) {
+            for (let s = from; s < end; s++) {
+                const c = stack[s], x = c % w, y = (c - x) / w;
+                if (x + 1 < w && !mask[c + 1] && joins(c, c + 1, x, x + 1, w, 1, span)) { mask[c + 1] = 255; stack[top++] = c + 1; count++; }
+                if (x > 0 && !mask[c - 1] && joins(c, c - 1, x, x - 1, w, 1, span)) { mask[c - 1] = 255; stack[top++] = c - 1; count++; }
+                if (y + 1 < h && !mask[c + w] && joins(c, c + w, y, y + 1, h, w, span)) { mask[c + w] = 255; stack[top++] = c + w; count++; }
+                if (y > 0 && !mask[c - w] && joins(c, c - w, y, y - 1, h, w, span)) { mask[c - w] = 255; stack[top++] = c - w; count++; }
+            }
+            from = end; end = top; round++;
+        }
+        return top;
+    };
+    const spans = sky ? [1] : [REGION_SPAN, 2, 1].filter((s, i, a) => s >= 1 && a.indexOf(s) === i);
+    // from the start alone first; when that finds next to nothing (the start lies in a border's margin), from what the
+    // direct test reaches around it; then the same with a shorter reach (something narrower than the reach)
+    const tries = [];
+    for (const span of spans) { tries.push([span, false]); if (span > 1) tries.push([span, true]); }
+    for (let t = 0; t < tries.length; t++) {
+        const [span, around] = tries[t];
+        mask.fill(0);
+        count = 1;
+        mask[seed] = 255; stack[0] = seed;
+        let top = around ? flood(1, 1, span) : 1;
+        top = flood(top, span, 0);
+        if (span > 1) flood(top, 1, span);   // back to the borders
+        // something to paint on: a patch a few reaches wide (the last try is taken as it is)
+        if (count >= 16 * span * span) break;
+    }
+    return { mask, w, h, count };
+}

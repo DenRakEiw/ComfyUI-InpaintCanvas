@@ -21,6 +21,8 @@ import { UploadCache, sourceTag } from "./inpaint_strokebuf.js";
 import { canvasRows, loadImageEl, viewUrl } from "./inpaint_load.js";
 import { defaultLight, normalizeLights } from "./inpaint_relight.js";
 import { wrapBox, wrapDecal, wrapGrow } from "./inpaint_wrap.js";
+import { surfaceRegion } from "./inpaint_surface.js";
+import { xfInv } from "./inpaint_resample.js";
 
 export class FiltersPart {
     /**
@@ -544,6 +546,66 @@ export class FiltersPart {
     /** A filter layer whose own pixels are an input (Deep paint): the brush and the eraser paint into its `px`. */
     hasOwnPixels(layer) {
         return !!(layer && layer.kind === "filter" && layer.px && FILTERS[layer.filter] && FILTERS[layer.filter].ownPixels);
+    }
+
+    /**
+     * Stay on surface (Deep paint's brush and eraser, the options bar's switch): the surface under the stroke's first
+     * point, from the surface maps' points (surfaceRegion), as the stroke's second clip beside the selection: paint
+     * lands on the wall the stroke began on and not on the arm in front of it. `{ canvas, xf, w, h, count }`: the
+     * region at the map's size (its border repeated one pixel, so the scaled draw does not fade at the picture's
+     * edge) and the map's place in the document; null when the switch is off, the layer is no Deep paint layer or
+     * the document has no points (maps made before them, or a model's answer without).
+     */
+    surfaceClipAt(layer, ix, iy) {
+        if (this.surfaceStay === false || !this.hasOwnPixels(layer)) return null;
+        const pm = this.maps && this.maps.points, nm = this.maps && this.maps.normals;
+        if (!pm || !pm.data) return null;
+        const xf = pm.xf || [this.width, 0, 0, this.height, 0, 0];
+        const inv = xfInv(xf);
+        const mx = (inv[0] * ix + inv[2] * iy + inv[4]) * pm.w, my = (inv[1] * ix + inv[3] * iy + inv[5]) * pm.h;
+        // a start right on a border between two surfaces belongs to neither (a region of a pixel or two): the first
+        // of the points two map pixels around it that lies on one; none, and the stroke is not limited
+        let r = null;
+        for (const [ox, oy] of [[0, 0], [-2, 0], [2, 0], [0, -2], [0, 2], [-2, -2], [2, -2], [-2, 2], [2, 2]]) {
+            const t = surfaceRegion(pm, nm && nm.data ? nm : null, mx + ox, my + oy);
+            if (!t) return null;
+            if (t.count >= 32) { r = t; break; }
+        }
+        if (!r) return null;
+        const w = r.w, h = r.h, W = w + 2, H = h + 2;
+        const img = new ImageData(W, H), o = img.data;
+        // the region's border smoothed over its neighbours (1 2 1 a side) and steepened again, so a slanted border is
+        // not a staircase of map pixels once it is scaled to the picture; a straight one stays where it is
+        const m = r.mask, at = (x, y) => m[Math.min(h - 1, Math.max(0, y)) * w + Math.min(w - 1, Math.max(0, x))];
+        for (let y = 0; y < H; y++) {
+            const my = y - 1;
+            for (let x = 0; x < W; x++) {
+                const mx = x - 1;
+                const sum = at(mx - 1, my - 1) + 2 * at(mx, my - 1) + at(mx + 1, my - 1) + 2 * at(mx - 1, my) + 4 * at(mx, my) + 2 * at(mx + 1, my)
+                    + at(mx - 1, my + 1) + 2 * at(mx, my + 1) + at(mx + 1, my + 1);
+                const a = Math.round(1.5 * (sum / 16) - 64);
+                if (a > 0) { const k = 4 * (y * W + x); o[k] = 255; o[k + 3] = a > 255 ? 255 : a; }
+            }
+        }
+        const canvas = makeCanvas(W, H);
+        canvas.getContext("2d").putImageData(img, 0, 0);
+        return { canvas, xf, w, h, count: r.count };
+    }
+
+    /**
+     * A stroke's surface clip (surfaceClipAt) over a context whose pixel is (a x + e, d y + f) for the document's
+     * (x, y): what the context holds stays only on the surface. destination-in over the whole context, so the
+     * context is a scratch of exactly the rectangle that is clipped, as for the selection's clip.
+     */
+    surfaceClipInto(ctx, surf, a, d, e, f) {
+        const xf = surf.xf;
+        ctx.save();
+        ctx.setTransform(a * xf[0] / surf.w, d * xf[1] / surf.w, a * xf[2] / surf.h, d * xf[3] / surf.h, a * xf[4] + e, d * xf[5] + f);
+        ctx.globalAlpha = 1;
+        ctx.globalCompositeOperation = "destination-in";
+        ctx.imageSmoothingEnabled = true;
+        ctx.drawImage(surf.canvas, -1, -1);
+        ctx.restore();
     }
 
     setFilterType(layer, id) {

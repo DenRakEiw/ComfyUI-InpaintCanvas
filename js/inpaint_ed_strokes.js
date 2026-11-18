@@ -392,6 +392,11 @@ export class StrokesPart {
             ctx.drawImage(this.clipCanvasFor(p.layer, target, x, y, w, h, this.bandScratch("_strokeClip", w, h), p.clipSel || this.sel), 0, 0);
             ctx.globalCompositeOperation = "source-over";
         }
+        if (p.surf) {
+            // Stay on surface (Deep paint): the target's pixels to the document's through the layer's place and scale
+            const fx = p.layer.w / target.width, fy = p.layer.h / target.height;
+            this.surfaceClipInto(ctx, p.surf, 1 / fx, 1 / fy, -p.layer.x / fx - x, -p.layer.y / fy - y);
+        }
         return c;
     }
 
@@ -476,6 +481,7 @@ export class StrokesPart {
         const sb = p.stroke, sp = sb && sb.px;
         if (!sp || !isTilePixels(target) || typeof target.compositeStroke !== "function" || InpaintEditor.strokeTiles === false) return false;
         if (sp.width !== target.width || sp.height !== target.height) return false;
+        if (p.surf) return false;   // Stay on surface: the clip is a scaled map, the bands apply it (strokePatch)
         const l = p.layer;
         const sel = p.clip ? (p.clipSel || this.sel) : null;
         if (sel && (!isTilePixels(sel) || target.width !== l.w || target.height !== l.h || l.x !== Math.round(l.x) || l.y !== Math.round(l.y))) return false;
@@ -809,7 +815,7 @@ export class StrokesPart {
     drawStrokeInto(ctx, layer, target, op, vp, dev) {
         const p = this.pointer, sb = p.stroke;
         if (!sb || sb.empty) return;
-        if (!p.clip) {
+        if (!p.clip && !p.surf) {
             ctx.globalAlpha = this.strokeAlpha(p);
             ctx.globalCompositeOperation = op;
             sb.drawOver(this, ctx, layer, target, vp);
@@ -829,8 +835,12 @@ export class StrokesPart {
         sb.drawOver(this, x, layer, target, { ...vp, x: vp.x, y: vp.y, w: vp.w, h: vp.h });
         // the selection over the same image rectangle: destination-in, and the scratch is exactly
         // the rectangle, so the operation's reach beyond what is drawn is what it has to be
-        x.globalCompositeOperation = "destination-in";
-        this.drawSelectionInto(x, vp.sx, { x: vp.x, y: vp.y, w: vp.w, h: vp.h });
+        if (p.clip) {
+            x.globalCompositeOperation = "destination-in";
+            this.drawSelectionInto(x, vp.sx, { x: vp.x, y: vp.y, w: vp.w, h: vp.h });
+        }
+        // Stay on surface (Deep paint): the surface the stroke began on, over the same rectangle
+        if (p.surf) this.surfaceClipInto(x, p.surf, vp.sx, vp.sy, -vp.x * vp.sx - dev[0], -vp.y * vp.sy - dev[1]);
         ctx.save();
         try {
             ctx.setTransform(1, 0, 0, 1, 0, 0);

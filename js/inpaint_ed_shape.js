@@ -322,10 +322,14 @@ export class ShapePart {
         const o = this.fillOpts || { tolerance: 32, contiguous: true, sample: "image" };
         const t0 = performance.now();
         const color = this.color, opacity = this.brushOpacity, alphaLocked = !!(layer && layer.alphaLock);
-        const tiles = this.tileMode && InpaintEditor.bucketTiles !== false && !(alphaLocked && opacity >= 1)
+        // Stay on surface: the bucket on a Deep paint layer fills only the surface under the click (surfaceClipAt); the
+        // region then goes through the canvas route, where the clip is drawn over its shape
+        const surf = layer ? this.surfaceClipAt(layer, ix, iy) : null;
+        const tiles = !surf && this.tileMode && InpaintEditor.bucketTiles !== false && !(alphaLocked && opacity >= 1)
             && (!layer || (isTilePixels(layer.px) && typeof layer.px.compositeFill === "function" && layer.px.width === layer.w && layer.px.height === layer.h && layer.x === Math.round(layer.x) && layer.y === Math.round(layer.y)));
         const r = await this.floodRegion(x, y, { tolerance: o.tolerance, contiguous: o.contiguous, sample: o.sample, color, clip: true, tiles });
-        const fill = r.shape, n = r.count;
+        let fill = r.shape;
+        const n = r.count;
         if (!n) { if (r.close) fill.close(); this.setStatus("Nothing to fill here (outside the selection?)."); return; }
         // an edit or a removed layer during the flood: the region was found in a picture that is not there any more
         if (this.historyGen !== gen || (layer && !this.layers.includes(layer))) {
@@ -348,6 +352,16 @@ export class ShapePart {
         // the fill is r.w x r.h at (r.x, r.y), scaled into the layer's pixels: it covers the box, nothing outside
         const box = [Math.floor(lx), Math.floor(ly), Math.ceil(lx + lw), Math.ceil(ly + lh)];
         const op = layer.alphaLock ? "source-atop" : "source-over";
+        if (surf && !r.tiles) {
+            // the shape on the surface only: a copy to draw into (the flood's own may be a bitmap), at the box's place
+            const c = makeCanvas(fill.width, fill.height);
+            const cx = c.getContext("2d");
+            cx.drawImage(fill, 0, 0);
+            this.surfaceClipInto(cx, surf, 1, 1, -r.x, -r.y);
+            if (r.close) fill.close();
+            r.close = false;
+            fill = c;
+        }
         let memErr = null;
         if (r.tiles) {
             try {

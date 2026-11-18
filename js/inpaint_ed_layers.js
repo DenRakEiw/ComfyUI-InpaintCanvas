@@ -718,6 +718,7 @@ export class LayersPart {
             this.setTool("select");
         }
         this.normalizeGroups();
+        if (this.syncSurfaceStayRow) this.syncSurfaceStayRow();   // the active layer may have changed (Deep paint's switch)
         if (!this.layerList) return;
         const list = this.layerList;
         // a menu opened from a row (the mask row's) belongs to the row that is about to be rebuilt

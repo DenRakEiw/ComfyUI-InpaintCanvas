@@ -243,6 +243,7 @@ export class SegmentPart {
         const region = this.getBounds() ? (this.cropSettings.fill === "green" ? "the solid green area" : "the area inside the magenta outline") : "the whole image";
         try {
             this.upBtn.disabled = true;
+            this.upsamplePromptId = null;   // the last run's: this one has none until the queue answers (and never, in-app)
             this.upsamplePending = { previous: this.promptText, useCase, ...(labels ? { request, labels: new Map(labels), refs } : {}) };
             this.upsampleCheck = null;
             this.setStatus(`Upsampling the prompt for "${useCase}" with ${backend.label} ...`);
