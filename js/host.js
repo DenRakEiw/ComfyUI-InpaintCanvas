@@ -194,6 +194,7 @@ export const host = {
     getRelightSettings() { return this.relightSettings || {}; },
     setRelightSettings(patch) { this.relightSettings = { ...(this.relightSettings || {}), ...(patch || {}) }; },
     async freeHelpers() {},
+    vlmLoaded: false,   // Scumble's caption model; the node has none
     async relightWhole() { throw new Error("relight whole picture is a Scumble feature"); },
     upsampleInstruction: null,   // the built-in upsample instruction (Scumble hands out its templates)
     generateNewAvailable() { return false; },

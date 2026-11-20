@@ -493,7 +493,11 @@ export class FiltersPart {
         // mismatch and is wrapped again (syncWraps)
         const stamp = (this._wrapSeq = (this._wrapSeq || 0) + 1);
         out.px._wrapStamp = stamp;
-        out.wrap = { source: src.id, angle: made && made.place ? made.place.angle : (out.wrap ? out.wrap.angle : 0), x: src.x, y: src.y, w: src.w, h: src.h, box: made ? made.box.slice() : null, stamp, geo: this.geometryToken() };
+        // the source's pixels as they were wrapped, on the wrap's own pixels (never saved): a recolour, a flip or a stroke
+        // on the source in the same box wraps again too (review 2026-11-16 p1-deeppaint-maps/wrap-live-follow-ignores-source-pixel-edits)
+        out.px._wrapSrc = src.px || null;
+        out.px._wrapSrcVer = src.px ? src.px.version || 0 : 0;
+        out.wrap = { source: src.id, angle: made && made.place ? made.place.angle : (out.wrap ? out.wrap.angle : 0), x: src.x, y: src.y, w: src.w, h: src.h, box: made ? made.box.slice() : null, stamp, geo: this.wrapGeo() };
         out.dirty = true;
         // markLayerChanged drops the link of a wrap changed by any other hand (the brush, Fill, Delete): not for this write
         this._wrapWriting = true;
@@ -506,22 +510,39 @@ export class FiltersPart {
      * wrap back with it). A source that is gone leaves its wrap as it is. `live`: during a drag, skipped for a decal
      * above about 6 MP (it lands on the release).
      */
+    /**
+     * The document's geometry as a wrap link records it: its map from the picture as opened (`docXf`), which an undo of a
+     * turn, crop, resize or extend puts back. `geometrySeq` only ever counts up, so an undo of a crop cut the link it
+     * restored (review 2026-11-16 p1-deeppaint-layer/geometry-undo-drops-live-wrap-link).
+     */
+    wrapGeo() {
+        return Array.from(this.docXf || []).join(",");
+    }
+
     syncWraps({ live = false } = {}) {
-        if (this._syncingWraps || !this.layers || !this.maps || !this.maps.normals) return false;
+        if (this._syncingWraps || !this.layers) return false;
+        // the picture turned, cropped, resized or extended since a link was made: the wrap stays as that operation left it.
+        // Checked with or without the surface maps, so a link of the old geometry is never saved (a link read from a file
+        // or the autosave takes the document's geometry as it is now)
+        const geo = this.wrapGeo();
+        for (const l of this.layers) {
+            const w = l.wrap;
+            if (!w || l.kind !== "filter") continue;
+            if (w.geo === undefined) w.geo = geo;
+            if (w.geo !== geo) l.wrap = null;
+        }
+        if (!this.maps || !this.maps.normals) return false;
         this._syncingWraps = true;
         let any = false;
         try {
             for (const l of this.layers) {
                 const w = l.wrap;
                 if (!w || l.kind !== "filter") continue;
-                // a link read from a file or the autosave takes the document's geometry as it is now
-                if (w.geo === undefined) w.geo = this.geometryToken();
-                // the picture turned, cropped, resized or extended since: the wrap stays as that operation left it
-                if (w.geo !== this.geometryToken()) { l.wrap = null; continue; }
                 const src = this.layers.find((x) => x.id === w.source);
                 if (!src || !src.px || (this.pending && this.pending.layer === src)) continue;
                 const stale = l.px && l.px._wrapStamp !== undefined && w.stamp !== undefined && l.px._wrapStamp !== w.stamp;
-                if (!stale && src.x === w.x && src.y === w.y && src.w === w.w && src.h === w.h) continue;
+                const srcChanged = !!(l.px && l.px._wrapSrc !== undefined && (l.px._wrapSrc !== src.px || l.px._wrapSrcVer !== (src.px.version || 0)));
+                if (!stale && !srcChanged && src.x === w.x && src.y === w.y && src.w === w.w && src.h === w.h) continue;
                 if (live && src.w * src.h > 6e6) continue;
                 const made = this.wrapPixels(src, w.angle || 0, { useSelection: false });
                 this.putWrap(l, src, made && !made.error ? made : null);
@@ -1528,9 +1549,10 @@ export class FiltersPart {
     // once the filter has run: its input's statistics may walk the stack again): the result goes over the picture where the
     // base is, `mix(in, filtered, baseAlpha)`
     applyFilterLayer(ctx, layer, index, forRun, chain = null, more = false, clip = null) {
-        if (!forRun) {
+        if (!forRun && !this.isFillLayer(layer)) {
             // While something below the filter is being painted or moved, the cached
             // result would hide the live change: show the layers unfiltered instead.
+            // A fill layer reads nothing below it, so it stays (it vanished during the gesture before).
             const p = this.pointer;
             const gestureLayer = (p && p.layer) || (this.pending && this.pending.layer) || null;
             // a hidden layer changes nothing below: the filter stays (a wrap's source moved while its wrap follows)

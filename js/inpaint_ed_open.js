@@ -500,7 +500,12 @@ export class OpenPart {
         const layers = doc.layers.slice();
         let basePx = null;
         const b = layers[0];
-        if (b && b.x === 0 && b.y === 0 && b.w === W && b.h === H && b.visible && b.opacity >= 0.999 && b.blend === "normal" && !b.maskPx) { basePx = b.px; layers.shift(); }
+        // the bottom layer becomes the base only when nothing hangs on it: not out of its group (a hidden group's layer
+        // became the always shown base), and not under a layer clipped to it (a cut-out with a clipped colour pass: the
+        // clip went and the pass spread over the transparency; review 2026-11-16 files-io/layered-open-promotes-grouped-or-transparent-clip-base)
+        const promote = b && b.x === 0 && b.y === 0 && b.w === W && b.h === H && b.visible && b.opacity >= 0.999 && b.blend === "normal" && !b.maskPx
+            && !b.group && !(layers[1] && layers[1].clip);
+        if (promote) { basePx = b.px; layers.shift(); }
         // a layer clipped to what became the base would show "clipped without effect": the base covers the picture anyway
         if (basePx) for (const L of layers) { if (!L.clip) break; L.clip = false; }
         else if (!layers.length && doc.compositePx) basePx = doc.compositePx;   // D0's pool route: already pixels

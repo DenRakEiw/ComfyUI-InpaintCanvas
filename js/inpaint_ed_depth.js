@@ -450,10 +450,20 @@ export class DepthPart {
                 const [mw, mh] = surfaceModelSize(W, H);
                 const [gw, gh] = workSize(W, H, WORK_MAX);
                 const t0 = performance.now();
+                const base0 = this.base;
                 const inp = await host.pictureInput(this, mw, mh, { skipFilters: true, background: "#808080" });
+                // the picture the fit reads is the one the models saw: taken before their 6-20 s, not after it
+                const pic = await host.pictureInput(this, gw, gh, { skipFilters: true, background: "#808080" });
                 this.setStatus("Deep paint: splitting the picture into colour, light and reflections with " + models.intrinsic.label + " ...");
                 const res = await host.surfaceAnalysis(this, { image: inp.image, width: mw, height: mh });
-                const pic = await host.pictureInput(this, gw, gh, { skipFilters: true, background: "#808080" });
+                // a stroke, a hidden layer or another picture of the same size while the models ran: the maps would be of
+                // a picture that is no longer there, under the old one's fingerprint (review 2026-11-16
+                // p1-deeppaint-maps/surface-maps-midrun-edit-corrupts-maps-and-fp)
+                const fpNow = fingerprint((await host.pictureInput(this, 64, 64, { skipFilters: true, background: "#808080" })).image, 64, 64);
+                if (this.base !== base0 || fpNow !== fp) {
+                    this.setStatus("The surface maps were dropped: the picture changed while they were made. Compute them again.", "warn");
+                    return null;
+                }
                 this.setStatus("Deep paint: fitting the light to the picture ...");
                 const d = res.intrinsic;
                 const job = await editorPool().run("surface_maps", {

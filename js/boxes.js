@@ -92,6 +92,19 @@ export function foldDesc(s) {
 }
 
 /**
+ * foldDesc for text that holds markers ({@layer:id}, {@ref:i}): the cut at DESC_MAX never falls inside one, a marker
+ * cut in two went to a paid run as its literal text (review 2026-11-16 prompt-refs/box-desc-marker-cut-at-400).
+ */
+export function foldMarked(s) {
+    const t = String(s == null ? "" : s).replace(/\s+/g, " ").trim();
+    if (t.length <= DESC_MAX) return t;
+    let cut = t.slice(0, DESC_MAX);
+    const open = cut.lastIndexOf("{@");
+    if (open >= 0 && cut.indexOf("}", open) < 0) cut = cut.slice(0, open);
+    return cut.trimEnd();
+}
+
+/**
  * A rectangle in image pixels ([l, t, r, b], r and b exclusive) as fractions of the frame, clamped to 0..1. Null when
  * the clamped box is empty (the rectangle lies outside the frame) or thinner than 1/1000 on a side.
  */
@@ -116,7 +129,7 @@ export function selectionBox(bounds, frame, { prompt = "", pair = null } = {}) {
     if (!Array.isArray(bounds) || bounds.length !== 4) return null;
     const rect = toFrame(bounds, frame);
     if (!rect) return null;
-    const desc = foldDesc(prompt);
+    const desc = foldMarked(prompt);
     const from = pair && Number.isInteger(pair.ref) && pair.ref >= 0;
     // named after the prompt's words (door_red_1), so the caption names something the model can read (S3e)
     const id = `${idWords(desc) || "edit"}_1`;
@@ -157,11 +170,13 @@ export function pluginBoxes(list, ctx, { taken = [], nameOf = null } = {}) {
     const used = new Set(taken.map((b) => (typeof b === "string" ? b : b && b.id)).filter(Boolean));
     const out = [], notes = [];
     const refOf = (layerId) => (ctx && ctx.references || []).find((x) => x && x.layerId === layerId) || null;
-    const descOf = (b, who) => foldDesc(b.desc).replace(LAYER_MARK, (_, id) => {
+    // the markers resolved first, then folded: a fold first cut a {@layer:...} in two, which then neither resolved nor
+    // was refused
+    const descOf = (b, who) => foldMarked(String(b.desc == null ? "" : b.desc).replace(/\s+/g, " ").trim().replace(LAYER_MARK, (_, id) => {
         const r = refOf(id);
         if (!r) throw fail("layer", `${who} names ${nameOf ? nameOf(id) : "layer " + id}, which is not a reference picture of this run: nothing was sent.`);
         return `{@ref:${r.index}}`;
-    });
+    }));
     list.forEach((b, i) => {
         const who = `Box ${b && typeof b.id === "string" ? b.id : "#" + (i + 1)}`;
         if (!b || typeof b !== "object") throw fail("shape", `${who}: not an object`);

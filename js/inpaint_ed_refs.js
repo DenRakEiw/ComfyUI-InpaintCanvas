@@ -112,7 +112,8 @@ export class RefsPart {
             });
         };
         fix(this.pluginData);
-        for (const s of [...(this.undo || []), ...(this.redo || [])]) if (s && s.pluginData) fix(s.pluginData);
+        // a `turn` step carries its own layers and prompt in its own numbering: its boxes stay with them
+        for (const s of [...(this.undo || []), ...(this.redo || [])]) if (s && s.kind !== "turn" && s.pluginData) fix(s.pluginData);
     }
 
     /**

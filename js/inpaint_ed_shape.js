@@ -253,7 +253,7 @@ export class ShapePart {
     sampleCanvas(source = "image") {
         if (source === "layer") {
             const l = this.activeLayer();
-            if (!l || l.kind === "filter") return this.compositeCanvas();
+            if (!l || (l.kind === "filter" && !this.hasOwnPixels(l))) return this.compositeCanvas();   // Deep paint: its own paint
             const key = "layer:" + l.id;
             const c = this.flatCache;
             if (c && c.version === this.compositeVersion && c.key === key) return c.canvas;

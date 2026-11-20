@@ -49,7 +49,9 @@ export class StackPart {
         ctx.setTransform(scale, 0, 0, scale, -x0 * scale, -y0 * scale);
         if (source === "layer") {
             const l = this.activeLayer();
-            if (l && l.kind !== "filter" && l.px && isTilePixels(l.px) && !this.liveStrokeOn(l) && (!this.liveMask(l) || this.tileMaskOf(l))) {
+            // a Deep paint layer's px is its own paint (hasOwnPixels): sampled as a pixel layer's, not the composite
+            // (review 2026-11-16 p1-deeppaint-layer/sample-layer-falls-through-to-composite)
+            if (l && (l.kind !== "filter" || this.hasOwnPixels(l)) && l.px && isTilePixels(l.px) && !this.liveStrokeOn(l) && (!this.liveMask(l) || this.tileMaskOf(l))) {
                 // C6 (c2b): the active layer on tiles from its own tiles at the pass's level, and its mask from the mask's
                 // (the canvas holds this layer only, so a whole-canvas destination-in is the mask). layerPixels gave the
                 // layer's display mirror, or `_masked` and two mirrors, and a Skia pyramid of it below half size: 0.57 to
@@ -64,7 +66,7 @@ export class StackPart {
                 }
                 return c;
             }
-            if (l && l.kind !== "filter" && l.px) {
+            if (l && (l.kind !== "filter" || this.hasOwnPixels(l)) && l.px) {
                 const px = this.layerPixels(l, true);
                 ctx.imageSmoothingEnabled = true;
                 ctx.drawImage(this.displaySource(px, (l.w * scale) / px.width), l.x, l.y, l.w, l.h);
@@ -504,7 +506,7 @@ export class StackPart {
         if (InpaintEditor.stacks === false || !this.tileMode || this.huge || !partsUsable() || !arenaEnabled()) return null;
         if (sample === "layer") {
             const l = this.activeLayer();
-            if (l && l.kind !== "filter" && l.px) {
+            if (l && (l.kind !== "filter" || this.hasOwnPixels(l)) && l.px) {
                 const plain = isTilePixels(l.px) && !this.liveStrokeOn(l) && (!this.liveMask(l) || this.tileMaskOf(l)) && l.px.width === l.w && l.px.height === l.h && l.x === Math.round(l.x) && l.y === Math.round(l.y);
                 return plain ? [null, { px: l.px, mask: this.liveMask(l) ? this.tileMaskOf(l) : null, x: l.x, y: l.y, alpha: 255 }] : null;
             }
@@ -823,7 +825,7 @@ export class StackPart {
         if (source === "layer") {
             // the same branch `sampleRegion` takes: the active layer alone, with its mask
             const l = this.activeLayer();
-            if (l && l.kind !== "filter" && l.px && !this.liveStrokeOn(l) && (!this.liveMask(l) || this.tileMaskOf(l))) {
+            if (l && (l.kind !== "filter" || this.hasOwnPixels(l)) && l.px && !this.liveStrokeOn(l) && (!this.liveMask(l) || this.tileMaskOf(l))) {
                 add(l.px, l.x, l.y, l.w, l.h);
                 add(this.liveMask(l), l.x, l.y, l.w, l.h);
             }

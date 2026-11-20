@@ -23,6 +23,12 @@ export class PointerPart {
         return this.snapshot(step);
     }
 
+    /** The selection step a gesture pushed at its press, named for what the release made of it. */
+    relabelTopSelectionStep(label) {
+        const top = this.undo && this.undo[this.undo.length - 1];
+        if (top && top.kind === "selection") { top.label = label; this.historyChanged(); }
+    }
+
     landUndo(p, changed) {
         const snap = p.undoSnap;
         p.undoSnap = null;
@@ -1013,7 +1019,8 @@ export class PointerPart {
         if (p.kind === "boxes") { if (this.boxes) this.boxes.pointer("up", e, ...this.toImage(e)); return; }
         if (p.kind === "plugin") { host.pluginPointer(this, "up", e, ...this.toImage(e), p); return; }
         if (p.kind === "rect") {
-            this.landUndo(p, !(p.startPx && !p.moved && p.mode !== "replace"));
+            // a click deselects (replace) or changes nothing (add, subtract, intersect); a click with nothing selected too
+            this.landUndo(p, !(p.startPx && !p.moved && (p.mode !== "replace" || !this.getBounds())));
             if (p.startPx && !p.moved) {
                 // a click without a drag deselects, like the lasso below. Without the screen
                 // pixel threshold a hand that wobbles by one pixel left a small selection
@@ -1055,13 +1062,15 @@ export class PointerPart {
             this.markSelectionChanged(this.boundsAfter(p.mode, shapeBox));
         } else if (p.kind === "selmove") {
             // a click without a drag deselects, the way the marquee tools do in Photoshop and Krita
-            if (!p.moved) { this.clearSelection(); return; }
+            // the press pushed this gesture's step: the click's deselect is that step, not a second one
+            if (!p.moved) { this.relabelTopSelectionStep("Deselect"); this.clearSelection({ undo: false }); return; }
             this.markSelectionChanged(this.selectionDirty ? undefined : this.cachedBounds);
             this.setStatus("Selection outline moved.");
         } else if (p.kind === "lasso") {
             const pts = this.lassoPoints;
             this.lassoPoints = null;
-            if ((!pts || pts.length <= 2) && p.mode === "replace") { this.clearSelection(); return; }   // a click deselects
+            // a click deselects, in the step the press pushed
+            if ((!pts || pts.length <= 2) && p.mode === "replace") { this.relabelTopSelectionStep("Deselect"); this.clearSelection({ undo: false }); return; }
             if (pts && pts.length > 2) {
                 let lx0 = pts[0][0], ly0 = pts[0][1], lx1 = lx0, ly1 = ly0;
                 for (const [px, py] of pts) { if (px < lx0) lx0 = px; if (px > lx1) lx1 = px; if (py < ly0) ly0 = py; if (py > ly1) ly1 = py; }

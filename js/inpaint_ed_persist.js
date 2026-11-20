@@ -235,8 +235,10 @@ export class PersistPart {
                                 maskPx, maskRef: maskPx ? l.mask : null, maskDirty: false, maskEdit: false, maskOff: !!(maskPx && l.maskOff),
                                 filter: fid, params: FILTERS[fid] ? { ...filterDefaults(fid), ...(l.params || {}) } : { ...(l.params || {}) }, lut: l.lut && l.lut.ref && !lutData ? null : l.lut || null, _lutData: lutData,
                                 plate: plateImg ? l.plate : null, _plateImg: plateImg,
-                                // a wrap's link to its source (Deep paint), checked: numbers and a source id, else none
-                                wrap: wrapLink(l.wrap),
+                                // a wrap's link to its source (Deep paint), checked: numbers and a source id, else none. Stamped
+                                // with the geometry it is restored in, so a turn or crop as the first edit detaches it instead of
+                                // stamping the geometry after it (review 2026-11-16 p1-deeppaint-maps/restored-wrap-geo-unstamped-corrupts-on-crop-or-turn)
+                                wrap: wrapLink(l.wrap) ? { ...wrapLink(l.wrap), geo: this.wrapGeo() } : null,
                             }, this.pixels));
                             this.filterCounter += 1;
                         } catch (err) {
@@ -392,6 +394,10 @@ export class PersistPart {
             if (this.boxes) this.boxes.refresh(true);
             this.draw();
             this.drawThumb();
+            // the listeners hear of the document once it is all in: the only notice before came from setBasePixels, while
+            // the layers, the settings and the selection were still empty (Each area, the plugin panels; review 2026-11-16
+            // canvas-core/setvalue-skips-final-notify-changed)
+            if (!stale()) this.notifyChanged();
         } catch (err) {
             console.error(err);
             this.setStatus("Could not restore canvas: " + (err.message || err), failKind(err));

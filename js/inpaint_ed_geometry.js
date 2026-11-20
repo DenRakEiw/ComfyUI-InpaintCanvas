@@ -1649,28 +1649,38 @@ export class GeometryPart {
             // Everything visible was baked into the new base; keep control and reference layers, and the layers the
             // flatten left out (hidden, in a hidden group, or clipped to one of those): they were not baked, and dropping
             // them took their pixels out of the document without a word
-            const kept = [], keptSet = new Set();
+            const kept = [], keptSet = new Set(), baseOf = new Map();
             this.layers.forEach((l, i) => {
                 const cb = l.clip ? this.clipBaseOf(l, i) : null;
+                if (cb) baseOf.set(l, cb);
                 if (this.isControl(l) || this.isReference(l) || !this.shown(l) || (cb && keptSet.has(cb))) { kept.push(l); keptSet.add(l); }
             });
             const hiddenKept = kept.filter((l) => !this.isControl(l) && !this.isReference(l)).length;
             for (const l of kept) {
+                // a kept layer clipped to a layer that went into the base would clip to whatever lies below it now
+                // (review 2026-11-16 p1-review-fixes/extend-canvas-kept-layers-corrupt-clip-and-dirty-state)
+                if (l.clip && !keptSet.has(baseOf.get(l))) l.clip = false;
+                let replaced = false;
                 if (l.kind === "filter") {
                     l.x = 0; l.y = 0; l.w = nw; l.h = nh;   // a filter covers the whole canvas
                     if (l.maskPx && l.maskPx.width === W && l.maskPx.height === H) { l.maskPx = l.maskPx.resized(nw, nh, { x: left, y: top }); l.maskDirty = true; l._maskedValid = false; }
-                    if (ownPx(l) && l.px && l.px.width === W && l.px.height === H) l.px = l.px.resized(nw, nh, { x: left, y: top });
+                    if (ownPx(l) && l.px && l.px.width === W && l.px.height === H) { l.px = l.px.resized(nw, nh, { x: left, y: top }); replaced = true; }
                     else plainFilterPx(this, l, nw, nh);
-                } else if (l.kind === "paint" && l.px && l.px.width === W && l.px.height === H && l.w === W && l.h === H) {
-                    // a new object (the canvas undo step holds the old one): the old pixels placed at left, top
+                    l._fcache = null;
+                } else if (l.kind === "paint" && l.px && l.px.width === W && l.px.height === H && l.w === W && l.h === H
+                    && l.x === 0 && l.y === 0 && !this.isReference(l)) {
+                    // a new object (the canvas undo step holds the old one): the old pixels placed at left, top. A layer
+                    // moved away from 0, 0 or a reference only moves (review 2026-11-16 canvas-tools/extend-moved-full-size-paint-layer-jumps)
                     l.px = l.px.resized(nw, nh, { x: left, y: top });
                     l.x = 0; l.y = 0; l.w = nw; l.h = nh;
                     if (l.maskPx) { l.maskPx = l.maskPx.resized(nw, nh, { x: left, y: top }); l.maskDirty = true; l._maskedValid = false; }
+                    replaced = true;
                 } else {
                     l.x += left; l.y += top;
                 }
-                // a plain filter layer's px is an empty store with no file of its own to upload
-                l.dirty = l.kind !== "filter" || ownPx(l);
+                // only new pixels need a new file: a layer that only moved keeps its own (a reference its lossless one),
+                // and a plain filter layer's px is an empty store with no file of its own to upload
+                if (replaced) l.dirty = true;
             }
             this.layers = kept;
             this.activeLayerId = null;

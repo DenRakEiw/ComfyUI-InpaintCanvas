@@ -607,7 +607,6 @@ export class SelectPart {
                 this.rangePending = null;
                 const popped = this.takeUndoEntry(snap);
                 if (popped) {
-                    this.undoBytes -= popped.bytes || 0;
                     this.applySnapshot(popped);
                     this.releaseSnapshot(popped);
                     this.historyChanged();
@@ -647,8 +646,7 @@ export class SelectPart {
     dropStaleSelectionEdit(snap, what) {
         const popped = this.takeUndoEntry(snap);
         if (popped) {
-            this.undoBytes -= popped.bytes || 0;
-            this.releaseSnapshot(popped);
+            this.releaseSnapshot(popped);   // it takes the step's bytes off the budget
             this.historyChanged();
         }
         this.setStatus(`${what} dropped: the selection changed while it ran.`);
@@ -664,7 +662,6 @@ export class SelectPart {
 
         const popped = this.takeUndoEntry(pending.snap);
         if (popped) {
-            this.undoBytes -= popped.bytes || 0;
             this.applySnapshot(popped);
             this.releaseSnapshot(popped);
         } else if (pending.snap) {
@@ -1468,10 +1465,15 @@ export class SelectPart {
 
     // ---- selection ops -----------------------------------------------------
 
-    clearSelection() {
+    /**
+     * Deselect. Nothing selected: no step (a push drops the redo steps; review 2026-11-16 canvas-tools/noop-steps-left-after-1b2f05d7).
+     * `undo: false` for a gesture whose own step, pushed at its press, already holds the selection.
+     */
+    clearSelection({ undo = true } = {}) {
         if (!this.sel) return;
+        if (undo && !this.getBounds()) return;
         this.selectionLabel = "";
-        this.pushUndo({ kind: "selection", label: "Deselect" });
+        if (undo) this.pushUndo({ kind: "selection", label: "Deselect" });
         this.sel.clear();
         this.markSelectionChanged(null);
         this.draw();

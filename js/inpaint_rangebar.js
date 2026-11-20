@@ -186,11 +186,15 @@ export function buildRangeBar(range, {
         pickBtn.className = "ipc-rangebar-btn";
         pickBtn.textContent = "Pick";
         pickBtn.title = "Pick value from picture";
+        // a begin() pairs with a stop() (the canvas tint of Selection > Range, a filter's held undo step): only around a
+        // value that was picked, and the commit before the redraw, whose histogram reads the committed colour (review
+        // 2026-11-16 canvas-select/rangebar-pick-invert-unpaired-begin-and-desync)
         pickBtn.addEventListener("click", async () => {
+            let begun = false;
             try {
-                if (begin) begin();
                 const val = await pick();
                 if (typeof val === "number" && !isNaN(val)) {
+                    if (begin) { begin(); begun = true; }
                     const w = curRange.hi - curRange.lo;
                     const half = w / 2;
                     let lo = Math.max(0, val - half);
@@ -198,15 +202,18 @@ export function buildRangeBar(range, {
                     if (lo === 0) hi = Math.min(1, w);
                     if (hi === 1) lo = Math.max(0, 1 - w);
                     curRange = { ...curRange, lo, hi };
-                    draw();
                     if (commit) commit(own());
-                } else if (typeof val === "string" && val.startsWith("#")) {
-                    curRange = { ...curRange, color: val };
                     draw();
+                } else if (typeof val === "string" && val.startsWith("#")) {
+                    if (begin) { begin(); begun = true; }
+                    curRange = { ...curRange, color: val };
                     if (commit) commit({ ...own(), color: val });
+                    draw();
                 }
             } catch (err) {
                 console.error("Eyedropper pick failed:", err);
+            } finally {
+                if (begun && stop) stop();
             }
         });
         head.appendChild(pickBtn);
@@ -221,8 +228,9 @@ export function buildRangeBar(range, {
         if (begin) begin();
         curRange = { ...curRange, invert: !curRange.invert };
         invBtn.classList.toggle("ipc-active", !!curRange.invert);
-        draw();
         if (commit) commit(own());
+        draw();
+        if (stop) stop();
     });
     head.appendChild(invBtn);
     wrap.appendChild(head);

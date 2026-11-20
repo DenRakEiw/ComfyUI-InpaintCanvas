@@ -321,7 +321,7 @@ export class ScopePart {
                 return null;
             }
             const s = Math.min(1, SCOPE_LONG / Math.max(this.width, this.height));
-            const src = await this.sampleRegionSettled("image", [0, 0, this.width, this.height], s, { display: true });
+            const src = await this.sampleRegionSettled("image", [0, 0, this.width, this.height], s, { forRun: true, display: true });   // the picture as it exports: no reference or control layer
             // the read's own CPU canvas: getImageData on a canvas the GPU holds would count towards Chromium's latch
             const w = src.width, h = src.height;
             const c = makeCanvas(w, h);

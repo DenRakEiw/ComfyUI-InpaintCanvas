@@ -9,6 +9,17 @@ import { failKind } from "./inpaint_status.js";
 import { LAYER_PENDING_KEYS, MAX_SNAPSHOTS, MAX_UNDO, MAX_UNDO_BYTES, SNAP_CANVAS_PX, UNDO_LABELS } from "./inpaint_consts.js";
 import { fileGone, needImage, refKey, snapImage, tileDiffBox } from "./inpaint_load.js";
 
+/**
+ * The document maps as a turn snapshot keeps them: each map its own object with its own `xf` (the pixel buffers are
+ * shared, nothing writes into them). A turn of the document sets `map.xf` on the live map objects, which the snapshot
+ * shared, so a restore brought the turned placement back (review 2026-11-16 canvas-core/turn-snapshot-maps-xf-shared).
+ */
+function mapsCopy(maps) {
+    const out = {};
+    for (const [k, m] of Object.entries(maps || {})) out[k] = m && typeof m === "object" ? { ...m, xf: m.xf && typeof m.xf.slice === "function" ? m.xf.slice() : m.xf } : m;
+    return out;
+}
+
 export class HistoryPart {
     // ---- undo ----------------------------------------------------------------
 
@@ -138,7 +149,9 @@ export class HistoryPart {
 
     releaseSnapshot(snap) {
         if (!snap) return;
-        this.undoBytes -= snap.bytes || 0;
+        // only a step whose bytes the budget counted takes them off again: a held snapshot never pushed, a named snapshot
+        // and a step taken out by hand once drove the count below zero, and trimUndo then let the budget overrun
+        if (snap._counted) { this.undoBytes -= snap.bytes || 0; snap._counted = false; }
         for (const k of ["url", "mask", "selection"]) {
             const v = snap[k];
             if (!v || v === true) continue;   // a layerrect step's `mask` is a flag
@@ -206,7 +219,10 @@ export class HistoryPart {
                 c.text = JSON.parse(JSON.stringify(tb.text));
                 Object.assign(c, { x: tb.x, y: tb.y, w: tb.w, h: tb.h, dirty: true });
                 // tiles: the "before" pixels themselves; canvases keep them as a PNG, so the text is drawn again when the record comes back
-                if (tb.px) c.px = tb.px.clone(); else c._textRedraw = true;
+                // on canvases the record's px is an empty one of the "before" size: the redraw reads its scale from it (the
+                // typed text's pixels gave a wrong one; review 2026-11-16 p1-outpaint-shadow/canvas-text-redraw-wrong-scale-on-undo)
+                if (tb.px) c.px = tb.px.clone();
+                else { c._textRedraw = true; c.px = this.pixels.Layer.empty(Math.max(1, tb.cw || 1), Math.max(1, tb.ch || 1)); }
             }
             // a text whose render is still on its way (typed, debounced): the record's pixels are older than its text
             if (!tb && l.text && (l._textTimer || l._textRendering)) c._textRedraw = true;
@@ -254,7 +270,7 @@ export class HistoryPart {
             groups: this.groupsCopy(),
             pixels,
             activeLayerId: this.activeLayerId,
-            maps: this.maps ? { ...this.maps } : {},
+            maps: mapsCopy(this.maps),
             ...this.geometrySnapshot(),
             doc: {
                 prompt: this.promptText,
@@ -351,6 +367,7 @@ export class HistoryPart {
             selPx: snap.selPx ? snap.selPx.clone() : null,
             layers: snap.layers.map((l) => this.snapshotLayer(l)),
             pixels: (snap.pixels || []).map((p) => ({ id: p.id, px: p.px ? p.px.clone() : null, maskPx: p.maskPx ? p.maskPx.clone() : null })),
+            maps: mapsCopy(snap.maps),
             doc: JSON.parse(JSON.stringify(snap.doc || {})),
         };
     }
@@ -492,7 +509,7 @@ export class HistoryPart {
         for (const s of this.redo) this.releaseSnapshot(s);
         this.redo = [];
         this.undo.push(snap);
-        this.undoBytes += snap.bytes || 0;
+        if (!snap._counted) { this.undoBytes += snap.bytes || 0; snap._counted = true; }
         this.trimUndo();
         this.scheduleDetachedRelease();
         this.historyChanged();
@@ -687,6 +704,9 @@ export class HistoryPart {
             if (this.textEdit) this.endTextEdit(false);
             const byId = new Map((snap.pixels || []).map((p) => [p.id, p]));
             const resized = snap.width !== this.width || snap.height !== this.height;
+            // the snapshot's maps carry their own placement: the outgoing ones (kept by the step on the other stack) are
+            // not turned back first, and the restored ones are not turned a second time
+            this.maps = {};
             this.restoreGeometry(snap);
             this.groups = (snap.groups || []).map((g) => ({ ...g }));
             if (snap.base !== this.base) this.recheckRestoredFiles({ base: snap.base });   // the layers below are all uploaded again
@@ -696,7 +716,7 @@ export class HistoryPart {
             const outgoing = this.layers;
             this.layers = snap.layers.map((l) => {
                 const kept = byId.get(l.id);
-                const copy = installLayerAliases({ ...l, dirty: true, exportRef: null, _maskedValid: false, _mcache: null, _fcache: null, _fxCache: null }, this.pixels);
+                const copy = installLayerAliases({ ...l, dirty: l.kind !== "filter" || this.hasOwnPixels(l), exportRef: null, _maskedValid: false, _mcache: null, _fcache: null, _fxCache: null }, this.pixels);
                 // the clones move into the document; the step must not hand them out twice
                 if (kept) {
                     if (kept.px) { copy.px = kept.px; kept.px = null; }
@@ -729,7 +749,7 @@ export class HistoryPart {
             if (doc.crop) { this.cropSettings = JSON.parse(JSON.stringify(doc.crop)); this.syncCropControls(); }
             if (doc.settings) this.settings = JSON.parse(JSON.stringify(doc.settings));
             this.syncGenControls();
-            this.maps = snap.maps ? { ...snap.maps } : {};
+            this.maps = mapsCopy(snap.maps);
             this.mapsVersion++;
             this.renderSettings();
             this.renderLayers();
@@ -757,7 +777,7 @@ export class HistoryPart {
             this.width = snap.width;
             this.height = snap.height;
             const outgoing = this.layers;
-            this.layers = snap.layers.map((l) => installLayerAliases({ ...l, dirty: true, exportRef: null, _maskedValid: false, _mcache: null, _fxCache: null, maskDirty: !!l.maskPx }, this.pixels));
+            this.layers = snap.layers.map((l) => installLayerAliases({ ...l, dirty: l.kind !== "filter" || this.hasOwnPixels(l), exportRef: null, _maskedValid: false, _mcache: null, _fxCache: null, maskDirty: !!l.maskPx }, this.pixels));
             this.releaseDroppedEdits(outgoing);
             this.activeLayerId = snap.activeLayerId;
             let sel = snap.selPx || null;   // on tiles the step's clone, taken out of the step (it is released after this)
@@ -1102,7 +1122,7 @@ export class HistoryPart {
         this.cancelPreviews();
         // the present, as the other stack's step: it keeps the step's label and time, so the list reads the same
         const current = this.snapshot(snap);
-        if (current) { (redo ? this.undo : this.redo).push(current); this.undoBytes += current.bytes || 0; }
+        if (current) { (redo ? this.undo : this.redo).push(current); this.undoBytes += current.bytes || 0; current._counted = true; }
         try {
             this.applySnapshot(snap, images);
             if (snap.kind === "turn") this.setStatus(`${redo ? "Redone" : "Undone"}: ${snap.label || UNDO_LABELS.turn}.`);   // the whole document changed

@@ -107,9 +107,11 @@ export class CompositePart {
         if (!layer || !layer.clip) return null;
         for (let j = i - 1; j >= 0; j--) {
             const b = this.layers[j];
-            if (b.clip) continue;
-            // a clip does not reach out of its group: the base is in the same one (a reference is in none and draws nothing)
-            if (!this.isReference(b) && (b.group || null) !== (layer.group || null)) return null;
+            // a reference layer is no base: runs and exports leave it out, so a layer clipped to it would vanish from them
+            // (review 2026-11-16 tiles/clip-target-hits-reference-layer); the base is the layer below it
+            if (b.clip || this.isReference(b)) continue;
+            // a clip does not reach out of its group: the base is in the same one
+            if ((b.group || null) !== (layer.group || null)) return null;
             return b;
         }
         return null;

@@ -1325,7 +1325,7 @@ class InpaintEditor {
             // model such as Flux.2 gets the whole card; in API mode they simply stay resident.
             if (this.genSettings.mode === "local" && this.helperUsed) await this.freeHelperModels();
             // the app's caption model (Florence-2) in VRAM: its process let go, nothing asked of ComfyUI
-            else if (this.genSettings.mode === "local" && this.vlmUsed) { this.vlmUsed = false; try { await host.freeHelpers(); } catch (err) { console.warn(err); } }
+            else if (this.genSettings.mode === "local" && (this.vlmUsed || host.vlmLoaded)) { this.vlmUsed = false; try { await host.freeHelpers(); } catch (err) { console.warn(err); } }
             this.setStatus(wired ? `Queueing (${this.genSettings.mode}, seed ${this.genSettings.seed}, result from ${name}) ...` : `Queueing, but nothing is wired into "result" or "result_local": the result will not come back into the canvas.`);
             await host.queueGenerate(this, area ? { refs, area } : { refs });
         } catch (err) {

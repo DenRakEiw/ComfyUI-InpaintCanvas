@@ -1206,7 +1206,7 @@ export class LayersPart {
             if (p.key === "preset" || whenNames.has(p.key)) {
                 this.renderLayers();
             } else {
-                const row = this.root && this.root.querySelector(`.ipc-layer[data-id="${layer.id}"]`);
+                const row = this.root && this.root.querySelector(`.ipc-layer[data-layer="${CSS.escape(String(layer.id))}"]`);
                 if (row) {
                     const sel = row.querySelector(`select.ipc-sel[data-param="${p.key}"]`);
                     if (sel && sel.value !== choice.id) sel.value = choice.id;

@@ -205,6 +205,11 @@ export class ShadowPart {
         const i = this.layers.indexOf(layer);
         if (!layer.clip) return { at: i, group: layer.group || null, clip: false };
         const target = this.clipTargetOf(layer, i);
+        // clipped to a pixel layer: the shadow goes right under the layer, clipped to the same base. Under the base it was
+        // hidden wherever the base is opaque, the only place the layer shows (review 2026-11-16
+        // p1-outpaint-shadow/clipped-layer-shadow-placed-under-clip-base)
+        if (target && target.kind !== "filter") return { at: i, group: layer.group || null, clip: true };
+        // clipped over a filter (a clip without effect): under the filter, which stays the target
         if (target) return { at: this.layers.indexOf(target), group: target.group || null, clip: false };
         let j = i;
         while (j > 0 && this.layers[j - 1].clip && (this.layers[j - 1].group || null) === (layer.group || null)) j--;

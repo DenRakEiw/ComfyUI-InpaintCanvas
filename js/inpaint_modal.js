@@ -785,7 +785,12 @@ function buildRangeSelect(ed, d) {
             },
             begin: () => ed.setRangePreview(ed.rangeLimit),
             preview: (r) => ed.setRangePreview({ ...ed.rangeLimit, ...r }),
-            commit: (r) => { ed.rangeLimit = { ...ed.rangeLimit, ...r }; },
+            commit: (r) => {
+                ed.rangeLimit = { ...ed.rangeLimit, ...r };
+                // the dialog's own Invert box and colour well show what the bar set (Pick, Invert)
+                if (ed.rangeInvertInput) ed.rangeInvertInput.checked = !!ed.rangeLimit.invert;
+                if (r && r.color && ed.rangeColorInput) ed.rangeColorInput.value = r.color;
+            },
             stop: () => ed.setRangePreview(null),
             pick: () => ed.pickOnce(source),
             hover: (on) => ed.setRangePreview(on ? ed.rangeLimit : null),
