@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/reftokens.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/reftokens.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // @ts-check
 // The @img tokens of the prompt (item 26, docs/PLAN_REFS.md C1 and C2). The prompt names the visible reference layers
 // by their place in the list, top first: `@img1` .. `@img999`. A token stays tied to its layer through every change

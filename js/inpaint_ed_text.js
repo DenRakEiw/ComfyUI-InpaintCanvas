@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_ed_text.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_ed_text.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // the text tool: the inline edit box, text layers and fonts: moved out of inpaint_canvas.js (item 56 S3, docs/PLAN_SPLIT.md), text unchanged.
 
 import { FONT_CATEGORIES, TEXT_DEFAULTS, addUserFont, fontCss, fontList, loadFontList, renderText, textAngle, textFrame } from "./inpaint_text.js";

@@ -1,7 +1,7 @@
 """FLUX 3 box rows for the Inpaint Canvas node: the edit rows and the caption that ComfyUI core's Flux 3 Image node
 cannot write (its ``bounding_boxes`` input writes new-image rows only).
 
-A port of Scumble's ``electron/main/providers/boxes.js`` (DenRakEiw/scumble), line by line, so the node writes the
+A port of Scumble's ``electron/main/providers/boxes.js`` (scumble-app/scumble), line by line, so the node writes the
 same words, numbers and JSON as the app: ``tests/boxes_vectors.json`` holds vectors computed by that file and
 ``tests/test_boxes.py`` checks every one. Pure Python, no torch: nodes.py measures the editor's boxes against the
 crop it built and calls this module.

@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_modal.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_modal.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // The editor's dialog, built once per document: buildEditorModal() puts the top bar, the tool
 // column, the canvas and the side panel together, and one function per panel fills it. Moved here
 // from InpaintEditor.buildModal() on 2026-09-20 (CLAUDE.md, the split of inpaint_canvas.js); the

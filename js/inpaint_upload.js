@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_upload.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_upload.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 /**
  * Uploads (moved out of inpaint_canvas.js as they were): a blob to ComfyUI's /upload/image or, when it is large, to
  * the node's own route, and a canvas or pixels as a PNG named by its hash.

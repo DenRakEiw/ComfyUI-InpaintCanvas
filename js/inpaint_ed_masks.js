@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_ed_masks.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_ed_masks.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // layer masks, cutout, the mask and layer menus, clipping: moved out of inpaint_canvas.js (item 56 S5, docs/PLAN_SPLIT.md), text unchanged.
 
 import { api, host } from "./host.js";

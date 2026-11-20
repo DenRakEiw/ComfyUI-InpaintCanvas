@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_png.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_png.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 /**
  * PNG files written in parts (docs/PLAN_BCE.md §E2): a picture never exists as one RGBA buffer or one canvas.
  *

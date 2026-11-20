@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/boxes_model.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/boxes_model.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // The Boxes model, shared by the app's Boxes plugin (plugins/boxes/main.js) and the node's editor (inpaint_boxes.js):
 // a box held to its shape, the changes over a list (one undo step each is the caller's), the selection as a box, what a
 // run would do with the boxes in its crop, the geometry map, the command fields and the panel's warning lines. Pure

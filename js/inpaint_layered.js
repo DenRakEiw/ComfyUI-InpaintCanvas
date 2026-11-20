@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_layered.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_layered.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 /**
  * Reading layered files: Photoshop PSD and OpenRaster ORA, the two formats the editor writes (inpaint_bands.js).
  * Plain data in, plain data out, no DOM: `node tools/layered_test.js` runs it as it is.

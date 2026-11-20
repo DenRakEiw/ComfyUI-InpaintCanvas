@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/px/kernels.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/px/kernels.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 /**
  * The pixel kernels the editor calls: the Rust build (px.wasm, SIMD128) once it has loaded, the JS twins in
  * kernels_js.js before that and wherever it cannot load (a browser without wasm SIMD, a page whose CSP refuses wasm).

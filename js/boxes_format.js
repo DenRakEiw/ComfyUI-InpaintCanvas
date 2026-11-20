@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/boxes_format.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/boxes_format.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // The FLUX 3 rows of the document's boxes for the clipboard ("Copy rows" in the Boxes panel of the app's plugin and of
 // the node's editor), measured against the whole picture. A run does not use this: the app's main process writes the
 // rows it sends after it knows the crop and the final order of the pictures (electron/main/providers/boxes.js), the

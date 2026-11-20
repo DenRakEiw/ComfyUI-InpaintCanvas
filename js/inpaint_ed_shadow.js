@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_ed_shadow.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_ed_shadow.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // *Layer › Add Contact Shadow* (item 61, docs/PLAN_0_1_57.md): a plain pixel layer in multiply directly under a layer
 // with transparency (a cut-out, a key, a pasted picture), its shadow from the layer's coverage (`inpaint_shadow.js`).
 // The work runs on a coverage grid of the object's own box at a working scale (never a document-size canvas: on tiles

@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_boxes.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_boxes.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // The editor's own Boxes (docs/PLAN_NODE_BOXES.md B4): the owner of boxes where no Boxes plugin is, the ComfyUI node
 // (its host member boxesInEditor is true; the app's is false and the app keeps plugins/boxes as the owner, so this
 // module is never built there). The boxes live in editor.pluginData.boxes ({ version: 1, boxes: [...] }, the app's

@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/px/px.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/px/px.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 /**
  * Loader and memory helpers for the px kernels (crates/px, docs/PLAN_BCE.md §B1).
  *

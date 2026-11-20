@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_encode.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_encode.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 /**
  * The PNG encoders (moved out of inpaint_canvas.js as they were): a canvas in the shared worker (`encodeCanvas`),
  * tile pixels, bands and row sources in parts by the pool (`encodeTilePixels`, `encodeBands`, `encodeRows`), with the

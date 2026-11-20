@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_rangebar.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_rangebar.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // Range bar control and whole-picture histograms (R1-S4 / F9)
 // Pure geometry functions for headless tests and UI control component.
 

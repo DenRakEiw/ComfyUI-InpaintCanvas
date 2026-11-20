@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_remove.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_remove.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // Remove (docs/PLAN_0_1_31.md §5 step 3): the geometry and the pixel moves around the in-app LaMa model, which takes a
 // fixed 512 x 512 picture and mask and answers 512 x 512. The editor reads the picture under a crop box around the hole,
 // this module scales the picture and the hole to the model's size and samples the model's answer back at the hole's

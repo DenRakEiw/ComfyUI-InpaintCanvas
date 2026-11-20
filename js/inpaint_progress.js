@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_progress.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_progress.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // A run's progress for the status row's bar (docs/PLAN_0_1_48.md S3; node issue DenRakEiw/ComfyUI-InpaintCanvas#1,
 // ask 1): ComfyUI's events for the prompts this document queued (the node k of n, a sampler's step v of m) and the
 // seconds of a run the app waits for (an API run, a pass on the whole picture). No DOM and no imports: the editor

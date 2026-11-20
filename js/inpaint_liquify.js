@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_liquify.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_liquify.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 /**
  * Liquify (PLAN_0_1_31 §5 step 5): the displacement field, its brushes, the bake of a layer through it and the preview
  * sampler. Pure, no DOM at import: the editor, the pool's workers and tools/liquify_test.js import it.

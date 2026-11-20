@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_parts.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_parts.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // Parts of a class or an object kept in modules of their own (item 56, docs/PLAN_SPLIT.md §2).
 //
 // A part module holds an ordinary class whose body is methods moved out of a long class, text unchanged:

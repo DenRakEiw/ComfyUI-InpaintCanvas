@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/prompt_field.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/prompt_field.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // The prompt field of the app (item 26, docs/PLAN_REFS.md 26c and C4): a contenteditable that the rest of the editor
 // reads like the textarea it replaces (`value`, the selection, `setSelectionRange`, `input` and `change`), and that
 // draws each @img token of the prompt as a chip: a round thumbnail, the label, a chevron. The text stays a plain

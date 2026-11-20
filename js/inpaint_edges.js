@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_edges.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_edges.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // @ts-check
 // Pure edge mathematics module for snap sampling, detail tile fusion and edge tile detection (R2-S2 / PLAN_NIK9_BUILD sec 3.3)
 // Holds JS functions and SNAP_GLSL with identical maths. No DOM at import.

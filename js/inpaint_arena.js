@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_arena.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_arena.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 /**
  * The tile arena (docs/PLAN_BCE.md §E1): where a tile's 256 KB of pixels live.
  *

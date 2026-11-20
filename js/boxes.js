@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/boxes.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/boxes.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // Boxes in the prompt, the renderer's half (item 28, docs/PLAN_BOXES.md §4 and §8): geometry in image pixels turned
 // into fractions of the frame a run sends (the crop of an edit, the new image of Generate new). Main's
 // electron/main/providers/boxes.js writes the rows the model reads, since only main knows the final layout of the

@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_canvas.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_canvas.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // Inpaint Canvas - layered canvas editor for ComfyUI.
 //
 // The node itself only shows a thumbnail and a button. The editor opens as a

@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_tiff.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_tiff.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 /**
  * TIFF files (docs/PLAN_0_1_29.md 3d): read as a stream and written in strips, as inpaint_png.js does PNG. A picture
  * never exists as one buffer: the reader hands out bands of RGBA8 rows while it decodes, the writer takes strips of

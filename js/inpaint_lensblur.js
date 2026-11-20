@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_lensblur.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_lensblur.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // @ts-check
 // Inpaint Canvas - depth-aware lens blur and bokeh filter (R2-S15)
 // Vogel disc sampling, scatter-as-gather rule, bleed suppression and specular highlight boost.

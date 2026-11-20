@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_depth.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_depth.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // @ts-check
 // The depth map mathematics for Depth Anything V2 Small (Nik-9 Parity R1-S3a).
 // Model sizing (DPT aspect-keeping multiple-of-14), working sizes, disparity range,

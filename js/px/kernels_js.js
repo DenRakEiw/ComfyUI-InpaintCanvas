@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/px/kernels_js.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/px/kernels_js.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 /**
  * The pixel kernels of the tile engine (docs/PLAN_BCE.md §B2). Phase B built them twice, in
  * Rust (wasm, SIMD128) and here, and measured both: Rust was 2.0 to 2.4× faster on the two

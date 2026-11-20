@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_haze.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_haze.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // @ts-check
 // Dehaze mathematics (Dark Channel Prior, airlight extraction, guided transmission refinement).
 // Pure ASCII, no DOM references: runs under plain Node, in Web Workers, and in the renderer.

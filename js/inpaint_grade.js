@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_grade.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_grade.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // @ts-check
 /**
  * Colour grading mathematical foundation and table generator (PLAN_NIK9_BUILD sec 3.4 / R3-S2).

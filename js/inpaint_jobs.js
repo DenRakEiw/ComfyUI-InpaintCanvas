@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_jobs.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_jobs.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 /**
  * The editor's side of its workers (moved out of inpaint_canvas.js as they were): the shared worker and its jobs
  * (`editorWorker`, `workerCall`), the mips worker, the pool (`editorPool`, inpaint_pool.js), the tile store's chain

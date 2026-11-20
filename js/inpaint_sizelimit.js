@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_sizelimit.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_sizelimit.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // What one canvas holds (docs/PLAN_0_1_48.md S5, docs/BUGS.md "Size limits"): a whole-picture landing, Resize and
 // Extend make the new picture as one canvas, so their ceiling is Chromium's canvas limit on both backends, not the
 // document's gigapixel. No imports: the editor, the tile engine, the app host and the commands share it.

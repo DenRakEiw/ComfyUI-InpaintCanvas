@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_filters_gl.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_filters_gl.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // WebGL2 path for the filter layers: the point adjustments (levels, curves, brightness /
 // contrast, hue / saturation, colour balance, black & white, invert), the 3D LUT and the
 // grain run as one fragment shader pass instead of a getImageData / putImageData loop

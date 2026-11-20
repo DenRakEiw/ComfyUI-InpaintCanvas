@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_ed_view.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_ed_view.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // the view (canvas size, coordinate maps, zoom), layer selection, layer pixels with the stroke, handles and cursors, side panes, rulers, guides and compare: moved out of inpaint_canvas.js (item 56 S10b, docs/PLAN_SPLIT.md), text unchanged.
 
 import { host } from "./host.js";

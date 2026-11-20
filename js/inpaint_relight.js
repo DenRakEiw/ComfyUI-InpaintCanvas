@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_relight.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_relight.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // @ts-check
 // Inpaint Canvas - relight light model, fit, Kelvin conversion and shading maths (L0a)
 // Orthographic height-field lighting from depth maps (PLAN_RELIGHT_BUILD.md sec 4.1).

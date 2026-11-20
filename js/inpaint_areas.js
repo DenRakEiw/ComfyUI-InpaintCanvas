@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_areas.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_areas.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // The separate areas of a selection (CLAUDE.md item 54, issue #9): a selection of several areas apart (people selected
 // by text, say) goes as one crop of all of them, scaled down to the model's size, so each area comes back soft. The app
 // counts the areas to say so and to run each one on its own (eacharea.js); this module is the arithmetic of it, pure: no

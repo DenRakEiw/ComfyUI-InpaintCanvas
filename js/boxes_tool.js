@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/boxes_tool.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/boxes_tool.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // The Boxes tool and overlay (item 28 S3b, docs/PLAN_BOXES.md §10). Drag on empty canvas draws a New box, a click selects
 // a box (its row in the panel lights up; the smallest box under the pointer), a drag moves it, the eight handles resize
 // it; Delete removes the selected box,

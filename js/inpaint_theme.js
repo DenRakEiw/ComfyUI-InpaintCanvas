@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_theme.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_theme.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 /**
  * The skin tokens (docs/SKINS.md, contract version 1) and the few canvas colours of the editor's chrome that follow
  * them: the rulers, the brush-tip thumbnail and the curves control. Every other canvas colour stays literal.

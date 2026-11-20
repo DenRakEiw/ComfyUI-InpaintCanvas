@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_pool.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_pool.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 /**
  * The worker pool (docs/PLAN_BCE.md §E1): up to eight of the editor's workers (`inpaint_worker.js`, each with its own
  * kernels), a queue with priorities, and the tile arena handed to every one of them.

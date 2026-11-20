@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_depthfx.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_depthfx.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // @ts-check
 import { registerGLFilter } from "./inpaint_filters_gl.js";
 import { SAMPLE_GLSL, passToMap, rg8View, guideView, sampleMap } from "./inpaint_maps.js";

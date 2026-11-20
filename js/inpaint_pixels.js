@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_pixels.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_pixels.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 /**
  * The pixels of a layer, a layer mask, the selection and the base behind one interface
  * (docs/PLAN_BCE.md C1). Every read and every write of those pixels in the editor goes

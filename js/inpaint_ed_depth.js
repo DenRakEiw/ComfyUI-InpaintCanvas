@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_ed_depth.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_ed_depth.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // the depth map, maps, depth edit and the filter-preview cancel helpers: moved out of inpaint_canvas.js (item 56 S7, docs/PLAN_SPLIT.md), text unchanged.
 
 import { host } from "./host.js";

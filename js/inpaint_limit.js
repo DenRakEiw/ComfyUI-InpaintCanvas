@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_limit.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_limit.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // @ts-check
 // Post-stage for filter layers: params.limit (F6 / R1-S7 / R2-S5).
 // Runs on the GPU via LIMIT_SHADER or on the CPU via limitStageCPU.

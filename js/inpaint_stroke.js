@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_stroke.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_stroke.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 /**
  * What a brush gesture does with the pointer before it paints (docs/PLAN_0_1_31.md §4 step 5): the pen's pressure through
  * a curve, and a stabiliser. Pure, no DOM, so tools/stroke_test.js runs it in plain Node.

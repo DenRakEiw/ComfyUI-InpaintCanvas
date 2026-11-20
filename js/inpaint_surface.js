@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_surface.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_surface.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // Deep paint's surface maps from the decomposition (docs/PLAN_SURFACE_PAINT.md §3.1, SP3): the model's albedo A,
 // shading S and residual R at its size (long side 768) become the document's shading and residual maps at the work
 // size (long side up to 4096), and MoGe-2's normals its normal map. Plain functions on typed arrays, no DOM: the pool's

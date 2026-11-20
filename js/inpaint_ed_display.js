@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_ed_display.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_ed_display.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // the display source, the pyramid and the GL compositor: moved out of inpaint_canvas.js (item 56 S10, docs/PLAN_SPLIT.md), text unchanged.
 
 import { GLCompositor } from "./inpaint_compositor.js";

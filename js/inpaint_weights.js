@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_weights.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_weights.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // @ts-check
 // Pure weights module for range selections, filter limits and UI previews (F3 / PLAN_NIK9_BUILD §3.1)
 // Holds JS functions and one GLSL string with identical maths, the Limit typedef and normaliser,

@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_tiles.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_tiles.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 /**
  * The tile store: the second backend of `LayerPixels` / `MaskPixels` (docs/PLAN_BCE.md §C2,
  * "C2 as built"). The same methods, argument forms and results as the canvas backend in

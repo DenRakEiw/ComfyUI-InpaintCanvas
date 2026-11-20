@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_ed_pointer.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_ed_pointer.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // tools and keys, the brush size, pointer events and the polygon close: moved out of inpaint_canvas.js (item 56 S6, docs/PLAN_SPLIT.md), text unchanged.
 
 import { host } from "./host.js";

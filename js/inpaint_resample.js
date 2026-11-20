@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_resample.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_resample.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 /**
  * The resampler: new pixels from old ones through an affine map, tile by tile, in integer maths (PLAN_0_1_31 §7, 23b).
  * Pure, no DOM at import: the pixel classes of both backends and the pool's workers import it.

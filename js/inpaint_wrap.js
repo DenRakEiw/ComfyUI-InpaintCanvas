@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_wrap.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_wrap.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // @ts-check
 // Deep paint's wrap (docs/PLAN_SURFACE_PAINT.md §3.3, SP7): a flat picture (a logo, a pattern) laid onto the surface the
 // picture shows, by arc length from the decal's centre. No DOM at import (plain functions, tested in Node).

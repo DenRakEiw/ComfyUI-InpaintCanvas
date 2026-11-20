@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_ed_select.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_ed_select.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // the selection: combine, select range, SAM logits, rectangle and shape, flood, wand, feather, quick mask, fill / copy / paste, clear and invert: moved out of inpaint_canvas.js (item 56 S5, docs/PLAN_SPLIT.md), text unchanged.
 
 import { bytesSource, clipMaskToSelection, floodMask, growMaskBounds, invertMask, maskBounds, maskToColorCanvas, rectSource, selectionGco, tilesSource } from "./inpaint_raster.js";

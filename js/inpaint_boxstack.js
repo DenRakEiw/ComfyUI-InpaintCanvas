@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_boxstack.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_boxstack.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 /**
  * A box of the picture composited from the tiles, here on the main thread and at once (docs/PLAN_0_1_31.md §4 step 2):
  * what a brush that samples the picture reads under its dab. The workers composite whole bands of a held stack for the

@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_ed_filters.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_ed_filters.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // emulated blends, frequency separation, dodge / burn, filter layers, picture stats, the range preview, applyFilterLayer: moved out of inpaint_canvas.js (item 56 S7, docs/PLAN_SPLIT.md), text unchanged.
 
 import { host } from "./host.js";

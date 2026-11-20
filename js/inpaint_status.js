@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_status.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_status.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // The status line's kinds (item 45, docs/PLAN_0_1_48.md S1 / S2): "error" and "warn" show red and blink five times
 // (the user counts warnings as errors; the app log keeps the two levels apart), "" is a plain line. Shared by the
 // editor, the app host, the shell and the plugin API; no imports, so every host can load it.

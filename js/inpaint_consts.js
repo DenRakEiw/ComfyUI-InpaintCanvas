@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_consts.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_consts.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // the editor's constants, roles, the brush size scale and makeCanvas: moved out of inpaint_canvas.js (item 56 S1, docs/PLAN_SPLIT.md), text unchanged.
 
 import { host } from "./host.js";

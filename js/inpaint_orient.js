@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_orient.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_orient.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // orientation, transform-matrix, text-angle and auto-crop helpers: moved out of inpaint_canvas.js (item 56 S1, docs/PLAN_SPLIT.md), text unchanged.
 
 import { textAngle, textFrame } from "./inpaint_text.js";

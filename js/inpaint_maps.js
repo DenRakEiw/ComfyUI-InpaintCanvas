@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_maps.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_maps.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // Document-level derived picture maps (depth, guide, sky mask).
 // Maps carry a unit-square-to-document-pixels affine transform `xf` and are never resampled on a turn.
 // Document maps are immutable in their data; changes or new versions produce a new DocMap.

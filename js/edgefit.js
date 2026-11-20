@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/edgefit.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/edgefit.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // Edge fit (item 42): register a layer or a provider's answer to the picture under it on the ring where both should
 // show the same thing, the way the node's `_align_patch` (nodes.py) does at stitch time with OpenCV's ECC.
 //

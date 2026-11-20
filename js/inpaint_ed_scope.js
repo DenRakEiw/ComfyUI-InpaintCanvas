@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_ed_scope.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_ed_scope.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // The live scope and the clipping warning (item 65, docs/PLAN_0_1_57.md): the Image tab's *Scope* section shows the RGB
 // and luma histogram of the visible picture, and Alt+J (View > Clipping Warning) marks pure black blue and pure white
 // red on the screen. Both are views only: nothing here writes a layer, the document, an export or a run's picture.

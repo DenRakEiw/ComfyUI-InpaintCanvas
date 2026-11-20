@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_shadow.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_shadow.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // A contact shadow from a layer's coverage (item 61, docs/PLAN_0_1_57.md): the shape, squashed toward its lowest opaque
 // edge (the foot) and blurred, darkest where it touches the ground and fading with the distance from it. Procedural, no
 // model. This module is the arithmetic on a coverage grid at a working scale (no DOM, no editor); the editor's side is

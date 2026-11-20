@@ -1,4 +1,4 @@
-// Generated from DenRakEiw/scumble renderer/editor/inpaint_surfacefx.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
+// Generated from scumble-app/scumble renderer/editor/inpaint_surfacefx.js by tools/build_node.py. Do not edit here: edit it in the app repo and build.
 // @ts-check
 // Deep paint's layer (docs/PLAN_SURFACE_PAINT.md §3.2, SP4): a filter layer `surface` whose own pixels hold the paint P
 // (straight RGBA). Over the picture below B it lays the paint as the surface's own colour, in linear light:
