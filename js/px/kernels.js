@@ -1219,8 +1219,14 @@ export async function tiffStrip(rgbaOrArgs, wOrLevel = 2, rowsOrLaps = null, lev
         lvl = level;
         lp = laps;
     }
+    // the fresh instance's zlib first (the same bytes as the strip's); when it cannot get its arena either (the strip
+    // failed for want of memory), JS's deflate
     const pz = rustPx();
-    return J.tiffPart(args, (bytes) => (pz ? pz.zlib(bytes, lvl) : J.deflate(bytes)), lp);
+    const zip = (bytes) => {
+        if (!pz) return J.deflate(bytes);
+        try { return pz.zlib(bytes, lvl); } catch (err) { if (!recovered(pz, err, "zlib")) throw err; return J.deflate(bytes); } finally { releaseIfLarge(); }
+    };
+    return J.tiffPart(args, zip, lp);
 }
 
 const TIFF_RUST = Object.freeze({
@@ -1259,9 +1265,11 @@ export function limitAlphaRows(rgba, map, mw, mh, xf, x0, y0, w, h, limit, snap 
         } finally { releaseIfLarge(); }
     }
     if (done > 0 && done < h) {
+        // the rows past those Rust did, as views (a raw ArrayBuffer / SharedArrayBuffer has no byteOffset)
         const off = done * w * 4;
-        const subRgba = new Uint8Array(rgba.buffer, rgba.byteOffset + off, (h - done) * w * 4);
-        const subCol = col ? new Uint8Array(col.buffer, col.byteOffset + off, (h - done) * w * 4) : null;
+        const view = (a) => (ArrayBuffer.isView(a) ? new Uint8Array(a.buffer, a.byteOffset + off, (h - done) * w * 4) : new Uint8Array(a, off, (h - done) * w * 4));
+        const subRgba = view(rgba);
+        const subCol = col ? view(col) : null;
         J.limitAlphaRows(subRgba, map, mw, mh, xf, x0, y0 + done, w, h - done, limit, snap, guide, subCol);
         return rgba;
     }

@@ -149,9 +149,8 @@ export class HistoryPart {
 
     releaseSnapshot(snap) {
         if (!snap) return;
-        // only a step whose bytes the budget counted takes them off again: a held snapshot never pushed, a named snapshot
-        // and a step taken out by hand once drove the count below zero, and trimUndo then let the budget overrun
-        if (snap._counted) { this.undoBytes -= snap.bytes || 0; snap._counted = false; }
+        // only a step whose bytes the budget counted takes them off again (the history keeps the count: inpaint_history.js)
+        this.undoHistory.uncount(snap);
         for (const k of ["url", "mask", "selection"]) {
             const v = snap[k];
             if (!v || v === true) continue;   // a layerrect step's `mask` is a flag
@@ -504,31 +503,19 @@ export class HistoryPart {
         if (label) snap.label = label;
         if (!snap.label) snap.label = UNDO_LABELS[snap.kind] || snap.kind;
         snap.at = Date.now();
-        // the redo steps go first: the budget counts them, and trimming against it while they are
-        // still counted threw away older undo steps that fit once the redo steps were gone
-        for (const s of this.redo) this.releaseSnapshot(s);
-        this.redo = [];
-        this.undo.push(snap);
-        if (!snap._counted) { this.undoBytes += snap.bytes || 0; snap._counted = true; }
-        this.trimUndo();
+        this.undoHistory.push(snap);   // the redo steps go, it is counted, the oldest steps past the depth go
         this.scheduleDetachedRelease();
         this.historyChanged();
     }
 
     /** Drop the oldest steps past the depth (the instance's maxUndo / maxUndoBytes, which the app's settings set). */
     trimUndo() {
-        const steps = Math.max(1, this.maxUndo || MAX_UNDO), bytes = this.maxUndoBytes || MAX_UNDO_BYTES;
-        while (this.undo.length > steps || (this.undoBytes > bytes && this.undo.length > 1)) {
-            this.releaseSnapshot(this.undo.shift());
-            this.undoTrimmed = true;
-        }
+        this.undoHistory.trim();
     }
 
     /** A new depth: applied at once (the oldest steps past it go), and to every step after. */
     setUndoDepth({ steps, bytes } = {}) {
-        if (steps != null) this.maxUndo = Math.max(1, Math.round(+steps) || MAX_UNDO);
-        if (bytes != null) this.maxUndoBytes = Math.max(1048576, Math.round(+bytes) || MAX_UNDO_BYTES);
-        this.trimUndo();
+        this.undoHistory.setDepth({ steps, bytes }, { steps: MAX_UNDO, bytes: MAX_UNDO_BYTES });
         this.historyChanged();
     }
 
@@ -546,13 +533,7 @@ export class HistoryPart {
      * were taken back). `steps` is what `stepHistory` takes to get there: negative undoes, positive redoes.
      */
     undoList() {
-        const rows = [{ label: this.undoTrimmed ? "Oldest kept" : "Start", at: null, steps: -this.undo.length }];
-        this.undo.forEach((s, i) => rows.push({ label: s.label || UNDO_LABELS[s.kind] || s.kind, at: s.at || null, steps: i + 1 - this.undo.length }));
-        for (let j = this.redo.length - 1; j >= 0; j--) {
-            const s = this.redo[j];
-            rows.push({ label: s.label || UNDO_LABELS[s.kind] || s.kind, at: s.at || null, steps: this.redo.length - j });
-        }
-        return rows.map((r) => ({ ...r, current: r.steps === 0, future: r.steps > 0 }));
+        return this.undoHistory.rows(UNDO_LABELS);
     }
 
     /**
@@ -629,13 +610,7 @@ export class HistoryPart {
      * the tab kept one undo step, and leaked the PNG blobs of its whole-layer steps.
      */
     clearUndo() {
-        this.historyGen++;
-        for (const s of this.undo) this.releaseSnapshot(s);
-        for (const s of this.redo) this.releaseSnapshot(s);
-        this.undo = [];
-        this.redo = [];
-        this.undoBytes = 0;
-        this.undoTrimmed = false;
+        this.undoHistory.clear();   // the generation moves, every step is released, the count back at zero
         this.historyChanged();
     }
 
@@ -683,13 +658,9 @@ export class HistoryPart {
             return;
         }
         if (snap.kind === "maps") {
-            if (!this.maps) this.maps = {};
             const entries = snap.maps ? Object.entries(snap.maps) : [[snap.map, snap.prev]];
-            for (const [kind, prev] of entries) {
-                if (prev) this.maps[kind] = prev;
-                else delete this.maps[kind];
-            }
-            this.mapsVersion++;
+            for (const [kind, prev] of entries) this.docMaps.put(kind, prev);
+            this.docMaps.bump();
             const kinds = entries.map(([k]) => k || "depth");
             for (const l of this.layers) {
                 if (l.kind === "filter" && kinds.some((kind) => l.params?.limit?.source === kind || this.mapsOf(l).includes(kind))) {
@@ -706,7 +677,7 @@ export class HistoryPart {
             const resized = snap.width !== this.width || snap.height !== this.height;
             // the snapshot's maps carry their own placement: the outgoing ones (kept by the step on the other stack) are
             // not turned back first, and the restored ones are not turned a second time
-            this.maps = {};
+            this.docMaps.replaceAll(null, { bump: false });
             this.restoreGeometry(snap);
             this.groups = (snap.groups || []).map((g) => ({ ...g }));
             if (snap.base !== this.base) this.recheckRestoredFiles({ base: snap.base });   // the layers below are all uploaded again
@@ -729,12 +700,11 @@ export class HistoryPart {
             this.activeLayerId = this.layers.some((l) => l.id === snap.activeLayerId) ? snap.activeLayerId : null;
             const sel = snap.selPx || this.pixels.Mask.empty(this.width, this.height);
             snap.selPx = null;
-            this.sel = sel;
+            this.selState.replace(sel);
             this.touchSource(sel);
             this.uploaded = this.makeUploaded();
             this.dropCompositeCaches();
-            this.selectionDirty = true; this.selectionLoose = false;
-            this.selectionDataUrl = null; this.selectionEncoded = false;
+            this.selState.invalidate();
             if (resized) this.fitView();   // a snapshot from before a quarter turn or a crop
             this.renderSelectionList();
             // what no undo step holds: the fields set_prompt, set_generation, set_crop and
@@ -749,8 +719,7 @@ export class HistoryPart {
             if (doc.crop) { this.cropSettings = JSON.parse(JSON.stringify(doc.crop)); this.syncCropControls(); }
             if (doc.settings) this.settings = JSON.parse(JSON.stringify(doc.settings));
             this.syncGenControls();
-            this.maps = mapsCopy(snap.maps);
-            this.mapsVersion++;
+            this.docMaps.replaceAll(mapsCopy(snap.maps));
             this.renderSettings();
             this.renderLayers();
             this.renderInfo();
@@ -786,12 +755,11 @@ export class HistoryPart {
                 sel = this.pixels.Mask.empty(this.width, this.height);
                 if (selImg) sel.drawInto(null, (ctx) => ctx.drawImage(selImg, 0, 0));
             }
-            this.sel = sel;
+            this.selState.replace(sel);
             this.touchSource(sel);
             this.uploaded = this.makeUploaded();
             this.dropCompositeCaches();
-            this.selectionDirty = true; this.selectionLoose = false;
-            this.selectionDataUrl = null; this.selectionEncoded = false;
+            this.selState.invalidate();
             if (this.extendInputs) for (const k of Object.keys(this.extendInputs)) this.extendInputs[k].value = 0;
             this.refsMutated();
             this.renderLayers();
@@ -1109,7 +1077,7 @@ export class HistoryPart {
             return;
         }
         if (this.pending) this.cancelPending();
-        now.pop();
+        this.undoHistory.popTop(redo);   // still counted: released (and uncounted) once it is put back
         if (failed) {
             // a step whose pixels could not be kept (its encode failed): said, not thrown at a key handler
             console.error(`Inpaint Canvas: ${word} step could not be restored`, failed);
@@ -1122,7 +1090,7 @@ export class HistoryPart {
         this.cancelPreviews();
         // the present, as the other stack's step: it keeps the step's label and time, so the list reads the same
         const current = this.snapshot(snap);
-        if (current) { (redo ? this.undo : this.redo).push(current); this.undoBytes += current.bytes || 0; current._counted = true; }
+        if (current) this.undoHistory.pushOther(current, redo);
         try {
             this.applySnapshot(snap, images);
             if (snap.kind === "turn") this.setStatus(`${redo ? "Redone" : "Undone"}: ${snap.label || UNDO_LABELS.turn}.`);   // the whole document changed

@@ -39,7 +39,13 @@ vec4 shade(vec4 c, vec2 uv) {
     float mv = u_hasMap == 1 ? snapField(u_map, u_guide, mp, i.rgb, u_snap) : 0.0;
     float w = (u_source == 0 && u_hasMap == 0) ? 0.0 : w_limit(u_source, i.rgb, mv, u_r, u_inv == 1, u_ref, u_tol);
     if (u_view == 1) return vec4(vec3(w), 1.0);
-    return u_over == 1 ? vec4(c.rgb, c.a * w) : mix(i, c, w);
+    if (u_over == 1) return vec4(c.rgb, c.a * w);
+    // straight colours: a mix where the alphas differ (Deep paint over transparency raises it) is a mix of the
+    // premultiplied ones, or a feathered edge over a clear pixel came out dark (review 2026-11-16
+    // p1-deeppaint-layer/plain-limit-darkens-over-transparency); equal alphas keep the plain mix, the same values
+    if (abs(i.a - c.a) < 1e-6) return mix(i, c, w);
+    float ao = mix(i.a, c.a, w);
+    return ao > 1e-6 ? vec4(mix(i.rgb * i.a, c.rgb * c.a, w) / ao, ao) : vec4(0.0);
 }
 `,
 };
@@ -57,11 +63,13 @@ export function limitStage(src, out, limitIn, info = {}, def = null) {
     if (!limitIn) return out;
     const limit = normalizeStoredLimit(limitIn);
     if (!limit) return out;
-    if (limit.lo <= 0 && limit.hi >= 1 && !limit.invert) return out;
-    if (limit.source === "depth" && (!info || !info.maps || !info.maps.depth)) {
+    // a depth limit without a depth map limits to nothing, whatever its range (0..1 drew the filter everywhere); a
+    // full range is no limit only while the limit itself is not being shown
+    if (limit.source === "depth" && (!info || !info.maps || !info.maps.depth || !info.maps.depth.data)) {
         if (info) info.limitMissing = true;
         return src;
     }
+    if (limit.lo <= 0 && limit.hi >= 1 && !limit.invert && !(info && info.limitView)) return out;
 
     // Fills always carry the weight in their alpha (\`def.over\`); a filter does so whenever its result is
     // drawn over the picture rather than becoming the chain's surface (\`info.limitOver\`, set by the
@@ -183,11 +191,23 @@ export function limitStageCPU(srcCanvas, outCanvas, limit, info = {}, over = fal
                 resData[ptr + 1] = cG;
                 resData[ptr + 2] = cB;
                 resData[ptr + 3] = Math.max(0, Math.min(255, Math.round(cA * w)));
-            } else {
+            } else if (iA === cA) {
                 resData[ptr] = Math.max(0, Math.min(255, Math.round(iR + (cR - iR) * w)));
                 resData[ptr + 1] = Math.max(0, Math.min(255, Math.round(iG + (cG - iG) * w)));
                 resData[ptr + 2] = Math.max(0, Math.min(255, Math.round(iB + (cB - iB) * w)));
-                resData[ptr + 3] = Math.max(0, Math.min(255, Math.round(iA + (cA - iA) * w)));
+                resData[ptr + 3] = iA;
+            } else {
+                // the alphas differ: the premultiplied colours mix (the shader's rule above)
+                const ao = iA + (cA - iA) * w;
+                if (ao > 0) {
+                    const pa = iA * (1 - w), pc = cA * w;
+                    resData[ptr] = Math.max(0, Math.min(255, Math.round((iR * pa + cR * pc) / ao)));
+                    resData[ptr + 1] = Math.max(0, Math.min(255, Math.round((iG * pa + cG * pc) / ao)));
+                    resData[ptr + 2] = Math.max(0, Math.min(255, Math.round((iB * pa + cB * pc) / ao)));
+                    resData[ptr + 3] = Math.max(0, Math.min(255, Math.round(ao)));
+                } else {
+                    resData[ptr] = resData[ptr + 1] = resData[ptr + 2] = resData[ptr + 3] = 0;
+                }
             }
         }
     }
@@ -212,14 +232,15 @@ export function limitAlphaRows(rgba, x0, y0, w, h, limit, map, col = null) {
     const lim = normalizeStoredLimit(limit);
     if (!lim) return;
 
-    // Shortcut: full range and not inverted leaves alpha untouched
-    if (lim.lo <= 0 && lim.hi >= 1 && !lim.invert) return;
-
-    // If depth limit but map or map.data is missing, effect is zero -> alpha becomes 0
+    // If depth limit but map or map.data is missing, effect is zero -> alpha becomes 0 (before the full-range
+    // shortcut: a depth limit at 0..1 without a map is still nothing)
     if (lim.source === "depth" && (!map || !map.data)) {
         for (let i = 3; i < rgba.length; i += 4) rgba[i] = 0;
         return;
     }
+
+    // Shortcut: full range and not inverted leaves alpha untouched
+    if (lim.lo <= 0 && lim.hi >= 1 && !lim.invert) return;
 
     const m = (map && map.data) ? passToMap(map, 1) : null;
     const snap = (map && map.guide) ? snapParams(map.meta?.snap?.strength) : null;

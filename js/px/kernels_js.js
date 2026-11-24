@@ -43,7 +43,10 @@ export const OPS = Object.freeze({
 // A kernel that sees both Uint8ClampedArray (ImageData.data) and Uint8Array reads through
 // polymorphic element access and runs at half speed; every entry point views its byte
 // inputs as Uint8Array first, which copies nothing.
-const bytesOf = (a) => (a instanceof Uint8Array ? a : new Uint8Array(a.buffer, a.byteOffset, a.byteLength));
+// the bytes of a typed array or of a raw ArrayBuffer / SharedArrayBuffer (the Rust side takes all three, so do the twins)
+const SAB = typeof SharedArrayBuffer !== "undefined" ? SharedArrayBuffer : null;
+const rawBuffer = (a) => a instanceof ArrayBuffer || (SAB !== null && a instanceof SAB);
+const bytesOf = (a) => (a instanceof Uint8Array ? a : rawBuffer(a) ? new Uint8Array(a) : new Uint8Array(a.buffer, a.byteOffset, a.byteLength));
 
 const LITTLE = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
 
@@ -3021,17 +3024,13 @@ export function limitAlphaRows(rgba, map, mw, mh, xf, x0, y0, w, h, limit, snap 
         throw new Error("limitAlphaRows: bad arguments");
     }
     if (map.length < mw * mh) throw new Error("limitAlphaRows: short map");
-    const u8 = ArrayBuffer.isView(rgba)
-        ? bytesOf(rgba)
-        : (rgba instanceof ArrayBuffer ? new Uint8Array(rgba) : null);
+    const u8 = ArrayBuffer.isView(rgba) || rawBuffer(rgba) ? bytesOf(rgba) : null;
     const needBytes = w * h * 4;
     if (!u8 || u8.length < needBytes) throw new Error("limitAlphaRows: short rgba");
 
     let cBytes = null;
     if (col != null) {
-        cBytes = ArrayBuffer.isView(col)
-            ? bytesOf(col)
-            : (col instanceof ArrayBuffer ? new Uint8Array(col) : null);
+        cBytes = ArrayBuffer.isView(col) || rawBuffer(col) ? bytesOf(col) : null;
         if (!cBytes || cBytes.length < needBytes) throw new Error("limitAlphaRows: short col");
     }
 
@@ -3059,9 +3058,7 @@ export function limitAlphaRows(rgba, map, mw, mh, xf, x0, y0, w, h, limit, snap 
         const gw = guide.w != null ? guide.w | 0 : mw;
         const gh = guide.h != null ? guide.h | 0 : mh;
         if (!gRaw || gw !== mw || gh !== mh) throw new Error("limitAlphaRows: bad guide");
-        gBytes = ArrayBuffer.isView(gRaw)
-            ? bytesOf(gRaw)
-            : (gRaw instanceof ArrayBuffer ? new Uint8Array(gRaw) : null);
+        gBytes = ArrayBuffer.isView(gRaw) || rawBuffer(gRaw) ? bytesOf(gRaw) : null;
         if (!gBytes || gBytes.length < mw * mh * 4) throw new Error("limitAlphaRows: short guide");
     }
     if (w === 0 || h === 0) return rgba;

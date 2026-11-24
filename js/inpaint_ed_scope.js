@@ -303,7 +303,9 @@ export class ScopePart {
 
     /** A gesture in the editor that a scope read must not run under (as the composite's upload and Resize wait for). */
     scopeHeld() {
-        return !!(this.gestureHeld() || this.pending);
+        // any pointer held, a pan and the compare divider too: Compare's redraw moves the composite's counter on every
+        // frame of them, and the scope counted the whole picture again every 300 ms of the drag (once after it is enough)
+        return !!(this.pointer || this.pending);
     }
 
     /**

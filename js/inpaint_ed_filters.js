@@ -24,6 +24,9 @@ import { wrapBox, wrapDecal, wrapGrow } from "./inpaint_wrap.js";
 import { surfaceRegion } from "./inpaint_surface.js";
 import { xfInv } from "./inpaint_resample.js";
 
+/** The most picture pixels one wrap covers (its box): about 24 bytes each are live at once. */
+const WRAP_MAX_PX = 36e6;
+
 export class FiltersPart {
     /**
      * Draw in a blend mode Canvas 2D has no operation for (linear light, PLAN_0_1_31 §4 step 8; PLAN_NIK9's other modes
@@ -393,18 +396,21 @@ export class FiltersPart {
      * *Layer › New Light Brush Layer* (SP6): a relight layer with one warm sun from the upper left and a mask that hides
      * all of it, the mask in edit and the brush picked, so painting brings the light in where it is painted (the light
      * follows the surfaces' facing from the depth map, and with the surface maps it lights the picture's own colour and
-     * keeps its reflections). The depth map is made by the relight layer as before. One undo step for the mask (adding
-     * a layer is none).
+     * keeps its reflections). The depth map is made by the relight layer as before. One undo step that takes the layer
+     * away (before: the mask's own step, whose undo left the sun lighting the whole picture).
      */
     newLightBrushLayer() {
         if (!this.width) { this.setStatus("Load an image first."); return null; }
+        this.pushUndo({ kind: "layers", label: "Light brush layer" });
         const layer = this.addFilterLayer("relight");
         if (!layer) return null;
         layer.name = `Light brush ${this.filterCounter}`;
         const size = { width: this.width, height: this.height };
         const sun = { ...defaultLight(0, size), type: "sun", x: Math.round(this.width * 0.25), y: Math.round(this.height * 0.2), color: 4500, intensity: 120 };
         layer.params = { ...layer.params, lights: normalizeLights([sun], size) };
-        this.fillLayerMask(layer, false);
+        layer.maskPx = this.pixels.Mask.empty(layer.px.width, layer.px.height);   // hides all
+        layer.maskOff = false;
+        this.markMaskChanged(layer);
         layer.maskEdit = true;
         this.activeLayerId = layer.id;
         this.setTool("paint");
@@ -458,10 +464,20 @@ export class FiltersPart {
      * reach it, null outside the picture. The selection of this moment limits it, as a fresh wrap.
      */
     wrapPixels(src, angle, { useSelection = true } = {}) {
-        const place = { cx: src.x + src.w / 2, cy: src.y + src.h / 2, w: src.w, h: src.h, angle };
+        // the painted part of the layer, not its box: a paint layer is the whole canvas, and wrapping that read and
+        // unwrapped the whole picture round its middle (3.6 GB at 15k; the review of 2026-11-16,
+        // wrap-paint-layer-full-canvas-15k). Kept per pixel version: a live wrap asks again at every move
+        const pw = src.px.width, ph = src.px.height;
+        let pb = src.px._wrapBounds && src.px._wrapBounds.ver === (src.px.version || 0) ? src.px._wrapBounds.b : undefined;
+        if (pb === undefined) { pb = src.px.bounds(); src.px._wrapBounds = { ver: src.px.version || 0, b: pb }; }
+        if (!pb) return { error: `${src.name} has no pixels: nothing to wrap.` };
+        const ux = src.w / pw, uy = src.h / ph;
+        const place = { cx: src.x + (pb[0] + pb[2]) / 2 * ux, cy: src.y + (pb[1] + pb[3]) / 2 * uy, w: (pb[2] - pb[0]) * ux, h: (pb[3] - pb[1]) * uy, angle };
         const box = wrapBox(place, this.width, this.height, this.maps.points ? wrapGrow(this.maps.points, place.cx, place.cy) : 1);
         if (!box) return null;
         const [x0, y0, x1, y1] = box, bw = x1 - x0, bh = y1 - y0;
+        // about 24 bytes a pixel live at once (the slopes, the coordinates, the decal and the result)
+        if (bw * bh > WRAP_MAX_PX) return { error: `${src.name} would wrap over ${bw} × ${bh} px of the picture, more than wrap handles at once (${Math.round(WRAP_MAX_PX / 1e6)} MP): wrap a smaller part, or scale the layer down first.` };
         let sel = null;
         if (useSelection && this.sel && this.getBounds()) {
             const a = this.sel.readRect(x0, y0, bw, bh).data;
@@ -470,7 +486,7 @@ export class FiltersPart {
             for (let i = 0; i < sel.length; i++) { sel[i] = a[4 * i + 3]; if (sel[i]) any = true; }
             if (!any) return { error: "The selection does not reach the layer: nothing to wrap." };
         }
-        const decal = src.px.readRect(0, 0, src.px.width, src.px.height);
+        const decal = src.px.readRect(pb[0], pb[1], pb[2] - pb[0], pb[3] - pb[1]);
         return { box, place, limited: !!sel, data: wrapDecal({ map: this.maps.normals, box, decal, place, sel, points: this.maps.points || null }) };
     }
 
@@ -723,27 +739,42 @@ export class FiltersPart {
         this.notifyChanged();
     }
 
-    async loadLutFile(layer, file) {
-        if (!file) return;
+    /**
+     * A LUT or grain plate file read, uploaded and set on the layer: an edit Ctrl+Z waits for (trackEdit), set on the
+     * layer of that id as it is when the file is in (an undo meanwhile may have put a copy in its place), not at all when
+     * the layer or the tab is gone.
+     */
+    loadLutFile(layer, file) {
+        if (!file) return Promise.resolve();
+        return this.trackEdit(this.loadLutFileNow(layer, file));
+    }
+
+    async loadLutFileNow(layer, file) {
         try {
             this.setStatus(`Reading ${file.name} ...`);
             const lut = lutFromCube(await file.text());
             const up = await uploadCanvas(lutToCanvas(lut), `n${this.node.id}_lut`);
-            this.pushUndo({ kind: "filter", id: layer.id, label: "Load LUT" });
+            layer = this.liveLayer(layer);
+            if (!layer) { this.setStatus(`${file.name}: the layer is gone, nothing loaded.`); return; }
+            this.pushUndoSnapshot(this.snapshot({ kind: "filter", id: layer.id }), { tracked: true, label: "Load LUT" });
             layer.lut = { name: file.name, size: lut.size, ref: up.ref };
             layer._lutData = lut;
             if (/^LUT/.test(layer.name || "") || !layer.name) layer.name = file.name.replace(/\.cube$/i, "");
             this.markFilterChanged(layer);
             this.renderLayers();
-            this.setStatus(`${file.name} loaded (${lut.size}³ LUT).`);
+            this.setStatus(`${file.name} loaded (${lut.size}³ LUT${lut.from ? `, resampled from its ${lut.from}³` : ""}).`);
         } catch (err) {
             console.error(err);
             this.setStatus("Could not load the LUT: " + (err.message || err), failKind(err));
         }
     }
 
-    async loadPlateFile(layer, file) {
-        if (!file) return;
+    loadPlateFile(layer, file) {
+        if (!file) return Promise.resolve();
+        return this.trackEdit(this.loadPlateFileNow(layer, file));
+    }
+
+    async loadPlateFileNow(layer, file) {
         try {
             this.setStatus(`Uploading ${file.name} ...`);
             const ext = ((file.name || "").match(/\.[a-z0-9]+$/i) || [".png"])[0];
@@ -751,7 +782,9 @@ export class FiltersPart {
             const ref = await uploadBlob(file, stem + ext, { overwrite: false });
             const img = await loadImageEl(viewUrl(ref));
             const st = plateStats(img);
-            this.pushUndo({ kind: "filter", id: layer.id, label: "Load grain plate" });
+            layer = this.liveLayer(layer);
+            if (!layer) { this.setStatus(`${file.name}: the layer is gone, nothing loaded.`); return; }
+            this.pushUndoSnapshot(this.snapshot({ kind: "filter", id: layer.id }), { tracked: true, label: "Load grain plate" });
             layer.plate = { name: file.name, ref, w: img.naturalWidth, h: img.naturalHeight, mean: Math.round(st.mean * 10) / 10, std: Math.round(st.std * 10) / 10 };
             layer._plateImg = img;
             this.markFilterChanged(layer);
@@ -761,6 +794,12 @@ export class FiltersPart {
             console.error(err);
             this.setStatus("Could not load the plate: " + (err.message || err), failKind(err));
         }
+    }
+
+    /** The layer of `layer`'s id in the document now (an undo of a layers step puts copies in place), or null. */
+    liveLayer(layer) {
+        if (this._destroyed || !layer) return null;
+        return this.layers.find((l) => l.id === layer.id) || null;
     }
 
     removePlate(layer) {
@@ -795,6 +834,9 @@ export class FiltersPart {
         }
         if (FILTERS[layer.filter] && FILTERS[layer.filter].ownPixels) {
             baseKey.push(layer.px ? layer.px.version : -1);
+            // a screen pass draws coarse cells of tiles whose chains are still in the worker (`ownPixelsFor`): their
+            // landing moves the pixels' chainEpoch, and the pass is made again with them
+            if (vp && (vp.screen || vp.display) && layer.px) baseKey.push("chains", layer.px.chainEpoch || 0);
             // a stroke on the layer is drawn over its pixels per pass (`ownPixelsFor`): every dab moves `pixelVersion`
             if (!forRun && this.liveStrokeOn(layer)) baseKey.push("stroke", this.pixelVersion);
         }
@@ -876,7 +918,11 @@ export class FiltersPart {
             ctx.globalCompositeOperation = "source-over";
             ctx.clearRect(0, 0, w, h);
             if (isTilePixels(layer.px)) {
-                const vp = { x: x0, y: y0, w: w / sx, h: h / sy, sx, sy };
+                // a pass for the screen reads as the screen's layers do: a tile without its chain shows a coarse cell
+                // and asks the mips worker for it (C6 b), instead of building it here (up to 2,360 chains in one frame at
+                // 15k; the review of 2026-11-16, own-pixels-mips-block-main-thread)
+                const cur = pass.forRun ? null : this.viewPass;
+                const vp = { x: x0, y: y0, w: w / sx, h: h / sy, sx, sy, screen: !!(cur && cur.screen), display: !!(cur && cur.display) };
                 ctx.setTransform(sx, 0, 0, sy, -x0 * sx, -y0 * sy);
                 this.drawTilesInto(ctx, layer.px, 0, 0, W, H, vp);
                 if (p) this.drawStrokeInto(ctx, { x: 0, y: 0, w: W, h: H }, layer.px, op, vp, [0, 0, w, h]);

@@ -324,6 +324,16 @@ export class MasksPart {
                 if (layer.kind === "text") {
                     // the text edited on the canvas would be written back onto the layer when its editor closes
                     if (this.textEdit && this.textEdit.layer === layer) { this.setStatus("Finish the text edit first (Enter / Escape)."); return false; }
+                    // text typed in the side panel a moment ago is drawn first (its debounced render would otherwise be
+                    // dropped and the mask baked into the text as it was before the typing)
+                    if (layer._textTimer || layer._textRendering) {
+                        const id = layer.id;
+                        return this.renderTextLayer(layer).then(() => {
+                            const l = this.layers.find((x) => x.id === id);
+                            if (!l) { this.setStatus("That layer is gone."); return false; }
+                            return this.maskOp(l, "apply", opts);
+                        });
+                    }
                     // a text layer's pixels are rendered from its description, so the next text edit would bring the
                     // hidden parts back: the text becomes pixels first (one "layers" step: undo brings the text back)
                     this.pushUndo({ kind: "layers", label: "Apply mask" });

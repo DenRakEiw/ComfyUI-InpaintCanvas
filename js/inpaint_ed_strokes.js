@@ -101,9 +101,13 @@ export class StrokesPart {
         const segs = [];
         let ix = x0, iy = y0, lx = (x0 - layer.x) * sx, ly = (y0 - layer.y) * sy;
         let bx0 = lx, by0 = ly, bx1 = lx, by1 = ly, rMax = 0;
+        // how far a dab reaches from its centre in image pixels: a turned square or chisel tip reaches its corners
+        // (half the size times the square root of two), and a layer scaled more on one axis stretches the dab along the
+        // other (`full` is the mean of both); the stroke's box was half the size and cut those corners flat at the end
+        const reach = (this.brushSize * Math.SQRT1_2) * Math.max(1, (sx + sy) / (2 * Math.min(sx, sy) || 1)) + 2;
         for (const [x, y, pr] of pts) {
-            this.strokeBounds(p, ix, iy, x, y, this.brushSize / 2 + 2);
-            this.strokeDirty(p, ix, iy, x, y, this.brushSize / 2 + 2);
+            this.strokeBounds(p, ix, iy, x, y, reach);
+            this.strokeDirty(p, ix, iy, x, y, reach);
             const nx = (x - layer.x) * sx, ny = (y - layer.y) * sy;
             const radius = full * (pr == null ? 1 : Math.max(0.05, Math.min(1, pr)));
             segs.push({ x0: lx, y0: ly, x1: nx, y1: ny, radius, len: Math.hypot(nx - lx, ny - ly), step: 1 });

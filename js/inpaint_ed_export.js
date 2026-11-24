@@ -501,7 +501,7 @@ export class ExportPart {
      */
     boundsAfter(mode, box) {
         // the known box, exact or a superset ({ within }), or undefined when nothing is known
-        const known = this.selectionDirty && !this.selectionLoose ? undefined : this.cachedBounds;
+        const known = this.selState.knownBounds();
         if (mode === "subtract") {
             // a subtract only removes: the old box still holds everything, as a superset
             if (known === undefined) return undefined;
@@ -522,17 +522,13 @@ export class ExportPart {
         if (known === undefined) return undefined;
         const old = known;
         const u = empty ? old : (!old ? b : [Math.min(old[0], b[0]), Math.min(old[1], b[1]), Math.max(old[2], b[2]), Math.max(old[3], b[3])]);
-        return this.selectionLoose && u ? { within: u } : u;
+        return this.selState.loose && u ? { within: u } : u;
     }
 
     getBounds() {
-        if (this.selectionDirty) {
-            // a superset is made exact by strips from its edges; otherwise the extent is scanned for
-            this.cachedBounds = this.selectionLoose && this.cachedBounds ? this.scanBoundsIn(this.cachedBounds) : this.selectionBounds();
-            this.selectionDirty = false;
-            this.selectionLoose = false;
-        }
-        return this.cachedBounds;
+        // a superset is made exact by strips from its edges; otherwise the extent is scanned for (the scan the
+        // editor gave the selection state: scanBoundsIn / selectionBounds)
+        return this.selState.bounds();
     }
 
     /** Auto sizing values for the current selection, or null without a selection. */

@@ -88,8 +88,10 @@ export function makeTool(env, api) {
         const value = e.area.value;
         e.dlg.remove();
         if (!commit) return;
-        let d = e.doc;
-        try { d = env.docById(e.docId) || e.doc; } catch (_) { /* the tab was closed: nothing to write */ return; }
+        // the tab closed meanwhile: nothing to write (its document object is a closed editor's)
+        let d = null;
+        try { d = env.docById(e.docId); } catch (_) { d = null; }
+        if (!d) return;
         const b = api.boxesOf(d).find((x) => x.id === e.id);
         if (!b || value === (e.field === "text" ? b.text || "" : b.desc || "")) return;
         try {
@@ -418,5 +420,10 @@ export function makeTool(env, api) {
             }
         },
     };
-    return { tool, selected: (doc) => selected.get(doc.id) || null, select, forget: (docId) => selected.delete(docId) };
+    return { tool, selected: (doc) => selected.get(doc.id) || null, select, forget: (docId) => {
+        // a closed tab: its open description box and its drag go with it (the box hung over the next tab)
+        if (editing && editing.docId === docId) closeEditor(false);
+        if (drag && drag.docId === docId) drag = null;
+        selected.delete(docId);
+    }, closeEditor: (commit = true) => closeEditor(commit) };
 }

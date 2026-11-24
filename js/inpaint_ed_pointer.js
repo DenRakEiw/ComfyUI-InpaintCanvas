@@ -209,6 +209,13 @@ export class PointerPart {
             }
             return;
         }
+        // a stroke or a drag still held: a key that adds, merges, groups or deletes layers waits for its end (Delete during
+        // a stroke removed the layer the stroke was painting on, and the stroke's commit then landed on nothing)
+        if (this.gestureHeld() && ((ctrl && ["n", "g", "j", "e"].includes(k)) || k === "delete" || k === "backspace")) {
+            e.preventDefault();
+            this.setStatus("Let go of the mouse first.");
+            return;
+        }
         if (ctrl && e.shiftKey && k === "n") { e.preventDefault(); this.addPaintLayer(); return; }
         if (ctrl && e.shiftKey && k === "r") { e.preventDefault(); this.toggleRulers(); return; }
         // Ctrl+Alt+G by the key, not `ctrl`: Windows reports a real Ctrl+Alt as AltGr, which types nothing on G in the usual layouts
@@ -493,7 +500,9 @@ export class PointerPart {
             // the tone brush's curve is fixed for the stroke; Alt swaps dodge and burn (Photoshop's habit)
             const tone = toneTool ? this.toneStroke(e.altKey) : null;
             const mode = tone ? "tone" : this.smudgeOpts && this.smudgeOpts.mode;
-            this.pushUndo({ kind: "layer", id: layer.id, label: tone ? tone.label : mode === "blur" ? "Blur" : mode === "sharpen" ? "Sharpen" : "Smudge" });
+            // held to the release: the smudge writes nothing before its first move, so a click alone pushes no step (a push
+            // drops the redo steps; review 2026-11-16 canvas-tools/noop-steps-left-after-1b2f05d7)
+            const undoSnap = this.holdUndo({ kind: "layer", id: layer.id, label: tone ? tone.label : mode === "blur" ? "Blur" : mode === "sharpen" ? "Sharpen" : "Smudge" });
             // chosen before the gesture starts: a read during it must see the picture as if no gesture ran (brushSource)
             // blur and sharpen filter the picture of the press, not what the stroke has already done to it: every dab moves
             // the pixels towards one result, which the strength reaches where the brush passes often (filtering the live
@@ -503,7 +512,7 @@ export class PointerPart {
             const src = sample === "layer" ? null : this.brushSource(sample, layer, { snapshot: fx });
             const orig = fx && sample === "layer" ? layer.px.clone() : null;
             const pressure = this.pressureOf(e);
-            this.pointer = { kind: "smudge", layer, src, orig, tone, last: [ix, iy], clip: this.strokeClip(layer, layer.px), pressure, stab: this.newStabiliser(ix, iy, pressure) };
+            this.pointer = { kind: "smudge", layer, src, orig, tone, last: [ix, iy], clip: this.strokeClip(layer, layer.px), pressure, stab: this.newStabiliser(ix, iy, pressure), undoSnap };
             // blur, sharpen and the tone brush dab where they are pressed, so a click lightens a spot (GIMP, Photoshop);
             // the smudge only picks up there, at its first move
             if (fx) this.smudgeDab(this.pointer, ix, iy, ix, iy);
@@ -890,10 +899,9 @@ export class PointerPart {
                 // the outline only moves: shift the known box instead of scanning the selection
                 const nb = [Math.max(0, p.origBounds[0] + mx), Math.max(0, p.origBounds[1] + my),
                     Math.min(this.width, p.origBounds[2] + mx), Math.min(this.height, p.origBounds[3] + my)];
-                this.cachedBounds = (nb[2] > nb[0] && nb[3] > nb[1]) ? nb : null;
-                this.selectionDirty = false;
+                this.selState.known((nb[2] > nb[0] && nb[3] > nb[1]) ? nb : null);
             } else {
-                this.selectionDirty = true; this.selectionLoose = false;
+                this.selState.rescan();
             }
         } else if (p.kind === "lasso") {
             this.lassoPoints.push([ix, iy]);
@@ -1064,7 +1072,7 @@ export class PointerPart {
             // a click without a drag deselects, the way the marquee tools do in Photoshop and Krita
             // the press pushed this gesture's step: the click's deselect is that step, not a second one
             if (!p.moved) { this.relabelTopSelectionStep("Deselect"); this.clearSelection({ undo: false }); return; }
-            this.markSelectionChanged(this.selectionDirty ? undefined : this.cachedBounds);
+            this.markSelectionChanged(this.selState.dirty ? undefined : this.selState.cached);
             this.setStatus("Selection outline moved.");
         } else if (p.kind === "lasso") {
             const pts = this.lassoPoints;
@@ -1133,6 +1141,7 @@ export class PointerPart {
             this.draw();
         } else if (p.kind === "smudge") {
             this.finishStroke(p);
+            this.landUndo(p, !!p.bounds);   // a dab widens the box; none was laid, nothing changed
             // the box the dabs covered (the whole layer before 0.1.32: every matched layer above lost its statistics)
             if (p.bounds) this.markLayerChanged(p.layer, this.strokeRect(p, p.layer.px));
             if (p.orig) { p.orig.release(); p.orig = null; }

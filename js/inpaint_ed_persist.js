@@ -31,9 +31,7 @@ export class PersistPart {
         if (!this.base) return this.lastValueString || "{}";
         if (this.sel && !this.selectionEncoded) {
             if (this.width * this.height <= SYNC_ENCODE_PX) {
-                this.selectionDataUrl = this.sel.toCanvas().toDataURL("image/png");
-                this.selectionBox = null;
-                this.selectionEncoded = true;
+                this.selState.stored(this.sel, this.sel.toCanvas().toDataURL("image/png"), null, this.selState.seq);
             } else {
                 // a 100 MP toDataURL blocks the editor for seconds: encode in the background,
                 // keep the last finished PNG until it lands
@@ -48,7 +46,7 @@ export class PersistPart {
             groups: this.groupsCopy(),
             layers: this.layers.map((l) => ({
                 id: l.id, name: l.name, kind: l.kind, role: l.role || "none", blend: l.blend || "normal", ref: l.ref,
-                x: l.x, y: l.y, w: l.w, h: l.h, opacity: l.opacity, visible: l.visible, mask: l.maskRef || null,
+                x: l.x, y: l.y, w: l.w, h: l.h, opacity: l.opacity, visible: l.visible, mask: l.maskPx ? (l.maskRef || null) : null,
                 ...(l.maskOff && l.maskPx ? { maskOff: true } : {}),
                 ...(l.match && l.match.strength > 0 ? { match: l.match } : {}),
                 ...(l.locked ? { locked: true } : {}),
@@ -231,7 +229,7 @@ export class PersistPart {
                             // is not): the next save would refuse the whole document over it
                             this.layers.push(installLayerAliases({
                                 id: l.id, name: l.name, kind: "filter", role: "none", blend: normalBlend(l.blend), ref: paintLost ? null : l.ref || null, px: pixels,
-                                x: 0, y: 0, w: this.width, h: this.height, opacity: l.opacity ?? 1, visible: l.visible !== false, dirty: false, locked: !!l.locked, clip: !!l.clip, group: l.group || null,
+                                x: 0, y: 0, w: this.width, h: this.height, opacity: l.opacity ?? 1, visible: l.visible !== false, dirty: false, locked: !!l.locked, alphaLock: !!l.alphaLock, clip: !!l.clip, group: l.group || null,
                                 maskPx, maskRef: maskPx ? l.mask : null, maskDirty: false, maskEdit: false, maskOff: !!(maskPx && l.maskOff),
                                 filter: fid, params: FILTERS[fid] ? { ...filterDefaults(fid), ...(l.params || {}) } : { ...(l.params || {}) }, lut: l.lut && l.lut.ref && !lutData ? null : l.lut || null, _lutData: lutData,
                                 plate: plateImg ? l.plate : null, _plateImg: plateImg,
@@ -325,7 +323,7 @@ export class PersistPart {
                     const blob = await (await fetch(state.selection)).blob();
                     const px = await pixelsFromPngStream(blob, this.pixels.Mask);
                     if (stale()) { px.release(); return; }
-                    if (px.width === this.width && px.height === this.height) { this.sel.release(); this.sel = px; }
+                    if (px.width === this.width && px.height === this.height) { this.sel.release(); this.selState.replace(px); }
                 } else {
                     const sel = await loadImageEl(state.selection);
                     if (stale()) return;
@@ -338,13 +336,10 @@ export class PersistPart {
                 // levels of the empty selection under the same version, and above 1 MP the bounds
                 // came from those, so a restored selection counted as none
                 this.touchSource(this.sel);
-                this.selectionDirty = true; this.selectionLoose = false;
                 // and encoded again: a getValue while the layers loaded (the app's autosave, ComfyUI
                 // serializing the graph) stored the empty selection's PNG as up to date, and every
                 // later save wrote that until the selection was changed by hand
-                this.selectionSeq++;
-                this.selectionEncoded = false;
-                this.selectionDataUrl = null;
+                this.selState.invalidate();
             }
             if (state.depth) {
                 let thumb = null;
@@ -365,7 +360,7 @@ export class PersistPart {
             } else {
                 this.depth = null;
             }
-            this.maps = {};
+            this.docMaps.replaceAll(null, { bump: false });   // filled below, one new version at the end
             if (state.maps && typeof state.maps === "object") {
                 for (const [kind, j] of Object.entries(state.maps)) {
                     if (!j || !j.ref) continue;
@@ -373,7 +368,7 @@ export class PersistPart {
                         const map = await mapFromJSON(kind, j, async (ref) => loadImageEl(viewUrl(ref)));
                         if (stale()) return;
                         if (map) {
-                            this.maps[kind] = map;
+                            this.docMaps.put(kind, map);
                             if (kind === "depth" && j.guide && !map.guide) {
                                 this.setStatus("the depth map's guide is missing; Recompute restores the edges", "warn");
                             }
@@ -386,7 +381,7 @@ export class PersistPart {
                     }
                 }
             }
-            this.mapsVersion++;
+            this.docMaps.bump();
             this.renderLayers();
             this.renderHistory();
             this.renderInfo();
@@ -460,7 +455,7 @@ export class PersistPart {
         const references = [];
         const refLayers = this.refLayersFor(opts.refIds);
         for (const l of refLayers) {
-            if (!l.maskPx && l.ref && !l.dirty) { references.push(l.ref); continue; }
+            if (!l.maskPx && l.ref && !l.dirty && !l._uploading) { references.push(l.ref); continue; }   // a ref being replaced: its pixels
             if (!l.exportRef) {
                 const up = await uploadCanvas(this.layerPixels(l), `n${id}_ref`);
                 l.exportRef = up.ref;

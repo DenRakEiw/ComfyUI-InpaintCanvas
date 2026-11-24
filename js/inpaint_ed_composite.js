@@ -154,6 +154,7 @@ export class CompositePart {
     /** Whether a layer is drawn: its own eye and the eyes of every group it is in. */
     shown(l) {
         if (!l.visible) return false;
+        if (this.relightState && this.relightState.isHidden(l.id)) return false;   // left out for a read (relightWhole)
         if (!l.group) return true;
         for (const g of this.groupsOf(l.group)) if (!g.visible) return false;
         return true;
@@ -491,6 +492,24 @@ export class CompositePart {
         return c;
     }
 
+    /** The canvas mesh of a pending distort / warp, through a scratch when the context draws below full opacity or blends. */
+    drawPendingMesh(ctx, px, p, n) {
+        const dst = (u, v) => this.pendingDst(p, u, v);
+        if (ctx.globalAlpha >= 1 && ctx.globalCompositeOperation === "source-over") { drawMesh(ctx, px, dst, n, n); return; }
+        const box = this.pendingBox(p, n);
+        if (box.bw > 8192 || box.bh > 8192 || box.bw * box.bh > 33554432) { drawMesh(ctx, px, dst, n, n); return; }
+        let sc = this.meshScratch;
+        if (!sc || sc.width < box.bw || sc.height < box.bh) sc = this.meshScratch = makeCanvas(Math.max(box.bw, sc ? sc.width : 0), Math.max(box.bh, sc ? sc.height : 0));
+        const sx = sc.getContext("2d");
+        sx.setTransform(1, 0, 0, 1, 0, 0);
+        sx.globalAlpha = 1;
+        sx.globalCompositeOperation = "source-over";
+        sx.clearRect(0, 0, box.bw, box.bh);
+        sx.imageSmoothingEnabled = ctx.imageSmoothingEnabled;
+        drawMesh(sx, px, (u, v) => { const [X, Y] = dst(u, v); return [X - box.minX, Y - box.minY]; }, n, n);
+        ctx.drawImage(sc, 0, 0, box.bw, box.bh, box.minX, box.minY, box.bw, box.bh);
+    }
+
     drawLayer(ctx, layer, opts = {}) {
         const p = this.pending;
         if (p && p.layer === layer) {
@@ -506,7 +525,12 @@ export class CompositePart {
                 ctx.drawImage(px, -layer.w / 2, -layer.h / 2, layer.w, layer.h);
                 ctx.restore();
             } else {
-                drawMesh(ctx, px, (u, v) => this.pendingDst(p, u, v), n, n);
+                // no handle held: the bake the commit makes (every pixel once), as soon as it is made; until then, and
+                // while a handle is dragged, the canvas mesh (its triangles overlap by a hair, so they are drawn at full
+                // opacity into a scratch first and the layer's opacity and blend go on once)
+                const baked = fine ? this.pendingPreview(p) : null;
+                if (baked) ctx.drawImage(baked.canvas, baked.minX, baked.minY, baked.bw, baked.bh);
+                else this.drawPendingMesh(ctx, px, p, n);
             }
             return;
         }
@@ -749,11 +773,16 @@ export class CompositePart {
         let before = null, pushed = false;
         try {
             this.setStatus("Flattening ...");
+            // a relight still settling bumps the counters below by itself: settled first, so they hold only the user's
+            if (this.relightSettled) await this.relightSettled();
+            if (!this.base || !this.layers.length) return;
             before = this.snapshot({ kind: "canvas" });
             // what the step and the composite are of: an edit or a landing result during the encode and the upload is in
             // neither, so the commit below would drop it (as in turnDocumentNow)
             const gen = this.historyGen, ids = this.layers.map((l) => l.id).join(",");
-            let ver = this.compositeVersion;
+            // the composite as the step records it: a solo, an eye, an opacity or a blend changed during the encode (none
+            // of them moves historyGen) leaves it, and the flatten is refused rather than baking that change in
+            const ver = this.compositeVersion;
             // E2: the upload and the new base from the same bands, without a canvas of the picture
             let px = null, ref, hash;
             const banded = await this.encodeComposite({ forRun: true }, {
@@ -764,12 +793,10 @@ export class CompositePart {
                 },
             });
             if (banded) {
-                ver = this.compositeVersion;   // encodeComposite checked its own bands; from here the upload's wait
                 hash = banded.hash;
                 ref = await uploadBlob(banded.blob, `n${this.node.id}_base_${hash}.png`);
             } else {
                 if (px) px.release();
-                ver = this.compositeVersion;
                 const flat = this.flattenToCanvas({ forRun: true });
                 px = this.pixels.Layer.fromCanvas(flat);   // C6 (d): not the upload decoded again
                 ({ ref, hash } = await uploadCanvas(flat, `n${this.node.id}_base`));
@@ -783,6 +810,7 @@ export class CompositePart {
             pushed = true;
             this.pushUndoSnapshot(before, { tracked: true, label: "Flatten" });
             this.layers = this.layers.filter((l) => this.isControl(l) || this.isReference(l));
+            this._solo = null;   // the soloed layers are in the base now
             this.activeLayerId = null;
             this.refsMutated();
             this.base = { ref, px };

@@ -9,7 +9,7 @@ import { uploadCanvas } from "./inpaint_upload.js";
 import { GUIDE, STALE_DIFF, WORK_MAX, modelSize, workSize } from "./inpaint_depth.js";
 import { deriveMap, editMap, fingerprint, fingerprintDiff, makeMap, packMap, selectionOnMap } from "./inpaint_maps.js";
 import { disparityFromPoints, linToSrgb255, packNormals, packPoints, surfaceModelSize } from "./inpaint_surface.js";
-import { xfInv } from "./inpaint_resample.js";
+import { xfInv, xfMul, xfScale } from "./inpaint_resample.js";
 import { SNAP_DEFAULT } from "./inpaint_edges.js";
 import { failKind } from "./inpaint_status.js";
 import { makeCanvas } from "./inpaint_consts.js";
@@ -44,9 +44,7 @@ export class DepthPart {
     }
 
     set depth(v) {
-        if (!this.maps) this.maps = {};
-        if (v) this.maps.depth = v;
-        else delete this.maps.depth;
+        this.docMaps.put("depth", v);
     }
 
     async ensureDepthMap({ force = false, edges = null, detail = null } = {}) {
@@ -230,6 +228,9 @@ export class DepthPart {
                     }
                     return existing;
                 }
+                // points of a picture that has changed since (painted over, replaced): the depth map made from them is
+                // as stale as they are, so it carries their fingerprint and says so (before: stamped fresh)
+                const pointsStale = !!(pm.meta && pm.meta.fp) && (await this.mapStale("points")).stale;
                 const t0 = performance.now();
                 const rw = pm.w, rh = Math.max(1, Math.round(pm.w * H / W));
                 const nm = this.maps.normals;
@@ -247,7 +248,7 @@ export class DepthPart {
                 const ms = Math.round(performance.now() - t0);
                 const snapStrength = edges != null ? Math.max(0, Math.min(100, Math.round(+edges))) : SNAP_DEFAULT;
                 const meta = {
-                    fp, source: "points", lo: poolRes.lo, hi: poolRes.hi, rawBounds: [got.lo, got.hi],
+                    fp: pointsStale ? pm.meta.fp : fp, source: "points", lo: poolRes.lo, hi: poolRes.hi, rawBounds: [got.lo, got.hi],
                     provider: (pm.meta && pm.meta.provider) || "", model: (pm.meta && pm.meta.normalsModel) || "MoGe-2",
                     ms: 0, totalMs: ms, raw: got.raw, rw, rh, snap: { strength: snapStrength },
                 };
@@ -258,8 +259,10 @@ export class DepthPart {
                     return null;
                 }
                 this._depthOverlayCanvas = null;
-                this._depthStale = false;
-                this.setStatus(`Depth map ${gw}x${gh} from the surface maps' points (MoGe-2) in ${(ms / 1000).toFixed(2)} s.`);
+                this._depthStale = pointsStale;
+                this.setStatus(pointsStale
+                    ? `Depth map ${gw}x${gh} from the surface maps' points (MoGe-2), which are of the picture before its last changes: compute the surface maps again for a depth map of the picture as it is.`
+                    : `Depth map ${gw}x${gh} from the surface maps' points (MoGe-2) in ${(ms / 1000).toFixed(2)} s.`, pointsStale ? "warn" : undefined);
                 return map;
             } catch (err) {
                 console.error("Depth from points failed:", err);
@@ -367,12 +370,7 @@ export class DepthPart {
             if (prev && (!map || prev.data !== map.data)) bytes += prev.data ? prev.data.byteLength : 0;
         }
         this.pushUndoSnapshot({ kind: "maps", maps: prevs, bytes }, { label });
-        if (!this.maps) this.maps = {};
-        for (const [kind, map] of Object.entries(maps)) {
-            if (map) this.maps[kind] = map;
-            else delete this.maps[kind];
-        }
-        this.mapsVersion++;
+        this.docMaps.set(maps);
         const kinds = Object.keys(maps);
         for (const l of this.layers) {
             if (l.kind === "filter" && kinds.some((kind) => l.params?.limit?.source === kind || this.mapsOf(l).includes(kind))) this.markFilterChanged(l);
@@ -381,6 +379,9 @@ export class DepthPart {
         this.renderHistory();
         this.draw();
         this.notifyChanged();
+        // a map whose upload failed is tried again by the background pass (syncLayersOnce), which only runs when
+        // something asks for it: without a pixel edit after it, the autosave kept the map without its file
+        if (this.mapsUnstored().length) this.scheduleAutosave();
         return true;
     }
 
@@ -403,19 +404,23 @@ export class DepthPart {
     async storeMaps({ quiet = false } = {}) {
         const nodeId = (this.node && this.node.id != null) ? this.node.id : "0";
         const failed = [];
+        let stored = false;
         for (const kind of this.mapsUnstored()) {
             // a map dropped, or replaced by one already stored, while an earlier one uploaded (setMaps, an undo)
             const map = this.maps && this.maps[kind];
             if (!map || !this.mapsUnstored().includes(kind)) continue;
             try {
-                if (!map.ref) map.ref = (await uploadCanvas(packMap(map), `n${nodeId}_${kind}`)).ref;
-                if (map.guide && !map.guideRef) map.guideRef = (await uploadCanvas(guideCanvas(map), `n${nodeId}_${kind}guide`)).ref;
+                if (!map.ref) { map.ref = (await uploadCanvas(packMap(map), `n${nodeId}_${kind}`)).ref; stored = true; }
+                if (map.guide && !map.guideRef) { map.guideRef = (await uploadCanvas(guideCanvas(map), `n${nodeId}_${kind}guide`)).ref; stored = true; }
             } catch (err) {
                 const why = String((err && err.message) || err);
                 if (quiet) { console.warn(`Inpaint Canvas: the ${kind} map could not be stored, the next pass tries again`, err); failed.push(kind); continue; }
+                if (stored) this.notifyChanged();
                 throw new Error(`The ${kind} map could not be stored (${why}), so the file would go without it. Try again; Compute the maps again if it keeps failing.`);
             }
         }
+        // the autosave holds the refs now (a save that fails after this flush would leave them only in memory)
+        if (stored) this.notifyChanged();
         return failed;
     }
 
@@ -909,13 +914,7 @@ export class DepthPart {
             if (!map || prev.guide !== map.guide) snapBytes += prev.guide ? prev.guide.byteLength : 0;
         }
         this.pushUndoSnapshot({ kind: "maps", map: kind, prev, bytes: snapBytes }, { label });
-        if (!this.maps) this.maps = {};
-        if (map) {
-            this.maps[kind] = map;
-        } else {
-            delete this.maps[kind];
-        }
-        this.mapsVersion++;
+        this.docMaps.set({ [kind]: map });
 
         for (const l of this.layers) {
             if (l.kind === "filter" && (l.params?.limit?.source === (kind || "depth") || this.mapsOf(l).includes(kind || "depth"))) {
@@ -926,6 +925,9 @@ export class DepthPart {
         this.renderHistory();
         this.draw();
         this.notifyChanged();
+        // a map whose upload failed is tried again by the background pass (syncLayersOnce), which only runs when
+        // something asks for it: without a pixel edit after it, the autosave kept the map without its file
+        if (this.mapsUnstored().length) this.scheduleAutosave();
         return true;
     }
 
@@ -942,11 +944,7 @@ export class DepthPart {
         const newMeta = { ...(cur.meta || {}), ...patch };
         const updated = deriveMap(cur, { meta: newMeta });
         if (preview) {
-            if (!this._mapUndoPending) {
-                this._mapUndoPending = cur;
-            }
-            this.maps[kind] = updated;
-            this.mapsVersion++;
+            this.docMaps.showPreview(kind, updated);   // the first preview keeps `cur` for the undo step
             for (const l of this.layers) {
                 if (l.kind === "filter" && (l.params?.limit?.source === (kind || "depth") || this.mapsOf(l).includes(kind || "depth"))) {
                     this.markFilterChanged(l);
@@ -955,11 +953,9 @@ export class DepthPart {
             this.draw();
             return true;
         }
-        const prev = this._mapUndoPending || cur;
-        this._mapUndoPending = null;
+        const prev = this.docMaps.endPreview(kind) || cur;
         this.pushUndoSnapshot({ kind: "maps", map: kind, prev, bytes: 0 }, { label });
-        this.maps[kind] = updated;
-        this.mapsVersion++;
+        this.docMaps.set({ [kind]: updated });
         for (const l of this.layers) {
             if (l.kind === "filter" && (l.params?.limit?.source === (kind || "depth") || this.mapsOf(l).includes(kind || "depth"))) {
                 this.markFilterChanged(l);
@@ -969,6 +965,9 @@ export class DepthPart {
         this.renderHistory();
         this.draw();
         this.notifyChanged();
+        // a map whose upload failed is tried again by the background pass (syncLayersOnce), which only runs when
+        // something asks for it: without a pixel edit after it, the autosave kept the map without its file
+        if (this.mapsUnstored().length) this.scheduleAutosave();
         return true;
     }
 
@@ -978,12 +977,10 @@ export class DepthPart {
      * @returns {boolean}
      */
     cancelMapMeta(kind = "depth") {
-        if (!this._mapUndoPending) return false;
-        const prev = this._mapUndoPending;
-        this._mapUndoPending = null;
-        if (!this.maps) this.maps = {};
-        this.maps[kind] = prev;
-        this.mapsVersion++;
+        // the map goes back under the kind it was previewed on (it was kept without its kind before item 77)
+        const p = this.docMaps.cancelPreview();
+        if (!p) return false;
+        kind = p.kind;
         for (const l of this.layers) {
             if (l.kind === "filter" && (l.params?.limit?.source === (kind || "depth") || this.mapsOf(l).includes(kind || "depth"))) {
                 this.markFilterChanged(l);
@@ -1145,7 +1142,8 @@ export class DepthPart {
 
     /**
      * Checks if the document map under `kind` is stale against the current picture.
-     * Renders pictureInput through the map's xf into 64 x 64 and compares fingerprint against meta.fp.
+     * Renders pictureInput through the map's xf into 64 x 64 and compares fingerprint against meta.fp (a map that
+     * followed a crop or a turn is compared with the part of the picture it covers, not the whole new picture).
      * @param {string} kind
      * @returns {Promise<{ stale: boolean, diff: number }>}
      */
@@ -1154,8 +1152,31 @@ export class DepthPart {
         if (!map || !map.meta || !map.meta.fp) return { stale: false, diff: 0 };
         if (this.width <= 0 || this.height <= 0) return { stale: false, diff: 0 };
         try {
-            const inp = await host.pictureInput(this, 64, 64, { skipFilters: true, background: "#808080" });
-            const fp = fingerprint(inp.image, 64, 64);
+            const W = this.width, H = this.height;
+            const xf = map.xf || [W, 0, 0, H, 0, 0];
+            const whole = [W, 0, 0, H, 0, 0].every((v, i) => Math.abs(xf[i] - v) < 1e-6 * Math.max(1, Math.abs(v)));
+            let image;
+            if (whole) {
+                image = (await host.pictureInput(this, 64, 64, { skipFilters: true, background: "#808080" })).image;
+            } else {
+                // a map that followed a crop, an extend, a turn or a flip: the picture as the map sees it (its unit square
+                // through `xf`), what its fingerprint was taken of; outside the picture grey, as the fingerprint's background
+                const pw = W >= H ? 256 : Math.max(1, Math.round(256 * W / H)), ph = W >= H ? Math.max(1, Math.round(256 * H / W)) : 256;
+                const inp = await host.pictureInput(this, pw, ph, { skipFilters: true, background: "#808080" });
+                const src = document.createElement("canvas");
+                src.width = pw; src.height = ph;
+                src.getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(inp.image.buffer, inp.image.byteOffset, inp.image.byteLength), pw, ph), 0, 0);
+                const c = document.createElement("canvas");
+                c.width = 64; c.height = 64;
+                const ctx = c.getContext("2d");
+                ctx.fillStyle = "#808080"; ctx.fillRect(0, 0, 64, 64);
+                ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = "high";
+                const m = xfMul(xfScale(64, 64), xfMul(xfInv(xf), xfScale(W / pw, H / ph)));
+                ctx.setTransform(m[0], m[1], m[2], m[3], m[4], m[5]);
+                ctx.drawImage(src, 0, 0);
+                image = new Uint8Array(ctx.getImageData(0, 0, 64, 64).data.buffer);
+            }
+            const fp = fingerprint(image, 64, 64);
             const diff = fingerprintDiff(map.meta.fp, fp);
             const thresh = map.meta.threshold != null ? map.meta.threshold : STALE_DIFF;
             return { stale: diff >= thresh, diff };

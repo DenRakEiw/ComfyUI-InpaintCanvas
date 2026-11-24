@@ -53,6 +53,10 @@ import { PointerPart } from "./inpaint_ed_pointer.js";
 import { DepthPart } from "./inpaint_ed_depth.js";
 import { FiltersPart } from "./inpaint_ed_filters.js";
 import { HistoryPart } from "./inpaint_ed_history.js";
+import { UndoHistory } from "./inpaint_history.js";
+import { SelectionState } from "./inpaint_selection.js";
+import { DocumentMaps } from "./inpaint_docmaps.js";
+import { RelightState } from "./inpaint_relightstate.js";
 import { PersistPart } from "./inpaint_ed_persist.js";
 import { ExportPart, bindExport } from "./inpaint_ed_export.js";
 import { OpenPart, bindOpen } from "./inpaint_ed_open.js";
@@ -89,7 +93,7 @@ class InpaintEditor {
 
     set selection(canvas) {
         deprecatedPixels("editor.selection", "editor.sel");
-        this.sel = canvas ? this.pixels.Mask.fromCanvas(canvas) : null;
+        this.selState.replace(canvas ? this.pixels.Mask.fromCanvas(canvas) : null);
     }
 
     constructor(node) {
@@ -112,9 +116,13 @@ class InpaintEditor {
         this.groups = [];            // { id, name, visible, locked, collapsed, parent }: folders of layers (PLAN_0_1_31 §6.5); a layer's `group` names its innermost
         this.activeGroupId = null;   // the group whose header row was clicked (its layers are the selection)
         this._solo = null;           // { ids, visible }: the layers shown alone, and what was visible before the first solo
-        this.sel = null;             // MaskPixels WxH (red, alpha = selected); null before an image is loaded
-        this._relightPending = new Set();
-        this._relightMarches = 0;    // relight_shadow marches in flight over all layers (`relightMarching`, the K0b harness)
+        // the selection: the mask (`sel`, MaskPixels WxH, red, alpha = selected; null before an image is loaded), its
+        // bounds cache, change counter, saved PNG and range run (inpaint_selection.js; item 77). The old field names
+        // forward to it, below
+        this.selState = new SelectionState({ scan: (within) => (within ? this.scanBoundsIn(within) : this.selectionBounds()) });
+        // relight's map jobs in flight, its march count and the layers a whole-picture read leaves out
+        // (inpaint_relightstate.js; item 77). `_relightPending` and `_relightMarches` forward to it, below
+        this.relightState = new RelightState();
         this.history = [];           // { key, ref, x, y, w, h, prompt, layerId, thumb }
         this.view = { scale: 1, x: 0, y: 0, angle: 0 };
         this.guides = { x: [], y: [] };
@@ -181,17 +189,10 @@ class InpaintEditor {
         this.lastRunNotes = [];         // what the last run's route declared it left out
         this.lastRunError = null;       // why the last Generate click was refused (commands.generate throws it)
         this.selectionLabel = "";       // what the selection is, when it came from "Select by text"
-        this.undo = [];
-        this.redo = [];
-        this.historyGen = 0;            // bumped by every change an undo that is still loading its step must not run over
-        this.maxUndo = MAX_UNDO;        // the history's depth: steps and bytes (the app's Settings › Memory sets them)
-        this.maxUndoBytes = MAX_UNDO_BYTES;
-        this.undoTrimmed = false;       // older steps were dropped since the last clear: the list's first row is not the start
+        // the undo history: the stacks, their byte budget, the depth (the app's Settings › Memory sets it) and the
+        // generation counter (inpaint_history.js; item 77). The fields of the same names forward to it, below
+        this.undoHistory = new UndoHistory({ maxSteps: MAX_UNDO, maxBytes: MAX_UNDO_BYTES, release: (s) => this.releaseSnapshot(s) });
         this.snapshots = [];            // named snapshots: [{ name, at, snap }] (turn snapshots, tiles only; not saved)
-        this.selectionDirty = true;
-        this.selectionLoose = false;   // cachedBounds is a superset of the selection, made exact on the next getBounds()
-        this.selectionDataUrl = null;
-        this.cachedBounds = null;
         this.compositeVersion = 0;      // bumped whenever the composite changes (filter caches key on it)
         this.pixelVersion = 0;          // bumped whenever a source canvas changed (the scene cache keys on it)
         this.pyramids = new WeakMap();  // source canvas -> cached downscaled levels for drawing
@@ -204,9 +205,6 @@ class InpaintEditor {
         this.viewCanvas = null;         // the visible region, composited at screen resolution
         this.viewPass = null;           // {x, y, w, h, sx, sy} while a region is being composited
         this.flatCache = null;          // {version, key, canvas} for eyedropper / clone / bucket / wand
-        this.undoBytes = 0;
-        this.selectionEncoded = false;  // the selection PNG in selectionDataUrl is up to date
-        this.selectionSeq = 0;
         this.uploaded = this.makeUploaded();
         this.filterCounter = 0;
         this.filterPreview = null;      // id of the filter layer whose slider is being dragged (low-res preview)
@@ -231,11 +229,10 @@ class InpaintEditor {
         this.hoverObjectId = 0;
         this.hoverObjectCanvas = null;
         this.depthPending = null;
-        this.rangePending = null;
         this.showDepthMap = false;
-        this.maps = {};
-        this.mapsVersion = 0;
-        this._mapUndoPending = null;
+        // the document maps by kind, their version and a meta preview's map (inpaint_docmaps.js; item 77). The old field
+        // names forward to it, below
+        this.docMaps = new DocumentMaps();
         this.rangeLimit = {
             source: host.depthSupported !== false ? "depth" : "luma",
             lo: 0,
@@ -921,8 +918,12 @@ class InpaintEditor {
                 layer.maskDirty = false;
                 layer._maskUploading = true;
                 try {
-                    const { ref } = await uploadPixels(layer.maskPx, `n${this.node.id}_lmask`);
-                    layer.maskRef = ref;
+                    const sent = layer.maskPx;
+                    const { ref } = await uploadPixels(sent, `n${this.node.id}_lmask`);
+                    // the mask removed or replaced during the upload: this file is not its mask (a removed mask would
+                    // come back at the next restore; a new one is dirty and goes up next time)
+                    if (layer.maskPx === sent) layer.maskRef = ref;
+                    else if (!layer.maskPx) layer.maskRef = null;
                 } catch (err) {
                     layer.maskDirty = true;
                     throw err;
@@ -1353,9 +1354,9 @@ class InpaintEditor {
 
     /** Encode the selection PNG for getValue off the main thread and save again when it lands. */
     encodeSelectionSoon() {
-        if (this._selEncoding) return;
-        this._selEncoding = true;
-        const seq = this.selectionSeq;
+        const s = this.selState;
+        if (!s.encodeStart()) return;
+        const seq = s.seq;
         const sel = this.sel;   // a replaced selection is a new object: its PNG is not stored
         // E5: on tiles the PNG holds the box the selection's tiles cover (`selectionBox` says where it goes), read from the
         // tiles; a box too large for a canvas (an inverted selection of a huge document) is the whole mask written in
@@ -1365,9 +1366,8 @@ class InpaintEditor {
         try {
             const ext = isTilePixels(sel) ? sel.bounds() : null;
             if (isTilePixels(sel) && !ext) {
-                this._selEncoding = false;
-                this.selectionDataUrl = null; this.selectionBox = null;
-                if (seq === this.selectionSeq) this.selectionEncoded = true;
+                s.encodeEnd();
+                s.stored(sel, null, null, seq);
                 return;
             }
             if (ext && (ext[2] - ext[0]) * (ext[3] - ext[1]) <= SEL_BOX_MAX_PX) {
@@ -1382,7 +1382,7 @@ class InpaintEditor {
                 blobOf = canvasToBlob(sel.toCanvas());
             }
         } catch (err) {
-            this._selEncoding = false;
+            s.encodeEnd();
             console.warn("Inpaint Canvas: selection encode failed", err);
             return;
         }
@@ -1394,18 +1394,12 @@ class InpaintEditor {
                 r.readAsDataURL(blob);
             }))
             .then((url) => {
-                this._selEncoding = false;
-                if (sel !== this.sel) return;
-                this.selectionDataUrl = url;
-                this.selectionBox = box;
-                if (seq === this.selectionSeq) {
-                    this.selectionEncoded = true;
-                    this.notifyChanged();   // save again, now with the fresh selection
-                } else {
-                    this.encodeSelectionSoon();
-                }
+                s.encodeEnd();
+                const kept = s.stored(sel, url, box, seq);   // "dropped": a replaced selection is not stored
+                if (kept === "current") this.notifyChanged();   // save again, now with the fresh selection
+                else if (kept === "stale") this.encodeSelectionSoon();
             })
-            .catch((err) => { this._selEncoding = false; console.warn("Inpaint Canvas: selection encode failed", err); });
+            .catch((err) => { s.encodeEnd(); console.warn("Inpaint Canvas: selection encode failed", err); });
     }
 
     /**
@@ -1600,7 +1594,7 @@ class InpaintEditor {
     destroy() {
         this._destroyed = true;
         if (this.runProgress) this.runProgress.clear();   // its one-second ticker
-        this._mapUndoPending = null;
+        this.docMaps.forgetPreview();
         clearTimeout(this._refLayTimer);
         if (this._compositor) { try { this._compositor.dispose(); } catch (_) { /* context gone */ } this._compositor = null; }
         this.close();
@@ -1616,6 +1610,46 @@ class InpaintEditor {
         if (this.scopeObserver) { try { this.scopeObserver.disconnect(); } catch (_) { /* ignore */ } }
     }
 }
+// The history's fields under their old names (item 77 step 1; `this.history` is the run history): read by many parts. Only the history writes the stacks and
+// the count; the setters of `undo`, `redo` and the depth are for tests that set them, `historyGen`'s for the parts that
+// bump it (a change a waiting undo must not run over).
+Object.defineProperties(InpaintEditor.prototype, {
+    undo: { get() { return this.undoHistory.undo; }, set(v) { this.undoHistory.replace(v, null); }, configurable: true },
+    redo: { get() { return this.undoHistory.redo; }, set(v) { this.undoHistory.replace(null, v); }, configurable: true },
+    undoBytes: { get() { return this.undoHistory.bytes; }, configurable: true },
+    undoTrimmed: { get() { return this.undoHistory.trimmed; }, configurable: true },
+    maxUndo: { get() { return this.undoHistory.maxSteps; }, set(v) { this.undoHistory.maxSteps = v; }, configurable: true },
+    maxUndoBytes: { get() { return this.undoHistory.maxBytes; }, set(v) { this.undoHistory.maxBytes = v; }, configurable: true },
+    historyGen: { get() { return this.undoHistory.gen; }, set(v) { this.undoHistory.gen = v; }, configurable: true },
+});
+// The selection's fields under their old names (item 77 step 2; `selection` is the deprecated canvas accessor above):
+// read by many parts. Only `selState` writes them; `sel`'s setter replaces the mask (the deprecated `selection` setter
+// and tests), the setters of the bounds flags, the counter and the PNG are for tests that set them.
+Object.defineProperties(InpaintEditor.prototype, {
+    sel: { get() { return this.selState.mask; }, set(v) { this.selState.replace(v); }, configurable: true },
+    cachedBounds: { get() { return this.selState.cached; }, configurable: true },
+    selectionDirty: { get() { return this.selState.dirty; }, set(v) { this.selState.dirty = v; }, configurable: true },
+    selectionLoose: { get() { return this.selState.loose; }, set(v) { this.selState.loose = v; }, configurable: true },
+    selectionSeq: { get() { return this.selState.seq; }, set(v) { this.selState.seq = v; }, configurable: true },
+    selectionDataUrl: { get() { return this.selState.dataUrl; }, set(v) { this.selState.dataUrl = v; }, configurable: true },
+    selectionEncoded: { get() { return this.selState.encoded; }, set(v) { this.selState.encoded = v; }, configurable: true },
+    selectionBox: { get() { return this.selState.box; }, configurable: true },
+    _selEncoding: { get() { return this.selState.encoding; }, configurable: true },
+    rangePending: { get() { return this.selState.range; }, configurable: true },
+});
+// The document maps under their old names (item 77 step 2): read by many parts and modules. Only `docMaps` changes the
+// set; the setters of `maps` (a whole new set) and `mapsVersion` are for tests that set them.
+Object.defineProperties(InpaintEditor.prototype, {
+    maps: { get() { return this.docMaps.all; }, set(v) { this.docMaps.replaceAll(v, { bump: false }); }, configurable: true },
+    mapsVersion: { get() { return this.docMaps.version; }, set(v) { this.docMaps.version = v; }, configurable: true },
+    _mapUndoPending: { get() { return this.docMaps.preview ? this.docMaps.preview.prev : null; }, configurable: true },
+});
+// Relight's runtime state under its old names (item 77 step 2), read only: tests and the perf harness wait on the jobs.
+Object.defineProperties(InpaintEditor.prototype, {
+    _relightPending: { get() { return this.relightState.jobs; }, configurable: true },
+    _relightMarches: { get() { return this.relightState.marches; }, configurable: true },
+});
+
 installParts(InpaintEditor, [PanelsPart, LayersPart, HistoryPanelPart, TextPart, TipsPart, HealPart, LiquifyPart, ShapePart, SelectPart, StackPart, SegmentPart, MasksPart, GeometryPart, PointerPart, DepthPart, FiltersPart, HistoryPart, PersistPart, ExportPart, OpenPart, StrokesPart, DisplayPart, CompositePart, MatchPart, DrawPart, RelightPart, ChromePart, ViewPart, RefsPart, ShadowPart, ScopePart]);
 bindDisplay(InpaintEditor);
 bindComposite(InpaintEditor);

@@ -137,16 +137,14 @@ export class OpenPart {
         }
         if (!keepLayers) this.clearSnapshots();   // a new picture is a new document: the snapshots were of the old one
         if (!this.sel || sizeChanged) {
-            this.sel = this.pixels.Mask.empty(this.width, this.height);
+            this.selState.replace(this.pixels.Mask.empty(this.width, this.height));
             this.clearUndo();
         }
         this.uploaded.baseHash = null;
         this.uploaded.baseRef = null;
         this.uploaded.controlHash = null;
         this.dropHint.style.display = "none";
-        this.selectionDirty = true; this.selectionLoose = false;
-        this.selectionDataUrl = null;
-        this.selectionEncoded = false;
+        this.selState.invalidate();
         this.scheduleDetachedRelease();   // the old layers' atlas pages go (C6 a); the old base's, the base setter queues
         this.flatCache = null;
         this.sceneSig = null;

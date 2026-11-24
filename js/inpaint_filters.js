@@ -396,20 +396,52 @@ export function lutFromCube(text) {
             if (parts.length >= 3) values.push(parts[0], parts[1], parts[2]);
         }
     }
-    if (!size || values.length < size * size * size * 3) throw new Error("not a valid 3D .cube file");
+    if (!Number.isInteger(size) || size < 2 || size > 256) throw new Error(`not a valid 3D .cube file: LUT_3D_SIZE ${size || "missing"} (2 to 256)`);
+    if (values.length < size * size * size * 3) throw new Error("not a valid 3D .cube file");
     // DOMAIN_MIN / DOMAIN_MAX are the input range the lattice spans, not a scale of its outputs
     // (filters/cube-domain-applied-to-outputs): the outputs stay as written, clamped to 0..1
-    const n = size * size * size * 3;
     const lo = [0, 1, 2].map((c) => (Number.isFinite(domainMin[c]) ? domainMin[c] : 0));
     const hi = [0, 1, 2].map((c) => (Number.isFinite(domainMax[c]) && domainMax[c] !== lo[c] ? domainMax[c] : lo[c] + 1));
     const unit = lo.every((v) => v === 0) && hi.every((v) => v === 1);
-    const out = unit ? values : lutOnUnitDomain(values, size, lo, hi);
-    const data = new Float32Array(n);
-    for (let i = 0; i < n; i++) {
+    let out = unit ? values : lutOnUnitDomain(values, size, lo, hi);
+    // the layer stores its LUT as a strip size*size wide, and a canvas of 65,536 pixels draws nothing: a lattice above
+    // LUT_MAX (a spec-valid 256) is resampled to it, trilinear (the filter samples it trilinear anyway)
+    let N = size;
+    if (N > LUT_MAX) { out = lutResized(out, N, LUT_MAX); N = LUT_MAX; }
+    const m = N * N * N * 3;
+    const data = new Float32Array(m);
+    for (let i = 0; i < m; i++) {
         const v = out[i];
         data[i] = v < 0 ? 0 : v > 1 ? 1 : v;
     }
-    return { size, data, title };
+    return { size: N, data, title, ...(N !== size ? { from: size } : {}) };
+}
+
+/** The largest lattice a LUT layer keeps (its strip is LUT_MAX * LUT_MAX pixels wide). */
+export const LUT_MAX = 128;
+
+/** A lattice of N per side resampled to M per side, trilinear, red fastest (the .cube order). */
+function lutResized(src, N, M) {
+    const out = new Float32Array(M * M * M * 3);
+    const at = (r, g, b, k) => src[((b * N + g) * N + r) * 3 + k];
+    const axis = new Array(M);
+    for (let i = 0; i < M; i++) {
+        const u = (i / (M - 1)) * (N - 1);
+        const f = Math.min(Math.floor(u), N - 2);
+        axis[i] = [f, u - f];
+    }
+    for (let b = 0; b < M; b++) for (let g = 0; g < M; g++) for (let r = 0; r < M; r++) {
+        const [r0, tr] = axis[r], [g0, tg] = axis[g], [b0, tb] = axis[b];
+        for (let k = 0; k < 3; k++) {
+            const c00 = at(r0, g0, b0, k) + (at(r0 + 1, g0, b0, k) - at(r0, g0, b0, k)) * tr;
+            const c10 = at(r0, g0 + 1, b0, k) + (at(r0 + 1, g0 + 1, b0, k) - at(r0, g0 + 1, b0, k)) * tr;
+            const c01 = at(r0, g0, b0 + 1, k) + (at(r0 + 1, g0, b0 + 1, k) - at(r0, g0, b0 + 1, k)) * tr;
+            const c11 = at(r0, g0 + 1, b0 + 1, k) + (at(r0 + 1, g0 + 1, b0 + 1, k) - at(r0, g0 + 1, b0 + 1, k)) * tr;
+            const c0 = c00 + (c10 - c00) * tg, c1 = c01 + (c11 - c01) * tg;
+            out[((b * M + g) * M + r) * 3 + k] = c0 + (c1 - c0) * tb;
+        }
+    }
+    return out;
 }
 
 /**

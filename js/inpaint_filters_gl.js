@@ -1133,7 +1133,11 @@ function applyPluginGL(id, pg, src, params, info, override) {
         }
         for (const s of pg.samplers) {
             const v = values[s.name];
-            if (v == null || pg.u[s.name] == null) continue;
+            if (pg.u[s.name] == null) continue;
+            // a sampler left out this time (film.bw's u_blur at Structure 0): pointed at unit 0, which holds this pass's
+            // source below; its own unit may still hold a pooled surface that becomes this pass's target (a feedback
+            // loop, GL_INVALID_OPERATION, and the filter fell back to the slow path)
+            if (v == null) { gl.uniform1i(pg.u[s.name], 0); continue; }
             uploadSampler(g, s, v);
             gl.uniform1i(pg.u[s.name], s.unit);
         }

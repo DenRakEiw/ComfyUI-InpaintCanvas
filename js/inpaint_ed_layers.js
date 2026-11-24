@@ -222,6 +222,7 @@ export class LayersPart {
     renameLayerInline(layer, nameEl) {
         const input = document.createElement("input");
         input.type = "text";
+        input.className = "ipc-rename";   // host_vlm's renameQuietly leaves a list with one of these alone
         input.value = layer.name;
         input.title = "Layer name";
         let done = false;

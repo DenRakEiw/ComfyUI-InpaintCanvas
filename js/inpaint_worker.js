@@ -885,8 +885,14 @@ export async function tiffPartJob(msg) {
         }
         await pxSettled();
     }
+    // the fresh instance's zlib first (the same bytes as the strip's); when it cannot get its arena either (the strip
+    // failed for want of memory), JS's deflate
     const pz = rustPx();
-    const r = await tiffPart({ rgba, w: msg.w, rows: msg.rows, predictor: msg.predictor }, (bytes) => (pz ? pz.zlib(bytes, level) : deflate(bytes)), laps);
+    const zip = (bytes) => {
+        if (!pz) return deflate(bytes);
+        try { return pz.zlib(bytes, level); } catch (err) { if (!recovered(pz, err, "zlib")) throw err; return deflate(bytes); }
+    };
+    const r = await tiffPart({ rgba, w: msg.w, rows: msg.rows, predictor: msg.predictor }, zip, laps);
     releaseIfLarge();
     return {
         chunk: r.chunk, raw: r.raw, transfer: [r.chunk],

@@ -2,6 +2,7 @@
 // the node widget, thumbs, tile / selection / mask draw helpers, the modal chrome (subbar, options bar): moved out of inpaint_canvas.js (item 56 S10b, docs/PLAN_SPLIT.md), text unchanged.
 
 import { TIFF_EXT } from "./inpaint_tiff.js";
+import { LAYERED_EXT } from "./inpaint_layered.js";
 import { MIP_LEVELS, isTilePixels } from "./inpaint_tiles.js";
 import { buildEditorModal } from "./inpaint_modal.js";
 import { el, icon, iconButton, numberInput, selectInput } from "./inpaint_dom.js";
@@ -35,7 +36,7 @@ export class ChromePart {
         root.addEventListener("dragover", (e) => { e.preventDefault(); e.stopPropagation(); });
         root.addEventListener("drop", (e) => {
             e.preventDefault(); e.stopPropagation();
-            const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []).filter((f) => f.type.startsWith("image/") || TIFF_EXT.test(f.name || ""));
+            const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []).filter((f) => f.type.startsWith("image/") || TIFF_EXT.test(f.name || "") || LAYERED_EXT.test(f.name || ""));
             if (!files.length) return;
             // no base yet or Ctrl held: (re)load the base; otherwise every file becomes a new image layer
             if (!this.width || e.ctrlKey) this.loadFile(files[0]);

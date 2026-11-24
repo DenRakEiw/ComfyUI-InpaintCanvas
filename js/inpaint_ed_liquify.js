@@ -77,7 +77,7 @@ export class LiquifyPart {
         for (const s of this.undo.concat(this.redo)) {
             if (!s || !s.liq || s.liq.sid !== liq.sid) continue;
             s.liq = null;
-            if (s.liqBytes) { s.bytes -= s.liqBytes; this.undoBytes -= s.liqBytes; s.liqBytes = 0; }
+            if (s.liqBytes) { this.undoHistory.shrink(s, s.liqBytes); s.liqBytes = 0; }
         }
         const p = this.pointer;
         if (p && p.kind === "liquify") this.freeLiquifyWindow(p);

@@ -90,7 +90,7 @@ function buildTopBar(ed, root) {
     if (host.overlay) top.appendChild(el("span", "ipc-title", "Inpaint Canvas"));
     ed.fileInput = document.createElement("input");
     ed.fileInput.type = "file";
-    ed.fileInput.accept = "image/*,.tif,.tiff";
+    ed.fileInput.accept = "image/*,.tif,.tiff,.psd,.ora";
     ed.fileInput.style.display = "none";
     ed.fileInput.addEventListener("change", () => {
         const f = ed.fileInput.files && ed.fileInput.files[0];
@@ -425,7 +425,7 @@ function buildLayers(ed) {
     layersHead.appendChild(el("span", "ipc-grow"));
     const fileInput = (onFiles) => {
         const inp = document.createElement("input");
-        inp.type = "file"; inp.accept = "image/*,.tif,.tiff"; inp.multiple = true; inp.style.display = "none";
+        inp.type = "file"; inp.accept = "image/*,.tif,.tiff,.psd,.ora"; inp.multiple = true; inp.style.display = "none";
         inp.addEventListener("change", () => { const files = Array.from(inp.files || []); inp.value = ""; if (files.length) onFiles(files); });
         layersHead.appendChild(inp);
         return inp;
@@ -454,7 +454,7 @@ function buildLayers(ed) {
     ed.layerList.addEventListener("drop", (e) => {
         e.preventDefault(); e.stopPropagation();
         ed.layerList.classList.remove("ipc-dropping");
-        const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []).filter((f) => f.type.startsWith("image/"));
+        const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []);   // addImageLayers keeps pictures, PSD / ORA and TIFF
         if (files.length) ed.addImageLayers(files, e.shiftKey ? "reference" : "none", e.shiftKey ? {} : { place: "fit" });
     });
     ed.panes.image.appendChild(ed.layerList);
@@ -482,7 +482,7 @@ function buildReferences(ed) {
     ed.refList.addEventListener("drop", (e) => {
         e.preventDefault(); e.stopPropagation();
         ed.refList.classList.remove("ipc-dropping");
-        const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []).filter((f) => f.type.startsWith("image/"));
+        const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []);   // addImageLayers keeps pictures, PSD / ORA and TIFF
         if (files.length) ed.addImageLayers(files, "reference");
     });
     ed.panes.image.appendChild(ed.refList);

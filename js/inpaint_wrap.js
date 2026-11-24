@@ -93,23 +93,43 @@ export function wrapSlopesPoints(pmap, nmap, box, cx, cy) {
     // document pixels per map pixel (a turn or a mirror keeps it): the focal length in document pixels
     const docPerMap = Math.sqrt(Math.abs(xf[0] * xf[3] - xf[1] * xf[2]) / (pw * ph));
     const f = meta.f * docPerMap;
-    const P = (dx, dy, out) => {
+    const P = (dx, dy, out, strict = false) => {
         const qu = (inv[0] * dx + inv[2] * dy + inv[4]) * pw - 0.5, qv = (inv[1] * dx + inv[3] * dy + inv[5]) * ph - 0.5;
         const fx0 = Math.floor(qu), fy0 = Math.floor(qv), fx = qu - fx0, fy = qv - fy0;
         const cx0 = fx0 < 0 ? 0 : fx0 > pw - 1 ? pw - 1 : fx0, cx1 = fx0 + 1 < 0 ? 0 : fx0 + 1 > pw - 1 ? pw - 1 : fx0 + 1;
         const cy0 = fy0 < 0 ? 0 : fy0 > ph - 1 ? ph - 1 : fy0, cy1 = fy0 + 1 < 0 ? 0 : fy0 + 1 > ph - 1 ? ph - 1 : fy0 + 1;
         const i00 = 3 * (cy0 * pw + cx0), i10 = 3 * (cy0 * pw + cx1), i01 = 3 * (cy1 * pw + cx0), i11 = 3 * (cy1 * pw + cx1);
+        // a point the mask dropped is all zero (packPoints), which decodes as the scene's lowest corner (lo, with lo[2] > 0):
+        // a silhouette's rim mixed that corner into its slopes (they spiked 10 to 400 times; review 2026-11-16
+        // p1-deeppaint-maps/wrap-points-bilinear-across-mask-zero). `strict` (the slopes' samples): no answer when a tap
+        // that weighs is dropped (a sample pulled towards its kept taps would halve the slope at the rim); else the kept
+        // taps alone, their weights made whole again (the centre's depth)
+        const k00 = pd[i00] | pd[i00 + 1] | pd[i00 + 2], k10 = pd[i10] | pd[i10 + 1] | pd[i10 + 2];
+        const k01 = pd[i01] | pd[i01 + 1] | pd[i01 + 2], k11 = pd[i11] | pd[i11 + 1] | pd[i11 + 2];
+        const w00 = k00 ? (1 - fx) * (1 - fy) : 0, w10 = k10 ? fx * (1 - fy) : 0, w01 = k01 ? (1 - fx) * fy : 0, w11 = k11 ? fx * fy : 0;
+        const ws = w00 + w10 + w01 + w11;
+        if (!(ws > 1e-9)) return null;
+        if (strict && ((!k00 && (1 - fx) * (1 - fy) > 0) || (!k10 && fx * (1 - fy) > 0) || (!k01 && (1 - fx) * fy > 0) || (!k11 && fx * fy > 0))) return null;
         for (let c = 0; c < 3; c++) {
-            const top = pd[i00 + c] + (pd[i10 + c] - pd[i00 + c]) * fx, bot = pd[i01 + c] + (pd[i11 + c] - pd[i01 + c]) * fx;
-            out[c] = lo[c] + ((top + (bot - top) * fy) / 65535) * sp[c];
+            const v = (pd[i00 + c] * w00 + pd[i10 + c] * w10 + pd[i01 + c] * w01 + pd[i11 + c] * w11) / ws;
+            out[c] = lo[c] + (v / 65535) * sp[c];
         }
         return out;
     };
+    // a centre on a dropped point (the sky between two surfaces) has no depth: the normals' slopes take over (wrapSlopes)
     const c0 = P(cx, cy, [0, 0, 0]);
-    if (!(c0[2] > 0)) return null;
+    if (!c0 || !(c0[2] > 0)) return null;
     const unit = c0[2] / f;
     const gx = new Float32Array(w * h), gy = new Float32Array(w * h);
-    const a = [0, 0, 0], b = [0, 0, 0];
+    const a = [0, 0, 0], b = [0, 0, 0], m = [0, 0, 0];
+    const slope = (ax, ay, bx, by, mx, my) => {
+        const pa = P(ax, ay, a, true), pb = P(bx, by, b, true);
+        if (pa && pb) return Math.max(0.05, Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]) / unit);
+        if (!pa && !pb) return 1;
+        if (!P(mx, my, m, true)) return 1;
+        const q = pa ? a : b;
+        return Math.max(0.05, 2 * Math.hypot(q[0] - m[0], q[1] - m[1], q[2] - m[2]) / unit);
+    };
     // the normals' mask (A), nearest map pixel, its inverse taken once
     const nInv = nmap && nmap.data ? xfInv(nmap.xf || [nmap.w, 0, 0, nmap.h, 0, 0]) : null;
     const masked = nInv ? (dx, dy) => {
@@ -124,10 +144,10 @@ export function wrapSlopesPoints(pmap, nmap, box, cx, cy) {
             if (masked(px, py)) { gx[i] = 1; gy[i] = 1; continue; }
             // at least 0.05: at the picture's edge both samples clamp to one map column (a length of 0 would repeat one
             // decal column as a smear)
-            P(px - 0.5, py, a); P(px + 0.5, py, b);
-            gx[i] = Math.max(0.05, Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]) / unit);
-            P(px, py - 0.5, a); P(px, py + 0.5, b);
-            gy[i] = Math.max(0.05, Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]) / unit);
+            // a side with no kept point (the map's own rim, finer than the normals' mask): the pixel's own point and the other
+            // side, twice the half step; neither: the flat slope of a masked pixel
+            gx[i] = slope(px - 0.5, py, px + 0.5, py, px, py);
+            gy[i] = slope(px, py - 0.5, px, py + 0.5, px, py);
         }
     }
     return { gx, gy };

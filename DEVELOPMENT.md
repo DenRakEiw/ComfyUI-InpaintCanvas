@@ -1,6 +1,6 @@
 # Development notes
 
-> **js/ is generated** (build 3b7d0d1a05a32e39 from scumble 0550eef4): every file in js/ except host.js, inpaint_node.js and inpaint_bridge.js comes from `renderer/editor/` in scumble-app/scumble through its `tools/build_node.py`. Edit the editor there, build, commit both repos.
+> **js/ is generated** (build a24e326af2bf057c from scumble 59d79564): every file in js/ except host.js, inpaint_node.js and inpaint_bridge.js comes from `renderer/editor/` in scumble-app/scumble through its `tools/build_node.py`. Edit the editor there, build, commit both repos.
 
 Everything that is not obvious from the code. Written so a fresh session can
 continue without the chat history. Dates are 2026-09-04 unless stated.

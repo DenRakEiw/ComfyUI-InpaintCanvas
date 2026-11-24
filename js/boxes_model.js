@@ -236,8 +236,27 @@ export function mapBox(r, m) {
     return out;
 }
 
-/** Every box through `m`, as new objects (never the old ones: an undo restores the old list). A From box's src lies in its layer and maps with it. */
-export const mapBoxes = (boxes, m) => boxes.map((x) => ({ ...x, rect: mapBox(x.rect, m), src: mapBox(x.src, m) }));
+/**
+ * Every box through `m`, as new objects (never the old ones: an undo restores the old list). A From box's src lies in its
+ * layer and maps with it: through `layers[id]` when the event gives its layer a move of its own (a new picture of another
+ * size places the reference layers again, `layerMoves`), else through `m` with the picture.
+ */
+export const mapBoxes = (boxes, m, layers = null) => boxes.map((x) => ({ ...x, rect: mapBox(x.rect, m), src: mapBox(x.src, x.kind === "from" && layers && x.layer && Array.isArray(layers[x.layer]) ? layers[x.layer] : m) }));
+
+/** The layers' boxes ({ id, x, y, w, h }), taken before the picture is replaced (for `layerMoves`). */
+export const layerBoxes = (layers) => (layers || []).map((l) => ({ id: l.id, x: l.x, y: l.y, w: l.w, h: l.h }));
+
+/** Per layer of `before` still in `layers`, the matrix from its box then to its box now (a geometry event's `layers`). */
+export function layerMoves(before, layers) {
+    const out = {};
+    for (const b of before || []) {
+        const l = (layers || []).find((x) => x.id === b.id);
+        if (!l || !(b.w > 0) || !(b.h > 0)) continue;
+        const sx = l.w / b.w, sy = l.h / b.h;
+        out[b.id] = [sx, 0, 0, sy, l.x - b.x * sx, l.y - b.y * sy];
+    }
+    return out;
+}
 
 // ---- what a box says -----------------------------------------------------------------------------------------------
 

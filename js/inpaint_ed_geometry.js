@@ -5,13 +5,14 @@ import { host } from "./host.js";
 import { FILTERS, scaleFilterParams } from "./inpaint_filters.js";
 import { renderText } from "./inpaint_text.js";
 import { uploadCanvas } from "./inpaint_upload.js";
-import { XF_IDENTITY, pixelMap, xfApply, xfBox, xfInv, xfMul, xfScale, xfTranslate } from "./inpaint_resample.js";
+import { XF_IDENTITY, canvasRoundTrip, pixelMap, xfApply, xfBox, xfInv, xfMul, xfScale, xfTranslate } from "./inpaint_resample.js";
 import { fitLayerRGBA, workScale } from "./edgefit.js";
 import { failKind } from "./inpaint_status.js";
 import { CANVAS_MAX_SIDE, canvasSizeRefusal } from "./inpaint_sizelimit.js";
 import { DOC_TURN_LABELS, HANDLE_PX, MASK_RGB, makeCanvas } from "./inpaint_consts.js";
 import { autoCropFrame, boxOnPixels, composeTextOrient, frameInside, normDeg, orientChain, orientIsUp, orientOfXf, orientOps, placeXf, snapNum, snapXf, spinText, straightenXf, textTotalAngle, turnRect, turnSize, validXf, xfIsIdentity, xfOfOp } from "./inpaint_orient.js";
-import { drawMesh, homography } from "./inpaint_mesh.js";
+import { homography } from "./inpaint_mesh.js";
+import { meshWarp } from "./inpaint_meshwarp.js";
 
 /** A filter layer whose own pixels are an input (Deep paint): its pixels follow every change of the picture's geometry. */
 function ownPx(l) { return !!(l && l.kind === "filter" && FILTERS[l.filter] && FILTERS[l.filter].ownPixels); }
@@ -57,6 +58,7 @@ export class GeometryPart {
 
     cancelPending() {
         this.pending = null;
+        this.meshScratch = null;
         this.updateSubbar();
         this.draw();
     }
@@ -89,6 +91,77 @@ export class GeometryPart {
         return [l.x + u * l.w, l.y + v * l.h];
     }
 
+    /** The box (whole image units) the pending shape's mesh points span. */
+    pendingBox(p, n) {
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (let j = 0; j <= n; j++) for (let i = 0; i <= n; i++) {
+            const [X, Y] = this.pendingDst(p, i / n, j / n);
+            minX = Math.min(minX, X); minY = Math.min(minY, Y); maxX = Math.max(maxX, X); maxY = Math.max(maxY, Y);
+        }
+        minX = Math.floor(minX); minY = Math.floor(minY); maxX = Math.ceil(maxX); maxY = Math.ceil(maxY);
+        return { minX, minY, bw: Math.max(1, maxX - minX), bh: Math.max(1, maxY - minY) };
+    }
+
+    /** What a distort / warp bake depends on: the shape, the layer's pixels and its mask. */
+    pendingBakeKey(p) {
+        const l = p.layer;
+        return [p.mode, p.n || 0, JSON.stringify(p.points), l.w, l.h, l.px ? l.px.version : -1, l.maskPx ? l.maskPx.version : -1, this.liveMask(l) ? 1 : 0].join("|");
+    }
+
+    /**
+     * The pending distort or warp baked by backward mapping (inpaint_meshwarp.js: every pixel written once, so a
+     * half-transparent pixel keeps its alpha on the mesh's edges; the review of 2026-11-16), at the layer's own
+     * resolution. `data` is the source's ImageData (the layer's pixels, with a live mask through it for a preview).
+     */
+    pendingBake(p, data) {
+        const n = this.pendingSubdivisions(p, true), l = p.layer;
+        const box = this.pendingBox(p, n);
+        const W = data.width, H = data.height;
+        const res = Math.max(W / l.w, H / l.h, 1);
+        const ow = Math.round(box.bw * res), oh = Math.round(box.bh * res);
+        const pts = [];
+        for (let j = 0; j <= n; j++) {
+            const row = [];
+            for (let i = 0; i <= n; i++) { const [X, Y] = this.pendingDst(p, i / n, j / n); row.push([(X - box.minX) * res, (Y - box.minY) * res]); }
+            pts.push(row);
+        }
+        const bytes = meshWarp(data.data, W, H, pts, n, n, ow, oh, canvasRoundTrip());
+        return { ...box, res, img: new ImageData(bytes, ow, oh), key: this.pendingBakeKey(p), px: l.px };
+    }
+
+    /**
+     * The preview of a pending distort / warp while no handle is held: the bake as a canvas once it is made, null until
+     * then (a bake for the current shape is made after this frame, and the view drawn again with it).
+     */
+    pendingPreview(p) {
+        const key = this.pendingBakeKey(p);
+        if (p.bake && p.bake.key === key && p.bake.canvas) return p.bake;
+        if (p.bakeWanted === key) return null;
+        p.bakeWanted = key;
+        setTimeout(() => {
+            if (this.pending !== p || this.pointer || this.pendingBakeKey(p) !== key) { if (p.bakeWanted === key) p.bakeWanted = null; return; }
+            try {
+                const l = p.layer;
+                const masked = this.liveMask(l);
+                let data;
+                if (masked) { const c = this.layerPixels(l, false); data = c.getContext("2d").getImageData(0, 0, c.width, c.height); }
+                else data = l.px.readRect(0, 0, l.px.width, l.px.height);
+                const b = this.pendingBake(p, data);
+                const c = makeCanvas(b.img.width, b.img.height);
+                c.getContext("2d").putImageData(b.img, 0, 0);
+                b.canvas = c;
+                // a bake from the masked canvas is not what the commit makes (the mask is baked into the pixels first)
+                if (masked) b.px = null;
+                p.bake = b;
+            } catch (err) {
+                console.warn("Inpaint Canvas: the transform preview could not be baked", err);
+            }
+            if (p.bakeWanted === key) p.bakeWanted = null;
+            if (this.pending === p) this.draw();
+        }, 0);
+        return null;
+    }
+
     pendingSubdivisions(p, fine) {
         if (p.mode === "rotate") return 1;
         if (p.mode === "distort") return fine ? 24 : 12;
@@ -115,13 +188,15 @@ export class GeometryPart {
             const handle = this.handleAt(lx, ly);
             if (handle) {
                 // scale in the un-rotated frame; the corner opposite the handle stays put on screen
-                this.pushUndo({ kind: "transform", id: l.id, label: "Scale" });
-                this.pointer = { kind: "scale", layer: l, handle, start: [lx, ly], orig: { x: l.x, y: l.y, w: l.w, h: l.h }, keepAspect: handle.length === 2 && !e.shiftKey, angle: p.angle, center: [cx, cy] };
+                // held to the release, as the move tool's: a click on a handle that scales nothing pushes no step
+                // (a push drops the redo steps; review 2026-11-16 canvas-tools/noop-steps-left-after-1b2f05d7)
+                const undoSnap = this.holdUndo({ kind: "transform", id: l.id, label: "Scale" });
+                this.pointer = { kind: "scale", layer: l, handle, start: [lx, ly], orig: { x: l.x, y: l.y, w: l.w, h: l.h }, keepAspect: handle.length === 2 && !e.shiftKey, angle: p.angle, center: [cx, cy], undoSnap, boxes0: `${l.x},${l.y},${l.w},${l.h}` };
                 return;
             }
             if (lx >= l.x && lx <= l.x + l.w && ly >= l.y && ly <= l.y + l.h) {
-                this.pushUndo({ kind: "transform", id: l.id, label: "Move layer" });
-                this.pointer = { kind: "move", layer: l, start: [ix, iy], orig: { x: l.x, y: l.y } };
+                const undoSnap = this.holdUndo({ kind: "transform", id: l.id, label: "Move layer" });
+                this.pointer = { kind: "move", layer: l, start: [ix, iy], orig: { x: l.x, y: l.y }, undoSnap, boxes0: `${l.x},${l.y},${l.w},${l.h}` };
                 return;
             }
             this.pointer = { kind: "pending", start: Math.atan2(iy - cy, ix - cx), startAngle: p.angle, snap: e.shiftKey };
@@ -193,39 +268,39 @@ export class GeometryPart {
         if (this.liveMask(layer)) this.applyMask(layer, { silent: true, undo: false });
         else if (layer.maskPx) { layer.maskPx = null; layer.maskOff = false; layer.maskEdit = false; this.markMaskChanged(layer); }
         const n = this.pendingSubdivisions(p, true);
-        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-        for (let j = 0; j <= n; j++) for (let i = 0; i <= n; i++) {
-            const [X, Y] = this.pendingDst(p, i / n, j / n);
-            minX = Math.min(minX, X); minY = Math.min(minY, Y); maxX = Math.max(maxX, X); maxY = Math.max(maxY, Y);
-        }
-        minX = Math.floor(minX); minY = Math.floor(minY); maxX = Math.ceil(maxX); maxY = Math.ceil(maxY);
-        const bw = Math.max(1, maxX - minX), bh = Math.max(1, maxY - minY);
-        // the source once, after applyMask above replaced the pixels; the mesh draws it per triangle
-        const src = layer.px.toCanvas();
-        // Keep the layer's native resolution (pixels per image unit).
-        const res = Math.max(src.width / layer.w, src.height / layer.h, 1);
-        const out = makeCanvas(Math.round(bw * res), Math.round(bh * res));
-        const ctx = out.getContext("2d");
-        ctx.imageSmoothingEnabled = true;
-        ctx.imageSmoothingQuality = "high";
-        const dst = (u, v) => { const [X, Y] = this.pendingDst(p, u, v); return [(X - minX) * res, (Y - minY) * res]; };
+        const { minX, minY, bw, bh } = this.pendingBox(p, n);
+        let made;
         if (p.mode === "rotate") {
-            const [X, Y] = dst(0, 0);
+            // the source once, after applyMask above replaced the pixels
+            const src = layer.px.toCanvas();
+            // Keep the layer's native resolution (pixels per image unit).
+            const res = Math.max(src.width / layer.w, src.height / layer.h, 1);
+            const out = makeCanvas(Math.round(bw * res), Math.round(bh * res));
+            const ctx = out.getContext("2d");
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = "high";
+            const [X, Y] = this.pendingDst(p, 0, 0);
             ctx.save();
-            ctx.translate(X, Y);
+            ctx.translate((X - minX) * res, (Y - minY) * res);
             ctx.rotate(p.angle);
             ctx.scale(layer.w * res / src.width, layer.h * res / src.height);
             ctx.drawImage(src, 0, 0);
             ctx.restore();
+            // no state is left behind on the new pixels' context (PLAN_BCE §C1 rule 11)
+            ctx.imageSmoothingQuality = "low";
+            made = this.pixels.Layer.fromCanvas(out);
         } else {
-            drawMesh(ctx, src, dst, n, n);
+            // distort and warp by backward mapping, every pixel once (the preview's bake when it was made from these pixels)
+            const key = this.pendingBakeKey(p);
+            const b = p.bake && p.bake.key === key && p.bake.px === layer.px ? p.bake
+                : this.pendingBake(p, layer.px.readRect(0, 0, layer.px.width, layer.px.height));
+            made = this.pixels.Layer.fromImageData(b.img);
         }
-        // no state is left behind on the new pixels' context (PLAN_BCE §C1 rule 11)
-        ctx.imageSmoothingQuality = "low";
         // replaced, not written (another size; the "layerfull" undo PNG may still be encoding from the old pixels)
-        layer.px = this.pixels.Layer.fromCanvas(out);
+        layer.px = made;
         layer.x = minX; layer.y = minY; layer.w = bw; layer.h = bh;
         this.pending = null;
+        this.meshScratch = null;
         this.markLayerChanged(layer);
         this.renderLayers();
         this.updateSubbar();
@@ -640,6 +715,7 @@ export class GeometryPart {
             || this._loading || this._docSaving) return "Wait for the running job to finish: it would land where the picture was before the turn.";
         // a render queued on ComfyUI lands in the geometry it was made for (the app's host counts them, host.js)
         if (this._localRuns && this._localRuns.size) return "A render on your ComfyUI is still running: its result would land where the picture was. Turn the picture when it is in.";
+        if (this._landingResults > 0) return "A result is still landing: it would land where the picture was. Wait a moment.";
         if (this.gestureHeld()) return "Release the button first.";
         return "";
     }
@@ -708,7 +784,7 @@ export class GeometryPart {
                 }
                 if (t.maskPx) l.maskPx = t.maskPx;
             }
-            this.sel = sel;
+            this.selState.replace(sel);
             const A = xfOfOp(op, W, H);
             this.geometrySeq++;
             this.mapExtras(A, "turn");
@@ -733,11 +809,10 @@ export class GeometryPart {
             this.uploaded = this.makeUploaded();
             this.dropCompositeCaches();
             this.touchSource(this.sel);
-            this.selectionDirty = true; this.selectionLoose = false;
-            this.selectionDataUrl = null; this.selectionEncoded = false;
+            this.selState.invalidate();
             // what was under way in the old geometry
             this.polyPoints = null; this.lassoPoints = null; this.shapePoints = null; this.shapeDrag = null;
-            this.cloneSource = null; this.hover = null;
+            this.cloneSource = null; this.cloneOffset = null; this.lastStrokeEnd = null; this.hover = null;
             if (this.extendInputs) for (const k of Object.keys(this.extendInputs)) this.extendInputs[k].value = 0;
             this.renderLayers(); this.renderHistory(); this.renderSelectionList(); this.renderInfo(); this.updateSubbar();
             this.fitView(); this.drawThumb();
@@ -790,15 +865,7 @@ export class GeometryPart {
             const xf = snapXf(xfMul(A, sv.xf || XF_IDENTITY));
             if (xfIsIdentity(xf)) delete sv.xf; else sv.xf = xf;
         }
-        if (this.maps) {
-            let anyMap = false;
-            for (const map of Object.values(this.maps)) {
-                if (!map || !map.xf) continue;
-                map.xf = snapXf(xfMul(A, map.xf));
-                anyMap = true;
-            }
-            if (anyMap) this.mapsVersion++;
-        }
+        this.docMaps.follow((xf) => snapXf(xfMul(A, xf)));
         for (const l of this.layers || []) {
             if (l && l.kind === "filter" && l.filter === "relight" && l.params && Array.isArray(l.params.lights)) {
                 for (const light of l.params.lights) {
@@ -880,6 +947,17 @@ export class GeometryPart {
      */
     followGeometry(kind, A, from, to) {
         this.geometrySeq++;
+        // the points the brushes remember in image pixels (Shift+click's line start, Clone's and Heal's source) move
+        // with the picture; a point the change took off the picture is forgotten
+        const moved = (p) => {
+            if (!p) return null;
+            const [x, y] = xfApply(A, p.x, p.y);
+            return x >= 0 && y >= 0 && x <= to.width && y <= to.height ? { ...p, x, y } : null;
+        };
+        this.lastStrokeEnd = moved(this.lastStrokeEnd);
+        this.cloneSource = moved(this.cloneSource);
+        if (!this.cloneSource) this.cloneOffset = null;
+        else if (this.cloneOffset) this.cloneOffset = { x: this.cloneOffset.x * A[0], y: this.cloneOffset.y * A[3] };   // a resize scales the offset
         this.mapExtras(A, kind);
         this.mapGuides(A, to.width, to.height);
         this.docXf = snapXf(xfMul(A, this.docXf));
@@ -1064,7 +1142,7 @@ export class GeometryPart {
                 if (p.maskPx) l.maskPx = p.maskPx;
                 if (p.text) { l.text = p.text; if (l._textUndo) this.releaseSnapshot(l._textUndo); l._textUndo = null; }
             }
-            this.sel = sel;
+            this.selState.replace(sel);
             this.geometrySeq++;
             this.mapExtras(A, "straighten");
             // a guide is not turned by a few degrees: it stays where it was on the screen, shifted by the crop
@@ -1089,10 +1167,9 @@ export class GeometryPart {
             this.uploaded = this.makeUploaded();
             this.dropCompositeCaches();
             this.touchSource(this.sel);
-            this.selectionDirty = true; this.selectionLoose = false;
-            this.selectionDataUrl = null; this.selectionEncoded = false;
+            this.selState.invalidate();
             this.polyPoints = null; this.lassoPoints = null; this.shapePoints = null; this.shapeDrag = null;
-            this.cloneSource = null; this.hover = null;
+            this.cloneSource = null; this.cloneOffset = null; this.lastStrokeEnd = null; this.hover = null;
             if (this.extendInputs) for (const k of Object.keys(this.extendInputs)) this.extendInputs[k].value = 0;
             this.renderLayers(); this.renderHistory(); this.renderSelectionList(); this.renderInfo(); this.updateSubbar();
             this.fitView(); this.drawThumb();
@@ -1252,7 +1329,7 @@ export class GeometryPart {
         const grows = !f.angle && (f.y < 0 || f.x < 0 || f.x + f.w > this.width || f.y + f.h > this.height);
         if (grows && this.extendGenerate) {
             const s = this.resultInputState();
-            if (s.provider && s.charged) {
+            if (s && s.charged) {
                 const yes = await this.ask({
                     title: "Generate the new border",
                     message: `After the extend, Generate runs on the new border with ${s.recipeName || "the selected recipe"} on ${s.label || "an API provider"}: a paid run, charged as any Generate. Cancel extends the canvas and generates nothing.`,
@@ -1404,14 +1481,13 @@ export class GeometryPart {
                 }
             }
             // a new object (the canvas undo step holds the old one): the old selection placed at -left, -top
-            this.sel = this.sel.resized(nw, nh, { x: -left, y: -top });
+            this.selState.replace(this.sel.resized(nw, nh, { x: -left, y: -top }));
             this.base = { ref, px };
             this.width = nw; this.height = nh;
             pushed = true;
             this.pushUndoSnapshot(before, { tracked: true, label: "Crop canvas" });
             this.uploaded = this.makeUploaded();
-            this.selectionDirty = true; this.selectionLoose = false;
-            this.selectionDataUrl = null; this.selectionEncoded = false;
+            this.selState.invalidate();
             this.followGeometry("crop", xfTranslate(-left, -top), { width: W, height: H }, { width: nw, height: nh });
             this.renderLayers(); this.renderHistory(); this.renderInfo(); this.fitView(); this.drawThumb(); this.notifyChanged();
             storeGeometryFiles(this, "cropped");
@@ -1492,14 +1568,13 @@ export class GeometryPart {
             const sc = sel.getContext("2d");
             sc.imageSmoothingEnabled = true;
             this.sel.drawTo(sc, 0, 0, nw, nh);
-            this.sel = this.pixels.Mask.fromCanvas(sel);
+            this.selState.replace(this.pixels.Mask.fromCanvas(sel));
             this.base = { ref, px };
             this.width = nw; this.height = nh;
             pushed = true;
             this.pushUndoSnapshot(before, { tracked: true, label: base ? "Upscale image" : "Resize image" });
             this.uploaded = this.makeUploaded();
-            this.selectionDirty = true; this.selectionLoose = false;
-            this.selectionDataUrl = null; this.selectionEncoded = false;
+            this.selState.invalidate();
             this.followGeometry("resize", xfScale(sx, sy), { width: W, height: H }, { width: nw, height: nh });
             this.renderLayers(); this.renderHistory(); this.renderInfo(); this.fitView(); this.drawThumb(); this.notifyChanged();
             storeGeometryFiles(this, "resized");
@@ -1688,14 +1763,13 @@ export class GeometryPart {
             this.base = { ref, px };
             this.width = nw; this.height = nh;
             // a new object (the canvas undo step holds the old one): the new border selected
-            this.sel = this.pixels.Mask.empty(nw, nh);
+            this.selState.replace(this.pixels.Mask.empty(nw, nh));
             this.sel.fill(null, "#ff0000");
             this.sel.clear([left, top, left + W, top + H]);
             pushed = true;
             this.pushUndoSnapshot(before, { tracked: true, label: "Extend canvas" });
             this.uploaded = this.makeUploaded();
-            this.selectionDirty = true; this.selectionLoose = false;
-            this.selectionDataUrl = null; this.selectionEncoded = false;
+            this.selState.invalidate();
             this.followGeometry("extend", xfTranslate(left, top), { width: W, height: H }, { width: nw, height: nh });
             for (const k of Object.keys(this.extendInputs)) this.extendInputs[k].value = 0;
             this.renderHistory();

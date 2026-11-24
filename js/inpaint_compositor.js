@@ -1078,7 +1078,9 @@ export class GLCompositor {
             const fx = l.w / sw, fy = l.h / sh;   // image pixels per source pixel
             const need = { x: (region.x - l.x) / fx, y: (region.y - l.y) / fy, w: region.w / fx, h: region.h / fy };
             const s = this._source(l.source, l.version, need);
-            if (!s) return null;
+            // the Canvas 2D path takes over: what this call put into the atlas and the source textures goes back to
+            // their budgets as at the end of a composite (a pan there kept adding atlas pages)
+            if (!s) { this._evict(); this._evictAtlas(); return null; }
             if (!s.tex) continue;   // off screen
             prepared.push({ ...l, tex: s.tex, x: l.x + s.x * fx, y: l.y + s.y * fy, w: s.w * fx, h: s.h * fy });
         }

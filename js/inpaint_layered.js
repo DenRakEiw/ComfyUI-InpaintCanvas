@@ -1016,10 +1016,22 @@ function pngSize(png) {
     return { w: v.getUint32(16), h: v.getUint32(20) };
 }
 
+// a tag's attributes read in one pass from the left, each value whole: `x='800'` inside name="ref x='800'" is part of
+// the name, not the layer's x (a search per name found it there first); kept per tag text while one file is read
+const ATTRS = new Map();
 const attr = (tag, name) => {
-    const m = new RegExp(`\\s${name}\\s*=\\s*("([^"]*)"|'([^']*)')`).exec(tag);
-    if (!m) return null;
-    return (m[2] != null ? m[2] : m[3]).replace(/&quot;/g, "\"").replace(/&apos;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+    let all = ATTRS.get(tag);
+    if (!all) {
+        all = new Map();
+        const re = /([A-Za-z_:][\w:.-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+        let m;
+        while ((m = re.exec(tag))) if (!all.has(m[1])) all.set(m[1], m[2] != null ? m[2] : m[3]);
+        if (ATTRS.size > 4096) ATTRS.clear();
+        ATTRS.set(tag, all);
+    }
+    const v = all.get(name);
+    if (v == null) return null;
+    return v.replace(/&quot;/g, "\"").replace(/&apos;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
 };
 
 /**
@@ -1099,7 +1111,7 @@ async function oraFromEntries(fileSize, zip, from, inflateRaw, onHeader) {
     const xmlBytes = await get("stack.xml", from.whole);
     if (!xmlBytes) throw new Error("the ORA file has no stack.xml");
     const xml = new TextDecoder().decode(xmlBytes);
-    const img = /<image\b[^>]*>/.exec(xml);
+    const img = /<image\b(?:[^>"']|"[^"]*"|'[^']*')*>/.exec(xml);
     if (!img) throw new Error("the ORA stack.xml has no <image>");
     const width = Math.round(+attr(img[0], "w")), height = Math.round(+attr(img[0], "h"));
     if (!(width > 0 && height > 0)) throw new Error("the ORA image has no size");
@@ -1111,7 +1123,7 @@ async function oraFromEntries(fileSize, zip, from, inflateRaw, onHeader) {
     const blends = [], missing = [];
     let grouped = 0;
     const groups = [];   // open stacks (the outermost <stack> is the image itself)
-    const re = /<(\/?)(stack|layer)\b([^>]*?)(\/?)>/g;
+    const re = /<(\/?)(stack|layer)\b((?:[^>"']|"[^"]*"|'[^']*')*?)(\/?)>/g;
     let m, level = 0;
     while ((m = re.exec(xml))) {
         const [, close, kind, body, selfClose] = m;

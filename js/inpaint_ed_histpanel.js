@@ -200,11 +200,10 @@ export class HistoryPanelPart {
             this.activeLayerId = null;
             this.history = [];
             this.savedSelections = [];
-            this.maps = {};
-            this.mapsVersion++;
+            this.docMaps.replaceAll(null);
             this.guides = { x: [], y: [] };
             this.compare = null;
-            this.sel = null;
+            this.selState.replace(null);
         }
         await this.setBasePixels(ref, px, { keepLayers, keep });
         this.clearUndo();
@@ -405,11 +404,10 @@ export class HistoryPanelPart {
             this.activeLayerId = null;
             this.history = [];
             this.savedSelections = [];
-            this.maps = {};
-            this.mapsVersion++;
+            this.docMaps.replaceAll(null);
             this.guides = { x: [], y: [] };
             this.compare = null;
-            this.sel = null;
+            this.selState.replace(null);
             await this.setBasePixels(ref, px, { keepLayers: false, keep });
             this._blankBase = true;
             this.clearUndo();
